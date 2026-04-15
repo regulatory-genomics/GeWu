@@ -57,6 +57,33 @@ use tokio::task::spawn_blocking;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+fn strip_tag_blocks(input: &str, tag: &str) -> String {
+    let start_tag = format!("<{}>", tag);
+    let end_tag = format!("</{}>", tag);
+    let mut output = input.to_string();
+
+    loop {
+        let lower = output.to_lowercase();
+        let Some(start) = lower.find(&start_tag) else {
+            break;
+        };
+        let Some(end_rel) = lower[start..].find(&end_tag) else {
+            break;
+        };
+        let end = start + end_rel + end_tag.len();
+        output.replace_range(start..end, "");
+    }
+
+    output
+}
+
+fn normalize_assistant_output(input: &str) -> String {
+    let cleaned = ["think", "analysis", "reasoning"]
+        .into_iter()
+        .fold(input.to_string(), |acc, tag| strip_tag_blocks(&acc, tag));
+    cleaned.trim().to_string()
+}
+
 pub struct Agent {
     llm: Arc<dyn LlmProvider>,
     tools: Arc<Vec<Arc<dyn Tool>>>,
@@ -254,14 +281,16 @@ impl Agent {
                     }
                 }
 
+                let normalized_content = normalize_assistant_output(&current_content);
+
                 let assistant_msg = Message::Assistant {
-                    content: if current_content.is_empty() { None } else { Some(current_content.clone()) },
+                    content: if normalized_content.is_empty() { None } else { Some(normalized_content.clone()) },
                     tool_calls: if current_tool_calls.is_empty() { None } else { Some(current_tool_calls.clone()) },
                 };
                 self.memory.add_message(assistant_msg).await;
 
                 if current_tool_calls.is_empty() {
-                    yield AgentEvent::Finish { response: current_content };
+                    yield AgentEvent::Finish { response: normalized_content };
                     break;
                 }
 
@@ -450,6 +479,25 @@ When constructing the summary, try to stick to this template:
 
         self.memory.replace(new_history).await;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod normalization_tests {
+    use super::normalize_assistant_output;
+
+    #[test]
+    fn strips_think_analysis_and_reasoning_blocks() {
+        let raw = "<think>internal</think> {\"ok\":true} <analysis>drop</analysis> <reasoning>drop2</reasoning>";
+        let cleaned = normalize_assistant_output(raw);
+        assert_eq!(cleaned, "{\"ok\":true}");
+    }
+
+    #[test]
+    fn preserves_regular_text_when_no_tags_present() {
+        let raw = "plain response";
+        let cleaned = normalize_assistant_output(raw);
+        assert_eq!(cleaned, "plain response");
     }
 }
 

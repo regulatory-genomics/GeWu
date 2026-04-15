@@ -383,6 +383,8 @@ pub enum ChatCompletionMessageToolCalls {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionMessageToolCall {
     pub id: String,
+    #[serde(rename = "type")]
+    pub tool_type: String,
     pub function: FunctionCall,
 }
 

@@ -348,6 +348,7 @@ impl OpenAIProvider {
                         .map(|tc| {
                             ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
                                 id: tc.id.clone(),
+                                tool_type: "function".to_string(),
                                 function: OpenAIFunctionCall {
                                     name: tc.function.name.clone(),
                                     arguments: tc.function.arguments.clone(),
