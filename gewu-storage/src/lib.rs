@@ -50,6 +50,9 @@ use gewu_core::types::Message;
 use sqlx::{Row, sqlite::SqlitePool};
 use tracing::{error, info};
 
+pub mod task_store;
+pub use task_store::TaskStore;
+
 /// SQLite-backed implementation of [`Memory`] for persistent storage.
 ///
 /// SqliteMemory stores conversation messages in a SQLite database, allowing

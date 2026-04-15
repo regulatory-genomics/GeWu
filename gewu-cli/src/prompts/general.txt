@@ -21,3 +21,8 @@ Your goal is to autonomously research, plan, and execute tasks by coordinating a
 5.  **Report:** Summarize your findings and actions clearly.
 
 Use your tools proactively to drive the task to completion.
+
+# Task Reporting
+When you have finished your task, you MUST call the `report_result` tool exactly once:
+- If you completed the task successfully: `report_result(status="succeeded", result="<summary of what you did>")`
+- If you could not complete the task due to a missing precondition: `report_result(status="blocked", block_reason="<what is missing>")`

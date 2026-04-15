@@ -279,3 +279,89 @@ pub struct TruncationResult {
     pub truncated: bool,
     pub output_path: Option<PathBuf>,
 }
+
+// ---------------------------------------------------------------------------
+// Specialist assembly types
+// ---------------------------------------------------------------------------
+
+/// A single tool capability that a specialist may require.
+///
+/// Each variant maps to a concrete tool constructor at assembly time.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ToolCapability {
+    ReadFile,
+    WriteFile,
+    EditFile,
+    Glob,
+    Bash { safe_mode: bool },
+    Grep,
+    WebFetch,
+    WebSearch,
+    List,
+    CodeSearch,
+    Todo,
+    Task,
+    ReportResult,
+}
+
+/// Declarative description of a specialist agent.
+///
+/// The runtime resolves `capabilities` into concrete tools and builds the
+/// agent — no hardcoded match branch required.
+#[derive(Debug, Clone)]
+pub struct SpecialistDescriptor {
+    pub id: &'static str,
+    pub description: &'static str,
+    pub capabilities: Vec<ToolCapability>,
+    pub system_prompt: &'static str,
+}
+
+// ---------------------------------------------------------------------------
+// Durable task types
+// ---------------------------------------------------------------------------
+
+/// Lifecycle status of a durable task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskStatus {
+    Ready,
+    Running,
+    Blocked,
+    Succeeded,
+    Failed,
+}
+
+impl TaskStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::Blocked => "blocked",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "ready" => Some(Self::Ready),
+            "running" => Some(Self::Running),
+            "blocked" => Some(Self::Blocked),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Persisted record for a durable task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRecord {
+    pub task_id: String,
+    pub specialist_id: String,
+    pub prompt: String,
+    pub status: TaskStatus,
+    pub attempt: u32,
+    pub block_reason: Option<String>,
+    pub result_json: Option<String>,
+}
