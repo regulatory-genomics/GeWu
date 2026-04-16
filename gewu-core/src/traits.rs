@@ -41,11 +41,14 @@
 //! }
 //! ```
 
-use crate::types::{Message, ProviderEvent, ToolContext, ToolResult};
+use crate::types::{Message, ProviderEvent, SpecialistDescriptor, ToolContext, ToolResult};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use schemars::schema::RootSchema;
+use serde_json::Value;
+use sqlx::SqlitePool;
 use std::error::Error;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[async_trait]
@@ -148,4 +151,50 @@ impl Memory for Vec<Message> {
     async fn replace(&mut self, messages: Vec<Message>) {
         *self = messages;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Plugin system traits
+// ---------------------------------------------------------------------------
+
+/// Context passed to tool factories during specialist assembly.
+///
+/// Contains the shared resources that tool constructors typically need.
+pub struct AssemblyContext {
+    pub working_directory: PathBuf,
+    pub provider: Arc<dyn LlmProvider>,
+    pub pool: SqlitePool,
+    pub metadata_json: Value,
+}
+
+/// A factory that produces tool instances from capability names.
+///
+/// Implement this trait to provide custom tools that can be assembled into
+/// specialists. Each factory declares which capability names it handles and
+/// creates the corresponding tool instances on demand.
+pub trait ToolFactory: Send + Sync {
+    /// The capability names this factory handles (e.g., `["count_lines"]`).
+    fn capabilities(&self) -> Vec<String>;
+
+    /// Create tool instances for the given capability name.
+    fn create_tools(
+        &self,
+        capability: &str,
+        ctx: &AssemblyContext,
+    ) -> Result<Vec<Box<dyn Tool>>, Box<dyn Error + Send + Sync>>;
+}
+
+/// A plugin that provides tool factories and/or specialist descriptors.
+///
+/// This is the single integration point for external crates. Implement this
+/// trait and pass it to `GeWuRuntime::builder().register_plugin(...)`.
+pub trait Plugin: Send + Sync {
+    /// A human-readable name for this plugin.
+    fn name(&self) -> &str;
+
+    /// Tool factories provided by this plugin.
+    fn tool_factories(&self) -> Vec<Box<dyn ToolFactory>>;
+
+    /// Specialist descriptors provided by this plugin.
+    fn specialist_descriptors(&self) -> Vec<SpecialistDescriptor>;
 }

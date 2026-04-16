@@ -252,11 +252,14 @@ impl McpClient {
                 let mut pending = pending_requests.lock().await;
                 if let Some(sender) = pending.remove(&id) {
                     if let Some(error) = response.error {
-                        if sender.send(Err(anyhow::anyhow!(
-                            "RPC Error {}: {}",
-                            error.code,
-                            error.message
-                        ))).is_err() {
+                        if sender
+                            .send(Err(anyhow::anyhow!(
+                                "RPC Error {}: {}",
+                                error.code,
+                                error.message
+                            )))
+                            .is_err()
+                        {
                             tracing::warn!("MCP: failed to send RPC error response to channel");
                         }
                     } else if let Some(result) = response.result {
@@ -511,11 +514,14 @@ impl McpClient {
                 if let Some(sender) = pending.remove(&id) {
                     if let Ok(response) = serde_json::from_value::<JsonRpcResponse>(msg) {
                         if let Some(error) = response.error {
-                            if sender.send(Err(anyhow::anyhow!(
-                                "RPC Error {}: {}",
-                                error.code,
-                                error.message
-                            ))).is_err() {
+                            if sender
+                                .send(Err(anyhow::anyhow!(
+                                    "RPC Error {}: {}",
+                                    error.code,
+                                    error.message
+                                )))
+                                .is_err()
+                            {
                                 tracing::warn!("MCP: failed to send RPC error response to channel");
                             }
                         } else if let Some(result) = response.result {

@@ -47,8 +47,8 @@ impl Tool for ListTool {
 
         let path_str = input.path.as_deref().unwrap_or(".");
 
-        let root_path = resolve_safe_path(&self.working_directory, path_str)
-            .map_err(into_tool_error)?;
+        let root_path =
+            resolve_safe_path(&self.working_directory, path_str).map_err(into_tool_error)?;
 
         let mut builder = WalkBuilder::new(&root_path);
         builder.hidden(false);
@@ -120,7 +120,10 @@ mod tests {
 
         let args = serde_json::json!({});
         let ctx = ToolContext::new("test", "msg");
-        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
         assert!(result.output.contains("a.txt"));
         assert!(result.output.contains("sub/"));

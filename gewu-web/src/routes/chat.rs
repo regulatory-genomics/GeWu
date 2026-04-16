@@ -83,11 +83,15 @@ pub async fn handle_chat(
     Json(req): Json<ChatRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, AppError> {
     info!("handle_chat called for session: {}", req.session_id);
-    
+
     let auth = app.auth_token.read().await;
-    let valid = query.token.as_ref().map(|t| auth.validate(t)).unwrap_or(false);
+    let valid = query
+        .token
+        .as_ref()
+        .map(|t| auth.validate(t))
+        .unwrap_or(false);
     drop(auth);
-    
+
     if !valid {
         warn!("Unauthorized chat attempt");
         return Err(AppError::Unauthorized);
@@ -95,18 +99,17 @@ pub async fn handle_chat(
 
     let agent_handle = app.get_agent(&req.session_id).await;
     let agent_handle = agent_handle.ok_or(AppError::SessionNotFound)?;
-    
+
     info!("Agent found for session: {}, starting chat", req.session_id);
 
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let message = req.message.clone();
-    
+
     tokio::spawn(async move {
         let mut agent = agent_handle.agent.lock().await;
         info!("Agent locked, calling ask() with message: {}", message);
         let stream = agent.ask(&message);
         futures::pin_mut!(stream);
-        
         let mut event_count = 0usize;
         while let Some(result) = stream.next().await {
             event_count += 1;

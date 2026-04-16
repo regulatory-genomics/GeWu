@@ -76,8 +76,12 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "gpt-5.3-codex".to_string());
 
     let db_path = cli.db_path.or_else(|| {
-        dirs::home_dir()
-            .map(|h| h.join(".gewu").join("gewu.db").to_string_lossy().to_string())
+        dirs::home_dir().map(|h| {
+            h.join(".gewu")
+                .join("gewu.db")
+                .to_string_lossy()
+                .to_string()
+        })
     });
 
     let mcp_servers = loaded_config.config.mcp_servers;
@@ -108,10 +112,22 @@ async fn main() -> Result<()> {
         .route("/api/info", get(routes::sessions::handle_server_info))
         .route("/api/chat", post(routes::chat::handle_chat))
         .route("/api/sessions", get(routes::sessions::handle_list_sessions))
-        .route("/api/sessions", post(routes::sessions::handle_create_session))
-        .route("/api/sessions/{id}", delete(routes::sessions::handle_delete_session))
-        .route("/api/sessions/{id}/messages", get(routes::sessions::handle_get_messages))
-        .route("/api/sessions/{id}/switch-agent", post(routes::sessions::handle_switch_agent))
+        .route(
+            "/api/sessions",
+            post(routes::sessions::handle_create_session),
+        )
+        .route(
+            "/api/sessions/{id}",
+            delete(routes::sessions::handle_delete_session),
+        )
+        .route(
+            "/api/sessions/{id}/messages",
+            get(routes::sessions::handle_get_messages),
+        )
+        .route(
+            "/api/sessions/{id}/switch-agent",
+            post(routes::sessions::handle_switch_agent),
+        )
         .route("/index.html", get(fallback::serve_index))
         .fallback(fallback::serve_static)
         .layer(cors)

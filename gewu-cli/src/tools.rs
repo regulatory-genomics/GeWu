@@ -5,12 +5,14 @@ use gewu_core::types::{TaskStatus, ToolContext, ToolResult};
 use gewu_storage::TaskStore;
 use schemars::schema::RootSchema;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use std::error::Error;
 use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
+
+use crate::runtime::GeWuRuntime;
 
 pub struct TaskTool {
     pub provider: Arc<dyn LlmProvider>,
@@ -122,15 +124,18 @@ impl Tool for TaskTool {
             input.subagent_type, input.description, task_id
         );
 
-        let (mut agent, _registry) = crate::registry::create_agent(
-            &input.subagent_type,
-            self.provider.clone(),
-            self.pool.clone(),
-            task_id.clone(),
-            Vec::new(),
-        )
-        .await
-        .map_err(|e| format!("Failed to create agent: {}", e))?;
+        let runtime = GeWuRuntime::builder()
+            .provider(self.provider.clone())
+            .pool(self.pool.clone())
+            .register_builtin_capabilities()
+            .register_builtin_specialists()
+            .build()
+            .map_err(|e| format!("Failed to build runtime: {}", e))?;
+
+        let (mut agent, _registry) = runtime
+            .build_specialist(&input.subagent_type, task_id.clone(), Vec::new())
+            .await
+            .map_err(|e| format!("Failed to create agent: {}", e))?;
 
         let mut stream = Box::pin(agent.ask(&input.prompt));
         let mut result = String::new();
@@ -185,7 +190,9 @@ impl Tool for TaskTool {
         }
 
         // Persist final state
-        let _ = store.update_status(&task_id, &final_status, block_reason.as_deref()).await;
+        let _ = store
+            .update_status(&task_id, &final_status, block_reason.as_deref())
+            .await;
         if final_status == TaskStatus::Succeeded {
             let _ = store.set_result(&task_id, &result).await;
         }

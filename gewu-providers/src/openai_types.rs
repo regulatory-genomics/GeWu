@@ -51,9 +51,7 @@ impl Client {
     }
 
     pub fn chat(&self) -> ChatCompletions<'_> {
-        ChatCompletions {
-            client: self,
-        }
+        ChatCompletions { client: self }
     }
 
     pub fn models(&self) -> Models<'_> {
@@ -72,10 +70,15 @@ impl<'a> ChatCompletions<'a> {
     ) -> Result<ChatCompletionStream, OpenAIError> {
         request.stream = Some(true);
         let url = format!("{}/chat/completions", self.client.config.base_url);
-        
-        let response = self.client.http_client
+
+        let response = self
+            .client
+            .http_client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.client.config.api_key))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.client.config.api_key),
+            )
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .json(&request)
@@ -97,10 +100,15 @@ impl<'a> ChatCompletions<'a> {
         request: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, OpenAIError> {
         let url = format!("{}/chat/completions", self.client.config.base_url);
-        
-        let response = self.client.http_client
+
+        let response = self
+            .client
+            .http_client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.client.config.api_key))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.client.config.api_key),
+            )
             .header("Content-Type", "application/json")
             .json(&request)
             .send()
@@ -169,23 +177,25 @@ where
             if let Some(pos) = self.buffer.find('\n') {
                 let line = self.buffer[..pos].to_string();
                 self.buffer = self.buffer[pos + 1..].to_string();
-                
+
                 let line = line.trim();
                 if line.is_empty() || line.starts_with(':') {
                     continue;
                 }
-                
+
                 if let Some(data) = line.strip_prefix("data: ") {
                     if data == "[DONE]" {
                         return Poll::Ready(None);
                     }
                     match serde_json::from_str::<ChatCompletionChunk>(data) {
                         Ok(chunk) => return Poll::Ready(Some(Ok(chunk))),
-                        Err(e) => return Poll::Ready(Some(Err(OpenAIError::SseParse(e.to_string())))),
+                        Err(e) => {
+                            return Poll::Ready(Some(Err(OpenAIError::SseParse(e.to_string()))));
+                        }
                     }
                 }
             }
-            
+
             match self.stream.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
                     if let Ok(s) = std::str::from_utf8(&bytes) {
@@ -215,10 +225,15 @@ pub struct Models<'a> {
 impl<'a> Models<'a> {
     pub async fn list(&self) -> Result<ModelsResponse, OpenAIError> {
         let url = format!("{}/models", self.client.config.base_url);
-        
-        let response = self.client.http_client
+
+        let response = self
+            .client
+            .http_client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.client.config.api_key))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.client.config.api_key),
+            )
             .send()
             .await?;
 
@@ -409,22 +424,22 @@ impl FunctionObjectArgs {
             parameters: Value::Object(serde_json::Map::new()),
         }
     }
-    
+
     pub fn name(mut self, name: &str) -> Self {
         self.name = name.to_string();
         self
     }
-    
+
     pub fn description(mut self, description: &str) -> Self {
         self.description = Some(description.to_string());
         self
     }
-    
+
     pub fn parameters(mut self, parameters: Value) -> Self {
         self.parameters = parameters;
         self
     }
-    
+
     pub fn build(self) -> Result<FunctionObject, OpenAIError> {
         if self.name.is_empty() {
             return Err(OpenAIError::Build("name is required".to_string()));
@@ -465,35 +480,37 @@ impl CreateChatCompletionRequestArgs {
         self.model = Some(model.to_string());
         self
     }
-    
+
     pub fn messages(mut self, messages: Vec<ChatCompletionRequestMessage>) -> Self {
         self.messages = Some(messages);
         self
     }
-    
+
     pub fn tools(mut self, tools: Vec<ChatCompletionTools>) -> Self {
         self.tools = Some(tools);
         self
     }
-    
+
     pub fn stream(mut self, stream: bool) -> Self {
         self.stream = Some(stream);
         self
     }
-    
+
     pub fn max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
         self
     }
-    
+
     pub fn temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
         self
     }
-    
+
     pub fn build(self) -> Result<CreateChatCompletionRequest, OpenAIError> {
         Ok(CreateChatCompletionRequest {
-            model: self.model.ok_or_else(|| OpenAIError::Build("model is required".to_string()))?,
+            model: self
+                .model
+                .ok_or_else(|| OpenAIError::Build("model is required".to_string()))?,
             messages: self.messages.unwrap_or_default(),
             tools: self.tools,
             stream: self.stream,
@@ -519,7 +536,7 @@ impl ChatCompletionRequestSystemMessageArgs {
         self.content = Some(content);
         self
     }
-    
+
     pub fn build(self) -> Result<SystemMessage, OpenAIError> {
         Ok(SystemMessage {
             content: self.content.unwrap_or_default(),
@@ -543,7 +560,7 @@ impl ChatCompletionRequestUserMessageArgs {
         self.content = Some(content);
         self
     }
-    
+
     pub fn build(self) -> Result<UserMessage, OpenAIError> {
         Ok(UserMessage {
             content: self.content.unwrap_or_default(),
@@ -571,12 +588,12 @@ impl ChatCompletionRequestAssistantMessageArgs {
         self.content = Some(content);
         self
     }
-    
+
     pub fn tool_calls(mut self, tool_calls: Vec<ChatCompletionMessageToolCalls>) -> Self {
         self.tool_calls = Some(tool_calls);
         self
     }
-    
+
     pub fn build(self) -> Result<AssistantMessage, OpenAIError> {
         Ok(AssistantMessage {
             content: self.content,
@@ -605,15 +622,17 @@ impl ChatCompletionRequestToolMessageArgs {
         self.tool_call_id = Some(tool_call_id);
         self
     }
-    
+
     pub fn content(mut self, content: String) -> Self {
         self.content = Some(content);
         self
     }
-    
+
     pub fn build(self) -> Result<ToolMessage, OpenAIError> {
         Ok(ToolMessage {
-            tool_call_id: self.tool_call_id.ok_or_else(|| OpenAIError::Build("tool_call_id is required".to_string()))?,
+            tool_call_id: self
+                .tool_call_id
+                .ok_or_else(|| OpenAIError::Build("tool_call_id is required".to_string()))?,
             content: self.content.unwrap_or_default(),
         })
     }

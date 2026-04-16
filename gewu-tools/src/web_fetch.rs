@@ -64,7 +64,10 @@ impl Tool for WebFetchTool {
         let status = response.status();
 
         if !status.is_success() {
-            return Ok(ToolResult::new("webfetch", format!("Request failed with status: {}", status)));
+            return Ok(ToolResult::new(
+                "webfetch",
+                format!("Request failed with status: {}", status),
+            ));
         }
 
         let html = response.text().await.map_err(into_tool_error)?;
@@ -104,7 +107,10 @@ mod tests {
 
         let args = serde_json::json!({ "url": url });
         let ctx = ToolContext::new("test", "msg");
-        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
         assert!(result.output.contains("Hello, World!"));
         assert!(!result.output.contains("<h1>"));

@@ -1,7 +1,5 @@
 pub mod config;
 pub mod mcp_loader;
-pub mod registry;
-pub mod tools;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -9,6 +7,7 @@ use futures::StreamExt;
 use gewu_core::traits::LlmProvider;
 use gewu_core::types::AgentEvent;
 use gewu_providers::OpenAIProvider;
+use gewu_runtime::{GeWuRuntime, list_available_agents};
 use sqlx::sqlite::SqlitePoolOptions;
 use std::env;
 use std::io::Write;
@@ -142,7 +141,7 @@ async fn main() -> Result<()> {
 
     if cli.list_agents {
         println!("Available Agents:");
-        for agent in registry::list_available_agents() {
+        for agent in list_available_agents() {
             println!("  - {}: {}", agent.name, agent.description);
         }
         return Ok(());
@@ -235,8 +234,15 @@ async fn main() -> Result<()> {
     let mcp_tools = mcp_loader::load_mcp_tools(loaded_config.config.mcp_servers).await?;
 
     // Create Agent
-    let (mut agent, _registry) =
-        registry::create_agent(&cli.agent, provider, pool, session_id, mcp_tools).await?;
+    let runtime = GeWuRuntime::builder()
+        .provider(provider.clone())
+        .pool(pool.clone())
+        .register_builtin_capabilities()
+        .register_builtin_specialists()
+        .build()?;
+    let (mut agent, _registry) = runtime
+        .build_specialist(&cli.agent, session_id, mcp_tools)
+        .await?;
     info!("Initialized agent: {}", cli.agent);
 
     // Initial Prompt handling

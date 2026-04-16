@@ -3,7 +3,9 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use gewu_core::agent::AgentBuilder;
 use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{AgentEvent, FunctionCall, Message, ProviderEvent, ToolCall, ToolContext, ToolResult};
+use gewu_core::types::{
+    AgentEvent, FunctionCall, Message, ProviderEvent, ToolCall, ToolContext, ToolResult,
+};
 use serde_json::Value;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
@@ -74,7 +76,11 @@ impl Tool for MockTool {
     fn schema(&self) -> schemars::schema::RootSchema {
         schemars::schema_for!(serde_json::Value)
     }
-    async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+    async fn execute(
+        &self,
+        _args: Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         Ok(ToolResult::new("mock_tool", "Tool output".to_string()))
     }
 }

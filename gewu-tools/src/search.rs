@@ -87,7 +87,10 @@ impl Tool for CodeSearchTool {
             .map_err(into_tool_error)?;
 
         if !res.status().is_success() {
-            return Ok(ToolResult::new("codesearch", format!("Request failed: {}", res.status())));
+            return Ok(ToolResult::new(
+                "codesearch",
+                format!("Request failed: {}", res.status()),
+            ));
         }
 
         let mut stream = res.bytes_stream();
@@ -180,7 +183,10 @@ impl Tool for WebSearchTool {
             .map_err(into_tool_error)?;
 
         if !res.status().is_success() {
-            return Ok(ToolResult::new("websearch", format!("Request failed: {}", res.status())));
+            return Ok(ToolResult::new(
+                "websearch",
+                format!("Request failed: {}", res.status()),
+            ));
         }
 
         let mut stream = res.bytes_stream();

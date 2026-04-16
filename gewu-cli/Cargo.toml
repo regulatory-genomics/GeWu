@@ -8,6 +8,7 @@ gewu-core = { path = "../gewu-core" }
 gewu-providers = { path = "../gewu-providers" }
 gewu-tools = { path = "../gewu-tools" }
 gewu-storage = { path = "../gewu-storage" }
+gewu-runtime = { path = "../gewu-runtime" }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }

@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use gewu_core::traits::Tool;
 use gewu_providers::OpenAIProvider;
-use gewu_cli::registry::create_agent;
+use gewu_runtime::GeWuRuntime;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePoolOptions;
-use sqlx::{SqlitePool, Row};
+use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -54,7 +54,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub async fn new(config: ServerConfig, auth_token: crate::auth::AuthState, mcp_tools: Vec<Arc<dyn Tool>>) -> Result<Self> {
+    pub async fn new(
+        config: ServerConfig,
+        auth_token: crate::auth::AuthState,
+        mcp_tools: Vec<Arc<dyn Tool>>,
+    ) -> Result<Self> {
         let db_pool = if let Some(ref path) = config.db_path {
             Some(create_db_pool(path).await?)
         } else {
@@ -79,17 +83,30 @@ impl AppState {
         let config = self.config.read().await;
         let api_key = config.api_key.clone().context("API key not configured")?;
         let endpoint = config.endpoint.clone().context("Endpoint not configured")?;
-        let model = config.model.clone().unwrap_or_else(|| "gpt-5.3-codex".to_string());
+        let model = config
+            .model
+            .clone()
+            .unwrap_or_else(|| "gpt-5.3-codex".to_string());
         drop(config);
 
         let pool_guard = self.db_pool.lock().await;
         let pool = pool_guard.as_ref().context("Database not initialized")?;
 
         info!("Creating provider and agent...");
-        let provider = Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model));
+        let provider = Arc::new(OpenAIProvider::new_with_endpoint(
+            &api_key, &endpoint, &model,
+        ));
 
         let mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
-        let (agent, _registry) = create_agent(&agent_type, provider, pool.clone(), session_id.clone(), mcp_tools).await?;
+        let runtime = GeWuRuntime::builder()
+            .provider(provider.clone())
+            .pool(pool.clone())
+            .register_builtin_capabilities()
+            .register_builtin_specialists()
+            .build()?;
+        let (agent, _registry) = runtime
+            .build_specialist(&agent_type, session_id.clone(), mcp_tools)
+            .await?;
         info!("Agent created successfully");
 
         let created_at = std::time::SystemTime::now()
@@ -109,7 +126,10 @@ impl AppState {
             agent_type: agent_type.clone(),
         });
 
-        self.sessions.write().await.insert(session_id.clone(), session_info.clone());
+        self.sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session_info.clone());
         self.agents.write().await.insert(session_id.clone(), handle);
         info!("Session {} stored in state", session_id);
 
@@ -134,15 +154,19 @@ impl AppState {
         self.agents.read().await.get(session_id).cloned()
     }
 
-    pub async fn get_session_messages(&self, session_id: &str) -> Result<Vec<gewu_core::types::Message>> {
+    pub async fn get_session_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<gewu_core::types::Message>> {
         let pool_guard = self.db_pool.lock().await;
         let pool = pool_guard.as_ref().context("Database not initialized")?;
 
-        let rows = sqlx::query("SELECT content FROM memory_messages WHERE session_id = ? ORDER BY id ASC")
-            .bind(session_id)
-            .fetch_all(pool)
-            .await
-            .context("Failed to load messages from DB")?;
+        let rows =
+            sqlx::query("SELECT content FROM memory_messages WHERE session_id = ? ORDER BY id ASC")
+                .bind(session_id)
+                .fetch_all(pool)
+                .await
+                .context("Failed to load messages from DB")?;
 
         let mut messages = Vec::new();
         for row in rows {
@@ -152,12 +176,23 @@ impl AppState {
             messages.push(message);
         }
 
-        info!("Loaded {} messages for session {}", messages.len(), session_id);
+        info!(
+            "Loaded {} messages for session {}",
+            messages.len(),
+            session_id
+        );
         Ok(messages)
     }
 
-    pub async fn switch_agent(&self, session_id: &str, new_agent_type: String) -> Result<SessionInfo> {
-        info!("Switching agent for session {} to type: {}", session_id, new_agent_type);
+    pub async fn switch_agent(
+        &self,
+        session_id: &str,
+        new_agent_type: String,
+    ) -> Result<SessionInfo> {
+        info!(
+            "Switching agent for session {} to type: {}",
+            session_id, new_agent_type
+        );
 
         let old_handle = self.agents.write().await.remove(session_id);
         if old_handle.is_none() {
@@ -167,16 +202,29 @@ impl AppState {
         let config = self.config.read().await;
         let api_key = config.api_key.clone().context("API key not configured")?;
         let endpoint = config.endpoint.clone().context("Endpoint not configured")?;
-        let model = config.model.clone().unwrap_or_else(|| "gpt-5.3-codex".to_string());
+        let model = config
+            .model
+            .clone()
+            .unwrap_or_else(|| "gpt-5.3-codex".to_string());
         drop(config);
 
         let pool_guard = self.db_pool.lock().await;
         let pool = pool_guard.as_ref().context("Database not initialized")?;
 
-        let provider = Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model));
+        let provider = Arc::new(OpenAIProvider::new_with_endpoint(
+            &api_key, &endpoint, &model,
+        ));
 
         let mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
-        let (agent, _registry) = create_agent(&new_agent_type, provider, pool.clone(), session_id.to_string(), mcp_tools).await?;
+        let runtime = GeWuRuntime::builder()
+            .provider(provider.clone())
+            .pool(pool.clone())
+            .register_builtin_capabilities()
+            .register_builtin_specialists()
+            .build()?;
+        let (agent, _registry) = runtime
+            .build_specialist(&new_agent_type, session_id.to_string(), mcp_tools)
+            .await?;
 
         let handle = Arc::new(AgentHandle {
             agent: Arc::new(Mutex::new(agent)),
@@ -186,12 +234,15 @@ impl AppState {
 
         let created_at = {
             let sessions = self.sessions.read().await;
-            sessions.get(session_id).map(|s| s.created_at).unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64
-            })
+            sessions
+                .get(session_id)
+                .map(|s| s.created_at)
+                .unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64
+                })
         };
 
         let session_info = SessionInfo {
@@ -200,7 +251,10 @@ impl AppState {
             created_at,
         };
 
-        self.agents.write().await.insert(session_id.to_string(), handle);
+        self.agents
+            .write()
+            .await
+            .insert(session_id.to_string(), handle);
         *self.sessions.write().await.get_mut(session_id).unwrap() = session_info.clone();
 
         info!("Agent switched successfully for session {}", session_id);

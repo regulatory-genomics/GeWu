@@ -1,0 +1,154 @@
+use crate::tools::TaskTool;
+use anyhow::{Result, anyhow};
+use gewu_core::traits::{AssemblyContext, LlmProvider, Tool, ToolFactory, ToolRegistry};
+use gewu_core::types::SpecialistDescriptor;
+use gewu_tools::{
+    BashTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool, ListTool, ReadFileTool,
+    ReportResultTool, TodoItem, TodoReadTool, TodoWriteTool, WebFetchTool, WebSearchTool,
+    WriteFileTool,
+};
+use sqlx::SqlitePool;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+pub struct AgentConfig {
+    pub name: String,
+    pub description: String,
+}
+
+pub fn specialist_descriptors() -> Vec<SpecialistDescriptor> {
+    vec![
+        SpecialistDescriptor {
+            id: "build".into(),
+            description: "The default agent. Executes tools based on configured permissions.".into(),
+            capabilities: vec![
+                "task", "read_file", "write_file", "edit_file", "glob",
+                "bash", "grep", "web_fetch", "list", "code_search",
+                "web_search", "todo", "report_result",
+            ].into_iter().map(String::from).collect(),
+            system_prompt: include_str!("prompts/build.txt").into(),
+        },
+        SpecialistDescriptor {
+            id: "explore".into(),
+            description: "Fast agent specialized for exploring codebases.".into(),
+            capabilities: vec![
+                "read_file", "glob", "bash_safe", "grep", "web_fetch",
+                "list", "code_search", "web_search", "report_result",
+            ].into_iter().map(String::from).collect(),
+            system_prompt: include_str!("prompts/explore.txt").into(),
+        },
+        SpecialistDescriptor {
+            id: "general".into(),
+            description: "General-purpose agent for researching complex questions and executing multi-step tasks.".into(),
+            capabilities: vec![
+                "task", "read_file", "write_file", "edit_file", "glob",
+                "bash", "grep", "web_fetch", "list", "code_search",
+                "web_search", "todo", "report_result",
+            ].into_iter().map(String::from).collect(),
+            system_prompt: include_str!("prompts/general.txt").into(),
+        },
+    ]
+}
+
+pub fn list_available_agents() -> Vec<AgentConfig> {
+    specialist_descriptors()
+        .iter()
+        .map(|d| AgentConfig {
+            name: d.id.clone(),
+            description: d.description.clone(),
+        })
+        .collect()
+}
+
+/// Look up a specialist descriptor by id.
+pub fn find_descriptor(name: &str) -> Option<SpecialistDescriptor> {
+    specialist_descriptors().into_iter().find(|d| d.id == name)
+}
+
+pub struct BuiltinToolFactory;
+
+impl ToolFactory for BuiltinToolFactory {
+    fn capabilities(&self) -> Vec<String> {
+        vec![
+            "read_file", "write_file", "edit_file", "glob", "bash",
+            "bash_safe", "grep", "web_fetch", "web_search", "list",
+            "code_search", "todo", "task", "report_result",
+        ].into_iter().map(String::from).collect()
+    }
+
+    fn create_tools(
+        &self,
+        capability: &str,
+        ctx: &AssemblyContext,
+    ) -> std::result::Result<Vec<Box<dyn Tool>>, Box<dyn std::error::Error + Send + Sync>> {
+        let wd = ctx.working_directory.clone();
+        match capability {
+            "read_file" => Ok(vec![Box::new(ReadFileTool { working_directory: wd })]),
+            "write_file" => Ok(vec![Box::new(WriteFileTool { working_directory: wd })]),
+            "edit_file" => Ok(vec![Box::new(EditFileTool { working_directory: wd })]),
+            "glob" => Ok(vec![Box::new(GlobTool { working_directory: wd })]),
+            "bash" => Ok(vec![Box::new(BashTool { working_directory: wd, safe_mode: false })]),
+            "bash_safe" => Ok(vec![Box::new(BashTool { working_directory: wd, safe_mode: true })]),
+            "grep" => Ok(vec![Box::new(GrepTool { working_directory: wd })]),
+            "web_fetch" => Ok(vec![Box::new(WebFetchTool)]),
+            "web_search" => Ok(vec![Box::new(WebSearchTool)]),
+            "list" => Ok(vec![Box::new(ListTool { working_directory: wd })]),
+            "code_search" => Ok(vec![Box::new(CodeSearchTool)]),
+            "todo" => {
+                let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
+                Ok(vec![
+                    Box::new(TodoWriteTool::new(todos.clone())),
+                    Box::new(TodoReadTool::new(todos)),
+                ])
+            }
+            "task" => Ok(vec![Box::new(TaskTool::new(ctx.provider.clone(), ctx.pool.clone()))]),
+            "report_result" => Ok(vec![Box::new(ReportResultTool)]),
+            _ => Err(format!("Unknown capability: {}", capability).into()),
+        }
+    }
+}
+
+pub fn resolve_tools(
+    capabilities: &[String],
+    working_directory: &PathBuf,
+    provider: Arc<dyn LlmProvider>,
+    pool: SqlitePool,
+) -> Vec<Box<dyn Tool>> {
+    let runtime = crate::runtime::GeWuRuntime::builder()
+        .provider(provider)
+        .pool(pool)
+        .register_builtin_capabilities()
+        .register_builtin_specialists()
+        .build();
+
+    match runtime {
+        Ok(runtime) => runtime
+            .resolve_capabilities_in_directory(capabilities, working_directory)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to resolve capabilities: {}", e);
+                vec![]
+            }),
+        Err(e) => {
+            tracing::warn!("Failed to build runtime for resolve_tools: {}", e);
+            vec![]
+        }
+    }
+}
+
+pub async fn create_agent(
+    name: &str,
+    provider: Arc<dyn LlmProvider>,
+    pool: SqlitePool,
+    session_id: String,
+    additional_tools: Vec<Arc<dyn Tool>>,
+) -> Result<(gewu_core::Agent, Arc<dyn ToolRegistry>)> {
+    let runtime = crate::runtime::GeWuRuntime::builder()
+        .provider(provider)
+        .pool(pool)
+        .register_builtin_capabilities()
+        .register_builtin_specialists()
+        .build()
+        .map_err(|e| anyhow!("Failed to build runtime: {}", e))?;
+
+    runtime.build_specialist(name, session_id, additional_tools).await
+}

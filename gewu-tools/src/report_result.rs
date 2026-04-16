@@ -3,7 +3,7 @@ use gewu_core::traits::Tool;
 use gewu_core::types::{ToolContext, ToolResult};
 use schemars::schema::RootSchema;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::error::Error;
 
 /// Tool that subagents call to report their task outcome.
@@ -19,7 +19,7 @@ pub struct ReportResultArgs {
     #[serde(default)]
     pub block_reason: Option<String>,
     #[serde(default)]
-    pub result: Option<String>,
+    pub result: Option<Value>,
 }
 
 #[async_trait]
@@ -48,7 +48,6 @@ impl Tool for ReportResultTool {
                     "description": "Why the task is blocked (only when status is blocked)"
                 },
                 "result": {
-                    "type": "string",
                     "description": "The task result or output (when succeeded)"
                 }
             },

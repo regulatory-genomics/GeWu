@@ -284,36 +284,53 @@ pub struct TruncationResult {
 // Specialist assembly types
 // ---------------------------------------------------------------------------
 
-/// A single tool capability that a specialist may require.
-///
-/// Each variant maps to a concrete tool constructor at assembly time.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ToolCapability {
-    ReadFile,
-    WriteFile,
-    EditFile,
-    Glob,
-    Bash { safe_mode: bool },
-    Grep,
-    WebFetch,
-    WebSearch,
-    List,
-    CodeSearch,
-    Todo,
-    Task,
-    ReportResult,
-}
-
 /// Declarative description of a specialist agent.
 ///
-/// The runtime resolves `capabilities` into concrete tools and builds the
-/// agent — no hardcoded match branch required.
+/// Used by both builtins and plugins — one type, one assembly path.
+/// Capabilities are string-based IDs resolved by `ToolFactory` implementations
+/// at assembly time.
+///
+/// Well-known builtin capability IDs:
+/// `"read_file"`, `"write_file"`, `"edit_file"`, `"glob"`, `"bash"`,
+/// `"bash_safe"`, `"grep"`, `"web_fetch"`, `"web_search"`, `"list"`,
+/// `"code_search"`, `"todo"`, `"task"`, `"report_result"`
 #[derive(Debug, Clone)]
 pub struct SpecialistDescriptor {
-    pub id: &'static str,
-    pub description: &'static str,
-    pub capabilities: Vec<ToolCapability>,
-    pub system_prompt: &'static str,
+    pub id: String,
+    pub description: String,
+    pub capabilities: Vec<String>,
+    pub system_prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecialistExecutionRequest {
+    pub task_id: String,
+    pub specialist_id: String,
+    pub session_id: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub metadata_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolExecutionRecord {
+    pub tool_name: String,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecialistExecutionEnvelope {
+    pub task_id: String,
+    pub session_id: String,
+    pub specialist_id: String,
+    pub status: TaskStatus,
+    pub attempt: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_json: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_outputs: Vec<ToolExecutionRecord>,
 }
 
 // ---------------------------------------------------------------------------

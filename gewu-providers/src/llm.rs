@@ -21,19 +21,17 @@
 //! - [`ResponseParser`] - Trait for parsing streaming responses
 //! - [`ToolCallAggregator`] - Handles fragmented tool call streaming
 
+use crate::Client;
 use crate::openai_types::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionMessageToolCalls,
-    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
+    AssistantMessage, ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
+    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartFile,
+    ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
     ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionTools, ChatCompletionStream, ChatCompletionTool,
-    CreateChatCompletionRequest, FunctionCall as OpenAIFunctionCall,
-    FunctionObjectArgs, ImageUrl, OpenAIConfig, AssistantMessage,
-    ChatCompletionRequestMessageContentPartText, FileData,
-    ChatCompletionRequestMessageContentPartFile,
+    ChatCompletionStream, ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequest,
+    FileData, FunctionCall as OpenAIFunctionCall, FunctionObjectArgs, ImageUrl, OpenAIConfig,
 };
-use crate::Client;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -346,14 +344,16 @@ impl OpenAIProvider {
                     calls
                         .iter()
                         .map(|tc| {
-                            ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
-                                id: tc.id.clone(),
-                                tool_type: "function".to_string(),
-                                function: OpenAIFunctionCall {
-                                    name: tc.function.name.clone(),
-                                    arguments: tc.function.arguments.clone(),
+                            ChatCompletionMessageToolCalls::Function(
+                                ChatCompletionMessageToolCall {
+                                    id: tc.id.clone(),
+                                    tool_type: "function".to_string(),
+                                    function: OpenAIFunctionCall {
+                                        name: tc.function.name.clone(),
+                                        arguments: tc.function.arguments.clone(),
+                                    },
                                 },
-                            })
+                            )
                         })
                         .collect()
                 });
@@ -463,7 +463,11 @@ impl RequestBuilder for OpenAIProvider {
         Ok(CreateChatCompletionRequest {
             model: self.model.clone(),
             messages: openai_messages,
-            tools: if openai_tools.is_empty() { None } else { Some(openai_tools) },
+            tools: if openai_tools.is_empty() {
+                None
+            } else {
+                Some(openai_tools)
+            },
             stream: None,
             max_tokens: None,
             temperature: None,
@@ -651,7 +655,7 @@ impl LlmProvider for OpenAIProvider {
         BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
         Box<dyn Error + Send + Sync>,
     > {
-let request = self.build(messages, tools)?;
+        let request = self.build(messages, tools)?;
 
         let stream = self
             .client

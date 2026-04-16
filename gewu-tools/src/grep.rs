@@ -91,82 +91,83 @@ impl Tool for GrepTool {
         let input: GrepArgs = serde_json::from_value(args).map_err(into_tool_error)?;
         let search_path_str = input.path.as_deref().unwrap_or(".");
 
-        let search_path = resolve_safe_path(&self.working_directory, search_path_str)
-            .map_err(into_tool_error)?;
+        let search_path =
+            resolve_safe_path(&self.working_directory, search_path_str).map_err(into_tool_error)?;
 
-        let result = tokio::task::spawn_blocking(move || -> Result<String, Box<dyn Error + Send + Sync>> {
-            let matcher = RegexMatcher::new(&input.pattern).map_err(into_tool_error)?;
-            let matches = Arc::new(Mutex::new(Vec::new()));
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<String, Box<dyn Error + Send + Sync>> {
+                let matcher = RegexMatcher::new(&input.pattern).map_err(into_tool_error)?;
+                let matches = Arc::new(Mutex::new(Vec::new()));
 
-            let mut builder = WalkBuilder::new(&search_path);
-            if let Some(inc) = &input.include {
-                let mut glob_builder = ignore::overrides::OverrideBuilder::new(&search_path);
-                if let Ok(_) = glob_builder.add(inc) {
-                    if let Ok(overrides) = glob_builder.build() {
-                        builder.overrides(overrides);
+                let mut builder = WalkBuilder::new(&search_path);
+                if let Some(inc) = &input.include {
+                    let mut glob_builder = ignore::overrides::OverrideBuilder::new(&search_path);
+                    if let Ok(_) = glob_builder.add(inc) {
+                        if let Ok(overrides) = glob_builder.build() {
+                            builder.overrides(overrides);
+                        }
                     }
                 }
-            }
 
-            let walker = builder.build();
+                let walker = builder.build();
 
-            let matches_clone_outer = matches.clone();
-            let matcher_clone_outer = matcher.clone();
+                let matches_clone_outer = matches.clone();
+                let matcher_clone_outer = matcher.clone();
 
-            for entry in walker
-                .filter_map(|result| result.ok())
-                .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
-            {
-                let path = entry.path().to_path_buf();
-                let matches_clone = matches_clone_outer.clone();
-                let matcher_clone = matcher_clone_outer.clone();
+                for entry in walker
+                    .filter_map(|result| result.ok())
+                    .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
+                {
+                    let path = entry.path().to_path_buf();
+                    let matches_clone = matches_clone_outer.clone();
+                    let matcher_clone = matcher_clone_outer.clone();
 
-                let collector = MatchCollector {
-                    matches: matches_clone,
-                    path: path.clone(),
+                    let collector = MatchCollector {
+                        matches: matches_clone,
+                        path: path.clone(),
+                    };
+
+                    let mut searcher = SearcherBuilder::new()
+                        .binary_detection(BinaryDetection::quit(b'\x00'))
+                        .build();
+
+                    let _ = searcher.search_path(&matcher_clone, &path, collector);
+                }
+
+                let matches_guard = matches.lock().unwrap();
+                if matches_guard.is_empty() {
+                    return Ok("No matches found.".to_string());
+                }
+
+                let limit = 100;
+                let truncated = matches_guard.len() > limit;
+                let display_matches = if truncated {
+                    &matches_guard[..limit]
+                } else {
+                    &matches_guard[..]
                 };
 
-                let mut searcher = SearcherBuilder::new()
-                    .binary_detection(BinaryDetection::quit(b'\x00'))
-                    .build();
+                let mut output = display_matches
+                    .iter()
+                    .map(|m| format!("{}:{}: {}", m.path, m.line_number, m.line_text))
+                    .collect::<Vec<String>>()
+                    .join("\n");
 
-                let _ = searcher.search_path(&matcher_clone, &path, collector);
-            }
+                if !output.is_empty() {
+                    output.push('\n');
+                }
 
-            let matches_guard = matches.lock().unwrap();
-            if matches_guard.is_empty() {
-                return Ok("No matches found.".to_string());
-            }
+                if truncated {
+                    output.push_str(&format!(
+                        "\n... and {} more matches not shown.",
+                        matches_guard.len() - limit
+                    ));
+                }
 
-            let limit = 100;
-            let truncated = matches_guard.len() > limit;
-            let display_matches = if truncated {
-                &matches_guard[..limit]
-            } else {
-                &matches_guard[..]
-            };
-
-            let mut output = display_matches
-                .iter()
-                .map(|m| format!("{}:{}: {}", m.path, m.line_number, m.line_text))
-                .collect::<Vec<String>>()
-                .join("\n");
-
-            if !output.is_empty() {
-                output.push('\n');
-            }
-
-            if truncated {
-                output.push_str(&format!(
-                    "\n... and {} more matches not shown.",
-                    matches_guard.len() - limit
-                ));
-            }
-
-            Ok(output)
-        })
-        .await
-        .map_err(into_tool_error)??;
+                Ok(output)
+            })
+            .await
+            .map_err(into_tool_error)??;
 
         Ok(ToolResult::new("grep", result))
     }
@@ -198,7 +199,10 @@ mod tests {
             "path": dir.path().to_str().unwrap()
         });
         let ctx = ToolContext::new("test", "msg");
-        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
         assert!(result.output.contains("a.txt"));
         assert!(result.output.contains("b.rs"));

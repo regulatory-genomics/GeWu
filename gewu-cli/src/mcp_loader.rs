@@ -39,12 +39,14 @@ pub async fn load_mcp_tools(
                 let client_arc = Arc::new(Mutex::new(client));
 
                 for tool in mcp_tools {
-                    let schema: Result<RootSchema, _> = serde_json::from_value(tool.input_schema.clone());
+                    let schema: Result<RootSchema, _> =
+                        serde_json::from_value(tool.input_schema.clone());
                     let schema = schema.unwrap_or_else(|_| {
                         serde_json::from_value(serde_json::json!({
                             "type": "object",
                             "properties": {}
-                        })).unwrap()
+                        }))
+                        .unwrap()
                     });
                     tools.push(Arc::new(McpToolWrapper {
                         client: client_arc.clone(),

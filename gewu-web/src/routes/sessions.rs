@@ -60,7 +60,9 @@ pub async fn handle_get_messages(
         .into_iter()
         .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
         .collect();
-    Ok(Json(MessagesResponse { messages: messages_json }))
+    Ok(Json(MessagesResponse {
+        messages: messages_json,
+    }))
 }
 
 pub async fn handle_validate(

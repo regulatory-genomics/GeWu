@@ -7,15 +7,15 @@
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use gewu_cli::config::LoadedConfig;
-use gewu_cli::{find_descriptor, resolve_tools};
+use gewu_core::Agent;
 use gewu_core::traits::{LlmProvider, Memory};
 use gewu_core::types::AgentEvent;
-use gewu_core::Agent;
 use gewu_providers::OpenAIProvider;
+use gewu_runtime::{find_descriptor, resolve_tools};
 use gewu_storage::SqliteMemory;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::sqlite::SqlitePoolOptions;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -42,11 +42,10 @@ async fn main() -> Result<()> {
     println!("Model: {model}");
     println!();
 
-    let provider: Arc<dyn LlmProvider> =
-        Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model));
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await?;
+    let provider: Arc<dyn LlmProvider> = Arc::new(OpenAIProvider::new_with_endpoint(
+        &api_key, &endpoint, &model,
+    ));
+    let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
 
     benchmark_1(&provider, &pool).await?;
     println!();
@@ -58,24 +57,24 @@ async fn main() -> Result<()> {
 // ═══════════════════════════════════════════════════════════════════
 // Benchmark 1: Explore assembled from descriptor, runs a real task
 // ═══════════════════════════════════════════════════════════════════
-async fn benchmark_1(
-    provider: &Arc<dyn LlmProvider>,
-    pool: &sqlx::SqlitePool,
-) -> Result<()> {
+async fn benchmark_1(provider: &Arc<dyn LlmProvider>, pool: &sqlx::SqlitePool) -> Result<()> {
     println!("── Benchmark 1: Specialist Assembly ──");
     println!();
 
     // 1. Look up descriptor
     let desc = find_descriptor("explore").expect("explore descriptor must exist");
-    println!("[1] Descriptor: id={}, capabilities={:?}",
+    println!(
+        "[1] Descriptor: id={}, capabilities={:?}",
         desc.id,
-        desc.capabilities.iter().map(|c| format!("{:?}", c)).collect::<Vec<_>>()
+        desc.capabilities
+            .iter()
+            .map(|c| format!("{:?}", c))
+            .collect::<Vec<_>>()
     );
 
     // 2. Resolve tools
     let wd = std::env::current_dir()?;
-    let todos = Arc::new(Mutex::new(Vec::new()));
-    let tools = resolve_tools(&desc.capabilities, &wd, provider.clone(), pool.clone(), todos);
+    let tools = resolve_tools(&desc.capabilities, &wd, provider.clone(), pool.clone());
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
     println!("[2] Resolved tools: {:?}", tool_names);
 
@@ -87,7 +86,7 @@ async fn benchmark_1(
         .llm(provider.clone())
         .with_tools(tools_arc)
         .memory(Box::new(memory))
-        .system_prompt(desc.system_prompt)
+        .system_prompt(&desc.system_prompt)
         .build()?;
     println!("[3] Agent built from descriptor");
 
@@ -111,7 +110,10 @@ async fn benchmark_1(
             }
             Ok(AgentEvent::Finish { response }) => result = response,
             Ok(AgentEvent::Error { error }) => println!("  [error] {error}"),
-            Err(e) => { println!("  [stream error] {e}"); break; }
+            Err(e) => {
+                println!("  [stream error] {e}");
+                break;
+            }
             _ => {}
         }
     }
@@ -120,8 +122,12 @@ async fn benchmark_1(
 
     let pass = !result.is_empty();
     println!();
-    println!("[RESULT] Benchmark 1: {} (tools used: {}, response length: {})",
-        if pass { "PASS" } else { "FAIL" }, tool_count, result.len());
+    println!(
+        "[RESULT] Benchmark 1: {} (tools used: {}, response length: {})",
+        if pass { "PASS" } else { "FAIL" },
+        tool_count,
+        result.len()
+    );
     Ok(())
 }
 
@@ -135,13 +141,10 @@ async fn benchmark_1(
 //   4. Call TaskTool::execute with same task_id → agent reports succeeded
 //   5. Verify from the returned envelope: status, attempt, result
 // ═══════════════════════════════════════════════════════════════════
-async fn benchmark_2(
-    provider: &Arc<dyn LlmProvider>,
-    pool: &sqlx::SqlitePool,
-) -> Result<()> {
-    use gewu_cli::tools::TaskTool;
+async fn benchmark_2(provider: &Arc<dyn LlmProvider>, pool: &sqlx::SqlitePool) -> Result<()> {
     use gewu_core::traits::Tool;
     use gewu_core::types::ToolContext;
+    use gewu_runtime::TaskTool;
 
     println!("── Benchmark 2: End-to-End Blocked Task Resume ──");
     println!();
@@ -171,23 +174,34 @@ async fn benchmark_2(
         "subagent_type": "explore",
     });
 
-    let result1 = task_tool.execute(args1, &ctx).await
+    let result1 = task_tool
+        .execute(args1, &ctx)
+        .await
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let envelope1: Value = serde_json::from_str(&result1.output)?;
 
     println!();
-    println!("[attempt 1] Envelope: {}", serde_json::to_string_pretty(&envelope1)?);
+    println!(
+        "[attempt 1] Envelope: {}",
+        serde_json::to_string_pretty(&envelope1)?
+    );
 
     let status1 = envelope1["status"].as_str().unwrap_or("unknown");
     let task_id = envelope1["task_id"].as_str().unwrap_or("").to_string();
     let attempt1 = envelope1["attempt"].as_u64().unwrap_or(0);
 
     if status1 != "blocked" {
-        println!("[RESULT] Benchmark 2: SKIP (agent didn't block on attempt 1, status={})", status1);
+        println!(
+            "[RESULT] Benchmark 2: SKIP (agent didn't block on attempt 1, status={})",
+            status1
+        );
         let _ = std::fs::remove_file(&target_file);
         return Ok(());
     }
-    println!("[attempt 1] Status: blocked, attempt: {}, task_id: {}", attempt1, &task_id);
+    println!(
+        "[attempt 1] Status: blocked, attempt: {}, task_id: {}",
+        attempt1, &task_id
+    );
     println!();
 
     // ── Fix the blocking condition ──
@@ -201,7 +215,10 @@ async fn benchmark_2(
     // Check prior history loaded
     let mem_check = SqliteMemory::new(pool.clone(), task_id.clone()).await?;
     let prior_msgs = mem_check.messages().len();
-    println!("[resume] {} prior messages from attempt 1 in SQLite", prior_msgs);
+    println!(
+        "[resume] {} prior messages from attempt 1 in SQLite",
+        prior_msgs
+    );
     drop(mem_check);
 
     let args2 = json!({
@@ -214,27 +231,42 @@ async fn benchmark_2(
         "task_id": &task_id,
     });
 
-    let result2 = task_tool.execute(args2, &ctx).await
+    let result2 = task_tool
+        .execute(args2, &ctx)
+        .await
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let envelope2: Value = serde_json::from_str(&result2.output)?;
 
     println!();
-    println!("[attempt 2] Envelope: {}", serde_json::to_string_pretty(&envelope2)?);
+    println!(
+        "[attempt 2] Envelope: {}",
+        serde_json::to_string_pretty(&envelope2)?
+    );
 
     let status2 = envelope2["status"].as_str().unwrap_or("unknown");
     let attempt2 = envelope2["attempt"].as_u64().unwrap_or(0);
-    let output2 = envelope2["output"].as_str().unwrap_or("");
+    let output2 = envelope2["output_json"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| envelope2["output_json"]["result"].as_str().map(str::to_string))
+        .unwrap_or_default();
 
     // ── Final verification ──
     println!();
-    println!("[final] status={}, attempt={}, output={:?}", status2, attempt2, &output2[..output2.len().min(80)]);
+    println!(
+        "[final] status={}, attempt={}, output={:?}",
+        status2,
+        attempt2,
+        &output2[..output2.len().min(80)]
+    );
 
-    let pass = status2 == "succeeded"
-        && attempt2 == 2
-        && output2.contains("42");
+    let pass = status2 == "succeeded" && attempt2 == 2 && output2.contains("42");
 
     println!();
-    println!("[RESULT] Benchmark 2: {}", if pass { "PASS" } else { "FAIL" });
+    println!(
+        "[RESULT] Benchmark 2: {}",
+        if pass { "PASS" } else { "FAIL" }
+    );
     if pass {
         println!("  Task blocked on attempt 1 (file missing)");
         println!("  Condition fixed (file created)");

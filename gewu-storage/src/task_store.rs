@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use gewu_core::types::{TaskRecord, TaskStatus};
-use sqlx::sqlite::SqlitePool;
+use serde_json::Value;
 use sqlx::Row;
+use sqlx::sqlite::SqlitePool;
 
 /// Durable task store backed by SQLite.
 pub struct TaskStore {
@@ -72,8 +73,7 @@ impl TaskStore {
             None => Ok(None),
             Some(row) => {
                 let status_str: String = row.try_get("status")?;
-                let status = TaskStatus::from_str(&status_str)
-                    .unwrap_or(TaskStatus::Failed);
+                let status = TaskStatus::from_str(&status_str).unwrap_or(TaskStatus::Failed);
                 Ok(Some(TaskRecord {
                     task_id: row.try_get("task_id")?,
                     specialist_id: row.try_get("specialist_id")?,
@@ -117,15 +117,18 @@ impl TaskStore {
     }
 
     pub async fn set_result(&self, task_id: &str, result_json: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE tasks SET result_json = ?, updated_at = unixepoch() WHERE task_id = ?",
-        )
-        .bind(result_json)
-        .bind(task_id)
-        .execute(&self.pool)
-        .await
-        .context("Failed to set task result")?;
+        sqlx::query("UPDATE tasks SET result_json = ?, updated_at = unixepoch() WHERE task_id = ?")
+            .bind(result_json)
+            .bind(task_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to set task result")?;
         Ok(())
+    }
+
+    pub async fn set_result_json(&self, task_id: &str, result_json: &Value) -> Result<()> {
+        let encoded = serde_json::to_string(result_json).context("Failed to encode task result JSON")?;
+        self.set_result(task_id, &encoded).await
     }
 }
 
@@ -145,23 +148,33 @@ mod tests {
         assert_eq!(rec.attempt, 0);
 
         // Update status to Running
-        store.update_status("t1", &TaskStatus::Running, None).await?;
+        store
+            .update_status("t1", &TaskStatus::Running, None)
+            .await?;
         store.increment_attempt("t1").await?;
         let rec = store.get_task("t1").await?.unwrap();
         assert_eq!(rec.status, TaskStatus::Running);
         assert_eq!(rec.attempt, 1);
 
         // Block
-        store.update_status("t1", &TaskStatus::Blocked, Some("missing cap")).await?;
+        store
+            .update_status("t1", &TaskStatus::Blocked, Some("missing cap"))
+            .await?;
         let rec = store.get_task("t1").await?.unwrap();
         assert_eq!(rec.status, TaskStatus::Blocked);
         assert_eq!(rec.block_reason.as_deref(), Some("missing cap"));
 
         // Resume + succeed
-        store.update_status("t1", &TaskStatus::Running, None).await?;
+        store
+            .update_status("t1", &TaskStatus::Running, None)
+            .await?;
         store.increment_attempt("t1").await?;
-        store.set_result("t1", r#"{"output":"done"}"#).await?;
-        store.update_status("t1", &TaskStatus::Succeeded, None).await?;
+        store
+            .set_result_json("t1", &serde_json::json!({"output":"done"}))
+            .await?;
+        store
+            .update_status("t1", &TaskStatus::Succeeded, None)
+            .await?;
         let rec = store.get_task("t1").await?.unwrap();
         assert_eq!(rec.status, TaskStatus::Succeeded);
         assert_eq!(rec.attempt, 2);

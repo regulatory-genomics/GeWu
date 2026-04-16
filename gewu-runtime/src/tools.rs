@@ -1,0 +1,127 @@
+use anyhow::Result;
+use async_trait::async_trait;
+use gewu_core::traits::{LlmProvider, Tool};
+use gewu_core::types::{SpecialistExecutionRequest, ToolContext, ToolResult};
+use schemars::schema::RootSchema;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sqlx::SqlitePool;
+use std::error::Error;
+use std::sync::Arc;
+use tracing::info;
+use uuid::Uuid;
+
+pub struct TaskTool {
+    pub provider: Arc<dyn LlmProvider>,
+    pub pool: SqlitePool,
+    description: String,
+}
+
+#[derive(Deserialize)]
+struct TaskArgsJson {
+    description: String,
+    prompt: String,
+    subagent_type: String,
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+impl TaskTool {
+    pub fn new(provider: Arc<dyn LlmProvider>, pool: SqlitePool) -> Self {
+        let description = Self::generate_description();
+        Self {
+            provider,
+            pool,
+            description,
+        }
+    }
+
+    fn generate_description() -> String {
+        let agents = crate::registry::list_available_agents();
+        let agent_list = agents
+            .iter()
+            .map(|a| format!("- \"{}\": {}", a.name, a.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        include_str!("prompts/task.txt").replace("{agents}", &agent_list)
+    }
+
+    fn build_schema() -> RootSchema {
+        serde_json::from_value(json!({
+            "type": "object",
+            "properties": {
+                "description": { "type": "string", "description": "A short (3-5 words) description of the task" },
+                "prompt": { "type": "string", "description": "The task for the agent to perform" },
+                "subagent_type": { "type": "string", "description": "The type of specialized agent to use for this task" },
+                "task_id": {
+                    "type": "string",
+                    "description": "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)"
+                }
+            },
+            "required": ["description", "prompt", "subagent_type"]
+        })).unwrap()
+    }
+}
+
+#[async_trait]
+impl Tool for TaskTool {
+    fn name(&self) -> &str {
+        "task"
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn schema(&self) -> RootSchema {
+        Self::build_schema()
+    }
+
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let input: TaskArgsJson = serde_json::from_value(args)?;
+        let task_id = match &input.task_id {
+            Some(id) => id.clone(),
+            None => Uuid::new_v4().to_string(),
+        };
+        let request = SpecialistExecutionRequest {
+            task_id: task_id.clone(),
+            specialist_id: input.subagent_type.clone(),
+            session_id: task_id.clone(),
+            prompt: input.prompt.clone(),
+            metadata_json: json!({
+                "description": input.description,
+            }),
+        };
+
+        info!(
+            "Spawning sub-agent '{}' for task: {} (task_id: {})",
+            request.specialist_id,
+            request
+                .metadata_json
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            task_id
+        );
+
+        let runtime = crate::runtime::GeWuRuntime::builder()
+            .provider(self.provider.clone())
+            .pool(self.pool.clone())
+            .register_builtin_capabilities()
+            .register_builtin_specialists()
+            .build()
+            .map_err(|e| format!("Failed to build runtime: {}", e))?;
+
+        let envelope = runtime
+            .execute_request(&request, Vec::new())
+            .await
+            .map_err(|e| format!("Failed to execute request: {}", e))?;
+
+        Ok(ToolResult::new("task", serde_json::to_string(&envelope)?))
+    }
+}

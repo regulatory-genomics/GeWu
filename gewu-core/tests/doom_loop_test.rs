@@ -60,7 +60,11 @@ impl Tool for TestTool {
     fn schema(&self) -> schemars::schema::RootSchema {
         schemars::schema_for!(serde_json::Value)
     }
-    async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
+    async fn execute(
+        &self,
+        _args: Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
         Ok(ToolResult::new("test_tool", "output".to_string()))
     }
 }

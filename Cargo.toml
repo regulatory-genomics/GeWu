@@ -3,6 +3,7 @@ members = ["gewu-cli",
     "gewu-core",
     "gewu-providers", "gewu-storage",
     "gewu-tools",
+    "gewu-runtime",
     "gewu-web",
     "gewu-graph",
 ]

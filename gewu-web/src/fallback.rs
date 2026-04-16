@@ -6,11 +6,11 @@ use axum::{
 
 pub async fn serve_static(req: Request) -> Response {
     let path = req.uri().path().trim_start_matches('/');
-    
+
     let static_path = std::path::Path::new("gewu-web/static");
 
     let full_path = static_path.join(path);
-    
+
     if full_path.exists() && full_path.is_file() {
         let body = Body::from(std::fs::read(&full_path).unwrap_or_default());
         let mime = if full_path.extension().map_or(false, |e| e == "wasm") {
@@ -27,7 +27,7 @@ pub async fn serve_static(req: Request) -> Response {
             .body(body)
             .unwrap_or_else(|_| Body::empty().into_response());
     }
-    
+
     Html("<html><body><h1>Not Found</h1></body></html>").into_response()
 }
 

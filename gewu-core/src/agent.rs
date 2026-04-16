@@ -438,7 +438,11 @@ When constructing the summary, try to stick to this template:
         if summary_text.is_empty() {
             compaction::prune(self.memory.messages_mut());
             if is_overflow(
-                self.memory.messages().iter().map(|m| estimate_message_tokens(m)).sum(),
+                self.memory
+                    .messages()
+                    .iter()
+                    .map(|m| estimate_message_tokens(m))
+                    .sum(),
                 self.context_limit,
             ) {
                 return Err(anyhow::anyhow!(
