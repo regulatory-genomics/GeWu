@@ -637,7 +637,8 @@
         const state = {
             sidebar: { width: 220, collapsed: false },
             sessions: [],
-            currentSession: null
+            currentSession: null,
+            currentSessionId: null
         };
 
         // DOM Elements
@@ -679,6 +680,7 @@
                     const parsed = JSON.parse(saved);
                     if (parsed.sidebar) state.sidebar = parsed.sidebar;
                     if (parsed.sessions) state.sessions = parsed.sessions;
+                    if (parsed.currentSessionId) state.currentSessionId = parsed.currentSessionId;
                 }
             } catch (e) {}
         }
@@ -688,7 +690,8 @@
             try {
                 localStorage.setItem('gewu_state', JSON.stringify({
                     sidebar: state.sidebar,
-                    sessions: state.sessions
+                    sessions: state.sessions,
+                    currentSessionId: state.currentSession?.id || state.currentSessionId || null
                 }));
             } catch (e) {}
         }
@@ -789,6 +792,34 @@
             }
         }
 
+        async function loadAgents() {
+            try {
+                const resp = await fetch(`/api/agents?token=${encodeURIComponent(token)}`);
+                if (!resp.ok) throw new Error('Failed to load agents');
+                const data = await resp.json();
+                const agents = (data.agents || []).map(agent => agent.name);
+                agentSelector.innerHTML = '';
+                agents.forEach(name => {
+                    const option = document.createElement('option');
+                    option.value = name;
+                    option.textContent = name;
+                    agentSelector.appendChild(option);
+                });
+                if (!agents.length) {
+                    const option = document.createElement('option');
+                    option.value = 'general';
+                    option.textContent = 'general';
+                    agentSelector.appendChild(option);
+                }
+            } catch (e) {
+                agentSelector.innerHTML = `
+                    <option value="general">general</option>
+                    <option value="build">build</option>
+                    <option value="explore">explore</option>
+                `;
+            }
+        }
+
         function setStatus(text, loading = false) {
             statusText.textContent = text;
             statusIndicator.className = loading ? 'loading' : '';
@@ -858,6 +889,7 @@
         async function switchSession(session) {
             if (state.currentSession?.id === session.id) return;
             state.currentSession = session;
+            state.currentSessionId = session.id;
             agentSelector.value = session.agent_type;
             clearChat();
             renderSessions();
@@ -953,6 +985,7 @@
                 const data = await resp.json();
                 const session = data.session;
                 state.currentSession = session;
+                state.currentSessionId = session.id;
                 agentSelector.value = session.agent_type;
                 state.sessions.unshift(session);
                 if (state.sessions.length > 10) state.sessions.pop();
@@ -989,6 +1022,7 @@
                 }
                 const data = await resp.json();
                 state.currentSession = data.session;
+                state.currentSessionId = data.session.id;
                 const idx = state.sessions.findIndex(s => s.id === state.currentSession.id);
                 if (idx !== -1) {
                     state.sessions[idx] = data.session;
@@ -1235,12 +1269,18 @@
         validateToken().then(valid => {
             if (!valid) return;
             loadServerInfo();
-            renderSessions();
-            if (state.currentSession) {
-                switchSession(state.currentSession);
-            } else {
-                addMessage('assistant', 'Select a session or create a new one to start.');
-            }
+            loadAgents().then(() => {
+                if (!state.currentSession && state.sessions.length > 0) {
+                    const restored = state.sessions.find(s => s.id === state.currentSessionId);
+                    state.currentSession = restored || state.sessions[0];
+                }
+                renderSessions();
+                if (state.currentSession) {
+                    switchSession(state.currentSession);
+                } else {
+                    addMessage('assistant', 'Select a session or create a new one to start.');
+                }
+            });
         });
     </script>
 </body>
