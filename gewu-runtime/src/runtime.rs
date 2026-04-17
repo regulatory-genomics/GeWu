@@ -6,8 +6,9 @@ use gewu_core::traits::{
     AssemblyContext, LlmProvider, Plugin, Tool, ToolFactory, ToolRegistry,
 };
 use gewu_core::types::{
-    AgentEvent, SpecialistDescriptor, SpecialistExecutionEnvelope, SpecialistExecutionRequest,
-    TaskStatus, ToolContext, ToolExecutionRecord, ToolResult,
+    AgentEvent, SpecialistAgentEventRecord, SpecialistDescriptor, SpecialistExecutionEnvelope,
+    SpecialistExecutionRequest, SpecialistLlmIoRecord, TaskStatus, ToolContext,
+    ToolExecutionRecord, ToolResult,
 };
 use gewu_storage::{SqliteMemory, TaskStore};
 use gewu_tools::{BatchTool, report_result::ReportResultArgs};
@@ -210,19 +211,50 @@ impl GeWuRuntime {
         let mut block_reason: Option<String> = None;
         let mut report_received = false;
         let mut tool_outputs: Vec<ToolExecutionRecord> = Vec::new();
+        let mut events: Vec<SpecialistAgentEventRecord> = Vec::new();
+        let mut final_error: Option<String> = None;
 
         while let Some(event_result) = stream.next().await {
             match event_result {
                 Ok(event) => match event {
                     AgentEvent::ContentDelta { delta } => {
+                        events.push(SpecialistAgentEventRecord {
+                            event_type: "content_delta".to_string(),
+                            tool_name: None,
+                            payload_json: serde_json::json!({ "delta": delta }),
+                        });
                         result_text.push_str(&delta);
                     }
+                    AgentEvent::ReasoningDelta { delta } => {
+                        events.push(SpecialistAgentEventRecord {
+                            event_type: "reasoning_delta".to_string(),
+                            tool_name: None,
+                            payload_json: serde_json::json!({ "delta": delta }),
+                        });
+                    }
+                    AgentEvent::ToolStart { tool, input } => {
+                        events.push(SpecialistAgentEventRecord {
+                            event_type: "tool_start".to_string(),
+                            tool_name: Some(tool),
+                            payload_json: serde_json::json!({ "input": input }),
+                        });
+                    }
                     AgentEvent::Finish { response } => {
+                        events.push(SpecialistAgentEventRecord {
+                            event_type: "finish".to_string(),
+                            tool_name: None,
+                            payload_json: serde_json::json!({ "response": response }),
+                        });
                         if !report_received {
                             result_text = response;
                         }
                     }
                     AgentEvent::ToolFinish { tool, output } if tool == "report_result" => {
+                        events.push(SpecialistAgentEventRecord {
+                            event_type: "tool_finish".to_string(),
+                            tool_name: Some(tool.clone()),
+                            payload_json: serde_json::json!({ "output": output }),
+                        });
                         tool_outputs.push(ToolExecutionRecord {
                             tool_name: tool.clone(),
                             output: output.clone(),
@@ -244,21 +276,32 @@ impl GeWuRuntime {
                         }
                     }
                     AgentEvent::ToolFinish { tool, output } => {
+                        events.push(SpecialistAgentEventRecord {
+                            event_type: "tool_finish".to_string(),
+                            tool_name: Some(tool.clone()),
+                            payload_json: serde_json::json!({ "output": output }),
+                        });
                         tool_outputs.push(ToolExecutionRecord {
                             tool_name: tool,
                             output,
                         });
                     }
                     AgentEvent::Error { error } => {
+                        events.push(SpecialistAgentEventRecord {
+                            event_type: "error".to_string(),
+                            tool_name: None,
+                            payload_json: serde_json::json!({ "error": error }),
+                        });
                         final_status = TaskStatus::Blocked;
                         block_reason = Some(error.clone());
+                        final_error = Some(error.clone());
                         result_text = error;
                         output_json = None;
                     }
-                    _ => {}
                 },
                 Err(e) => {
                     final_status = TaskStatus::Failed;
+                    final_error = Some(e.to_string());
                     result_text = e.to_string();
                     output_json = None;
                     break;
@@ -291,10 +334,17 @@ impl GeWuRuntime {
             output_json: if block_reason.is_some() {
                 None
             } else {
-                Some(output_json.unwrap_or_else(|| Value::String(result_text)))
+                Some(output_json.unwrap_or_else(|| Value::String(result_text.clone())))
             },
             block_reason,
             tool_outputs,
+            events,
+            llm_io: vec![SpecialistLlmIoRecord {
+                system_prompt: descriptor.system_prompt.clone(),
+                user_prompt: request.prompt.clone(),
+                final_response: Some(result_text),
+                error: final_error,
+            }],
         })
     }
 }

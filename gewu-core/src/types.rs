@@ -319,6 +319,23 @@ pub struct ToolExecutionRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecialistAgentEventRecord {
+    pub event_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    pub payload_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecialistLlmIoRecord {
+    pub system_prompt: String,
+    pub user_prompt: String,
+    pub final_response: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecialistExecutionEnvelope {
     pub task_id: String,
     pub session_id: String,
@@ -331,6 +348,10 @@ pub struct SpecialistExecutionEnvelope {
     pub block_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_outputs: Vec<ToolExecutionRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<SpecialistAgentEventRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub llm_io: Vec<SpecialistLlmIoRecord>,
 }
 
 // ---------------------------------------------------------------------------
