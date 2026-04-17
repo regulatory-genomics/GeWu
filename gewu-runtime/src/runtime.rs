@@ -118,6 +118,17 @@ impl GeWuRuntime {
         session_id: String,
         additional_tools: Vec<Arc<dyn Tool>>,
     ) -> Result<(Agent, Arc<dyn ToolRegistry>)> {
+        self.build_specialist_with_metadata(name, session_id, additional_tools, Value::Null)
+            .await
+    }
+
+    pub async fn build_specialist_with_metadata(
+        &self,
+        name: &str,
+        session_id: String,
+        additional_tools: Vec<Arc<dyn Tool>>,
+        metadata_json: Value,
+    ) -> Result<(Agent, Arc<dyn ToolRegistry>)> {
         let descriptor = self
             .find_specialist(name)
             .ok_or_else(|| anyhow!("Unknown specialist: {}", name))?;
@@ -125,7 +136,7 @@ impl GeWuRuntime {
         let tools = self.resolve_capabilities_with_metadata(
             &descriptor.capabilities,
             &std::env::current_dir()?,
-            Value::Null,
+            metadata_json,
         )?;
         let memory = SqliteMemory::new(self.pool.clone(), session_id).await?;
 
