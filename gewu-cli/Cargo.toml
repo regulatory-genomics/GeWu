@@ -28,7 +28,12 @@ schemars = "0.8"
 [features]
 default = []
 genome = ["dep:genome-plugin"]
+fateweaver = ["dep:fateweaver-plugin"]
 
 [dependencies.genome-plugin]
 path = "../../GeWu-genome/crates/genome-plugin"
+optional = true
+
+[dependencies.fateweaver-plugin]
+path = "../../FateWeaver/crates/fateweaver-plugin"
 optional = true

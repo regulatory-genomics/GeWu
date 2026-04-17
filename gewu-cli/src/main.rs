@@ -162,6 +162,15 @@ async fn main() -> Result<()> {
                 println!("  - {}: {}", desc.id, desc.description);
             }
         }
+        #[cfg(feature = "fateweaver")]
+        {
+            println!("\nFateWeaver plugin specialists:");
+            for desc in fateweaver_plugin::fateweaver_specialist_descriptors(
+                fateweaver_plugin::config::FateWeaverPluginConfig::default(),
+            ) {
+                println!("  - {}: {}", desc.id, desc.description);
+            }
+        }
         if !file_config.plugins.is_empty() {
             println!("\nConfigured plugins: {:?}", file_config.plugins.keys().collect::<Vec<_>>());
         }
@@ -251,6 +260,9 @@ async fn main() -> Result<()> {
     // Register genome plugin when compiled with the genome feature
     #[cfg(feature = "genome")]
     plugin_registry.register("genome", genome_plugin::build_genome_plugin);
+
+    #[cfg(feature = "fateweaver")]
+    plugin_registry.register("fateweaver", fateweaver_plugin::build_fateweaver_plugin);
 
     let plugin_host = PluginHost::from_config(
         &loaded_config.config.plugins,
