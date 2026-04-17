@@ -155,9 +155,15 @@ async fn main() -> Result<()> {
         for agent in list_available_agents() {
             println!("  - {}: {}", agent.name, agent.description);
         }
+        #[cfg(feature = "genome")]
+        {
+            println!("\nGenome plugin specialists:");
+            for desc in genome_plugin::genome_specialist_descriptors() {
+                println!("  - {}: {}", desc.id, desc.description);
+            }
+        }
         if !file_config.plugins.is_empty() {
             println!("\nConfigured plugins: {:?}", file_config.plugins.keys().collect::<Vec<_>>());
-            println!("Plugin specialists will be available when the runtime is started.");
         }
         return Ok(());
     }
@@ -239,7 +245,12 @@ async fn main() -> Result<()> {
     let mcp_tools = mcp_loader::load_mcp_tools(loaded_config.config.mcp_servers).await?;
 
     // Build runtime with plugin host
-    let plugin_registry = PluginRegistry::new();
+    let mut plugin_registry = PluginRegistry::new();
+
+    // Register genome plugin when compiled with the genome feature
+    #[cfg(feature = "genome")]
+    plugin_registry.register("genome", genome_plugin::build_genome_plugin);
+
     let plugin_host = PluginHost::from_config(
         &loaded_config.config.plugins,
         &plugin_registry,
