@@ -245,6 +245,7 @@ async fn main() -> Result<()> {
     let mcp_tools = mcp_loader::load_mcp_tools(loaded_config.config.mcp_servers).await?;
 
     // Build runtime with plugin host
+    #[allow(unused_mut)]
     let mut plugin_registry = PluginRegistry::new();
 
     // Register genome plugin when compiled with the genome feature

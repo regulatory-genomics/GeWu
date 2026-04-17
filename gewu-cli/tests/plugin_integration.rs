@@ -160,3 +160,105 @@ async fn test_plugin_specialist_assembly() {
         names
     );
 }
+
+#[tokio::test]
+async fn test_plugin_host_loads_from_config() {
+    use gewu_runtime::{PluginHost, PluginRegistry};
+    use std::collections::HashMap;
+
+    let pool = SqlitePoolOptions::new()
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let provider: Arc<dyn LlmProvider> = Arc::new(StubLlm);
+
+    let mut registry = PluginRegistry::new();
+    registry.register("example", |_ctx| Ok(Box::new(ExamplePlugin) as Box<dyn Plugin>));
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "example".to_string(),
+        serde_json::json!({"enabled": true}),
+    );
+
+    let host = PluginHost::from_config(
+        &configs,
+        &registry,
+        provider,
+        pool,
+        PathBuf::from("/tmp"),
+    )
+    .unwrap();
+
+    assert_eq!(host.plugin_names(), vec!["example"]);
+    assert_eq!(host.plugins().len(), 1);
+}
+
+#[tokio::test]
+async fn test_plugin_host_skips_disabled() {
+    use gewu_runtime::{PluginHost, PluginRegistry};
+    use std::collections::HashMap;
+
+    let pool = SqlitePoolOptions::new()
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let provider: Arc<dyn LlmProvider> = Arc::new(StubLlm);
+
+    let mut registry = PluginRegistry::new();
+    registry.register("example", |_ctx| Ok(Box::new(ExamplePlugin) as Box<dyn Plugin>));
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "example".to_string(),
+        serde_json::json!({"enabled": false}),
+    );
+
+    let host = PluginHost::from_config(
+        &configs,
+        &registry,
+        provider,
+        pool,
+        PathBuf::from("/tmp"),
+    )
+    .unwrap();
+
+    assert!(host.plugins().is_empty());
+}
+
+#[tokio::test]
+async fn test_runtime_factory_builds_with_plugins() {
+    use gewu_runtime::{PluginHost, PluginRegistry, RuntimeFactory};
+    use std::collections::HashMap;
+
+    let pool = SqlitePoolOptions::new()
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let provider: Arc<dyn LlmProvider> = Arc::new(StubLlm);
+
+    let mut registry = PluginRegistry::new();
+    registry.register("example", |_ctx| Ok(Box::new(ExamplePlugin) as Box<dyn Plugin>));
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "example".to_string(),
+        serde_json::json!({"enabled": true}),
+    );
+
+    let host = PluginHost::from_config(
+        &configs,
+        &registry,
+        provider.clone(),
+        pool.clone(),
+        PathBuf::from("/tmp"),
+    )
+    .unwrap();
+
+    let runtime = RuntimeFactory::build(provider, pool, &host).unwrap();
+
+    // Should have both builtin and plugin specialists
+    let listed = runtime.list_specialists();
+    assert!(listed.iter().any(|a| a.name == "build"), "missing builtin build");
+    assert!(listed.iter().any(|a| a.name == "line-counter"), "missing plugin line-counter");
+}
