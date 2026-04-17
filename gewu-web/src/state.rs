@@ -1,15 +1,20 @@
 use anyhow::{Context, Result};
 use gewu_core::traits::Tool;
 use gewu_providers::OpenAIProvider;
-use gewu_runtime::{RuntimeFactory, PluginHost};
+use gewu_runtime::{PluginHost, PluginRegistry, RuntimeFactory};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 use uuid::Uuid;
+
+#[cfg(feature = "genome")]
+use genome_plugin;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct SessionInfo {
@@ -24,6 +29,8 @@ pub struct ServerConfig {
     pub endpoint: Option<String>,
     pub model: Option<String>,
     pub db_path: Option<String>,
+    #[serde(default)]
+    pub plugins: HashMap<String, Value>,
 }
 
 impl Default for ServerConfig {
@@ -33,6 +40,7 @@ impl Default for ServerConfig {
             endpoint: None,
             model: Some("gpt-5.3-codex".to_string()),
             db_path: None,
+            plugins: HashMap::new(),
         }
     }
 }
@@ -54,6 +62,51 @@ pub struct AppState {
 }
 
 impl AppState {
+    fn build_plugin_host(
+        &self,
+        provider: Arc<dyn gewu_core::traits::LlmProvider>,
+        pool: SqlitePool,
+        plugins: HashMap<String, Value>,
+    ) -> Result<PluginHost> {
+        #[allow(unused_mut)]
+        let mut plugin_registry = PluginRegistry::new();
+
+        #[cfg(feature = "genome")]
+        plugin_registry.register("genome", genome_plugin::build_genome_plugin);
+
+        let working_directory = std::env::current_dir()
+            .or_else(|_| Ok::<PathBuf, std::io::Error>(PathBuf::from(".")))?;
+
+        PluginHost::from_config(&plugins, &plugin_registry, provider, pool, working_directory)
+    }
+
+    pub async fn list_available_agents(&self) -> Result<Vec<(String, String)>> {
+        let config = self.config.read().await;
+        let api_key = config.api_key.clone().context("API key not configured")?;
+        let endpoint = config.endpoint.clone().context("Endpoint not configured")?;
+        let model = config
+            .model
+            .clone()
+            .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+        let plugins = config.plugins.clone();
+        drop(config);
+
+        let pool_guard = self.db_pool.lock().await;
+        let pool = pool_guard.as_ref().context("Database not initialized")?;
+
+        let provider = Arc::new(OpenAIProvider::new_with_endpoint(
+            &api_key, &endpoint, &model,
+        ));
+
+        let plugin_host = self.build_plugin_host(provider.clone(), pool.clone(), plugins)?;
+        let runtime = RuntimeFactory::build(provider, pool.clone(), &plugin_host)?;
+        Ok(runtime
+            .list_specialists()
+            .into_iter()
+            .map(|agent| (agent.name, agent.description))
+            .collect())
+    }
+
     pub async fn new(
         config: ServerConfig,
         auth_token: crate::auth::AuthState,
@@ -87,6 +140,7 @@ impl AppState {
             .model
             .clone()
             .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+        let plugins = config.plugins.clone();
         drop(config);
 
         let pool_guard = self.db_pool.lock().await;
@@ -98,7 +152,7 @@ impl AppState {
         ));
 
         let mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
-        let plugin_host = PluginHost::empty();
+        let plugin_host = self.build_plugin_host(provider.clone(), pool.clone(), plugins)?;
         let runtime = RuntimeFactory::build(provider.clone(), pool.clone(), &plugin_host)?;
         let (agent, _registry) = runtime
             .build_specialist(&agent_type, session_id.clone(), mcp_tools)
@@ -202,6 +256,7 @@ impl AppState {
             .model
             .clone()
             .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+        let plugins = config.plugins.clone();
         drop(config);
 
         let pool_guard = self.db_pool.lock().await;
@@ -212,7 +267,7 @@ impl AppState {
         ));
 
         let mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
-        let plugin_host = PluginHost::empty();
+        let plugin_host = self.build_plugin_host(provider.clone(), pool.clone(), plugins)?;
         let runtime = RuntimeFactory::build(provider.clone(), pool.clone(), &plugin_host)?;
         let (agent, _registry) = runtime
             .build_specialist(&new_agent_type, session_id.to_string(), mcp_tools)

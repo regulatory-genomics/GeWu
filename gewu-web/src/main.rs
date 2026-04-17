@@ -91,6 +91,7 @@ async fn main() -> Result<()> {
         endpoint: Some(endpoint),
         model: Some(model),
         db_path,
+        plugins: loaded_config.config.plugins,
     };
 
     let mcp_tools = mcp_loader::load_mcp_tools(mcp_servers).await?;
@@ -110,6 +111,7 @@ async fn main() -> Result<()> {
         .route("/", get(fallback::serve_index))
         .route("/api/validate", get(routes::sessions::handle_validate))
         .route("/api/info", get(routes::sessions::handle_server_info))
+        .route("/api/agents", get(routes::sessions::handle_list_agents))
         .route("/api/chat", post(routes::chat::handle_chat))
         .route("/api/sessions", get(routes::sessions::handle_list_sessions))
         .route(

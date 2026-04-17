@@ -42,6 +42,17 @@ pub struct ServerInfo {
 }
 
 #[derive(Debug, serde::Serialize)]
+pub struct AgentInfoResponse {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct AgentsResponse {
+    pub agents: Vec<AgentInfoResponse>,
+}
+
+#[derive(Debug, serde::Serialize)]
 pub struct ValidateResponse {
     pub valid: bool,
 }
@@ -85,6 +96,18 @@ pub async fn handle_server_info(
         model: config.model.unwrap_or_else(|| "unknown".to_string()),
         endpoint: config.endpoint.unwrap_or_else(|| "unknown".to_string()),
     }))
+}
+
+pub async fn handle_list_agents(
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<AgentsResponse>, AppError> {
+    let agents = app
+        .list_available_agents()
+        .await?
+        .into_iter()
+        .map(|(name, description)| AgentInfoResponse { name, description })
+        .collect();
+    Ok(Json(AgentsResponse { agents }))
 }
 
 pub async fn handle_list_sessions(
