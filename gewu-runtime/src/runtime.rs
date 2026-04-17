@@ -407,6 +407,14 @@ impl GeWuRuntimeBuilder {
         self
     }
 
+    /// Register factories and specialists from a borrowed plugin reference.
+    /// Used by RuntimeFactory when iterating over PluginHost's plugins.
+    pub fn register_plugin_from_host(mut self, plugin: &dyn Plugin) -> Self {
+        self.factories.extend(plugin.tool_factories());
+        self.specialists.extend(plugin.specialist_descriptors());
+        self
+    }
+
     pub fn build(self) -> Result<GeWuRuntime> {
         let provider = self
             .provider

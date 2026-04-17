@@ -167,6 +167,17 @@ pub struct AssemblyContext {
     pub metadata_json: Value,
 }
 
+/// Platform-level context provided to plugins during initialization.
+///
+/// Contains shared infrastructure resources and plugin-specific configuration
+/// so plugins don't need to reach into global environment state.
+pub struct PluginPlatformContext {
+    pub provider: Arc<dyn LlmProvider>,
+    pub pool: SqlitePool,
+    pub working_directory: PathBuf,
+    pub plugin_config: Value,
+}
+
 /// A factory that produces tool instances from capability names.
 ///
 /// Implement this trait to provide custom tools that can be assembled into

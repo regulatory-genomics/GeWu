@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use gewu_core::traits::Tool;
 use gewu_providers::OpenAIProvider;
-use gewu_runtime::GeWuRuntime;
+use gewu_runtime::{RuntimeFactory, PluginHost};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
@@ -98,12 +98,8 @@ impl AppState {
         ));
 
         let mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
-        let runtime = GeWuRuntime::builder()
-            .provider(provider.clone())
-            .pool(pool.clone())
-            .register_builtin_capabilities()
-            .register_builtin_specialists()
-            .build()?;
+        let plugin_host = PluginHost::empty();
+        let runtime = RuntimeFactory::build(provider.clone(), pool.clone(), &plugin_host)?;
         let (agent, _registry) = runtime
             .build_specialist(&agent_type, session_id.clone(), mcp_tools)
             .await?;
@@ -216,12 +212,8 @@ impl AppState {
         ));
 
         let mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
-        let runtime = GeWuRuntime::builder()
-            .provider(provider.clone())
-            .pool(pool.clone())
-            .register_builtin_capabilities()
-            .register_builtin_specialists()
-            .build()?;
+        let plugin_host = PluginHost::empty();
+        let runtime = RuntimeFactory::build(provider.clone(), pool.clone(), &plugin_host)?;
         let (agent, _registry) = runtime
             .build_specialist(&new_agent_type, session_id.to_string(), mcp_tools)
             .await?;

@@ -12,6 +12,8 @@ pub struct Config {
     pub model: Option<String>,
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
+    #[serde(default)]
+    pub plugins: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug)]

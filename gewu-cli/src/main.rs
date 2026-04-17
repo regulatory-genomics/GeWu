@@ -7,7 +7,7 @@ use futures::StreamExt;
 use gewu_core::traits::LlmProvider;
 use gewu_core::types::AgentEvent;
 use gewu_providers::OpenAIProvider;
-use gewu_runtime::{GeWuRuntime, list_available_agents};
+use gewu_runtime::{RuntimeFactory, PluginHost, PluginRegistry, list_available_agents};
 use sqlx::sqlite::SqlitePoolOptions;
 use std::env;
 use std::io::Write;
@@ -139,14 +139,7 @@ async fn main() -> Result<()> {
 
     tracing::subscriber::set_global_default(subscriber)?;
 
-    if cli.list_agents {
-        println!("Available Agents:");
-        for agent in list_available_agents() {
-            println!("  - {}: {}", agent.name, agent.description);
-        }
-        return Ok(());
-    }
-
+    // Build plugin host early so list_agents can include plugin specialists
     let loaded_config = config::LoadedConfig::load(cli.llm_config.as_deref())?;
 
     if let Some(path) = &loaded_config.path {
@@ -156,6 +149,18 @@ async fn main() -> Result<()> {
     }
 
     let file_config = &loaded_config.config;
+
+    if cli.list_agents {
+        println!("Available Agents (builtins):");
+        for agent in list_available_agents() {
+            println!("  - {}: {}", agent.name, agent.description);
+        }
+        if !file_config.plugins.is_empty() {
+            println!("\nConfigured plugins: {:?}", file_config.plugins.keys().collect::<Vec<_>>());
+            println!("Plugin specialists will be available when the runtime is started.");
+        }
+        return Ok(());
+    }
 
     let api_key = cli.api_key
         .or_else(|| env::var("OPENAI_API_KEY").ok())
@@ -233,13 +238,16 @@ async fn main() -> Result<()> {
     // Load MCP tools
     let mcp_tools = mcp_loader::load_mcp_tools(loaded_config.config.mcp_servers).await?;
 
-    // Create Agent
-    let runtime = GeWuRuntime::builder()
-        .provider(provider.clone())
-        .pool(pool.clone())
-        .register_builtin_capabilities()
-        .register_builtin_specialists()
-        .build()?;
+    // Build runtime with plugin host
+    let plugin_registry = PluginRegistry::new();
+    let plugin_host = PluginHost::from_config(
+        &loaded_config.config.plugins,
+        &plugin_registry,
+        provider.clone(),
+        pool.clone(),
+        std::env::current_dir()?,
+    )?;
+    let runtime = RuntimeFactory::build(provider.clone(), pool.clone(), &plugin_host)?;
     let (mut agent, _registry) = runtime
         .build_specialist(&cli.agent, session_id, mcp_tools)
         .await?;
