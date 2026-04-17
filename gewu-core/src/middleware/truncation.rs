@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 pub const MAX_LINES: usize = 2000;
 pub const MAX_BYTES: usize = 50 * 1024;
-pub const TRUNCATION_DIR: &str = "truncation";
+pub const TRUNCATION_DIR: &str = ".gewu/truncation";
 
 #[derive(Clone)]
 pub struct TruncationService {
