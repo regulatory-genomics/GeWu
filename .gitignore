@@ -6,3 +6,10 @@ target/
 .opencode/
 gewu-cli/target/
 docs/
+.gewu/
+.omc/
+findings.md
+progress.md
+task_plan.md
+entities.json
+mempalace.yaml
