@@ -8,6 +8,7 @@ gewu-cli/target/
 docs/
 .gewu/
 .omc/
+.mempalace_opencode_convos/
 findings.md
 progress.md
 task_plan.md
