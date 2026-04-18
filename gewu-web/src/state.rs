@@ -13,9 +13,6 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 use uuid::Uuid;
 
-#[cfg(feature = "genome")]
-use genome_plugin;
-
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct SessionInfo {
     pub id: String,
@@ -51,6 +48,8 @@ pub struct AgentHandle {
     pub agent_type: String,
 }
 
+pub type PluginRegistrar = Arc<dyn Fn(&mut PluginRegistry) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub auth_token: Arc<RwLock<crate::auth::AuthState>>,
@@ -59,6 +58,7 @@ pub struct AppState {
     pub config: Arc<RwLock<ServerConfig>>,
     pub db_pool: Arc<Mutex<Option<SqlitePool>>>,
     pub mcp_tools: Arc<Vec<Arc<dyn Tool>>>,
+    pub plugin_registrar: PluginRegistrar,
 }
 
 impl AppState {
@@ -68,11 +68,8 @@ impl AppState {
         pool: SqlitePool,
         plugins: HashMap<String, Value>,
     ) -> Result<PluginHost> {
-        #[allow(unused_mut)]
         let mut plugin_registry = PluginRegistry::new();
-
-        #[cfg(feature = "genome")]
-        plugin_registry.register("genome", genome_plugin::build_genome_plugin);
+        (self.plugin_registrar)(&mut plugin_registry);
 
         let working_directory = std::env::current_dir()
             .or_else(|_| Ok::<PathBuf, std::io::Error>(PathBuf::from(".")))?;
@@ -111,6 +108,7 @@ impl AppState {
         config: ServerConfig,
         auth_token: crate::auth::AuthState,
         mcp_tools: Vec<Arc<dyn Tool>>,
+        plugin_registrar: PluginRegistrar,
     ) -> Result<Self> {
         let db_pool = if let Some(ref path) = config.db_path {
             Some(create_db_pool(path).await?)
@@ -126,6 +124,7 @@ impl AppState {
             config: Arc::new(RwLock::new(config)),
             db_pool: Arc::new(Mutex::new(db_pool)),
             mcp_tools: Arc::new(mcp_tools),
+            plugin_registrar,
         })
     }
 

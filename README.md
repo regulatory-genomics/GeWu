@@ -85,20 +85,32 @@ Each key under `plugins` is a plugin name. The object is passed as `plugin_confi
 
 ### Building with a Plugin
 
-Plugins are gated behind Cargo feature flags. For example, to enable the genome plugin:
+GeWu core does not ship built-in domain plugins. Plugin integration now happens via
+composition binaries that depend on `gewu-cli` or `gewu-web` as libraries and register
+plugin constructors at startup.
 
 ```bash
-cargo build --features genome
-cargo run --features genome --bin gewu-cli -- --agent genome-orchestrator
+# No plugins
+cargo run --bin gewu-cli -- --agent build
+
+# Genome-enabled distribution (from GeWu-genome)
+cargo run -p gewu-genome-cli -- --agent genome-orchestrator
+
+# Genome-enabled web distribution (from GeWu-genome)
+cargo run -p gewu-genome-web -- --port 8080
+
+# FateWeaver-enabled distribution (from FateWeaver)
+cargo run -p gewu-fateweaver-cli -- --agent fateweaver_orchestrator
 ```
 
 ### Listing Available Agents
 
 ```bash
-cargo run --features genome --bin gewu-cli -- --list-agents
+cargo run --bin gewu-cli -- --list-agents
 ```
 
-This shows both builtin agents (build, explore, general) and any plugin-provided specialists.
+Composition binaries list both builtin and plugin-provided specialists through the same
+`--list-agents` command.
 
 ### Writing a Plugin
 
@@ -123,12 +135,28 @@ pub fn build_my_plugin(ctx: &PluginPlatformContext) -> anyhow::Result<Box<dyn Pl
 }
 ```
 
-Then register it in `gewu-cli/src/main.rs`:
+Then register it from your own composition binary:
 
 ```rust
-#[cfg(feature = "my_plugin")]
-plugin_registry.register("my-plugin", my_plugin::build_my_plugin);
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    gewu_cli::run_with_plugins(|registry| {
+        registry.register("my-plugin", my_plugin::build_my_plugin);
+    })
+    .await
+}
 ```
+
+### Composition Crates
+
+- `gewu-genome-cli` / `gewu-genome-web` (in `GeWu-genome`) register the `genome` plugin.
+- `gewu-fateweaver-cli` (in `FateWeaver`) registers the `fateweaver` plugin.
+
+To build your own plugin-enabled distribution:
+
+1. Create a binary crate that depends on `gewu-cli` or `gewu-web` and your plugin crate.
+2. Call `gewu_cli::run_with_plugins(...)` or `gewu_web::run_with_plugins(...)` from `main`.
+3. Register plugin constructors with `PluginRegistry::register("<name>", <constructor>)`.
 
 ### Config Precedence
 

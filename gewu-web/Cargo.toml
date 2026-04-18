@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2021"
 description = "GeWu Web UI - Browser-based interface for the GeWu agent framework"
 
-[features]
-default = []
-genome = ["dep:genome-plugin"]
-
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
@@ -34,7 +30,6 @@ gewu-tools = { path = "../gewu-tools" }
 gewu-storage = { path = "../gewu-storage" }
 gewu-runtime = { path = "../gewu-runtime" }
 gewu-cli = { path = "../gewu-cli" }
-genome-plugin = { path = "../../GeWu-genome/crates/genome-plugin", optional = true }
 
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-native-tls"] }
 
