@@ -14,6 +14,10 @@ pub struct Config {
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
     #[serde(default)]
     pub plugins: std::collections::HashMap<String, serde_json::Value>,
+    #[serde(rename = "specialistDirs", default)]
+    pub specialist_dirs: Vec<String>,
+    #[serde(rename = "toolProviderDirs", default)]
+    pub tool_provider_dirs: Vec<String>,
 }
 
 #[derive(Debug)]

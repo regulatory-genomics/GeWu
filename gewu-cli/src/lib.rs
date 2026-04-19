@@ -126,6 +126,29 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
     Ok(())
 }
 
+fn resolve_manifest_dirs(config: &config::Config) -> Vec<PathBuf> {
+    let home = dirs::home_dir();
+    let mut dirs: Vec<PathBuf> = config
+        .specialist_dirs
+        .iter()
+        .map(|s| {
+            if s.starts_with("~/") {
+                if let Some(ref h) = home {
+                    return h.join(&s[2..]);
+                }
+            }
+            PathBuf::from(s)
+        })
+        .collect();
+    if dirs.is_empty() {
+        if let Some(ref h) = home {
+            dirs.push(h.join(".gewu").join("specialists"));
+        }
+        dirs.push(PathBuf::from(".gewu/specialists"));
+    }
+    dirs
+}
+
 pub fn build_plugin_host_with<F>(
     plugins: &HashMap<String, serde_json::Value>,
     provider: Arc<dyn LlmProvider>,
@@ -162,7 +185,10 @@ where
         working_directory,
         extra_register,
     )?;
-    let runtime = RuntimeFactory::build(provider, pool, &plugin_host)?;
+    let runtime = RuntimeFactory::build_with_manifest_dirs(
+        provider, pool, &plugin_host,
+        &resolve_manifest_dirs(&loaded_config.config),
+    )?;
 
     println!("Available Agents:");
     for agent in runtime.list_specialists() {
@@ -294,6 +320,7 @@ where
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     println!("Session ID: {}", session_id);
 
+    let manifest_dirs = resolve_manifest_dirs(&file_config);
     let mcp_tools = mcp_loader::load_mcp_tools(file_config.mcp_servers).await?;
     let plugin_host = build_plugin_host_with(
         &file_config.plugins,
@@ -302,7 +329,10 @@ where
         env::current_dir()?,
         extra_register,
     )?;
-    let runtime = RuntimeFactory::build(provider.clone(), pool.clone(), &plugin_host)?;
+    let runtime = RuntimeFactory::build_with_manifest_dirs(
+        provider.clone(), pool.clone(), &plugin_host,
+        &manifest_dirs,
+    )?;
     let (mut agent, _registry) = runtime
         .build_specialist(&cli.agent, session_id, mcp_tools)
         .await?;

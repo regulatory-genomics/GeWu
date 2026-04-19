@@ -281,6 +281,41 @@ pub struct TruncationResult {
 }
 
 // ---------------------------------------------------------------------------
+// Capability / tool-provider types
+// ---------------------------------------------------------------------------
+
+/// Metadata describing a capability (logical tool) exposed by a `ToolProvider`.
+///
+/// Capability names are the string ids referenced by specialists. A descriptor
+/// carries the human-readable description, an optional JSON schema for the
+/// tool's input, and a provider-kind tag ("builtin", "plugin", "cli", "script",
+/// "mcp", "http", "python", "container", "database", "graph").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityDescriptor {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub provider_kind: String,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub input_schema: serde_json::Value,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
+}
+
+impl CapabilityDescriptor {
+    pub fn new(name: impl Into<String>, provider_kind: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: String::new(),
+            provider_kind: provider_kind.into(),
+            input_schema: serde_json::Value::Null,
+            metadata: serde_json::Value::Null,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Specialist assembly types
 // ---------------------------------------------------------------------------
 

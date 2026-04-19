@@ -52,8 +52,8 @@ pub mod traits;
 pub mod types;
 
 pub use agent::Agent;
-pub use traits::{AssemblyContext, LlmProvider, Memory, Plugin, PluginPlatformContext, Tool, ToolFactory, ToolRegistry};
+pub use traits::{AssemblyContext, LlmProvider, Memory, Plugin, PluginPlatformContext, Tool, ToolFactory, ToolProvider, ToolRegistry};
 pub use types::{
-    FileAttachment, Message, SpecialistDescriptor, SpecialistExecutionEnvelope,
+    CapabilityDescriptor, FileAttachment, Message, SpecialistDescriptor, SpecialistExecutionEnvelope,
     SpecialistExecutionRequest, ToolContext, ToolExecutionRecord, ToolResult, TruncationResult,
 };

@@ -17,10 +17,12 @@ use sqlx::SqlitePool;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::capability::{CapabilityRegistry, ToolFactoryProvider};
 use crate::registry::{AgentConfig, BuiltinToolFactory};
 
 pub struct GeWuRuntime {
     factories: Vec<Box<dyn ToolFactory>>,
+    capability_registry: Arc<CapabilityRegistry>,
     specialists: Vec<SpecialistDescriptor>,
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
@@ -30,7 +32,9 @@ impl GeWuRuntime {
     pub fn builder() -> GeWuRuntimeBuilder {
         GeWuRuntimeBuilder {
             factories: Vec::new(),
+            extra_providers: Vec::new(),
             specialists: Vec::new(),
+            manifest_dirs: Vec::new(),
             provider: None,
             pool: None,
         }
@@ -48,6 +52,12 @@ impl GeWuRuntime {
                 description: d.description.clone(),
             })
             .collect()
+    }
+
+    /// Access the runtime's capability registry. Used by manifest-driven paths
+    /// and for diagnostics (e.g. `gewu list capabilities`).
+    pub fn capability_registry(&self) -> &CapabilityRegistry {
+        &self.capability_registry
     }
 
     fn resolve_capabilities_with_working_directory(
@@ -386,7 +396,9 @@ impl ToolRegistry for RuntimeToolRegistry {
 
 pub struct GeWuRuntimeBuilder {
     factories: Vec<Box<dyn ToolFactory>>,
+    extra_providers: Vec<(String, String, Box<dyn ToolFactory>)>,
     specialists: Vec<SpecialistDescriptor>,
+    manifest_dirs: Vec<PathBuf>,
     provider: Option<Arc<dyn LlmProvider>>,
     pool: Option<SqlitePool>,
 }
@@ -404,6 +416,8 @@ impl GeWuRuntimeBuilder {
 
     pub fn register_builtin_capabilities(mut self) -> Self {
         self.factories.push(Box::new(BuiltinToolFactory));
+        self.extra_providers
+            .push(("builtin".into(), "builtin".into(), Box::new(BuiltinToolFactory)));
         self
     }
 
@@ -412,8 +426,20 @@ impl GeWuRuntimeBuilder {
         self
     }
 
+    pub fn with_manifest_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.manifest_dirs.push(dir.into());
+        self
+    }
+
     pub fn register_plugin(mut self, plugin: Box<dyn Plugin>) -> Self {
-        self.factories.extend(plugin.tool_factories());
+        let name = plugin.name().to_string();
+        for factory in plugin.tool_factories() {
+            self.factories.push(factory);
+        }
+        for factory in plugin.tool_factories() {
+            self.extra_providers
+                .push(("plugin".into(), name.clone(), factory));
+        }
         self.specialists.extend(plugin.specialist_descriptors());
         self
     }
@@ -421,7 +447,14 @@ impl GeWuRuntimeBuilder {
     /// Register factories and specialists from a borrowed plugin reference.
     /// Used by RuntimeFactory when iterating over PluginHost's plugins.
     pub fn register_plugin_from_host(mut self, plugin: &dyn Plugin) -> Self {
-        self.factories.extend(plugin.tool_factories());
+        let name = plugin.name().to_string();
+        for factory in plugin.tool_factories() {
+            self.factories.push(factory);
+        }
+        for factory in plugin.tool_factories() {
+            self.extra_providers
+                .push(("plugin".into(), name.clone(), factory));
+        }
         self.specialists.extend(plugin.specialist_descriptors());
         self
     }
@@ -432,9 +465,47 @@ impl GeWuRuntimeBuilder {
             .ok_or_else(|| anyhow!("provider is required"))?;
         let pool = self.pool.ok_or_else(|| anyhow!("pool is required"))?;
 
+        let mut registry = CapabilityRegistry::new();
+        for (kind, id, factory) in self.extra_providers {
+            registry.register(Arc::new(ToolFactoryProvider::new(kind, id, factory)));
+        }
+
+        let mut specialists = self.specialists;
+
+        // Load manifest-driven specialists
+        if !self.manifest_dirs.is_empty() {
+            let mut loader = crate::manifest::loader::SpecialistManifestLoader::new();
+            for dir in &self.manifest_dirs {
+                loader.add_dir(dir);
+            }
+            match loader.load(Some(&registry)) {
+                Ok(manifest_specs) => {
+                    let override_ids: std::collections::HashSet<String> = manifest_specs
+                        .iter()
+                        .filter(|s| specialists.iter().any(|e| e.id == s.id))
+                        .map(|s| {
+                            tracing::info!(
+                                "Manifest specialist '{}' overrides code-defined descriptor",
+                                s.id
+                            );
+                            s.id.clone()
+                        })
+                        .collect();
+                    if !override_ids.is_empty() {
+                        specialists.retain(|s| !override_ids.contains(&s.id));
+                    }
+                    specialists.extend(manifest_specs);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load specialist manifests: {}", e);
+                }
+            }
+        }
+
         Ok(GeWuRuntime {
             factories: self.factories,
-            specialists: self.specialists,
+            capability_registry: Arc::new(registry),
+            specialists,
             provider,
             pool,
         })

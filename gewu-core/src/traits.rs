@@ -41,7 +41,9 @@
 //! }
 //! ```
 
-use crate::types::{Message, ProviderEvent, SpecialistDescriptor, ToolContext, ToolResult};
+use crate::types::{
+    CapabilityDescriptor, Message, ProviderEvent, SpecialistDescriptor, ToolContext, ToolResult,
+};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use schemars::schema::RootSchema;
@@ -195,6 +197,39 @@ pub trait ToolFactory: Send + Sync {
     ) -> Result<Vec<Box<dyn Tool>>, Box<dyn Error + Send + Sync>>;
 }
 
+/// A unified source of tools, keyed by capability id.
+///
+/// `ToolProvider` is a strict superset of `ToolFactory`: in addition to naming
+/// capabilities, it supplies rich `CapabilityDescriptor`s (kind, description,
+/// schema, metadata). This is the abstraction used by `CapabilityRegistry` to
+/// resolve capabilities declared in manifests.
+///
+/// Any `ToolFactory` can be adapted via
+/// `gewu_runtime::capability::ToolFactoryProvider`.
+pub trait ToolProvider: Send + Sync {
+    /// A short identifier for the provider kind:
+    /// "builtin" | "plugin" | "cli" | "script" | "mcp" | "http" | "python"
+    /// | "container" | "database" | "graph".
+    fn kind(&self) -> &str;
+
+    /// Optional stable id for this provider instance (used for diagnostics and
+    /// namespacing). Defaults to the kind.
+    fn id(&self) -> &str {
+        self.kind()
+    }
+
+    /// The capabilities this provider handles.
+    fn capabilities(&self) -> Vec<CapabilityDescriptor>;
+
+    /// Build concrete tool(s) for a capability name. Returning an empty vec
+    /// signals the capability is not handled.
+    fn build_tools(
+        &self,
+        capability: &str,
+        ctx: &AssemblyContext,
+    ) -> Result<Vec<Box<dyn Tool>>, Box<dyn Error + Send + Sync>>;
+}
+
 /// A plugin that provides tool factories and/or specialist descriptors.
 ///
 /// This is the single integration point for external crates. Implement this
@@ -208,4 +243,12 @@ pub trait Plugin: Send + Sync {
 
     /// Specialist descriptors provided by this plugin.
     fn specialist_descriptors(&self) -> Vec<SpecialistDescriptor>;
+
+    /// Optional directory containing YAML specialist manifests bundled with
+    /// this plugin. Loaded by `CapabilityRegistry` / `SpecialistManifestLoader`
+    /// when the runtime is built. Returning `None` means the plugin ships no
+    /// manifests (the default).
+    fn specialist_manifest_dir(&self) -> Option<PathBuf> {
+        None
+    }
 }

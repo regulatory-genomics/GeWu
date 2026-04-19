@@ -1,14 +1,12 @@
 use anyhow::Result;
 use gewu_core::traits::LlmProvider;
 use sqlx::SqlitePool;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::plugin_host::PluginHost;
 use crate::runtime::GeWuRuntime;
 
-/// Shared factory for building a `GeWuRuntime` with builtins and plugins.
-///
-/// Both CLI and Web should use this to ensure consistent runtime construction.
 pub struct RuntimeFactory;
 
 impl RuntimeFactory {
@@ -19,6 +17,16 @@ impl RuntimeFactory {
         pool: SqlitePool,
         plugin_host: &PluginHost,
     ) -> Result<GeWuRuntime> {
+        Self::build_with_manifest_dirs(provider, pool, plugin_host, &[])
+    }
+
+    /// Build a runtime with manifest directories for YAML-defined specialists.
+    pub fn build_with_manifest_dirs(
+        provider: Arc<dyn LlmProvider>,
+        pool: SqlitePool,
+        plugin_host: &PluginHost,
+        manifest_dirs: &[PathBuf],
+    ) -> Result<GeWuRuntime> {
         let mut builder = GeWuRuntime::builder()
             .provider(provider)
             .pool(pool)
@@ -26,8 +34,14 @@ impl RuntimeFactory {
             .register_builtin_specialists();
 
         for plugin in plugin_host.plugins() {
-            // Extract factories and descriptors without consuming the plugin
             builder = builder.register_plugin_from_host(plugin.as_ref());
+            if let Some(dir) = plugin.specialist_manifest_dir() {
+                builder = builder.with_manifest_dir(dir);
+            }
+        }
+
+        for dir in manifest_dirs {
+            builder = builder.with_manifest_dir(dir);
         }
 
         builder.build()
