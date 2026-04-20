@@ -16,6 +16,8 @@ pub struct Config {
     pub plugins: std::collections::HashMap<String, serde_json::Value>,
     #[serde(rename = "specialistDirs", default)]
     pub specialist_dirs: Vec<String>,
+    #[serde(rename = "workflowDirs", default)]
+    pub workflow_dirs: Vec<String>,
     #[serde(rename = "toolProviderDirs", default)]
     pub tool_provider_dirs: Vec<String>,
 }

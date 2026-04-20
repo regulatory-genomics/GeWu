@@ -6,8 +6,11 @@ use clap::Parser;
 use futures::StreamExt;
 use gewu_core::traits::LlmProvider;
 use gewu_core::types::AgentEvent;
+use gewu_graph::Blackboard;
 use gewu_providers::OpenAIProvider;
-use gewu_runtime::{PluginHost, PluginRegistry, RuntimeFactory};
+use gewu_runtime::{
+    PluginHost, PluginRegistry, RuntimeFactory, WorkflowCompiler, WorkflowRegistry,
+};
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 use std::collections::HashMap;
 use std::env;
@@ -78,6 +81,24 @@ pub struct Cli {
     /// Path to LLM configuration file
     #[arg(long)]
     pub llm_config: Option<String>,
+
+    /// Run a declarative workflow by id (from `--workflow-dir` or
+    /// `~/.gewu/workflows/`). When set, the interactive agent loop is skipped.
+    #[arg(long)]
+    pub workflow: Option<String>,
+
+    /// Input for `--workflow`. Either inline JSON (`{"k":1}`) or `@path.json`.
+    /// Defaults to `{}` (empty object) when omitted.
+    #[arg(long)]
+    pub workflow_input: Option<String>,
+
+    /// Additional directory to scan for workflow manifests. May be repeated.
+    #[arg(long = "workflow-dir")]
+    pub workflow_dirs: Vec<String>,
+
+    /// List available workflows and exit.
+    #[arg(long)]
+    pub list_workflows: bool,
 }
 
 async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
@@ -107,7 +128,13 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                 }
                 AgentEvent::ToolFinish { tool, output } => {
                     let display_output = if output.len() > 200 {
-                        format!("{}...", &output[..200])
+                        let end = output
+                            .char_indices()
+                            .map(|(i, _)| i)
+                            .take_while(|&i| i <= 200)
+                            .last()
+                            .unwrap_or(0);
+                        format!("{}...", &output[..end])
                     } else {
                         output
                     };
@@ -147,6 +174,43 @@ fn resolve_manifest_dirs(config: &config::Config) -> Vec<PathBuf> {
         dirs.push(PathBuf::from(".gewu/specialists"));
     }
     dirs
+}
+
+fn resolve_workflow_dirs(config: &config::Config, cli_extra: &[String]) -> Vec<PathBuf> {
+    let home = dirs::home_dir();
+    let expand = |s: &String| -> PathBuf {
+        if s.starts_with("~/") {
+            if let Some(ref h) = home {
+                return h.join(&s[2..]);
+            }
+        }
+        PathBuf::from(s)
+    };
+    let mut dirs: Vec<PathBuf> = config.workflow_dirs.iter().map(expand).collect();
+    for s in cli_extra {
+        dirs.push(expand(s));
+    }
+    if dirs.is_empty() {
+        if let Some(ref h) = home {
+            dirs.push(h.join(".gewu").join("workflows"));
+        }
+        dirs.push(PathBuf::from(".gewu/workflows"));
+    }
+    dirs
+}
+
+fn parse_workflow_input(raw: Option<&str>) -> Result<serde_json::Value> {
+    let s = match raw {
+        None => return Ok(serde_json::json!({})),
+        Some(s) => s,
+    };
+    if let Some(path) = s.strip_prefix('@') {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("reading workflow input file: {}", path))?;
+        serde_json::from_str(&content).with_context(|| format!("parsing JSON from {}", path))
+    } else {
+        serde_json::from_str(s).with_context(|| "parsing --workflow-input as JSON")
+    }
 }
 
 pub fn build_plugin_host_with<F>(
@@ -205,6 +269,69 @@ where
     Ok(())
 }
 
+async fn print_available_workflows<F>(
+    loaded_config: &LoadedConfig,
+    cli_dirs: &[String],
+    extra_register: F,
+) -> Result<()>
+where
+    F: FnOnce(&mut PluginRegistry),
+{
+    let provider: Arc<dyn LlmProvider> = Arc::new(OpenAIProvider::new_with_endpoint(
+        "dummy",
+        "http://localhost",
+        "dummy",
+    ));
+    let pool = SqlitePoolOptions::new()
+        .connect("sqlite::memory:")
+        .await
+        .context("Failed to create in-memory SQLite database for workflow listing")?;
+    let working_directory = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let plugin_host = build_plugin_host_with(
+        &loaded_config.config.plugins,
+        provider,
+        pool,
+        working_directory,
+        extra_register,
+    )?;
+    let dirs = resolve_workflow_dirs(&loaded_config.config, cli_dirs);
+    let registry = WorkflowRegistry::from_sources(&plugin_host, &dirs)?;
+
+    println!("Available Workflows:");
+    for id in registry.ids() {
+        let m = registry.get(&id).unwrap();
+        let desc = if m.description.is_empty() { "—" } else { &m.description };
+        println!("  - {}: {}", id, desc);
+    }
+    Ok(())
+}
+
+async fn run_workflow(
+    runtime: gewu_runtime::GeWuRuntime,
+    registry: WorkflowRegistry,
+    workflow_id: &str,
+    input: serde_json::Value,
+) -> Result<()> {
+    let manifest = registry
+        .get(workflow_id)
+        .with_context(|| {
+            format!(
+                "Workflow '{}' not found. Available: {:?}",
+                workflow_id,
+                registry.ids()
+            )
+        })?
+        .clone();
+    let compiler =
+        WorkflowCompiler::new(Arc::new(runtime)).with_workflows(registry.into_map());
+    let graph = compiler.compile(&manifest)?;
+    let bb = Blackboard::from_value(input);
+    let out = graph.invoke(bb).await?;
+    let pretty = serde_json::to_string_pretty(out.as_value())?;
+    println!("{}", pretty);
+    Ok(())
+}
+
 pub async fn run_with_plugins<F>(extra_register: F) -> Result<()>
 where
     F: FnOnce(&mut PluginRegistry),
@@ -243,6 +370,11 @@ where
 
     if cli.list_agents {
         return print_available_agents(&loaded_config, extra_register).await;
+    }
+
+    if cli.list_workflows {
+        return print_available_workflows(&loaded_config, &cli.workflow_dirs, extra_register)
+            .await;
     }
 
     let file_config = loaded_config.config;
@@ -321,6 +453,7 @@ where
     println!("Session ID: {}", session_id);
 
     let manifest_dirs = resolve_manifest_dirs(&file_config);
+    let workflow_dirs = resolve_workflow_dirs(&file_config, &cli.workflow_dirs);
     let mcp_tools = mcp_loader::load_mcp_tools(file_config.mcp_servers).await?;
     let plugin_host = build_plugin_host_with(
         &file_config.plugins,
@@ -333,6 +466,13 @@ where
         provider.clone(), pool.clone(), &plugin_host,
         &manifest_dirs,
     )?;
+
+    if let Some(workflow_id) = cli.workflow.as_deref() {
+        let input = parse_workflow_input(cli.workflow_input.as_deref())?;
+        let registry = WorkflowRegistry::from_sources(&plugin_host, &workflow_dirs)?;
+        return run_workflow(runtime, registry, workflow_id, input).await;
+    }
+
     let (mut agent, _registry) = runtime
         .build_specialist(&cli.agent, session_id, mcp_tools)
         .await?;

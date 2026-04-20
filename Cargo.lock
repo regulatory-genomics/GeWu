@@ -813,6 +813,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "gewu-core",
+ "gewu-graph",
  "gewu-providers",
  "gewu-runtime",
  "gewu-storage",
@@ -822,6 +823,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -879,11 +881,16 @@ dependencies = [
  "bytes",
  "futures",
  "gewu-core",
+ "hex",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-test",
 ]
 
 [[package]]
@@ -892,8 +899,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "dirs",
  "futures",
  "gewu-core",
+ "gewu-graph",
  "gewu-storage",
  "gewu-tools",
  "reqwest",

@@ -14,10 +14,12 @@ use gewu_storage::{SqliteMemory, TaskStore};
 use gewu_tools::{BatchTool, report_result::ReportResultArgs};
 use serde_json::Value;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::capability::{CapabilityRegistry, ToolFactoryProvider};
+use crate::composer::{ComposerContext, ComposerToolFactory, composer_specialist_descriptor};
 use crate::registry::{AgentConfig, BuiltinToolFactory};
 
 pub struct GeWuRuntime {
@@ -502,12 +504,62 @@ impl GeWuRuntimeBuilder {
             }
         }
 
+        // Register the composer specialist and its tools. The composer
+        // context captures a snapshot of the specialists and capabilities
+        // that are already registered — so it must come last.
+        let composer_desc = composer_specialist_descriptor();
+        let composer_ctx = ComposerContext {
+            specialists: Arc::new(specialists.clone()),
+            capabilities: Arc::new(registry.list_capabilities()),
+            workflows: Arc::new(HashMap::new()),
+            output_dir: default_workflow_output_dir(),
+        };
+        let composer_factory = ComposerToolFactory::new(composer_ctx);
+        let mut factories = self.factories;
+        factories.push(Box::new(composer_factory));
+        registry.register(Arc::new(ToolFactoryProvider::new(
+            "builtin",
+            "composer",
+            Box::new(ComposerToolFactoryForRegistry),
+        )));
+        specialists.push(composer_desc);
+
         Ok(GeWuRuntime {
-            factories: self.factories,
+            factories,
             capability_registry: Arc::new(registry),
             specialists,
             provider,
             pool,
         })
+    }
+}
+
+fn default_workflow_output_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".gewu").join("workflows"))
+        .unwrap_or_else(|| PathBuf::from(".gewu/workflows"))
+}
+
+/// Lightweight factory that registers the composer capability names into the
+/// `CapabilityRegistry` index. Actual tool creation is handled by
+/// `ComposerToolFactory` (which holds the `ComposerContext`).
+struct ComposerToolFactoryForRegistry;
+
+impl ToolFactory for ComposerToolFactoryForRegistry {
+    fn capabilities(&self) -> Vec<String> {
+        crate::composer::COMPOSER_CAPABILITIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+    fn create_tools(
+        &self,
+        _capability: &str,
+        _ctx: &AssemblyContext,
+    ) -> std::result::Result<Vec<Box<dyn Tool>>, Box<dyn std::error::Error + Send + Sync>> {
+        // The real tools are created by ComposerToolFactory which is in the
+        // factories vec. This stub exists only so the registry index knows
+        // these capability names exist.
+        Ok(vec![])
     }
 }

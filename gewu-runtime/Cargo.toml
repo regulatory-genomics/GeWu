@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 gewu-core = { path = "../gewu-core" }
+gewu-graph = { path = "../gewu-graph" }
 gewu-tools = { path = "../gewu-tools" }
 gewu-storage = { path = "../gewu-storage" }
 anyhow = "1.0"
@@ -19,6 +20,7 @@ futures = "0.3.32"
 schemars = "0.8"
 serde_yaml = "0.9"
 reqwest = { version = "0.12", features = ["json"] }
+dirs = "6.0.0"
 
 [dev-dependencies]
 tempfile = "3"

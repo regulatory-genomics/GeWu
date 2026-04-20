@@ -1,4 +1,5 @@
 use crate::tools::TaskTool;
+use crate::workflow_tools::{ComposeWorkflowTool, RunWorkflowTool};
 use anyhow::{Result, anyhow};
 use gewu_core::traits::{AssemblyContext, LlmProvider, Tool, ToolFactory, ToolRegistry};
 use gewu_core::types::SpecialistDescriptor;
@@ -25,6 +26,7 @@ pub fn specialist_descriptors() -> Vec<SpecialistDescriptor> {
                 "task", "read_file", "write_file", "edit_file", "glob",
                 "bash", "grep", "web_fetch", "list", "code_search",
                 "web_search", "todo", "report_result",
+                "compose_workflow", "run_workflow",
             ].into_iter().map(String::from).collect(),
             system_prompt: include_str!("prompts/build.txt").into(),
         },
@@ -44,6 +46,7 @@ pub fn specialist_descriptors() -> Vec<SpecialistDescriptor> {
                 "task", "read_file", "write_file", "edit_file", "glob",
                 "bash", "grep", "web_fetch", "list", "code_search",
                 "web_search", "todo", "report_result",
+                "compose_workflow", "run_workflow",
             ].into_iter().map(String::from).collect(),
             system_prompt: include_str!("prompts/general.txt").into(),
         },
@@ -73,6 +76,7 @@ impl ToolFactory for BuiltinToolFactory {
             "read_file", "write_file", "edit_file", "glob", "bash",
             "bash_safe", "grep", "web_fetch", "web_search", "list",
             "code_search", "todo", "task", "report_result",
+            "compose_workflow", "run_workflow",
         ].into_iter().map(String::from).collect()
     }
 
@@ -102,6 +106,8 @@ impl ToolFactory for BuiltinToolFactory {
                 ])
             }
             "task" => Ok(vec![Box::new(TaskTool::new(ctx.provider.clone(), ctx.pool.clone()))]),
+            "compose_workflow" => Ok(vec![Box::new(ComposeWorkflowTool::new(ctx.provider.clone(), ctx.pool.clone()))]),
+            "run_workflow" => Ok(vec![Box::new(RunWorkflowTool::new(ctx.provider.clone(), ctx.pool.clone(), vec![]))]),
             "report_result" => Ok(vec![Box::new(ReportResultTool)]),
             _ => Err(format!("Unknown capability: {}", capability).into()),
         }

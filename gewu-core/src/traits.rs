@@ -251,4 +251,12 @@ pub trait Plugin: Send + Sync {
     fn specialist_manifest_dir(&self) -> Option<PathBuf> {
         None
     }
+
+    /// Optional directory containing YAML workflow manifests bundled with
+    /// this plugin. Loaded by `WorkflowManifestLoader` when the runtime is
+    /// built. Returning `None` means the plugin ships no workflows (the
+    /// default).
+    fn workflow_manifest_dir(&self) -> Option<PathBuf> {
+        None
+    }
 }
