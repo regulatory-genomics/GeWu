@@ -29,6 +29,8 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::command_tool::CommandToolDef;
+use crate::command_tool_registry::CommandToolRegistry;
 use crate::manifest::workflow::WorkflowManifest;
 use crate::workflow;
 
@@ -289,6 +291,115 @@ async fn do_write(ctx: &ComposerContext, args: WriteArgs) -> Result<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Tool: register_tool
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct RegisterToolArgs {
+    name: String,
+    description: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    working_dir: Option<PathBuf>,
+    #[serde(default = "default_timeout")]
+    timeout_ms: u64,
+    #[serde(default)]
+    input_schema: Option<Value>,
+}
+
+fn default_timeout() -> u64 {
+    30_000
+}
+
+pub struct RegisterToolTool {
+    tools_dir: PathBuf,
+}
+
+impl RegisterToolTool {
+    pub fn new(tools_dir: PathBuf) -> Self {
+        Self { tools_dir }
+    }
+}
+
+#[async_trait]
+impl Tool for RegisterToolTool {
+    fn name(&self) -> &str {
+        "register_tool"
+    }
+    fn description(&self) -> &str {
+        "Register an external command as a GeWu tool capability. The command \
+         must exist and be executable. The tool is persisted to \
+         ~/.gewu/tools/<name>.yaml and will be available in subsequent \
+         workflow runs. Returns { ok, name, path } on success."
+    }
+    fn schema(&self) -> RootSchema {
+        serde_json::from_value(json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Unique tool name (e.g. compute_bazi_chart)" },
+                "description": { "type": "string", "description": "What this tool does" },
+                "command": { "type": "string", "description": "Absolute path to the executable" },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "CLI arguments appended after command" },
+                "working_dir": { "type": "string", "description": "Working directory for the process" },
+                "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default 30000)" },
+                "input_schema": { "type": "object", "description": "Optional JSON Schema for the tool's input" }
+            },
+            "required": ["name", "description", "command"]
+        }))
+        .unwrap()
+    }
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let a: RegisterToolArgs = serde_json::from_value(args)
+            .map_err(|e| format!("invalid args: {}", e))?;
+
+        let def = CommandToolDef {
+            name: a.name.clone(),
+            description: a.description,
+            command: a.command,
+            args: a.args,
+            working_dir: a.working_dir,
+            env: Default::default(),
+            timeout_ms: a.timeout_ms,
+            input_schema: a.input_schema,
+        };
+
+        let mut registry = CommandToolRegistry::new(&self.tools_dir)
+            .map_err(|e| format!("open tool registry: {}", e))?;
+
+        match registry.register(def) {
+            Ok(()) => {
+                let path = self.tools_dir.join(format!("{}.yaml", a.name));
+                let out = json!({
+                    "ok": true,
+                    "name": a.name,
+                    "path": path.to_string_lossy(),
+                });
+                Ok(ToolResult::new(
+                    "register_tool",
+                    serde_json::to_string(&out).unwrap_or_default(),
+                ))
+            }
+            Err(e) => {
+                let out = json!({
+                    "ok": false,
+                    "error": e.to_string(),
+                });
+                Ok(ToolResult::new(
+                    "register_tool",
+                    serde_json::to_string(&out).unwrap_or_default(),
+                ))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ToolFactory wrapping the composer tools as capabilities.
 // ---------------------------------------------------------------------------
 
@@ -296,15 +407,23 @@ pub const COMPOSER_CAPABILITIES: &[&str] = &[
     "list_specialists",
     "list_capabilities",
     "write_workflow",
+    "register_tool",
 ];
 
 pub struct ComposerToolFactory {
     ctx: ComposerContext,
+    tools_dir: PathBuf,
 }
 
 impl ComposerToolFactory {
     pub fn new(ctx: ComposerContext) -> Self {
-        Self { ctx }
+        let tools_dir = crate::command_tool_registry::CommandToolRegistry::default_dir();
+        Self { ctx, tools_dir }
+    }
+
+    pub fn with_tools_dir(mut self, dir: PathBuf) -> Self {
+        self.tools_dir = dir;
+        self
     }
 }
 
@@ -321,6 +440,7 @@ impl ToolFactory for ComposerToolFactory {
             "list_specialists" => vec![Box::new(ListSpecialistsTool::new(self.ctx.clone()))],
             "list_capabilities" => vec![Box::new(ListCapabilitiesTool::new(self.ctx.clone()))],
             "write_workflow" => vec![Box::new(WriteWorkflowTool::new(self.ctx.clone()))],
+            "register_tool" => vec![Box::new(RegisterToolTool::new(self.tools_dir.clone()))],
             _ => vec![],
         })
     }

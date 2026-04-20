@@ -938,6 +938,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "dirs",
  "futures-util",
  "gewu-core",
  "glob",

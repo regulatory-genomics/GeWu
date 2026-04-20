@@ -4,7 +4,7 @@
 //! It uses the `ignore` crate to respect `.gitignore` files and the `grep` crate for
 //! efficient searching.
 
-use crate::fs_utils::{into_tool_error, resolve_safe_path};
+use crate::fs_utils::{into_tool_error, resolve_read_path};
 use anyhow::Result;
 use async_trait::async_trait;
 use gewu_core::traits::Tool;
@@ -92,7 +92,7 @@ impl Tool for GrepTool {
         let search_path_str = input.path.as_deref().unwrap_or(".");
 
         let search_path =
-            resolve_safe_path(&self.working_directory, search_path_str).map_err(into_tool_error)?;
+            resolve_read_path(&self.working_directory, search_path_str).map_err(into_tool_error)?;
 
         let result =
             tokio::task::spawn_blocking(move || -> Result<String, Box<dyn Error + Send + Sync>> {

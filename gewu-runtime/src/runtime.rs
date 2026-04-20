@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::capability::{CapabilityRegistry, ToolFactoryProvider};
+use crate::command_tool_registry::CommandToolRegistry;
 use crate::composer::{ComposerContext, ComposerToolFactory, composer_specialist_descriptor};
 use crate::registry::{AgentConfig, BuiltinToolFactory};
 
@@ -89,7 +90,13 @@ impl GeWuRuntime {
                 }
             }
             if !resolved {
-                return Err(anyhow!("No factory can resolve capability: {}", cap));
+                // Fall back to capability registry (handles command tools, etc.)
+                if self.capability_registry.contains(cap) {
+                    let produced = self.capability_registry.resolve(&[cap.clone()], &ctx)?;
+                    tools.extend(produced);
+                } else {
+                    return Err(anyhow!("No factory can resolve capability: {}", cap));
+                }
             }
         }
         Ok(tools)
@@ -501,6 +508,25 @@ impl GeWuRuntimeBuilder {
                 Err(e) => {
                     tracing::warn!("Failed to load specialist manifests: {}", e);
                 }
+            }
+        }
+
+        // Load command-backed tools from ~/.gewu/tools/
+        let tools_dir = CommandToolRegistry::default_dir();
+        match CommandToolRegistry::new(&tools_dir) {
+            Ok(cmd_registry) => {
+                let count = cmd_registry.definitions().len();
+                if count > 0 {
+                    tracing::info!(
+                        "Loaded {} command tool(s) from {}",
+                        count,
+                        tools_dir.display()
+                    );
+                    registry.register(Arc::new(cmd_registry.into_provider()));
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load command tools from {}: {}", tools_dir.display(), e);
             }
         }
 

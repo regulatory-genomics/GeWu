@@ -57,6 +57,54 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     ret
 }
 
+/// Resolves a user-provided path for write access.
+/// Allows writing to the project root OR ~/.gewu/ (GeWu's config directory).
+pub fn resolve_write_path(root: impl AsRef<Path>, user_path: impl AsRef<Path>) -> Result<PathBuf> {
+    let user_path = user_path.as_ref();
+
+    if user_path.is_absolute() {
+        let normalized = normalize_path(user_path);
+        let gewu_dir = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/"))
+            .join(".gewu");
+        if normalized.starts_with(root.as_ref()) || normalized.starts_with(&gewu_dir) {
+            Ok(normalized)
+        } else {
+            Err(anyhow::anyhow!(
+                "Path traversal detected: {:?} is outside of root {:?}",
+                normalized,
+                root.as_ref()
+            ))
+        }
+    } else {
+        resolve_safe_path(root, user_path)
+    }
+}
+
+/// Resolves a user-provided path for read-only access.
+/// Allows reading from anywhere under the user's home directory or the project root.
+/// This is less restrictive than resolve_safe_path since reads are non-destructive.
+pub fn resolve_read_path(root: impl AsRef<Path>, user_path: impl AsRef<Path>) -> Result<PathBuf> {
+    let user_path = user_path.as_ref();
+
+    if user_path.is_absolute() {
+        let normalized = normalize_path(user_path);
+        // Allow any absolute path under home dir or project root
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        if normalized.starts_with(&home) || normalized.starts_with(root.as_ref()) {
+            Ok(normalized)
+        } else {
+            Err(anyhow::anyhow!(
+                "Read access denied: {:?} is outside of home directory",
+                normalized
+            ))
+        }
+    } else {
+        // Relative paths resolve against root (same as before)
+        resolve_safe_path(root, user_path)
+    }
+}
+
 /// Resolves a user-provided path against a root directory, ensuring it stays within the root.
 /// Returns the absolute path if safe, or an error if it attempts to traverse outside.
 pub fn resolve_safe_path(root: impl AsRef<Path>, user_path: impl AsRef<Path>) -> Result<PathBuf> {

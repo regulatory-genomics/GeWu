@@ -19,7 +19,7 @@
 
 use crate::fs_utils::{
     glob_with_gitignore, into_tool_error, is_binary_file, mime_type, read_bytes, read_text,
-    resolve_safe_path, write,
+    resolve_read_path, resolve_write_path, write,
 };
 use crate::replacers::smart_replace;
 use anyhow::Result;
@@ -120,7 +120,7 @@ impl Tool for ReadFileTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: ReadArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_safe_path(&self.working_directory, &input.file_path)
+        let file_path = resolve_read_path(&self.working_directory, &input.file_path)
             .map_err(into_tool_error)?;
 
         let metadata = tokio::fs::metadata(&file_path).await;
@@ -370,7 +370,7 @@ impl Tool for WriteFileTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: WriteArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_safe_path(&self.working_directory, &input.file_path)
+        let file_path = resolve_write_path(&self.working_directory, &input.file_path)
             .map_err(into_tool_error)?;
 
         write(&file_path, input.content.as_bytes())
@@ -404,7 +404,7 @@ impl Tool for EditFileTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: EditArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_safe_path(&self.working_directory, &input.file_path)
+        let file_path = resolve_write_path(&self.working_directory, &input.file_path)
             .map_err(into_tool_error)?;
 
         let content = read_text(&file_path).await.map_err(into_tool_error)?;
@@ -444,18 +444,19 @@ impl Tool for GlobTool {
         let input: GlobArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
         let search_dir = if let Some(p) = &input.path {
-            resolve_safe_path(&self.working_directory, p).map_err(into_tool_error)?
+            resolve_read_path(&self.working_directory, p).map_err(into_tool_error)?
         } else {
             self.working_directory.clone()
         };
 
         let paths = glob_with_gitignore(&search_dir, &input.pattern).map_err(into_tool_error)?;
 
+        let home = dirs::home_dir().unwrap_or_default();
         let paths_str: Vec<String> = paths
             .into_iter()
             .filter(|p| {
                 let normalized = crate::fs_utils::normalize_path(p);
-                normalized.starts_with(&self.working_directory)
+                normalized.starts_with(&self.working_directory) || normalized.starts_with(&home)
             })
             .map(|p| p.to_string_lossy().into_owned())
             .collect();

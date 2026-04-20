@@ -1,4 +1,6 @@
 pub mod capability;
+pub mod command_tool;
+pub mod command_tool_registry;
 pub mod composer;
 pub mod factory;
 pub mod manifest;
@@ -13,6 +15,8 @@ pub mod workflow_registry;
 pub mod workflow_tools;
 
 pub use capability::{CapabilityRegistry, ToolFactoryProvider};
+pub use command_tool::{CommandTool, CommandToolDef};
+pub use command_tool_registry::{CommandToolProvider, CommandToolRegistry};
 pub use factory::RuntimeFactory;
 pub use manifest::loader::SpecialistManifestLoader;
 pub use manifest::schema::{PromptSource, SpecialistManifest};
@@ -31,5 +35,6 @@ pub use trace_diff::{DiffEntry, DiffKind, DiffOptions, diff_blackboards, format_
 pub use workflow::{Predicate, WorkflowCompiler, validate as validate_workflow, validate_with_ids};
 pub use workflow_registry::WorkflowRegistry;
 pub use composer::{
-    COMPOSER_CAPABILITIES, ComposerContext, ComposerToolFactory, composer_specialist_descriptor,
+    COMPOSER_CAPABILITIES, ComposerContext, ComposerToolFactory, RegisterToolTool,
+    composer_specialist_descriptor,
 };

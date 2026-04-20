@@ -321,6 +321,7 @@ impl WorkflowCompiler {
 fn extract_input(bb: &Blackboard, path: Option<&str>) -> Value {
     match path {
         None => bb.as_value().clone(),
+        Some("$") => bb.as_value().clone(),
         Some(p) => {
             let p = p.strip_prefix("$.").unwrap_or(p);
             if p.is_empty() {
