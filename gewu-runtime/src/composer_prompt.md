@@ -53,3 +53,40 @@ Node kinds:
 - **Never** invent manifest fields. Stick to the schema above.
 - **Never** produce a workflow with unreachable nodes, duplicate parallel write keys, or conditional loops (`max_loops > 0` is not yet supported).
 - When in doubt about control flow, prefer fewer nodes and explicit data flow via `input:`/`write:` over implicit coupling.
+
+## Blackboard initial state
+
+When a workflow is invoked via `run_workflow(workflow_id, input)`, the `input` JSON object becomes the **root** of the blackboard. For example:
+
+```
+run_workflow(input={"prompt": "hello", "lang": "en"})
+```
+
+The blackboard starts as `{"prompt": "hello", "lang": "en"}`. So to read the user's prompt, use `input: $.prompt` — NOT `$.input.prompt`.
+
+## When to use `tool:` on specialist nodes
+
+The `tool:` field on a `kind: specialist` node is an **optional hint** that tells the specialist which capability is relevant. Use it ONLY when:
+- The specialist has multiple capabilities and you want to pin a specific one.
+- The step is a deterministic tool call that happens to need LLM reasoning to prepare arguments.
+
+Do NOT use `tool:` when:
+- The specialist's job is open-ended (e.g. "answer a question", "write code", "review something"). In these cases, omit `tool:` entirely and let the specialist decide which tools to use.
+- The specialist only has one obvious capability for the task.
+
+## Example: simple Q&A workflow
+
+```yaml
+id: ask
+entry: answer
+finish: [answer]
+nodes:
+  answer:
+    kind: specialist
+    specialist: build
+    input: $.prompt
+    write: answer
+edges: []
+```
+
+Called with `run_workflow(input={"prompt": "What is 2+2?"})`, the `build` specialist receives "What is 2+2?" as its prompt and writes its response to `$.answer`.

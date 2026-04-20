@@ -351,14 +351,19 @@ fn error_partial(write_path: &str, msg: String) -> Blackboard {
 }
 
 fn build_prompt(template: Option<&str>, tool_hint: Option<&str>, input: &Value) -> String {
-    let input_str = serde_json::to_string_pretty(input).unwrap_or_else(|_| "{}".to_string());
+    let input_str = match input {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        _ => serde_json::to_string_pretty(input).unwrap_or_else(|_| "{}".to_string()),
+    };
     let base = match template {
         Some(t) => t.replace("{{input}}", &input_str),
-        None => format!("Input:\n{}", input_str),
+        None if input_str.is_empty() => "Complete this workflow step.".to_string(),
+        None => input_str,
     };
     match tool_hint {
         Some(t) => format!(
-            "{}\n\nYou must call the `{}` tool exactly once to complete this step.",
+            "{}\n\nHint: the `{}` tool is available and relevant to this step.",
             base, t
         ),
         None => base,
