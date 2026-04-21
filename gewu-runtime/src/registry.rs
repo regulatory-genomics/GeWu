@@ -1,4 +1,4 @@
-use crate::composer::RegisterToolTool;
+use crate::composer::{RegisterToolTool, WriteSpecialistTool};
 use crate::command_tool_registry::CommandToolRegistry;
 use crate::tools::TaskTool;
 use crate::workflow_tools::{ComposeWorkflowTool, RunWorkflowTool};
@@ -28,7 +28,7 @@ pub fn specialist_descriptors() -> Vec<SpecialistDescriptor> {
                 "task", "read_file", "write_file", "edit_file", "glob",
                 "bash", "grep", "web_fetch", "list", "code_search",
                 "web_search", "todo", "report_result",
-                "compose_workflow", "run_workflow", "register_tool",
+                "compose_workflow", "run_workflow", "register_tool", "write_specialist",
             ].into_iter().map(String::from).collect(),
             system_prompt: include_str!("prompts/build.txt").into(),
         },
@@ -48,7 +48,7 @@ pub fn specialist_descriptors() -> Vec<SpecialistDescriptor> {
                 "task", "read_file", "write_file", "edit_file", "glob",
                 "bash", "grep", "web_fetch", "list", "code_search",
                 "web_search", "todo", "report_result",
-                "compose_workflow", "run_workflow", "register_tool",
+                "compose_workflow", "run_workflow", "register_tool", "write_specialist",
             ].into_iter().map(String::from).collect(),
             system_prompt: include_str!("prompts/general.txt").into(),
         },
@@ -78,7 +78,7 @@ impl ToolFactory for BuiltinToolFactory {
             "read_file", "write_file", "edit_file", "glob", "bash",
             "bash_safe", "grep", "web_fetch", "web_search", "list",
             "code_search", "todo", "task", "report_result",
-            "compose_workflow", "run_workflow", "register_tool",
+            "compose_workflow", "run_workflow", "register_tool", "write_specialist",
         ].into_iter().map(String::from).collect()
     }
 
@@ -111,6 +111,9 @@ impl ToolFactory for BuiltinToolFactory {
             "compose_workflow" => Ok(vec![Box::new(ComposeWorkflowTool::new(ctx.provider.clone(), ctx.pool.clone()))]),
             "run_workflow" => Ok(vec![Box::new(RunWorkflowTool::new(ctx.provider.clone(), ctx.pool.clone(), vec![]))]),
             "register_tool" => Ok(vec![Box::new(RegisterToolTool::new(CommandToolRegistry::default_dir()))]),
+            "write_specialist" => Ok(vec![Box::new(WriteSpecialistTool::new(
+                crate::composer::default_specialists_dir(),
+            ))]),
             "report_result" => Ok(vec![Box::new(ReportResultTool)]),
             _ => Err(format!("Unknown capability: {}", capability).into()),
         }

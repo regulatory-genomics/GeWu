@@ -400,6 +400,106 @@ impl Tool for RegisterToolTool {
 }
 
 // ---------------------------------------------------------------------------
+// Tool: write_specialist
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct WriteSpecialistArgs {
+    id: String,
+    description: String,
+    capabilities: Vec<String>,
+    system_prompt: String,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+pub struct WriteSpecialistTool {
+    specialists_dir: PathBuf,
+}
+
+impl WriteSpecialistTool {
+    pub fn new(specialists_dir: PathBuf) -> Self {
+        Self { specialists_dir }
+    }
+}
+
+#[async_trait]
+impl Tool for WriteSpecialistTool {
+    fn name(&self) -> &str {
+        "write_specialist"
+    }
+    fn description(&self) -> &str {
+        "Create and persist a new specialist definition. The specialist is saved \
+         to ~/.gewu/specialists/<id>.yaml and will be available in subsequent \
+         runtime builds. Use this to create focused specialists with specific \
+         capabilities and system prompts."
+    }
+    fn schema(&self) -> RootSchema {
+        serde_json::from_value(json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Unique specialist ID" },
+                "description": { "type": "string", "description": "What this specialist does" },
+                "capabilities": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "List of capability names this specialist can use"
+                },
+                "system_prompt": { "type": "string", "description": "System prompt for the specialist" },
+                "overwrite": { "type": "boolean", "description": "Allow overwriting existing specialist (default false)" }
+            },
+            "required": ["id", "description", "capabilities", "system_prompt"]
+        }))
+        .unwrap()
+    }
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let a: WriteSpecialistArgs = serde_json::from_value(args)
+            .map_err(|e| format!("invalid args: {}", e))?;
+
+        if a.id.is_empty() {
+            return Ok(ToolResult::new("write_specialist",
+                serde_json::to_string(&json!({"ok": false, "error": "id cannot be empty"})).unwrap()));
+        }
+
+        std::fs::create_dir_all(&self.specialists_dir)
+            .map_err(|e| format!("create specialists dir: {}", e))?;
+
+        let path = self.specialists_dir.join(format!("{}.yaml", a.id));
+        if path.exists() && !a.overwrite {
+            return Ok(ToolResult::new("write_specialist",
+                serde_json::to_string(&json!({
+                    "ok": false,
+                    "error": format!("specialist '{}' already exists (pass overwrite=true to replace)", a.id)
+                })).unwrap()));
+        }
+
+        let manifest = json!({
+            "id": a.id,
+            "description": a.description,
+            "prompt": { "inline": a.system_prompt },
+            "capabilities": a.capabilities,
+        });
+        let yaml = serde_yaml::to_string(&manifest)
+            .map_err(|e| format!("serialize: {}", e))?;
+        std::fs::write(&path, yaml)
+            .map_err(|e| format!("write {}: {}", path.display(), e))?;
+
+        let out = json!({
+            "ok": true,
+            "id": a.id,
+            "path": path.to_string_lossy(),
+            "capabilities": a.capabilities,
+        });
+        Ok(ToolResult::new("write_specialist",
+            serde_json::to_string(&out).unwrap_or_default()))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ToolFactory wrapping the composer tools as capabilities.
 // ---------------------------------------------------------------------------
 
@@ -408,23 +508,33 @@ pub const COMPOSER_CAPABILITIES: &[&str] = &[
     "list_capabilities",
     "write_workflow",
     "register_tool",
+    "write_specialist",
 ];
 
 pub struct ComposerToolFactory {
     ctx: ComposerContext,
     tools_dir: PathBuf,
+    specialists_dir: PathBuf,
 }
 
 impl ComposerToolFactory {
     pub fn new(ctx: ComposerContext) -> Self {
         let tools_dir = crate::command_tool_registry::CommandToolRegistry::default_dir();
-        Self { ctx, tools_dir }
+        let specialists_dir = default_specialists_dir();
+        Self { ctx, tools_dir, specialists_dir }
     }
 
     pub fn with_tools_dir(mut self, dir: PathBuf) -> Self {
         self.tools_dir = dir;
         self
     }
+}
+
+pub fn default_specialists_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".gewu")
+        .join("specialists")
 }
 
 impl ToolFactory for ComposerToolFactory {
@@ -441,6 +551,7 @@ impl ToolFactory for ComposerToolFactory {
             "list_capabilities" => vec![Box::new(ListCapabilitiesTool::new(self.ctx.clone()))],
             "write_workflow" => vec![Box::new(WriteWorkflowTool::new(self.ctx.clone()))],
             "register_tool" => vec![Box::new(RegisterToolTool::new(self.tools_dir.clone()))],
+            "write_specialist" => vec![Box::new(WriteSpecialistTool::new(self.specialists_dir.clone()))],
             _ => vec![],
         })
     }

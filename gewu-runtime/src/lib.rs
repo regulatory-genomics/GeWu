@@ -21,7 +21,7 @@ pub use factory::RuntimeFactory;
 pub use manifest::loader::SpecialistManifestLoader;
 pub use manifest::schema::{PromptSource, SpecialistManifest};
 pub use manifest::workflow::{
-    ConditionalEdgeSpec, EdgeSpec, NodeSpec, WorkflowManifest,
+    ConditionalEdgeSpec, EdgeSpec, InlineSpecialist, NodeSpec, SpecialistRef, WorkflowManifest,
 };
 pub use manifest::workflow_loader::WorkflowManifestLoader;
 pub use plugin_host::{PluginConstructor, PluginHost, PluginRegistry};
@@ -36,5 +36,5 @@ pub use workflow::{Predicate, WorkflowCompiler, validate as validate_workflow, v
 pub use workflow_registry::WorkflowRegistry;
 pub use composer::{
     COMPOSER_CAPABILITIES, ComposerContext, ComposerToolFactory, RegisterToolTool,
-    composer_specialist_descriptor,
+    WriteSpecialistTool, composer_specialist_descriptor,
 };

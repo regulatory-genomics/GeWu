@@ -26,6 +26,36 @@ pub struct WorkflowManifest {
     pub metadata: Value,
 }
 
+/// Reference to a specialist: either by ID (string) or inline definition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum SpecialistRef {
+    /// Reference an existing specialist by ID.
+    ById(String),
+    /// Inline specialist definition — compiled into an ephemeral descriptor.
+    Inline(InlineSpecialist),
+}
+
+/// Inline specialist definition embedded in a workflow node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InlineSpecialist {
+    pub id: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    pub system_prompt: String,
+}
+
+impl SpecialistRef {
+    pub fn id(&self) -> &str {
+        match self {
+            SpecialistRef::ById(id) => id,
+            SpecialistRef::Inline(s) => &s.id,
+        }
+    }
+}
+
 /// A single node in a workflow.
 ///
 /// Four kinds, discriminated by a `kind:` tag:
@@ -40,7 +70,7 @@ pub struct WorkflowManifest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NodeSpec {
     Specialist {
-        specialist: String,
+        specialist: SpecialistRef,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -138,7 +168,7 @@ edges:
         assert_eq!(m.finish, vec!["b".to_string()]);
         assert_eq!(m.nodes.len(), 2);
         match &m.nodes["a"] {
-            NodeSpec::Specialist { specialist, .. } => assert_eq!(specialist, "speaker"),
+            NodeSpec::Specialist { specialist, .. } => assert_eq!(specialist.id(), "speaker"),
             _ => panic!("expected specialist node"),
         }
         assert_eq!(m.edges.len(), 1);
@@ -239,5 +269,61 @@ edges:
         let s = serde_yaml::to_string(&manifest).unwrap();
         let back: WorkflowManifest = serde_yaml::from_str(&s).unwrap();
         assert_eq!(back, manifest);
+    }
+
+    #[test]
+    fn parse_inline_specialist() {
+        let yaml = r#"
+id: test_inline
+entry: s
+finish: [s]
+nodes:
+  s:
+    kind: specialist
+    specialist:
+      id: custom_synth
+      description: "A custom synthesis specialist"
+      capabilities: [report_result]
+      system_prompt: "You are a synthesis agent."
+    write: out
+edges: []
+"#;
+        let m: WorkflowManifest = serde_yaml::from_str(yaml).unwrap();
+        match &m.nodes["s"] {
+            NodeSpec::Specialist { specialist, .. } => {
+                assert_eq!(specialist.id(), "custom_synth");
+                match specialist {
+                    SpecialistRef::Inline(inline) => {
+                        assert_eq!(inline.capabilities, vec!["report_result"]);
+                        assert_eq!(inline.system_prompt, "You are a synthesis agent.");
+                    }
+                    _ => panic!("expected inline specialist"),
+                }
+            }
+            _ => panic!("expected specialist node"),
+        }
+    }
+
+    #[test]
+    fn parse_string_specialist_backward_compat() {
+        let yaml = r#"
+id: compat
+entry: s
+finish: [s]
+nodes:
+  s:
+    kind: specialist
+    specialist: general
+    write: out
+edges: []
+"#;
+        let m: WorkflowManifest = serde_yaml::from_str(yaml).unwrap();
+        match &m.nodes["s"] {
+            NodeSpec::Specialist { specialist, .. } => {
+                assert_eq!(specialist.id(), "general");
+                assert!(matches!(specialist, SpecialistRef::ById(_)));
+            }
+            _ => panic!("expected specialist node"),
+        }
     }
 }

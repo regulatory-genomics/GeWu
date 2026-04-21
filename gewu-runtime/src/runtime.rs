@@ -131,6 +131,76 @@ impl GeWuRuntime {
         )
     }
 
+    /// Execute an inline specialist defined in a workflow node.
+    /// Unlike execute_request, this doesn't look up the specialist in the registry —
+    /// it uses the provided descriptor directly.
+    pub async fn execute_inline_specialist(
+        &self,
+        descriptor: &SpecialistDescriptor,
+        prompt: &str,
+        session_id: &str,
+        tools: Vec<Box<dyn Tool>>,
+        _metadata_json: Value,
+    ) -> Result<Value> {
+        let memory = SqliteMemory::new(self.pool.clone(), session_id.to_string()).await?;
+
+        let tools_arc: Vec<Arc<dyn Tool>> = tools
+            .into_iter()
+            .map(|t| Arc::from(t) as Arc<dyn Tool>)
+            .collect();
+
+        let tools_for_registry = Arc::new(tools_arc.clone());
+        let registry: Arc<dyn ToolRegistry> = Arc::new(RuntimeToolRegistry {
+            tools: tools_for_registry,
+        });
+
+        let batch_tool: Arc<dyn Tool> = Arc::new(BatchTool::new(registry.clone()));
+        let mut all_tools = vec![batch_tool];
+        all_tools.extend(tools_arc);
+
+        let system_prompt = if descriptor.system_prompt.is_empty() {
+            prompt.to_string()
+        } else {
+            descriptor.system_prompt.clone()
+        };
+
+        let mut agent = Agent::builder()
+            .llm(self.provider.clone())
+            .with_tools(all_tools)
+            .memory(Box::new(memory))
+            .system_prompt(&system_prompt)
+            .build()?;
+
+        let mut stream = Box::pin(agent.ask(prompt));
+        let mut result_text = String::new();
+
+        while let Some(event_result) = futures::StreamExt::next(&mut stream).await {
+            match event_result {
+                Ok(event) => match event {
+                    AgentEvent::Finish { response } => {
+                        result_text = response;
+                    }
+                    AgentEvent::ToolFinish { tool, output } if tool == "report_result" => {
+                        if let Ok(report) = serde_json::from_str::<gewu_tools::report_result::ReportResultArgs>(&output) {
+                            if let Some(val) = report.result {
+                                return Ok(val);
+                            }
+                        }
+                    }
+                    AgentEvent::Error { error } => {
+                        return Err(anyhow!("Inline specialist error: {}", error));
+                    }
+                    _ => {}
+                },
+                Err(e) => {
+                    return Err(anyhow!("Inline specialist stream error: {}", e));
+                }
+            }
+        }
+
+        Ok(Value::String(result_text))
+    }
+
     pub async fn build_specialist(
         &self,
         name: &str,

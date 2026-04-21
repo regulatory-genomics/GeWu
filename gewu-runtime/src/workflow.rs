@@ -16,8 +16,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::manifest::workflow::{EdgeSpec, NodeSpec, WorkflowManifest};
+use crate::manifest::workflow::{EdgeSpec, NodeSpec, SpecialistRef, WorkflowManifest};
 use crate::runtime::GeWuRuntime;
+
+use gewu_core::types::SpecialistDescriptor;
 
 type NodeFut = Pin<Box<dyn Future<Output = Blackboard> + Send>>;
 type NodeFn = Arc<dyn Fn(Blackboard) -> NodeFut + Send + Sync>;
@@ -30,6 +32,7 @@ type NodeFn = Arc<dyn Fn(Blackboard) -> NodeFut + Send + Sync>;
 pub struct WorkflowCompiler {
     runtime: Arc<GeWuRuntime>,
     workflows: Arc<HashMap<String, WorkflowManifest>>,
+    inline_specialists: HashMap<String, SpecialistDescriptor>,
 }
 
 impl WorkflowCompiler {
@@ -37,6 +40,7 @@ impl WorkflowCompiler {
         Self {
             runtime,
             workflows: Arc::new(HashMap::new()),
+            inline_specialists: HashMap::new(),
         }
     }
 
@@ -46,7 +50,15 @@ impl WorkflowCompiler {
     }
 
     pub fn compile(&self, m: &WorkflowManifest) -> Result<CompiledGraph<Blackboard>> {
-        validate(m, &self.runtime, &self.workflows)?;
+        // Collect inline specialist definitions from the manifest
+        let mut compiler = WorkflowCompiler {
+            runtime: Arc::clone(&self.runtime),
+            workflows: Arc::clone(&self.workflows),
+            inline_specialists: self.inline_specialists.clone(),
+        };
+        collect_inline_specialists(&m.nodes, &mut compiler.inline_specialists);
+
+        validate_with_inline(m, &compiler.runtime, &compiler.workflows, &compiler.inline_specialists)?;
 
         let session_id = format!("workflow:{}:{}", m.id, Uuid::new_v4());
         let mut graph: StateGraph<Blackboard> = StateGraph::new();
@@ -56,7 +68,7 @@ impl WorkflowCompiler {
         }
 
         for (node_id, spec) in &m.nodes {
-            let handler = self.compile_node(node_id, spec, &session_id)?;
+            let handler = compiler.compile_node(node_id, spec, &session_id)?;
             let h = Arc::clone(&handler);
             graph.add_node(node_id.as_str(), move |bb: Blackboard| {
                 let h = Arc::clone(&h);
@@ -148,7 +160,7 @@ impl WorkflowCompiler {
     fn compile_specialist_node(
         &self,
         id: &str,
-        specialist: &str,
+        specialist_ref: &SpecialistRef,
         tool_hint: Option<&str>,
         input: Option<&str>,
         write: Option<&str>,
@@ -156,7 +168,19 @@ impl WorkflowCompiler {
         session_id: &str,
     ) -> Result<NodeFn> {
         let runtime = Arc::clone(&self.runtime);
-        let specialist = specialist.to_string();
+        let specialist_id = specialist_ref.id().to_string();
+
+        // For inline specialists, register as ephemeral descriptor in the closure
+        let inline_desc: Option<SpecialistDescriptor> = match specialist_ref {
+            SpecialistRef::Inline(inline) => Some(SpecialistDescriptor {
+                id: inline.id.clone(),
+                description: inline.description.clone(),
+                capabilities: inline.capabilities.clone(),
+                system_prompt: inline.system_prompt.clone(),
+            }),
+            SpecialistRef::ById(_) => None,
+        };
+
         let tool_hint = tool_hint.map(|s| s.to_string());
         let input_path = input.map(|s| s.to_string());
         let write_path = write.map(|s| s.to_string()).unwrap_or_else(|| id.to_string());
@@ -166,7 +190,8 @@ impl WorkflowCompiler {
 
         Ok(Arc::new(move |bb: Blackboard| -> NodeFut {
             let runtime = Arc::clone(&runtime);
-            let specialist = specialist.clone();
+            let specialist_id = specialist_id.clone();
+            let inline_desc = inline_desc.clone();
             let tool_hint = tool_hint.clone();
             let input_path = input_path.clone();
             let write_path = write_path.clone();
@@ -180,10 +205,27 @@ impl WorkflowCompiler {
                     tool_hint.as_deref(),
                     &input_val,
                 );
+
+                // For inline specialists, build directly with the descriptor
+                if let Some(desc) = &inline_desc {
+                    let session = format!("{}:{}", session_id, node_id);
+                    let tools = match runtime.resolve_capabilities(&desc.capabilities) {
+                        Ok(t) => t,
+                        Err(e) => return error_partial(&write_path, e.to_string()),
+                    };
+                    let result = runtime
+                        .execute_inline_specialist(desc, &prompt_text, &session, tools, input_val)
+                        .await;
+                    return match result {
+                        Ok(output) => to_partial(&write_path, Ok(output)),
+                        Err(e) => error_partial(&write_path, e.to_string()),
+                    };
+                }
+
                 let task_id = format!("{}:{}", node_id, Uuid::new_v4());
                 let req = SpecialistExecutionRequest {
                     task_id,
-                    specialist_id: specialist.clone(),
+                    specialist_id: specialist_id.clone(),
                     session_id: format!("{}:{}", session_id, node_id),
                     prompt: prompt_text,
                     metadata_json: input_val,
@@ -442,7 +484,7 @@ pub fn validate(
     runtime: &GeWuRuntime,
     workflows: &HashMap<String, WorkflowManifest>,
 ) -> Result<()> {
-    let specialists: HashSet<String> = runtime
+    let mut specialists: HashSet<String> = runtime
         .list_specialists()
         .into_iter()
         .map(|s| s.name)
@@ -453,7 +495,58 @@ pub fn validate(
         .into_iter()
         .map(|c| c.name)
         .collect();
+    // Add inline specialist IDs so ById refs to them also pass
+    let mut inline = HashMap::new();
+    collect_inline_specialists(&m.nodes, &mut inline);
+    for id in inline.keys() {
+        specialists.insert(id.clone());
+    }
     validate_with_ids(m, &specialists, &capabilities, workflows)
+}
+
+fn validate_with_inline(
+    m: &WorkflowManifest,
+    runtime: &GeWuRuntime,
+    workflows: &HashMap<String, WorkflowManifest>,
+    inline_specialists: &HashMap<String, SpecialistDescriptor>,
+) -> Result<()> {
+    let mut specialists: HashSet<String> = runtime
+        .list_specialists()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    for id in inline_specialists.keys() {
+        specialists.insert(id.clone());
+    }
+    let capabilities: HashSet<String> = runtime
+        .capability_registry()
+        .list_capabilities()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    validate_with_ids(m, &specialists, &capabilities, workflows)
+}
+
+fn collect_inline_specialists(
+    nodes: &BTreeMap<String, NodeSpec>,
+    out: &mut HashMap<String, SpecialistDescriptor>,
+) {
+    for spec in nodes.values() {
+        match spec {
+            NodeSpec::Specialist { specialist: SpecialistRef::Inline(inline), .. } => {
+                out.insert(inline.id.clone(), SpecialistDescriptor {
+                    id: inline.id.clone(),
+                    description: inline.description.clone(),
+                    capabilities: inline.capabilities.clone(),
+                    system_prompt: inline.system_prompt.clone(),
+                });
+            }
+            NodeSpec::Parallel { branches } => {
+                collect_inline_specialists(branches, out);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Same validation as [`validate`], but parameterized by id sets instead of
@@ -485,7 +578,7 @@ fn validate_refs_with_ids(
 }
 
 fn validate_node_refs_with_ids(
-    id: &str,
+    node_id: &str,
     spec: &NodeSpec,
     known_specialists: &HashSet<String>,
     known_capabilities: &HashSet<String>,
@@ -493,19 +586,35 @@ fn validate_node_refs_with_ids(
 ) -> Result<()> {
     match spec {
         NodeSpec::Specialist { specialist, .. } => {
-            if !known_specialists.contains(specialist) {
-                return Err(anyhow!(
-                    "node '{}' references unknown specialist: {}",
-                    id,
-                    specialist
-                ));
+            match specialist {
+                SpecialistRef::ById(id) => {
+                    if !known_specialists.contains(id) {
+                        return Err(anyhow!(
+                            "node '{}' references unknown specialist: {}",
+                            node_id,
+                            id
+                        ));
+                    }
+                }
+                SpecialistRef::Inline(inline) => {
+                    for cap in &inline.capabilities {
+                        if !known_capabilities.contains(cap) {
+                            return Err(anyhow!(
+                                "inline specialist '{}' in node '{}' references unknown capability: {}",
+                                inline.id,
+                                node_id,
+                                cap
+                            ));
+                        }
+                    }
+                }
             }
         }
         NodeSpec::Tool { tool, .. } => {
             if !known_capabilities.contains(tool) {
                 return Err(anyhow!(
                     "node '{}' references unknown capability: {}",
-                    id,
+                    node_id,
                     tool
                 ));
             }
@@ -525,7 +634,7 @@ fn validate_node_refs_with_ids(
             if !workflows.contains_key(workflow) {
                 return Err(anyhow!(
                     "node '{}' references unknown workflow: {}",
-                    id,
+                    node_id,
                     workflow
                 ));
             }
@@ -555,12 +664,26 @@ fn validate_node_refs(
 ) -> Result<()> {
     match spec {
         NodeSpec::Specialist { specialist, .. } => {
-            if runtime.find_specialist(specialist).is_none() {
-                return Err(anyhow!(
-                    "node '{}' references unknown specialist: {}",
-                    id,
-                    specialist
-                ));
+            match specialist {
+                SpecialistRef::ById(sid) => {
+                    if runtime.find_specialist(sid).is_none() {
+                        return Err(anyhow!(
+                            "node '{}' references unknown specialist: {}",
+                            id,
+                            sid
+                        ));
+                    }
+                }
+                SpecialistRef::Inline(inline) => {
+                    for cap in &inline.capabilities {
+                        if !runtime.capability_registry().contains(cap) {
+                            return Err(anyhow!(
+                                "inline specialist '{}' in node '{}' references unknown capability: {}",
+                                inline.id, id, cap
+                            ));
+                        }
+                    }
+                }
             }
         }
         NodeSpec::Tool { tool, .. } => {
