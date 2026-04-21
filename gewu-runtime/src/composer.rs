@@ -85,6 +85,7 @@ impl Tool for ListSpecialistsTool {
         serde_json::from_value(json!({
             "type": "object",
             "properties": {},
+            "required": [],
             "additionalProperties": false
         }))
         .unwrap()
@@ -141,6 +142,7 @@ impl Tool for ListCapabilitiesTool {
         serde_json::from_value(json!({
             "type": "object",
             "properties": {},
+            "required": [],
             "additionalProperties": false
         }))
         .unwrap()
@@ -507,8 +509,6 @@ pub const COMPOSER_CAPABILITIES: &[&str] = &[
     "list_specialists",
     "list_capabilities",
     "write_workflow",
-    "register_tool",
-    "write_specialist",
 ];
 
 pub struct ComposerToolFactory {

@@ -427,8 +427,22 @@ impl OpenAIProvider {
         let mut openai_tools: Vec<ChatCompletionTools> = Vec::new();
         for tool in tools {
             let schema = tool.schema();
-            let parameters = serde_json::to_value(&schema)
+            let mut parameters = serde_json::to_value(&schema)
                 .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+            if let Some(obj) = parameters.as_object_mut() {
+                let is_object = obj
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|t| t == "object");
+                if is_object {
+                    if !obj.contains_key("properties") {
+                        obj.insert("properties".into(), serde_json::json!({}));
+                    }
+                    if !obj.contains_key("required") {
+                        obj.insert("required".into(), serde_json::json!([]));
+                    }
+                }
+            }
             let function = FunctionObjectArgs::default()
                 .name(tool.name())
                 .description(tool.description())

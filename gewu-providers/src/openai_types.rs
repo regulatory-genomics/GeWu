@@ -19,6 +19,8 @@ pub enum OpenAIError {
     Json(#[from] serde_json::Error),
     #[error("Build error: {0}")]
     Build(String),
+    #[error("SSE stream done")]
+    Done,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +166,39 @@ where
             buffer: String::new(),
         }
     }
+
+    fn try_parse_event(event_block: &str) -> Option<Result<ChatCompletionChunk, OpenAIError>> {
+        let mut data_parts = Vec::new();
+        for line in event_block.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+            if let Some(data) = line.strip_prefix("data: ") {
+                data_parts.push(data);
+            } else if let Some(data) = line.strip_prefix("data:") {
+                data_parts.push(data.trim_start());
+            }
+        }
+        if data_parts.is_empty() {
+            return None;
+        }
+        let data = data_parts.join("");
+        if data == "[DONE]" {
+            return Some(Err(OpenAIError::Done));
+        }
+        match serde_json::from_str::<ChatCompletionChunk>(&data) {
+            Ok(chunk) => Some(Ok(chunk)),
+            Err(e) => {
+                tracing::warn!(
+                    "SSE: skipping malformed event (len={}, err={})",
+                    data.len(),
+                    e
+                );
+                None
+            }
+        }
+    }
 }
 
 impl<S> Stream for SseStream<S>
@@ -174,25 +209,14 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            if let Some(pos) = self.buffer.find('\n') {
-                let line = self.buffer[..pos].to_string();
-                self.buffer = self.buffer[pos + 1..].to_string();
+            if let Some(pos) = self.buffer.find("\n\n") {
+                let event_block = self.buffer[..pos].to_string();
+                self.buffer = self.buffer[pos + 2..].to_string();
 
-                let line = line.trim();
-                if line.is_empty() || line.starts_with(':') {
-                    continue;
-                }
-
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data == "[DONE]" {
-                        return Poll::Ready(None);
-                    }
-                    match serde_json::from_str::<ChatCompletionChunk>(data) {
-                        Ok(chunk) => return Poll::Ready(Some(Ok(chunk))),
-                        Err(e) => {
-                            return Poll::Ready(Some(Err(OpenAIError::SseParse(e.to_string()))));
-                        }
-                    }
+                match Self::try_parse_event(&event_block) {
+                    Some(Err(OpenAIError::Done)) => return Poll::Ready(None),
+                    Some(result) => return Poll::Ready(Some(result)),
+                    None => continue,
                 }
             }
 
@@ -206,11 +230,14 @@ where
                     return Poll::Ready(Some(Err(OpenAIError::Http(e))));
                 }
                 Poll::Ready(None) => {
-                    if self.buffer.is_empty() {
+                    let remaining = std::mem::take(&mut self.buffer);
+                    if remaining.trim().is_empty() {
                         return Poll::Ready(None);
                     }
-                    self.buffer.clear();
-                    return Poll::Ready(None);
+                    match Self::try_parse_event(&remaining) {
+                        Some(Err(OpenAIError::Done)) | None => return Poll::Ready(None),
+                        Some(result) => return Poll::Ready(Some(result)),
+                    }
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -712,4 +739,129 @@ pub struct ChatCompletionResponseChoice {
 pub struct ChatCompletionResponseMessage {
     pub role: String,
     pub content: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    fn make_chunk_json(content: &str) -> String {
+        format!(
+            r#"{{"id":"c1","choices":[{{"index":0,"delta":{{"content":"{}"}}}}]}}"#,
+            content
+        )
+    }
+
+    fn bytes_stream(
+        chunks: Vec<&str>,
+    ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> {
+        futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|s| Ok(Bytes::from(s.to_string())))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[tokio::test]
+    async fn single_line_events() {
+        let raw = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            make_chunk_json("hello"),
+            make_chunk_json("world"),
+        );
+        let stream = SseStream::new(bytes_stream(vec![&raw]));
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_ok());
+        assert!(items[1].is_ok());
+        let c0 = items[0].as_ref().unwrap();
+        assert_eq!(c0.choices[0].delta.content.as_deref(), Some("hello"));
+        let c1 = items[1].as_ref().unwrap();
+        assert_eq!(c1.choices[0].delta.content.as_deref(), Some("world"));
+    }
+
+    #[tokio::test]
+    async fn multi_line_data_event() {
+        let json = make_chunk_json("joined");
+        let (first, second) = json.split_at(json.len() / 2);
+        let raw = format!("data: {}\ndata: {}\n\ndata: [DONE]\n\n", first, second);
+        let stream = SseStream::new(bytes_stream(vec![&raw]));
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].as_ref().unwrap().choices[0].delta.content.as_deref(),
+            Some("joined")
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_event_skipped() {
+        let raw = format!(
+            "data: {{bad json}}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            make_chunk_json("ok"),
+        );
+        let stream = SseStream::new(bytes_stream(vec![&raw]));
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].as_ref().unwrap().choices[0].delta.content.as_deref(),
+            Some("ok")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_end_without_trailing_newlines() {
+        let raw = format!("data: {}", make_chunk_json("last"));
+        let stream = SseStream::new(bytes_stream(vec![&raw]));
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].as_ref().unwrap().choices[0].delta.content.as_deref(),
+            Some("last")
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_tcp_delivery() {
+        let json = make_chunk_json("split");
+        let full = format!("data: {}\n\ndata: [DONE]\n\n", json);
+        let mid = full.len() / 2;
+        let (a, b) = full.split_at(mid);
+        let stream = SseStream::new(bytes_stream(vec![a, b]));
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].as_ref().unwrap().choices[0].delta.content.as_deref(),
+            Some("split")
+        );
+    }
+
+    #[tokio::test]
+    async fn done_terminates_stream() {
+        let raw = format!(
+            "data: {}\n\ndata: [DONE]\n\ndata: {}\n\n",
+            make_chunk_json("before"),
+            make_chunk_json("after"),
+        );
+        let stream = SseStream::new(bytes_stream(vec![&raw]));
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].as_ref().unwrap().choices[0].delta.content.as_deref(),
+            Some("before")
+        );
+    }
+
+    #[tokio::test]
+    async fn comment_lines_ignored() {
+        let raw = format!(
+            ": keep-alive\n\ndata: {}\n\ndata: [DONE]\n\n",
+            make_chunk_json("hi"),
+        );
+        let stream = SseStream::new(bytes_stream(vec![&raw]));
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 1);
+    }
 }

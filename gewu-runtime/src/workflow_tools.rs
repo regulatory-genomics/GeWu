@@ -104,6 +104,7 @@ impl Tool for ComposeWorkflowTool {
             .pool(self.pool.clone())
             .register_builtin_capabilities()
             .register_builtin_specialists()
+            .with_manifest_dir(crate::composer::default_specialists_dir())
             .build()
             .map_err(|e| format!("Failed to build runtime: {}", e))?;
 
@@ -231,6 +232,7 @@ impl Tool for RunWorkflowTool {
             .pool(self.pool.clone())
             .register_builtin_capabilities()
             .register_builtin_specialists()
+            .with_manifest_dir(crate::composer::default_specialists_dir())
             .build()
             .map_err(|e| format!("Failed to build runtime: {}", e))?;
 

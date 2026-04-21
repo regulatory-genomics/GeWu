@@ -44,7 +44,8 @@ pub async fn load_mcp_tools(
                     let schema = schema.unwrap_or_else(|_| {
                         serde_json::from_value(serde_json::json!({
                             "type": "object",
-                            "properties": {}
+                            "properties": {},
+                            "required": []
                         }))
                         .unwrap()
                     });
