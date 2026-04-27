@@ -8,7 +8,7 @@
 use anyhow::{anyhow, Result};
 use futures::future::join_all;
 use gewu_core::types::{SpecialistExecutionRequest, ToolContext};
-use gewu_graph::{Blackboard, CompiledGraph, StateGraph, END};
+use gewu_graph::{Blackboard, CompiledGraph, NodeResult, StateGraph, END};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -72,7 +72,7 @@ impl WorkflowCompiler {
             let h = Arc::clone(&handler);
             graph.add_node(node_id.as_str(), move |bb: Blackboard| {
                 let h = Arc::clone(&h);
-                async move { h(bb).await }
+                async move { NodeResult::Partial(h(bb).await) }
             });
         }
 
@@ -347,7 +347,7 @@ impl WorkflowCompiler {
             Box::pin(async move {
                 let input_val = extract_input(&bb, input_path.as_deref());
                 let sub_bb = Blackboard::from_value(input_val);
-                match subgraph.invoke(sub_bb).await {
+                match subgraph.ainvoke(sub_bb).await {
                     Ok(out) => to_partial(&write_path, Ok(out.into_value())),
                     Err(e) => error_partial(&write_path, e.to_string()),
                 }

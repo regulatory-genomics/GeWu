@@ -326,7 +326,7 @@ async fn run_workflow(
         WorkflowCompiler::new(Arc::new(runtime)).with_workflows(registry.into_map());
     let graph = compiler.compile(&manifest)?;
     let bb = Blackboard::from_value(input);
-    let out = graph.invoke(bb).await?;
+    let out = graph.ainvoke(bb).await?;
     let pretty = serde_json::to_string_pretty(out.as_value())?;
     println!("{}", pretty);
     Ok(())
@@ -392,7 +392,7 @@ where
         .or_else(|| env::var("OPENAI_ENDPOINT").ok())
         .or(cli.base_url.clone())
         .or_else(|| env::var("OPENAI_BASE_URL").ok())
-        .or(file_config.endpoint.clone())
+        .or(file_config.base_url.clone())
         .context(
             "Endpoint not provided. Set via --endpoint, --base-url, OPENAI_ENDPOINT/OPENAI_BASE_URL env var, or config.json",
         )?;

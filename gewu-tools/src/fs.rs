@@ -285,7 +285,8 @@ impl Tool for ReadFileTool {
             }
 
             let truncated_line = if text.len() > MAX_LINE_LENGTH {
-                format!("{}{}", &text[..MAX_LINE_LENGTH], MAX_LINE_SUFFIX)
+                let boundary = text.floor_char_boundary(MAX_LINE_LENGTH);
+                format!("{}{}", &text[..boundary], MAX_LINE_SUFFIX)
             } else {
                 text.clone()
             };

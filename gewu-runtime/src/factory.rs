@@ -44,6 +44,18 @@ impl RuntimeFactory {
             builder = builder.with_manifest_dir(dir);
         }
 
+        let home_specialists = dirs::home_dir()
+            .map(|h| h.join(".gewu").join("specialists"))
+            .unwrap_or_else(|| PathBuf::from(".gewu/specialists"));
+        if home_specialists.is_dir() {
+            builder = builder.with_manifest_dir(&home_specialists);
+        }
+
+        let project_specialists = PathBuf::from(".gewu/specialists");
+        if project_specialists.is_dir() && project_specialists != home_specialists {
+            builder = builder.with_manifest_dir(project_specialists);
+        }
+
         builder.build()
     }
 }

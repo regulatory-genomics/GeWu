@@ -22,10 +22,9 @@
 //! - [`ResponseParser`] - Trait for parsing streaming responses
 //! - [`ToolCallAggregator`] - Handles fragmented tool call streaming
 
-use crate::Client;
 use crate::openai_types::{
-    AssistantMessage, ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
+    ChatCompletionMessageToolCalls,
     ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartFile,
     ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,

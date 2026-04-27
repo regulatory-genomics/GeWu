@@ -104,12 +104,26 @@ impl Tool for HttpTool {
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
         let client = reqwest::Client::new();
+        let mut url = self.cap.url.clone();
+        if let Some(obj) = args.as_object() {
+            for (k, v) in obj {
+                let placeholder = format!("{{{}}}", k);
+                if url.contains(&placeholder) {
+                    let val = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string().trim_matches('"').to_string(),
+                    };
+                    url = url.replace(&placeholder, &val);
+                }
+            }
+        }
+
         let mut req = match self.cap.method.to_uppercase().as_str() {
-            "GET" => client.get(&self.cap.url),
-            "POST" => client.post(&self.cap.url),
-            "PUT" => client.put(&self.cap.url),
-            "DELETE" => client.delete(&self.cap.url),
-            "PATCH" => client.patch(&self.cap.url),
+            "GET" => client.get(&url),
+            "POST" => client.post(&url),
+            "PUT" => client.put(&url),
+            "DELETE" => client.delete(&url),
+            "PATCH" => client.patch(&url),
             m => return Err(format!("unsupported HTTP method: {}", m).into()),
         };
 
@@ -117,7 +131,28 @@ impl Tool for HttpTool {
             req = req.header(k.as_str(), v.as_str());
         }
 
-        if self.cap.method.to_uppercase() != "GET" {
+        if self.cap.method.to_uppercase() == "GET" {
+            if let Some(obj) = args.as_object() {
+                let pairs: Vec<(String, String)> = obj
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        let placeholder = format!("{{{}}}", k);
+                        if self.cap.url.contains(&placeholder) {
+                            return None;
+                        }
+                        let s = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            serde_json::Value::Null => return None,
+                            other => other.to_string(),
+                        };
+                        Some((k.clone(), s))
+                    })
+                    .collect();
+                if !pairs.is_empty() {
+                    req = req.query(&pairs);
+                }
+            }
+        } else {
             req = req.json(&args);
         }
 

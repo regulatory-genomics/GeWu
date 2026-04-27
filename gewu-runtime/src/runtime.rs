@@ -551,7 +551,103 @@ impl GeWuRuntimeBuilder {
 
         let mut specialists = self.specialists;
 
-        // Load manifest-driven specialists
+        // Load command-backed tools from ~/.gewu/tools/
+        let tools_dir = CommandToolRegistry::default_dir();
+        match CommandToolRegistry::new(&tools_dir) {
+            Ok(cmd_registry) => {
+                let count = cmd_registry.definitions().len();
+                if count > 0 {
+                    tracing::info!(
+                        "Loaded {} command tool(s) from {}",
+                        count,
+                        tools_dir.display()
+                    );
+                    registry.register(Arc::new(cmd_registry.into_provider()));
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load command tools from {}: {}", tools_dir.display(), e);
+            }
+        }
+
+        // Load HTTP tool providers from ~/.gewu/tool-providers/
+        let tool_providers_dir = dirs::home_dir()
+            .map(|h| h.join(".gewu").join("tool-providers"))
+            .unwrap_or_else(|| PathBuf::from(".gewu/tool-providers"));
+
+        if tool_providers_dir.is_dir() {
+            match std::fs::read_dir(&tool_providers_dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        let is_yaml = path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| e == "yaml" || e == "yml")
+                            .unwrap_or(false);
+                        if !is_yaml {
+                            continue;
+                        }
+
+                        match std::fs::read_to_string(&path) {
+                            Ok(content) => {
+                                match serde_yaml::from_str::<crate::manifest::schema::ToolProviderManifest>(&content) {
+                                    Ok(manifest) if manifest.kind == "http" => {
+                                        match serde_yaml::from_str::<crate::providers::http::HttpProviderSpec>(&content) {
+                                            Ok(http_spec) => {
+                                                let provider_id = http_spec.id.clone();
+                                                let cap_count = http_spec.capabilities.len();
+                                                registry.register(Arc::new(
+                                                    crate::providers::http::HttpToolProvider::from_spec(http_spec),
+                                                ));
+                                                tracing::info!(
+                                                    "Loaded HTTP tool provider '{}' with {} capabilities from {}",
+                                                    provider_id,
+                                                    cap_count,
+                                                    path.display()
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Failed to parse HTTP provider spec from {}: {}",
+                                                    path.display(),
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Ok(_) => {
+                                        tracing::debug!(
+                                            "Skipping non-HTTP tool provider: {}",
+                                            path.display()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to parse tool provider manifest {}: {}",
+                                            path.display(),
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to read {}: {}", path.display(), e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "No tool-providers directory at {}: {}",
+                        tool_providers_dir.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        // Load manifest-driven specialists (after tools so capability validation works)
         if !self.manifest_dirs.is_empty() {
             let mut loader = crate::manifest::loader::SpecialistManifestLoader::new();
             for dir in &self.manifest_dirs {
@@ -578,25 +674,6 @@ impl GeWuRuntimeBuilder {
                 Err(e) => {
                     tracing::warn!("Failed to load specialist manifests: {}", e);
                 }
-            }
-        }
-
-        // Load command-backed tools from ~/.gewu/tools/
-        let tools_dir = CommandToolRegistry::default_dir();
-        match CommandToolRegistry::new(&tools_dir) {
-            Ok(cmd_registry) => {
-                let count = cmd_registry.definitions().len();
-                if count > 0 {
-                    tracing::info!(
-                        "Loaded {} command tool(s) from {}",
-                        count,
-                        tools_dir.display()
-                    );
-                    registry.register(Arc::new(cmd_registry.into_provider()));
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load command tools from {}: {}", tools_dir.display(), e);
             }
         }
 

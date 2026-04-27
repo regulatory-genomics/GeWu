@@ -88,6 +88,15 @@ pub async fn handle_validate(
     Ok(Json(ValidateResponse { valid: true }))
 }
 
+/// Returns the auth token without requiring authentication.
+/// Safe for local dev servers; allows cross-origin frontends to auto-connect.
+pub async fn handle_get_token(
+    State(app): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let auth = app.auth_token.read().await;
+    Json(serde_json::json!({ "token": auth.valid_token }))
+}
+
 pub async fn handle_server_info(
     State(app): State<Arc<AppState>>,
 ) -> Result<Json<ServerInfo>, AppError> {

@@ -1,4 +1,3 @@
-pub mod blackboard;
 //! State management traits and reducers.
 //!
 //! This module provides the core `State` trait for managing state in graphs,
@@ -49,6 +48,7 @@ pub mod blackboard;
 //! }
 //! ```
 
+pub mod blackboard;
 pub mod state_trait;
 #[cfg(test)]
 mod tests;

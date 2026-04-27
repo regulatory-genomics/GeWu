@@ -20,10 +20,13 @@ impl Default for TruncationService {
 
 impl TruncationService {
     pub fn new() -> Self {
+        let truncation_dir = dirs::home_dir()
+            .map(|h| h.join(".gewu").join("truncation"))
+            .unwrap_or_else(|| PathBuf::from(TRUNCATION_DIR));
         Self {
             max_lines: MAX_LINES,
             max_bytes: MAX_BYTES,
-            truncation_dir: PathBuf::from(TRUNCATION_DIR),
+            truncation_dir,
         }
     }
 

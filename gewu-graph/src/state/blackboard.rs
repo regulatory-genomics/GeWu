@@ -107,7 +107,9 @@ impl Blackboard {
                 obj.insert((*seg).to_string(), value);
                 return;
             }
-            let entry = obj.entry((*seg).to_string()).or_insert_with(|| Value::Object(Map::new()));
+            let entry = obj
+                .entry((*seg).to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
             if !entry.is_object() {
                 *entry = Value::Object(Map::new());
             }

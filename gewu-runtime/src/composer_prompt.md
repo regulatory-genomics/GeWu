@@ -76,13 +76,13 @@ Node kinds:
 
 ## Blackboard initial state
 
-When a workflow is invoked via `run_workflow(workflow_id, input)`, the `input` JSON object becomes the **root** of the blackboard. For example:
+When a workflow is invoked via `run_workflow(workflow_id, input)`, the `input` JSON object becomes the **root** of the blackboard AND is also mirrored under `$.input`. For example:
 
 ```
 run_workflow(input={"prompt": "hello", "lang": "en"})
 ```
 
-The blackboard starts as `{"prompt": "hello", "lang": "en"}`. So to read the user's prompt, use `input: $.prompt` — NOT `$.input.prompt`.
+The blackboard starts as `{"prompt": "hello", "lang": "en", "input": {"prompt": "hello", "lang": "en"}}`. So you can reference the user's data via either `input: $` (full root) or `input: $.input` (the mirrored copy). Both work. Prefer `input: $` when you want the entire input, or `input: $.input.prompt` to access a specific field.
 
 ## When to use `tool:` on specialist nodes
 

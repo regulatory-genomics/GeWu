@@ -242,9 +242,12 @@ impl Tool for RunWorkflowTool {
             .compile(&manifest)
             .map_err(|e| format!("Compile workflow '{}': {}", input.workflow_id, e))?;
 
-        let bb = Blackboard::from_value(input.input);
+        let mut bb = Blackboard::from_value(input.input.clone());
+        if input.input.is_object() {
+            bb.set_path("input", input.input);
+        }
         let out = graph
-            .invoke(bb)
+            .ainvoke(bb)
             .await
             .map_err(|e| format!("Invoke workflow '{}': {}", input.workflow_id, e))?;
 

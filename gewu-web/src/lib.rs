@@ -69,7 +69,7 @@ where
         .endpoint
         .or_else(|| std::env::var("OPENAI_ENDPOINT").ok())
         .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
-        .or(loaded_config.config.endpoint.clone())
+        .or(loaded_config.config.base_url.clone())
         .context("Endpoint not provided")?;
 
     let model = cli
@@ -115,6 +115,7 @@ where
     let app = Router::new()
         .route("/", get(fallback::serve_index))
         .route("/api/validate", get(routes::sessions::handle_validate))
+        .route("/api/token", get(routes::sessions::handle_get_token))
         .route("/api/info", get(routes::sessions::handle_server_info))
         .route("/api/agents", get(routes::sessions::handle_list_agents))
         .route("/api/chat", post(routes::chat::handle_chat))

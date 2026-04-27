@@ -109,11 +109,26 @@ impl Tool for TaskTool {
             task_id
         );
 
-        let runtime = crate::runtime::GeWuRuntime::builder()
+        let mut builder = crate::runtime::GeWuRuntime::builder()
             .provider(self.provider.clone())
             .pool(self.pool.clone())
             .register_builtin_capabilities()
-            .register_builtin_specialists()
+            .register_builtin_specialists();
+
+        // Load ~/.gewu/specialists/ so custom specialists (module-analyst, etc.) are available
+        let home_specialists = dirs::home_dir()
+            .map(|h| h.join(".gewu").join("specialists"))
+            .unwrap_or_else(|| std::path::PathBuf::from(".gewu/specialists"));
+        if home_specialists.is_dir() {
+            builder = builder.with_manifest_dir(&home_specialists);
+        }
+
+        let project_specialists = std::path::PathBuf::from(".gewu/specialists");
+        if project_specialists.is_dir() && project_specialists != home_specialists {
+            builder = builder.with_manifest_dir(project_specialists);
+        }
+
+        let runtime = builder
             .build()
             .map_err(|e| format!("Failed to build runtime: {}", e))?;
 
