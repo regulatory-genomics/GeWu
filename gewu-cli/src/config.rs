@@ -7,9 +7,10 @@ use gewu_tools::mcp::types::McpServerConfig;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct Config {
-    pub endpoint: Option<String>,
+    pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub model: Option<String>,
+    pub provider: Option<String>,
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
     #[serde(default)]

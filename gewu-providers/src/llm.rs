@@ -1,8 +1,8 @@
-//! OpenAI-compatible LLM provider implementation.
+//! LLM provider implementations.
 //!
-//! This module provides an implementation of the [`LlmProvider`] trait
-//! for OpenAI-compatible APIs. It supports both direct OpenAI API calls
-//! and custom endpoints (e.g., for proxies or self-hosted models).
+//! This module provides implementations of the [`LlmProvider`] trait
+//! for various LLM APIs. Currently supports OpenAI-compatible APIs
+//! and Anthropic's Claude API.
 //!
 //! # Features
 //!
@@ -16,7 +16,8 @@
 //!
 //! The provider consists of several components:
 //!
-//! - [`OpenAIProvider`] - Main provider implementation
+//! - [`OpenAIProvider`] - OpenAI-compatible provider implementation
+//! - [`AnthropicProvider`] - Anthropic Claude provider implementation
 //! - [`RequestBuilder`] - Trait for building API requests
 //! - [`ResponseParser`] - Trait for parsing streaming responses
 //! - [`ToolCallAggregator`] - Handles fragmented tool call streaming
@@ -31,6 +32,14 @@ use crate::openai_types::{
     ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionStream, ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequest,
     FileData, FunctionCall as OpenAIFunctionCall, FunctionObjectArgs, ImageUrl, OpenAIConfig,
+    AssistantMessage as OpenAIAssistantMessage, Client as OpenAIClient,
+};
+use crate::anthropic_types::{
+    AnthropicChunk, AnthropicConfig, AnthropicMessage, AnthropicStream, AnthropicTool,
+    ContentBlock, ContentBlockDeltaChunk, ContentBlockStart,
+    ContentBlockStartChunk, ContentDelta, CreateMessageRequest,
+    MessageStartChunk, ToolCall, UserMessage,
+    AssistantMessage as AnthropicAssistantMessage, Client as AnthropicClient,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -102,7 +111,7 @@ pub trait ResponseParser: Send + Sync {
 /// );
 /// ```
 pub struct OpenAIProvider {
-    client: Client,
+    client: OpenAIClient,
     model: String,
     capabilities: Capabilities,
 }
@@ -118,7 +127,7 @@ impl OpenAIProvider {
         let config = OpenAIConfig::new(api_key, "https://api.openai.com/v1");
         let capabilities = Self::default_capabilities_for_model(model);
         Self {
-            client: Client::with_config(config),
+            client: OpenAIClient::with_config(config),
             model: model.to_string(),
             capabilities,
         }
@@ -138,7 +147,7 @@ impl OpenAIProvider {
         let config = OpenAIConfig::new(api_key, base_url);
         let capabilities = Self::default_capabilities_for_model(model);
         Self {
-            client: Client::with_config(config),
+            client: OpenAIClient::with_config(config),
             model: model.to_string(),
             capabilities,
         }
@@ -359,7 +368,7 @@ impl OpenAIProvider {
                 });
 
                 Ok(vec![ChatCompletionRequestMessage::Assistant(
-                    AssistantMessage {
+                    OpenAIAssistantMessage {
                         content: content.clone(),
                         tool_calls: openai_calls,
                     },
@@ -674,6 +683,426 @@ impl LlmProvider for OpenAIProvider {
         let stream = self
             .client
             .chat()
+            .create_stream(request)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+
+        let parsed_stream = self.parse_stream(stream);
+
+        Ok(parsed_stream)
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+        let models = self.client.models();
+        let response = models
+            .list()
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        Ok(response.data.into_iter().map(|m| m.id).collect())
+    }
+}
+
+pub struct AnthropicProvider {
+    client: AnthropicClient,
+    model: String,
+    capabilities: Capabilities,
+}
+
+impl AnthropicProvider {
+    pub fn new(api_key: &str, model: &str) -> Self {
+        let config = AnthropicConfig::new(api_key, "https://api.anthropic.com");
+        let capabilities = Self::default_capabilities_for_model(model);
+        Self {
+            client: AnthropicClient::with_config(config),
+            model: model.to_string(),
+            capabilities,
+        }
+    }
+
+    pub fn new_with_endpoint(api_key: &str, base_url: &str, model: &str) -> Self {
+        let config = AnthropicConfig::new(api_key, base_url);
+        let capabilities = Self::default_capabilities_for_model(model);
+        Self {
+            client: AnthropicClient::with_config(config),
+            model: model.to_string(),
+            capabilities,
+        }
+    }
+
+    pub fn with_extended_thinking(mut self) -> Self {
+        self.client.config.beta = Some("thinking-2025-05-14".to_string());
+        self
+    }
+
+    fn default_capabilities_for_model(model: &str) -> Capabilities {
+        let model_lower = model.to_lowercase();
+        if model_lower.contains("claude-3-5-sonnet") || model_lower.contains("claude-3-opus") {
+            Capabilities {
+                input: gewu_core::types::InputCapabilities {
+                    text: true,
+                    image: true,
+                    audio: false,
+                    video: false,
+                    pdf: true,
+                },
+                output: gewu_core::types::OutputCapabilities {
+                    text: true,
+                    image: false,
+                    audio: false,
+                    video: false,
+                    pdf: false,
+                },
+            }
+        } else if model_lower.contains("claude-3-haiku") {
+            Capabilities {
+                input: gewu_core::types::InputCapabilities {
+                    text: true,
+                    image: false,
+                    audio: false,
+                    video: false,
+                    pdf: false,
+                },
+                output: gewu_core::types::OutputCapabilities {
+                    text: true,
+                    image: false,
+                    audio: false,
+                    video: false,
+                    pdf: false,
+                },
+            }
+        } else {
+            Capabilities {
+                input: gewu_core::types::InputCapabilities {
+                    text: true,
+                    image: true,
+                    audio: false,
+                    video: false,
+                    pdf: true,
+                },
+                output: gewu_core::types::OutputCapabilities {
+                    text: true,
+                    image: false,
+                    audio: false,
+                    video: false,
+                    pdf: false,
+                },
+            }
+        }
+    }
+
+    fn convert_content_part(&self, part: &ContentPart) -> Option<ContentBlock> {
+        match part {
+            ContentPart::Text { text } => Some(ContentBlock::Text {
+                text: text.clone(),
+            }),
+            ContentPart::Image { data, mime_type } => Some(ContentBlock::Text {
+                text: format!("[Image: {}](data:{};base64,{})", mime_type, mime_type, data),
+            }),
+            ContentPart::Audio { data, mime_type } => Some(ContentBlock::Text {
+                text: format!("[Audio: {}](data:{};base64,{})", mime_type, mime_type, data),
+            }),
+            ContentPart::Video { data, mime_type } => Some(ContentBlock::Text {
+                text: format!("[Video: {}](data:{};base64,{})", mime_type, mime_type, data),
+            }),
+            ContentPart::File { data, mime_type } => {
+                Some(ContentBlock::Text {
+                    text: format!("[File: {}](data:{};base64,{})", mime_type, mime_type, data),
+                })
+            }
+        }
+    }
+
+    fn convert_message(
+        &self,
+        msg: &Message,
+    ) -> Result<Vec<AnthropicMessage>, Box<dyn Error + Send + Sync>> {
+        match msg {
+            Message::System { content: _ } => Ok(vec![]),
+            Message::User { content } => {
+                let blocks: Vec<ContentBlock> = content
+                    .iter()
+                    .filter_map(|p| self.convert_content_part(p))
+                    .collect();
+                Ok(vec![AnthropicMessage::User(UserMessage { content: blocks })])
+            }
+            Message::Assistant {
+                content,
+                tool_calls,
+            } => {
+                let mut blocks: Vec<ContentBlock> = Vec::new();
+                if let Some(text) = content {
+                    if !text.is_empty() {
+                        blocks.push(ContentBlock::Text { text: text.clone() });
+                    }
+                }
+                let anthropic_tool_calls: Option<Vec<ToolCall>> = if let Some(calls) = tool_calls {
+                    if !calls.is_empty() {
+                        Some(
+                            calls
+                                .iter()
+                                .map(|tc| {
+                                    let args_value: Value =
+                                        serde_json::from_str(&tc.function.arguments)
+                                            .unwrap_or(Value::Null);
+                                    ToolCall {
+                                        id: tc.id.clone(),
+                                        tool_type: "tool_use".to_string(),
+                                        name: tc.function.name.clone(),
+                                        input: args_value,
+                                    }
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if blocks.is_empty() && anthropic_tool_calls.is_none() {
+                    Ok(vec![])
+                } else {
+                    Ok(vec![AnthropicMessage::Assistant(AnthropicAssistantMessage {
+                        content: if blocks.is_empty() {
+                            None
+                        } else {
+                            Some(blocks)
+                        },
+                        tool_calls: anthropic_tool_calls,
+                    })])
+                }
+            }
+            Message::Tool {
+                tool_call_id: _,
+                tool_name: _,
+                content,
+                media,
+            } => {
+                let mut blocks: Vec<ContentBlock> = Vec::new();
+                blocks.push(ContentBlock::Text {
+                    text: content.clone(),
+                });
+                for part in media {
+                    if let Some(block) = self.convert_content_part(part) {
+                        blocks.push(block);
+                    }
+                }
+                Ok(vec![AnthropicMessage::User(UserMessage { content: blocks })])
+            }
+        }
+    }
+
+    fn convert_tools(
+        &self,
+        tools: &[Arc<dyn Tool>],
+    ) -> Result<Vec<AnthropicTool>, Box<dyn Error + Send + Sync>> {
+        let mut anthropic_tools: Vec<AnthropicTool> = Vec::new();
+        for tool in tools {
+            let schema = tool.schema();
+            let parameters = serde_json::to_value(&schema)
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+            anthropic_tools.push(AnthropicTool {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                input_schema: parameters,
+            });
+        }
+        Ok(anthropic_tools)
+    }
+
+    fn build(
+        &self,
+        messages: &[Message],
+        tools: &[Arc<dyn Tool>],
+    ) -> Result<CreateMessageRequest, Box<dyn Error + Send + Sync>> {
+        let mut anthropic_messages: Vec<AnthropicMessage> = Vec::new();
+        let mut system_prompt = String::new();
+
+        for msg in messages {
+            if let Message::System { content } = msg {
+                if !system_prompt.is_empty() {
+                    system_prompt.push('\n');
+                }
+                system_prompt.push_str(content);
+            } else {
+                let converted = self.convert_message(msg)?;
+                anthropic_messages.extend(converted);
+            }
+        }
+
+        let anthropic_tools = self.convert_tools(tools)?;
+
+        Ok(CreateMessageRequest {
+            model: self.model.clone(),
+            messages: anthropic_messages,
+            system: if system_prompt.is_empty() {
+                None
+            } else {
+                Some(system_prompt)
+            },
+            tools: if anthropic_tools.is_empty() {
+                None
+            } else {
+                Some(anthropic_tools)
+            },
+            stream: true,
+            max_tokens: Some(8192),
+        })
+    }
+}
+
+#[derive(Default)]
+struct AnthropicToolCallAggregator {
+    states: Vec<ToolCallState>,
+}
+
+impl AnthropicToolCallAggregator {
+    fn process_chunk(&mut self, chunk: &ContentBlockStartChunk, index: u32) -> Vec<ProviderEvent> {
+        let mut events = Vec::new();
+        let idx = index as usize;
+
+        if idx >= self.states.len() {
+            self.states.resize_with(idx + 1, ToolCallState::default);
+        }
+
+        match &chunk.content_block {
+            ContentBlockStart::ToolUse { id, name } => {
+                let state = &mut self.states[idx];
+                state.id = Some(id.clone());
+                state.name = Some(name.clone());
+                state.started = true;
+                events.push(ProviderEvent::ToolCallStart {
+                    id: id.clone(),
+                    name: name.clone(),
+                });
+            }
+            ContentBlockStart::Thinking { thinking, .. } => {
+                if !thinking.is_empty() {
+                    events.push(ProviderEvent::ReasoningDelta {
+                        delta: thinking.clone(),
+                    });
+                }
+            }
+            ContentBlockStart::Text { .. } => {}
+        }
+
+        events
+    }
+
+    fn process_delta(&mut self, chunk: &ContentBlockDeltaChunk, index: u32) -> Vec<ProviderEvent> {
+        let mut events = Vec::new();
+        let idx = index as usize;
+
+        if idx >= self.states.len() {
+            return events;
+        }
+
+        let state = &mut self.states[idx];
+
+        match &chunk.delta {
+            ContentDelta::InputJsonDelta { partial_json } => {
+                if !state.started {
+                    return events;
+                }
+                state.argument_buffer.push_str(partial_json);
+                if let Some(id) = state.id.clone() {
+                    let new_len = state.argument_buffer.len();
+                    if new_len > state.sent_len {
+                        let delta = state.argument_buffer[state.sent_len..new_len].to_string();
+                        state.sent_len = new_len;
+                        if !delta.is_empty() {
+                            events.push(ProviderEvent::ToolCallDelta {
+                                id,
+                                delta,
+                            });
+                        }
+                    }
+                }
+            }
+            ContentDelta::ThinkingDelta { thinking } => {
+                if !thinking.is_empty() {
+                    events.push(ProviderEvent::ReasoningDelta {
+                        delta: thinking.clone(),
+                    });
+                }
+            }
+            ContentDelta::TextDelta { .. } => {}
+        }
+
+        events
+    }
+}
+
+impl AnthropicProvider {
+    fn parse_stream(
+        &self,
+        stream: AnthropicStream,
+    ) -> futures::stream::BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>> {
+        let s = async_stream::try_stream! {
+            let mut tool_aggregator = AnthropicToolCallAggregator::default();
+            let mut stream = stream;
+
+            while let Some(result) = stream.next().await {
+                let chunk = result.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+
+                match chunk {
+                    AnthropicChunk::MessageStart(MessageStartChunk { .. }) => {}
+                    AnthropicChunk::ContentBlockStart(chunk) => {
+                        for event in tool_aggregator.process_chunk(&chunk, chunk.index) {
+                            yield event;
+                        }
+                    }
+                    AnthropicChunk::ContentBlockDelta(chunk) => {
+                        for event in tool_aggregator.process_delta(&chunk, chunk.index) {
+                            yield event;
+                        }
+                        match &chunk.delta {
+                            ContentDelta::TextDelta { text } => {
+                                if !text.is_empty() {
+                                    yield ProviderEvent::ContentDelta { delta: text.clone() };
+                                }
+                            }
+                            ContentDelta::ThinkingDelta { thinking } => {
+                                if !thinking.is_empty() {
+                                    yield ProviderEvent::ReasoningDelta { delta: thinking.clone() };
+                                }
+                            }
+                            ContentDelta::InputJsonDelta { .. } => {}
+                        }
+                    }
+                    AnthropicChunk::ContentBlockStop(_) => {}
+                    AnthropicChunk::MessageDelta(chunk) => {
+                        if let Some(reason) = chunk.delta.stop_reason {
+                            yield ProviderEvent::Finish { reason: Some(reason) };
+                        }
+                    }
+                    AnthropicChunk::MessageStop => {}
+                    AnthropicChunk::Error(e) => {
+                        yield ProviderEvent::Error { error: e.error.message };
+                    }
+                }
+            }
+        };
+
+        Box::pin(s)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for AnthropicProvider {
+    async fn stream_response<'a>(
+        &'a self,
+        messages: &[Message],
+        tools: &[Arc<dyn Tool>],
+    ) -> Result<
+        futures::stream::BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+        Box<dyn Error + Send + Sync>,
+    > {
+        let request = self.build(messages, tools)?;
+
+        let stream = self
+            .client
+            .messages()
             .create_stream(request)
             .await
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;

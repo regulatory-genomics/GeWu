@@ -6,6 +6,7 @@ members = ["gewu-cli",
     "gewu-runtime",
     "gewu-web",
     "gewu-graph",
+    "gewu-rag",
 ]
 exclude = ["opencode"]
 resolver = "2"

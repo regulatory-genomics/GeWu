@@ -1,5 +1,5 @@
 use anyhow::Result;
-use gewu_graph::{CompiledGraph, GraphTool, State, StateGraph};
+use gewu_graph::{CompiledGraph, GraphTool, NodeResult, State, StateGraph};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -183,7 +183,7 @@ fn build_research_graph(endpoint: &str, api_key: &str, model: &str) -> CompiledG
         let p = p1.clone();
         let k = k1.clone();
         let m = m1.clone();
-        async move { generate_search_queries(state, &p, &k, &m).await }
+        async move { NodeResult::Partial(generate_search_queries(state, &p, &k, &m).await) }
     };
 
     let p2 = endpoint.to_string();
@@ -193,7 +193,7 @@ fn build_research_graph(endpoint: &str, api_key: &str, model: &str) -> CompiledG
         let p = p2.clone();
         let k = k2.clone();
         let m = m2.clone();
-        async move { perform_searches(state, &p, &k, &m).await }
+        async move { NodeResult::Partial(perform_searches(state, &p, &k, &m).await) }
     };
 
     let p3 = endpoint.to_string();
@@ -203,7 +203,7 @@ fn build_research_graph(endpoint: &str, api_key: &str, model: &str) -> CompiledG
         let p = p3.clone();
         let k = k3.clone();
         let m = m3.clone();
-        async move { synthesize(state, &p, &k, &m).await }
+        async move { NodeResult::Partial(synthesize(state, &p, &k, &m).await) }
     };
 
     let p4 = endpoint.to_string();
@@ -213,7 +213,7 @@ fn build_research_graph(endpoint: &str, api_key: &str, model: &str) -> CompiledG
         let p = p4.clone();
         let k = k4.clone();
         let m = m4.clone();
-        async move { format_response(state, &p, &k, &m).await }
+        async move { NodeResult::Partial(format_response(state, &p, &k, &m).await) }
     };
 
     graph.add_node("generate_queries", generate_queries);
@@ -291,7 +291,7 @@ async fn main() -> Result<()> {
             ..Default::default()
         };
 
-        let result = research_graph.invoke(initial_state).await;
+        let result = research_graph.ainvoke(initial_state).await;
 
         match result {
             Ok(state) => {

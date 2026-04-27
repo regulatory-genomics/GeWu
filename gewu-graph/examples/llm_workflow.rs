@@ -1,5 +1,5 @@
 use anyhow::Result;
-use gewu_graph::graph::{CompiledGraph, StateGraph};
+use gewu_graph::graph::{CompiledGraph, NodeResult, StateGraph};
 use gewu_graph::State;
 use serde::{Deserialize, Serialize};
 
@@ -239,6 +239,12 @@ async fn synthesizer(state: AgentState) -> PartialAgentState {
 fn build_graph() -> CompiledGraph<AgentState> {
     let mut graph = StateGraph::<AgentState>::new();
 
+    let classify_intent = |state: AgentState| async move { NodeResult::Partial(classify_intent(state).await) };
+    let code_assist = |state: AgentState| async move { NodeResult::Partial(code_assist(state).await) };
+    let qa_assist = |state: AgentState| async move { NodeResult::Partial(qa_assist(state).await) };
+    let general_assist = |state: AgentState| async move { NodeResult::Partial(general_assist(state).await) };
+    let synthesizer = |state: AgentState| async move { NodeResult::Partial(synthesizer(state).await) };
+
     graph.add_node("classify_intent", classify_intent);
     graph.add_node("code_assist", code_assist);
     graph.add_node("qa_assist", qa_assist);
@@ -323,7 +329,7 @@ async fn main() -> Result<()> {
             ..Default::default()
         };
 
-        match graph.invoke(initial_state).await {
+        match graph.ainvoke(initial_state).await {
             Ok(result) => {
                 println!("Final Response:\n{}", result.final_response);
             }
@@ -359,7 +365,7 @@ async fn main() -> Result<()> {
             ..Default::default()
         };
 
-        match graph.invoke(initial_state).await {
+        match graph.ainvoke(initial_state).await {
             Ok(result) => {
                 println!("\n{}\n", result.final_response);
             }
