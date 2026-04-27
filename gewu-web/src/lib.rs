@@ -4,7 +4,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use clap::Parser;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::Level;
@@ -25,6 +25,9 @@ use state::{AppState, PluginRegistrar};
 #[command(version = "0.1.0")]
 #[command(about = "GeWu Web UI - Browser-based interface for the GeWu agent framework")]
 struct Cli {
+    #[arg(long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
+    host: IpAddr,
+
     #[arg(long, default_value = "8080")]
     port: u16,
 
@@ -138,12 +141,12 @@ where
         .layer(cors)
         .with_state(app_state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
+    let addr = SocketAddr::new(cli.host, cli.port);
 
     println!("========================================");
     println!("GeWu Web UI");
     println!("========================================");
-    println!("URL: http://localhost:{}/?token={}", cli.port, token);
+    println!("URL: http://{}:{}/?token={}", cli.host, cli.port, token);
     println!("========================================");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
