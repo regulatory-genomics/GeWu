@@ -69,6 +69,102 @@ pub struct ToolProviderCapability {
     pub input_schema: Value,
 }
 
+/// YAML-configured runtime plugin manifest.
+///
+/// Runtime plugins are loaded without recompiling GeWu. They can contribute
+/// agent-callable tools and lifecycle hooks through an external provider such
+/// as an HTTP daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimePluginManifest {
+    pub id: String,
+    pub kind: RuntimePluginKind,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub on_error: HookErrorPolicy,
+    #[serde(default)]
+    pub tools: Vec<RuntimeToolSpec>,
+    #[serde(default)]
+    pub hooks: Vec<RuntimeHookSpec>,
+    #[serde(flatten)]
+    pub spec: Value,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePluginKind {
+    Http,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeToolSpec {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub endpoint: String,
+    #[serde(default = "default_post")]
+    pub method: String,
+    #[serde(default)]
+    pub input_schema: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeHookSpec {
+    pub name: String,
+    pub event: RuntimeHookEvent,
+    pub endpoint: String,
+    #[serde(default = "default_post")]
+    pub method: String,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub on_error: HookErrorPolicy,
+}
+
+fn default_post() -> String {
+    "POST".to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeHookEvent {
+    #[serde(rename = "specialist.system_prompt.transform")]
+    SpecialistSystemPromptTransform,
+    #[serde(rename = "agent.event")]
+    AgentEvent,
+    #[serde(rename = "tool.execute.before")]
+    ToolExecuteBefore,
+    #[serde(rename = "tool.execute.after")]
+    ToolExecuteAfter,
+}
+
+impl RuntimeHookEvent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SpecialistSystemPromptTransform => "specialist.system_prompt.transform",
+            Self::AgentEvent => "agent.event",
+            Self::ToolExecuteBefore => "tool.execute.before",
+            Self::ToolExecuteAfter => "tool.execute.after",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HookErrorPolicy {
+    #[default]
+    Continue,
+    Fail,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +204,38 @@ capabilities:
             PromptSource::File { file } => assert_eq!(file, "./prompts/build.txt"),
             _ => panic!("expected file prompt"),
         }
+    }
+
+    #[test]
+    fn parse_runtime_plugin_manifest() {
+        let yaml = r#"
+id: gewu-memory
+kind: http
+enabled: true
+base_url: http://127.0.0.1:7878
+timeout_ms: 1500
+on_error: continue
+tools:
+  - name: memory_search
+    description: Search prior memory
+    endpoint: /v1/memory/search
+    method: POST
+    input_schema:
+      type: object
+hooks:
+  - name: prepare_memory_context
+    event: specialist.system_prompt.transform
+    endpoint: /v1/context/prepare
+"#;
+        let m: RuntimePluginManifest = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(m.id, "gewu-memory");
+        assert_eq!(m.kind, RuntimePluginKind::Http);
+        assert!(m.enabled);
+        assert_eq!(m.tools[0].name, "memory_search");
+        assert_eq!(
+            m.hooks[0].event,
+            RuntimeHookEvent::SpecialistSystemPromptTransform
+        );
+        assert_eq!(m.hooks[0].method, "POST");
     }
 }
