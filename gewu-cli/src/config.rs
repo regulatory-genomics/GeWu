@@ -8,6 +8,7 @@ use gewu_tools::mcp::types::McpServerConfig;
 #[derive(Debug, Deserialize, Default)]
 pub struct Config {
     pub base_url: Option<String>,
+    pub endpoint: Option<String>,
     pub api_key: Option<String>,
     pub model: Option<String>,
     pub provider: Option<String>,
@@ -21,6 +22,8 @@ pub struct Config {
     pub workflow_dirs: Vec<String>,
     #[serde(rename = "toolProviderDirs", default)]
     pub tool_provider_dirs: Vec<String>,
+    #[serde(rename = "runtimePluginDirs", default)]
+    pub runtime_plugin_dirs: Vec<String>,
 }
 
 #[derive(Debug)]

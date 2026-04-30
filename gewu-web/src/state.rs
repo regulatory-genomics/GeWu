@@ -28,6 +28,8 @@ pub struct ServerConfig {
     pub db_path: Option<String>,
     #[serde(default)]
     pub plugins: HashMap<String, Value>,
+    #[serde(rename = "runtimePluginDirs", default)]
+    pub runtime_plugin_dirs: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -38,8 +40,18 @@ impl Default for ServerConfig {
             model: Some("gpt-5.3-codex".to_string()),
             db_path: None,
             plugins: HashMap::new(),
+            runtime_plugin_dirs: Vec::new(),
         }
     }
+}
+
+fn expand_config_path(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(s)
 }
 
 pub struct AgentHandle {
@@ -74,7 +86,13 @@ impl AppState {
         let working_directory = std::env::current_dir()
             .or_else(|_| Ok::<PathBuf, std::io::Error>(PathBuf::from(".")))?;
 
-        PluginHost::from_config(&plugins, &plugin_registry, provider, pool, working_directory)
+        PluginHost::from_config(
+            &plugins,
+            &plugin_registry,
+            provider,
+            pool,
+            working_directory,
+        )
     }
 
     pub async fn list_available_agents(&self) -> Result<Vec<(String, String)>> {
@@ -86,6 +104,11 @@ impl AppState {
             .clone()
             .unwrap_or_else(|| "gpt-5.3-codex".to_string());
         let plugins = config.plugins.clone();
+        let runtime_plugin_dirs: Vec<PathBuf> = config
+            .runtime_plugin_dirs
+            .iter()
+            .map(|s| expand_config_path(s))
+            .collect();
         drop(config);
 
         let pool_guard = self.db_pool.lock().await;
@@ -96,7 +119,13 @@ impl AppState {
         ));
 
         let plugin_host = self.build_plugin_host(provider.clone(), pool.clone(), plugins)?;
-        let runtime = RuntimeFactory::build(provider, pool.clone(), &plugin_host)?;
+        let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs(
+            provider,
+            pool.clone(),
+            &plugin_host,
+            &[],
+            &runtime_plugin_dirs,
+        )?;
         Ok(runtime
             .list_specialists()
             .into_iter()
@@ -140,6 +169,11 @@ impl AppState {
             .clone()
             .unwrap_or_else(|| "gpt-5.3-codex".to_string());
         let plugins = config.plugins.clone();
+        let runtime_plugin_dirs: Vec<PathBuf> = config
+            .runtime_plugin_dirs
+            .iter()
+            .map(|s| expand_config_path(s))
+            .collect();
         drop(config);
 
         let pool_guard = self.db_pool.lock().await;
@@ -152,7 +186,13 @@ impl AppState {
 
         let mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
         let plugin_host = self.build_plugin_host(provider.clone(), pool.clone(), plugins)?;
-        let runtime = RuntimeFactory::build(provider.clone(), pool.clone(), &plugin_host)?;
+        let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs(
+            provider.clone(),
+            pool.clone(),
+            &plugin_host,
+            &[],
+            &runtime_plugin_dirs,
+        )?;
         let (agent, _registry) = runtime
             .build_specialist(&agent_type, session_id.clone(), mcp_tools)
             .await?;
@@ -256,6 +296,11 @@ impl AppState {
             .clone()
             .unwrap_or_else(|| "gpt-5.3-codex".to_string());
         let plugins = config.plugins.clone();
+        let runtime_plugin_dirs: Vec<PathBuf> = config
+            .runtime_plugin_dirs
+            .iter()
+            .map(|s| expand_config_path(s))
+            .collect();
         drop(config);
 
         let pool_guard = self.db_pool.lock().await;
@@ -267,7 +312,13 @@ impl AppState {
 
         let mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
         let plugin_host = self.build_plugin_host(provider.clone(), pool.clone(), plugins)?;
-        let runtime = RuntimeFactory::build(provider.clone(), pool.clone(), &plugin_host)?;
+        let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs(
+            provider.clone(),
+            pool.clone(),
+            &plugin_host,
+            &[],
+            &runtime_plugin_dirs,
+        )?;
         let (agent, _registry) = runtime
             .build_specialist(&new_agent_type, session_id.to_string(), mcp_tools)
             .await?;

@@ -199,6 +199,23 @@ fn resolve_workflow_dirs(config: &config::Config, cli_extra: &[String]) -> Vec<P
     dirs
 }
 
+fn expand_config_path(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(s)
+}
+
+fn resolve_runtime_plugin_dirs(config: &config::Config) -> Vec<PathBuf> {
+    config
+        .runtime_plugin_dirs
+        .iter()
+        .map(|s| expand_config_path(s))
+        .collect()
+}
+
 fn parse_workflow_input(raw: Option<&str>) -> Result<serde_json::Value> {
     let s = match raw {
         None => return Ok(serde_json::json!({})),
@@ -249,9 +266,12 @@ where
         working_directory,
         extra_register,
     )?;
-    let runtime = RuntimeFactory::build_with_manifest_dirs(
-        provider, pool, &plugin_host,
+    let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs(
+        provider,
+        pool,
+        &plugin_host,
         &resolve_manifest_dirs(&loaded_config.config),
+        &resolve_runtime_plugin_dirs(&loaded_config.config),
     )?;
 
     println!("Available Agents:");
@@ -300,7 +320,11 @@ where
     println!("Available Workflows:");
     for id in registry.ids() {
         let m = registry.get(&id).unwrap();
-        let desc = if m.description.is_empty() { "—" } else { &m.description };
+        let desc = if m.description.is_empty() {
+            "—"
+        } else {
+            &m.description
+        };
         println!("  - {}: {}", id, desc);
     }
     Ok(())
@@ -322,8 +346,7 @@ async fn run_workflow(
             )
         })?
         .clone();
-    let compiler =
-        WorkflowCompiler::new(Arc::new(runtime)).with_workflows(registry.into_map());
+    let compiler = WorkflowCompiler::new(Arc::new(runtime)).with_workflows(registry.into_map());
     let graph = compiler.compile(&manifest)?;
     let bb = Blackboard::from_value(input);
     let out = graph.ainvoke(bb).await?;
@@ -373,8 +396,7 @@ where
     }
 
     if cli.list_workflows {
-        return print_available_workflows(&loaded_config, &cli.workflow_dirs, extra_register)
-            .await;
+        return print_available_workflows(&loaded_config, &cli.workflow_dirs, extra_register).await;
     }
 
     let file_config = loaded_config.config;
@@ -392,6 +414,7 @@ where
         .or_else(|| env::var("OPENAI_ENDPOINT").ok())
         .or(cli.base_url.clone())
         .or_else(|| env::var("OPENAI_BASE_URL").ok())
+        .or(file_config.endpoint.clone())
         .or(file_config.base_url.clone())
         .context(
             "Endpoint not provided. Set via --endpoint, --base-url, OPENAI_ENDPOINT/OPENAI_BASE_URL env var, or config.json",
@@ -447,12 +470,11 @@ where
         .await
         .context("Failed to connect to SQLite database")?;
 
-    let session_id = cli
-        .session_id
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let session_id = cli.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     println!("Session ID: {}", session_id);
 
     let manifest_dirs = resolve_manifest_dirs(&file_config);
+    let runtime_plugin_dirs = resolve_runtime_plugin_dirs(&file_config);
     let workflow_dirs = resolve_workflow_dirs(&file_config, &cli.workflow_dirs);
     let mcp_tools = mcp_loader::load_mcp_tools(file_config.mcp_servers).await?;
     let plugin_host = build_plugin_host_with(
@@ -462,9 +484,12 @@ where
         env::current_dir()?,
         extra_register,
     )?;
-    let runtime = RuntimeFactory::build_with_manifest_dirs(
-        provider.clone(), pool.clone(), &plugin_host,
+    let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs(
+        provider.clone(),
+        pool.clone(),
+        &plugin_host,
         &manifest_dirs,
+        &runtime_plugin_dirs,
     )?;
 
     if let Some(workflow_id) = cli.workflow.as_deref() {

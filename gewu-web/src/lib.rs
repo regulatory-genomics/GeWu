@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::{
-    Router,
     routing::{delete, get, post},
+    Router,
 };
 use clap::Parser;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -98,15 +98,15 @@ where
         model: Some(model),
         db_path,
         plugins: loaded_config.config.plugins,
+        runtime_plugin_dirs: loaded_config.config.runtime_plugin_dirs,
     };
 
     let mcp_tools = mcp_loader::load_mcp_tools(mcp_servers).await?;
 
     let auth_state = AuthState::new();
     let plugin_registrar: PluginRegistrar = Arc::new(register_plugins);
-    let app_state = Arc::new(
-        AppState::new(config, auth_state.clone(), mcp_tools, plugin_registrar).await?,
-    );
+    let app_state =
+        Arc::new(AppState::new(config, auth_state.clone(), mcp_tools, plugin_registrar).await?);
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -123,7 +123,10 @@ where
         .route("/api/agents", get(routes::sessions::handle_list_agents))
         .route("/api/chat", post(routes::chat::handle_chat))
         .route("/api/sessions", get(routes::sessions::handle_list_sessions))
-        .route("/api/sessions", post(routes::sessions::handle_create_session))
+        .route(
+            "/api/sessions",
+            post(routes::sessions::handle_create_session),
+        )
         .route(
             "/api/sessions/{id}",
             delete(routes::sessions::handle_delete_session),
