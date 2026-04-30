@@ -2,9 +2,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use futures::StreamExt;
 use gewu_core::Agent;
-use gewu_core::traits::{
-    AssemblyContext, LlmProvider, Plugin, Tool, ToolFactory, ToolRegistry,
-};
+use gewu_core::traits::{AssemblyContext, LlmProvider, Plugin, Tool, ToolFactory, ToolRegistry};
 use gewu_core::types::{
     AgentEvent, SpecialistAgentEventRecord, SpecialistDescriptor, SpecialistExecutionEnvelope,
     SpecialistExecutionRequest, SpecialistLlmIoRecord, TaskStatus, ToolContext,
@@ -12,6 +10,7 @@ use gewu_core::types::{
 };
 use gewu_storage::{SqliteMemory, TaskStore};
 use gewu_tools::{BatchTool, report_result::ReportResultArgs};
+use schemars::schema::RootSchema;
 use serde_json::Value;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -21,12 +20,16 @@ use std::sync::Arc;
 use crate::capability::{CapabilityRegistry, ToolFactoryProvider};
 use crate::command_tool_registry::CommandToolRegistry;
 use crate::composer::{ComposerContext, ComposerToolFactory, composer_specialist_descriptor};
+use crate::hooks::{HookRegistry, HttpHookProvider};
+use crate::manifest::runtime_plugin_loader::RuntimePluginManifestLoader;
+use crate::manifest::schema::RuntimeHookEvent;
 use crate::registry::{AgentConfig, BuiltinToolFactory};
 
 pub struct GeWuRuntime {
     factories: Vec<Box<dyn ToolFactory>>,
     capability_registry: Arc<CapabilityRegistry>,
     specialists: Vec<SpecialistDescriptor>,
+    hook_registry: Arc<HookRegistry>,
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
 }
@@ -38,6 +41,7 @@ impl GeWuRuntime {
             extra_providers: Vec::new(),
             specialists: Vec::new(),
             manifest_dirs: Vec::new(),
+            runtime_plugin_dirs: Vec::new(),
             provider: None,
             pool: None,
         }
@@ -103,7 +107,11 @@ impl GeWuRuntime {
     }
 
     pub fn resolve_capabilities(&self, caps: &[String]) -> Result<Vec<Box<dyn Tool>>> {
-        self.resolve_capabilities_with_working_directory(caps, std::env::current_dir()?, Value::Null)
+        self.resolve_capabilities_with_working_directory(
+            caps,
+            std::env::current_dir()?,
+            Value::Null,
+        )
     }
 
     pub fn resolve_capabilities_in_directory(
@@ -149,6 +157,13 @@ impl GeWuRuntime {
             .map(|t| Arc::from(t) as Arc<dyn Tool>)
             .collect();
 
+        let tools_arc = self.wrap_tools_with_hooks(
+            tools_arc,
+            descriptor.id.clone(),
+            session_id.to_string(),
+            _metadata_json.clone(),
+        );
+
         let tools_for_registry = Arc::new(tools_arc.clone());
         let registry: Arc<dyn ToolRegistry> = Arc::new(RuntimeToolRegistry {
             tools: tools_for_registry,
@@ -163,6 +178,15 @@ impl GeWuRuntime {
         } else {
             descriptor.system_prompt.clone()
         };
+        let system_prompt = self
+            .transform_system_prompt(
+                descriptor,
+                system_prompt,
+                session_id,
+                Some(prompt),
+                &_metadata_json,
+            )
+            .await?;
 
         let mut agent = Agent::builder()
             .llm(self.provider.clone())
@@ -181,7 +205,10 @@ impl GeWuRuntime {
                         result_text = response;
                     }
                     AgentEvent::ToolFinish { tool, output } if tool == "report_result" => {
-                        if let Ok(report) = serde_json::from_str::<gewu_tools::report_result::ReportResultArgs>(&output) {
+                        if let Ok(report) = serde_json::from_str::<
+                            gewu_tools::report_result::ReportResultArgs,
+                        >(&output)
+                        {
                             if let Some(val) = report.result {
                                 return Ok(val);
                             }
@@ -225,15 +252,22 @@ impl GeWuRuntime {
         let tools = self.resolve_capabilities_with_metadata(
             &descriptor.capabilities,
             &std::env::current_dir()?,
-            metadata_json,
+            metadata_json.clone(),
         )?;
-        let memory = SqliteMemory::new(self.pool.clone(), session_id).await?;
+        let memory = SqliteMemory::new(self.pool.clone(), session_id.clone()).await?;
 
         let mut tools_arc: Vec<Arc<dyn Tool>> = tools
             .into_iter()
             .map(|t| Arc::from(t) as Arc<dyn Tool>)
             .collect();
         tools_arc.extend(additional_tools);
+
+        let tools_arc = self.wrap_tools_with_hooks(
+            tools_arc,
+            descriptor.id.clone(),
+            session_id.clone(),
+            metadata_json.clone(),
+        );
 
         let tools_for_registry = Arc::new(tools_arc.clone());
         let registry: Arc<dyn ToolRegistry> = Arc::new(RuntimeToolRegistry {
@@ -244,11 +278,21 @@ impl GeWuRuntime {
         let mut all_tools = vec![batch_tool];
         all_tools.extend(tools_arc);
 
+        let system_prompt = self
+            .transform_system_prompt(
+                descriptor,
+                descriptor.system_prompt.clone(),
+                &session_id,
+                None,
+                &metadata_json,
+            )
+            .await?;
+
         let agent = Agent::builder()
             .llm(self.provider.clone())
             .with_tools(all_tools)
             .memory(Box::new(memory))
-            .system_prompt(&descriptor.system_prompt)
+            .system_prompt(&system_prompt)
             .build()?;
 
         Ok((agent, registry))
@@ -283,6 +327,13 @@ impl GeWuRuntime {
             .collect();
         tools_arc.extend(additional_tools);
 
+        let tools_arc = self.wrap_tools_with_hooks(
+            tools_arc,
+            descriptor.id.clone(),
+            request.session_id.clone(),
+            request.metadata_json.clone(),
+        );
+
         let tools_for_registry = Arc::new(tools_arc.clone());
         let registry: Arc<dyn ToolRegistry> = Arc::new(RuntimeToolRegistry {
             tools: tools_for_registry,
@@ -292,11 +343,21 @@ impl GeWuRuntime {
         let mut all_tools = vec![batch_tool];
         all_tools.extend(tools_arc);
 
+        let system_prompt = self
+            .transform_system_prompt(
+                descriptor,
+                descriptor.system_prompt.clone(),
+                &request.session_id,
+                Some(&request.prompt),
+                &request.metadata_json,
+            )
+            .await?;
+
         let mut agent = Agent::builder()
             .llm(self.provider.clone())
             .with_tools(all_tools)
             .memory(Box::new(memory))
-            .system_prompt(&descriptor.system_prompt)
+            .system_prompt(&system_prompt)
             .build()?;
 
         store
@@ -318,43 +379,58 @@ impl GeWuRuntime {
             match event_result {
                 Ok(event) => match event {
                     AgentEvent::ContentDelta { delta } => {
-                        events.push(SpecialistAgentEventRecord {
+                        let record = SpecialistAgentEventRecord {
                             event_type: "content_delta".to_string(),
                             tool_name: None,
-                            payload_json: serde_json::json!({ "delta": delta }),
-                        });
+                            payload_json: serde_json::json!({ "delta": delta.clone() }),
+                        };
+                        self.emit_agent_event_hook(descriptor, request, &record)
+                            .await;
+                        events.push(record);
                         result_text.push_str(&delta);
                     }
                     AgentEvent::ReasoningDelta { delta } => {
-                        events.push(SpecialistAgentEventRecord {
+                        let record = SpecialistAgentEventRecord {
                             event_type: "reasoning_delta".to_string(),
                             tool_name: None,
-                            payload_json: serde_json::json!({ "delta": delta }),
-                        });
+                            payload_json: serde_json::json!({ "delta": delta.clone() }),
+                        };
+                        self.emit_agent_event_hook(descriptor, request, &record)
+                            .await;
+                        events.push(record);
                     }
                     AgentEvent::ToolStart { tool, input } => {
-                        events.push(SpecialistAgentEventRecord {
+                        let record = SpecialistAgentEventRecord {
                             event_type: "tool_start".to_string(),
                             tool_name: Some(tool),
                             payload_json: serde_json::json!({ "input": input }),
-                        });
+                        };
+                        self.emit_agent_event_hook(descriptor, request, &record)
+                            .await;
+                        events.push(record);
                     }
                     AgentEvent::Finish { response } => {
-                        events.push(SpecialistAgentEventRecord {
+                        let record = SpecialistAgentEventRecord {
                             event_type: "finish".to_string(),
                             tool_name: None,
-                            payload_json: serde_json::json!({ "response": response }),
-                        });
+                            payload_json: serde_json::json!({ "response": response.clone() }),
+                        };
+                        self.emit_agent_event_hook(descriptor, request, &record)
+                            .await;
+                        events.push(record);
                         if !report_received {
                             result_text = response;
                         }
                     }
                     AgentEvent::ToolFinish { tool, output } if tool == "report_result" => {
-                        events.push(SpecialistAgentEventRecord {
+                        let record = SpecialistAgentEventRecord {
                             event_type: "tool_finish".to_string(),
                             tool_name: Some(tool.clone()),
-                            payload_json: serde_json::json!({ "output": output }),
-                        });
+                            payload_json: serde_json::json!({ "output": output.clone() }),
+                        };
+                        self.emit_agent_event_hook(descriptor, request, &record)
+                            .await;
+                        events.push(record);
                         tool_outputs.push(ToolExecutionRecord {
                             tool_name: tool.clone(),
                             output: output.clone(),
@@ -376,22 +452,28 @@ impl GeWuRuntime {
                         }
                     }
                     AgentEvent::ToolFinish { tool, output } => {
-                        events.push(SpecialistAgentEventRecord {
+                        let record = SpecialistAgentEventRecord {
                             event_type: "tool_finish".to_string(),
                             tool_name: Some(tool.clone()),
-                            payload_json: serde_json::json!({ "output": output }),
-                        });
+                            payload_json: serde_json::json!({ "output": output.clone() }),
+                        };
+                        self.emit_agent_event_hook(descriptor, request, &record)
+                            .await;
+                        events.push(record);
                         tool_outputs.push(ToolExecutionRecord {
                             tool_name: tool,
                             output,
                         });
                     }
                     AgentEvent::Error { error } => {
-                        events.push(SpecialistAgentEventRecord {
+                        let record = SpecialistAgentEventRecord {
                             event_type: "error".to_string(),
                             tool_name: None,
-                            payload_json: serde_json::json!({ "error": error }),
-                        });
+                            payload_json: serde_json::json!({ "error": error.clone() }),
+                        };
+                        self.emit_agent_event_hook(descriptor, request, &record)
+                            .await;
+                        events.push(record);
                         final_status = TaskStatus::Blocked;
                         block_reason = Some(error.clone());
                         final_error = Some(error.clone());
@@ -440,11 +522,224 @@ impl GeWuRuntime {
             tool_outputs,
             events,
             llm_io: vec![SpecialistLlmIoRecord {
-                system_prompt: descriptor.system_prompt.clone(),
+                system_prompt,
                 user_prompt: request.prompt.clone(),
                 final_response: Some(result_text),
                 error: final_error,
             }],
+        })
+    }
+
+    async fn transform_system_prompt(
+        &self,
+        descriptor: &SpecialistDescriptor,
+        system_prompt: String,
+        session_id: &str,
+        user_prompt: Option<&str>,
+        metadata_json: &Value,
+    ) -> Result<String> {
+        if self.hook_registry.is_empty() {
+            return Ok(system_prompt);
+        }
+        let payload = serde_json::json!({
+            "event": RuntimeHookEvent::SpecialistSystemPromptTransform.as_str(),
+            "user_id": metadata_json.get("user_id").and_then(Value::as_str).unwrap_or("default"),
+            "project_id": metadata_json.get("project_id").and_then(Value::as_str),
+            "agent_id": descriptor.id.clone(),
+            "specialist_id": descriptor.id.clone(),
+            "session_id": session_id,
+            "workspace_root": std::env::current_dir().ok().map(|p| p.display().to_string()),
+            "prompt": user_prompt.unwrap_or_default(),
+            "system_prompt": system_prompt.clone(),
+            "metadata": {
+                "host": "gewu",
+                "runtime_metadata": metadata_json,
+            },
+        });
+        self.hook_registry
+            .transform_system_prompt(system_prompt, payload)
+            .await
+    }
+
+    fn wrap_tools_with_hooks(
+        &self,
+        tools: Vec<Arc<dyn Tool>>,
+        specialist_id: String,
+        session_id: String,
+        metadata_json: Value,
+    ) -> Vec<Arc<dyn Tool>> {
+        if self.hook_registry.is_empty() {
+            return tools;
+        }
+        tools
+            .into_iter()
+            .map(|tool| {
+                Arc::new(HookedTool {
+                    inner: tool,
+                    hook_registry: self.hook_registry.clone(),
+                    specialist_id: specialist_id.clone(),
+                    session_id: session_id.clone(),
+                    metadata_json: metadata_json.clone(),
+                }) as Arc<dyn Tool>
+            })
+            .collect()
+    }
+
+    async fn emit_agent_event_hook(
+        &self,
+        descriptor: &SpecialistDescriptor,
+        request: &SpecialistExecutionRequest,
+        record: &SpecialistAgentEventRecord,
+    ) {
+        if self.hook_registry.is_empty() {
+            return;
+        }
+        let content = record
+            .payload_json
+            .get("delta")
+            .or_else(|| record.payload_json.get("response"))
+            .or_else(|| record.payload_json.get("input"))
+            .or_else(|| record.payload_json.get("output"))
+            .or_else(|| record.payload_json.get("error"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| record.payload_json.to_string());
+        let event_kind = match record.event_type.as_str() {
+            "content_delta" | "finish" => "assistant_response",
+            "tool_start" => "tool_call",
+            "tool_finish" => "tool_result",
+            "error" => "system_note",
+            _ => "system_note",
+        };
+        let payload = serde_json::json!({
+            "event": RuntimeHookEvent::AgentEvent.as_str(),
+            "event_kind": event_kind,
+            "user_id": request.metadata_json.get("user_id").and_then(Value::as_str).unwrap_or("default"),
+            "project_id": request.metadata_json.get("project_id").and_then(Value::as_str),
+            "agent_id": descriptor.id.clone(),
+            "specialist_id": descriptor.id.clone(),
+            "session_id": request.session_id.clone(),
+            "agent_event_type": record.event_type.clone(),
+            "tool_name": record.tool_name.clone(),
+            "content": content,
+            "metadata": {
+                "host": "gewu",
+                "hook_event": RuntimeHookEvent::AgentEvent.as_str(),
+                "agent_event_type": record.event_type.clone(),
+                "tool_name": record.tool_name.clone(),
+                "payload": record.payload_json.clone(),
+            },
+        });
+        if let Err(err) = self
+            .hook_registry
+            .call_event(RuntimeHookEvent::AgentEvent, payload)
+            .await
+        {
+            tracing::warn!("agent.event hook failed: {}", err);
+        }
+    }
+}
+
+struct HookedTool {
+    inner: Arc<dyn Tool>,
+    hook_registry: Arc<HookRegistry>,
+    specialist_id: String,
+    session_id: String,
+    metadata_json: Value,
+}
+
+#[async_trait]
+impl Tool for HookedTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn schema(&self) -> RootSchema {
+        self.inner.schema()
+    }
+
+    async fn execute(
+        &self,
+        args: Value,
+        ctx: &ToolContext,
+    ) -> std::result::Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
+        let before_payload = self.tool_hook_payload(
+            RuntimeHookEvent::ToolExecuteBefore,
+            "tool_call",
+            args.to_string(),
+            serde_json::json!({ "args": args.clone() }),
+            ctx,
+        );
+        if let Err(err) = self
+            .hook_registry
+            .call_event(RuntimeHookEvent::ToolExecuteBefore, before_payload)
+            .await
+        {
+            tracing::warn!("tool.execute.before hook failed: {}", err);
+        }
+
+        let result = self.inner.execute(args.clone(), ctx).await;
+
+        let (content, metadata) = match &result {
+            Ok(output) => (
+                output.output.clone(),
+                serde_json::json!({ "args": args, "status": "ok" }),
+            ),
+            Err(err) => (
+                err.to_string(),
+                serde_json::json!({ "args": args, "status": "error" }),
+            ),
+        };
+        let after_payload = self.tool_hook_payload(
+            RuntimeHookEvent::ToolExecuteAfter,
+            "tool_result",
+            content,
+            metadata,
+            ctx,
+        );
+        if let Err(err) = self
+            .hook_registry
+            .call_event(RuntimeHookEvent::ToolExecuteAfter, after_payload)
+            .await
+        {
+            tracing::warn!("tool.execute.after hook failed: {}", err);
+        }
+
+        result
+    }
+}
+
+impl HookedTool {
+    fn tool_hook_payload(
+        &self,
+        event: RuntimeHookEvent,
+        event_kind: &str,
+        content: String,
+        metadata: Value,
+        ctx: &ToolContext,
+    ) -> Value {
+        serde_json::json!({
+            "event": event.as_str(),
+            "event_kind": event_kind,
+            "user_id": self.metadata_json.get("user_id").and_then(Value::as_str).unwrap_or("default"),
+            "project_id": self.metadata_json.get("project_id").and_then(Value::as_str),
+            "agent_id": self.specialist_id.clone(),
+            "specialist_id": self.specialist_id.clone(),
+            "session_id": self.session_id.clone(),
+            "tool_name": self.inner.name(),
+            "content": content,
+            "metadata": {
+                "host": "gewu",
+                "hook_event": event.as_str(),
+                "tool_name": self.inner.name(),
+                "tool_context_session_id": ctx.session_id.clone(),
+                "tool_context_message_id": ctx.message_id.clone(),
+                "payload": metadata,
+            },
         })
     }
 }
@@ -478,6 +773,7 @@ pub struct GeWuRuntimeBuilder {
     extra_providers: Vec<(String, String, Box<dyn ToolFactory>)>,
     specialists: Vec<SpecialistDescriptor>,
     manifest_dirs: Vec<PathBuf>,
+    runtime_plugin_dirs: Vec<PathBuf>,
     provider: Option<Arc<dyn LlmProvider>>,
     pool: Option<SqlitePool>,
 }
@@ -495,18 +791,27 @@ impl GeWuRuntimeBuilder {
 
     pub fn register_builtin_capabilities(mut self) -> Self {
         self.factories.push(Box::new(BuiltinToolFactory));
-        self.extra_providers
-            .push(("builtin".into(), "builtin".into(), Box::new(BuiltinToolFactory)));
+        self.extra_providers.push((
+            "builtin".into(),
+            "builtin".into(),
+            Box::new(BuiltinToolFactory),
+        ));
         self
     }
 
     pub fn register_builtin_specialists(mut self) -> Self {
-        self.specialists.extend(crate::registry::specialist_descriptors());
+        self.specialists
+            .extend(crate::registry::specialist_descriptors());
         self
     }
 
     pub fn with_manifest_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.manifest_dirs.push(dir.into());
+        self
+    }
+
+    pub fn with_runtime_plugin_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.runtime_plugin_dirs.push(dir.into());
         self
     }
 
@@ -550,6 +855,7 @@ impl GeWuRuntimeBuilder {
         }
 
         let mut specialists = self.specialists;
+        let mut hook_registry = HookRegistry::new();
 
         // Load command-backed tools from ~/.gewu/tools/
         let tools_dir = CommandToolRegistry::default_dir();
@@ -566,7 +872,11 @@ impl GeWuRuntimeBuilder {
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to load command tools from {}: {}", tools_dir.display(), e);
+                tracing::warn!(
+                    "Failed to load command tools from {}: {}",
+                    tools_dir.display(),
+                    e
+                );
             }
         }
 
@@ -591,9 +901,15 @@ impl GeWuRuntimeBuilder {
 
                         match std::fs::read_to_string(&path) {
                             Ok(content) => {
-                                match serde_yaml::from_str::<crate::manifest::schema::ToolProviderManifest>(&content) {
+                                match serde_yaml::from_str::<
+                                    crate::manifest::schema::ToolProviderManifest,
+                                >(&content)
+                                {
                                     Ok(manifest) if manifest.kind == "http" => {
-                                        match serde_yaml::from_str::<crate::providers::http::HttpProviderSpec>(&content) {
+                                        match serde_yaml::from_str::<
+                                            crate::providers::http::HttpProviderSpec,
+                                        >(&content)
+                                        {
                                             Ok(http_spec) => {
                                                 let provider_id = http_spec.id.clone();
                                                 let cap_count = http_spec.capabilities.len();
@@ -645,6 +961,56 @@ impl GeWuRuntimeBuilder {
                     );
                 }
             }
+        }
+
+        let mut runtime_plugin_loader = RuntimePluginManifestLoader::with_default_dirs();
+        for dir in &self.runtime_plugin_dirs {
+            runtime_plugin_loader.add_dir(dir);
+        }
+        match runtime_plugin_loader.load() {
+            Ok(runtime_plugins) => {
+                for loaded in runtime_plugins {
+                    match loaded.manifest.kind {
+                        crate::manifest::schema::RuntimePluginKind::Http => {
+                            match crate::providers::http::HttpToolProvider::from_runtime_plugin(
+                                &loaded.manifest,
+                            ) {
+                                Ok(Some(provider)) => {
+                                    tracing::info!(
+                                        "Loaded runtime plugin HTTP tools '{}' from {}",
+                                        loaded.manifest.id,
+                                        loaded.source_path.display()
+                                    );
+                                    registry.register(Arc::new(provider));
+                                }
+                                Ok(None) => {}
+                                Err(e) => tracing::warn!(
+                                    "Failed to load runtime plugin tools from {}: {}",
+                                    loaded.source_path.display(),
+                                    e
+                                ),
+                            }
+                            match HttpHookProvider::from_runtime_plugin(&loaded.manifest) {
+                                Ok(Some(provider)) => {
+                                    tracing::info!(
+                                        "Loaded runtime plugin hooks '{}' from {}",
+                                        provider.id(),
+                                        loaded.source_path.display()
+                                    );
+                                    hook_registry.register(provider);
+                                }
+                                Ok(None) => {}
+                                Err(e) => tracing::warn!(
+                                    "Failed to load runtime plugin hooks from {}: {}",
+                                    loaded.source_path.display(),
+                                    e
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("Failed to load runtime plugin manifests: {}", e),
         }
 
         // Load manifest-driven specialists (after tools so capability validation works)
@@ -701,6 +1067,7 @@ impl GeWuRuntimeBuilder {
             factories,
             capability_registry: Arc::new(registry),
             specialists,
+            hook_registry: Arc::new(hook_registry),
             provider,
             pool,
         })

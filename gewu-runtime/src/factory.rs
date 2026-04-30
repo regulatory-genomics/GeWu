@@ -27,6 +27,23 @@ impl RuntimeFactory {
         plugin_host: &PluginHost,
         manifest_dirs: &[PathBuf],
     ) -> Result<GeWuRuntime> {
+        Self::build_with_manifest_and_runtime_plugin_dirs(
+            provider,
+            pool,
+            plugin_host,
+            manifest_dirs,
+            &[],
+        )
+    }
+
+    /// Build a runtime with specialist manifest directories and YAML runtime plugin directories.
+    pub fn build_with_manifest_and_runtime_plugin_dirs(
+        provider: Arc<dyn LlmProvider>,
+        pool: SqlitePool,
+        plugin_host: &PluginHost,
+        manifest_dirs: &[PathBuf],
+        runtime_plugin_dirs: &[PathBuf],
+    ) -> Result<GeWuRuntime> {
         let mut builder = GeWuRuntime::builder()
             .provider(provider)
             .pool(pool)
@@ -42,6 +59,10 @@ impl RuntimeFactory {
 
         for dir in manifest_dirs {
             builder = builder.with_manifest_dir(dir);
+        }
+
+        for dir in runtime_plugin_dirs {
+            builder = builder.with_runtime_plugin_dir(dir);
         }
 
         let home_specialists = dirs::home_dir()
