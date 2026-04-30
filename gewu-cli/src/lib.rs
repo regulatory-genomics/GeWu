@@ -4,12 +4,13 @@ pub mod mcp_loader;
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures::StreamExt;
-use gewu_core::traits::LlmProvider;
-use gewu_core::types::AgentEvent;
+use gewu_core::traits::{LlmProvider, Tool};
+use gewu_core::types::{AgentEvent, SpecialistExecutionRequest};
 use gewu_graph::Blackboard;
 use gewu_providers::OpenAIProvider;
 use gewu_runtime::{
-    PluginHost, PluginRegistry, RuntimeFactory, WorkflowCompiler, WorkflowRegistry,
+    PluginHost, PluginRegistry, RuntimeFactory, SpecialistExecutionEvent, WorkflowCompiler,
+    WorkflowRegistry,
 };
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 use std::collections::HashMap;
@@ -101,18 +102,30 @@ pub struct Cli {
     pub list_workflows: bool,
 }
 
-async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
-    let mut stream = Box::pin(agent.ask(prompt));
-    let mut reasoning = String::new();
-    let mut content = String::new();
+async fn run_runtime_agent(
+    runtime: &gewu_runtime::GeWuRuntime,
+    agent_id: &str,
+    session_id: &str,
+    additional_tools: &[Arc<dyn Tool>],
+    prompt: &str,
+) -> Result<()> {
+    let request = SpecialistExecutionRequest {
+        task_id: Uuid::new_v4().to_string(),
+        specialist_id: agent_id.to_string(),
+        session_id: session_id.to_string(),
+        prompt: prompt.to_string(),
+        metadata_json: serde_json::json!({
+            "user_id": "default",
+        }),
+    };
+    let mut stream = runtime.execute_request_stream(request, additional_tools.to_vec());
     let mut reasoning_started = false;
     while let Some(event_result) = stream.next().await {
-        match event_result {
-            Ok(event) => match event {
+        match event_result? {
+            SpecialistExecutionEvent::Agent(event) => match event {
                 AgentEvent::ContentDelta { delta } => {
                     print!("{}", delta);
                     std::io::stdout().flush()?;
-                    content.push_str(&delta);
                 }
                 AgentEvent::ReasoningDelta { delta } => {
                     if !reasoning_started {
@@ -121,7 +134,6 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                     }
                     print!("{}{}", delta, RESET);
                     std::io::stdout().flush()?;
-                    reasoning.push_str(&delta);
                 }
                 AgentEvent::ToolStart { tool, input } => {
                     println!("\n[Tool Start: {}] Input: {}", tool, input);
@@ -147,7 +159,13 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                     error!("Error from agent: {}", error);
                 }
             },
-            Err(e) => error!("Stream error: {}", e),
+            SpecialistExecutionEvent::Completed(envelope) => {
+                if envelope.output_json.is_none() {
+                    if let Some(reason) = envelope.block_reason {
+                        println!("{}", reason);
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -498,16 +516,15 @@ where
         return run_workflow(runtime, registry, workflow_id, input).await;
     }
 
-    let (mut agent, _registry) = runtime
-        .build_specialist(&cli.agent, session_id, mcp_tools)
-        .await?;
     info!("Initialized agent: {}", cli.agent);
 
     if let Some(prompt_parts) = cli.prompt {
         let prompt = prompt_parts.join(" ");
         if !prompt.is_empty() {
             println!("> {}", prompt);
-            if let Err(e) = run_agent(&mut agent, &prompt).await {
+            if let Err(e) =
+                run_runtime_agent(&runtime, &cli.agent, &session_id, &mcp_tools, &prompt).await
+            {
                 error!("Error: {}", e);
             }
         }
@@ -533,7 +550,9 @@ where
             break;
         }
 
-        if let Err(e) = run_agent(&mut agent, input).await {
+        if let Err(e) =
+            run_runtime_agent(&runtime, &cli.agent, &session_id, &mcp_tools, input).await
+        {
             error!("Error processing message: {}", e);
         }
     }
