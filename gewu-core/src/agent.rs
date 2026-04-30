@@ -38,6 +38,10 @@
 //! ```
 
 use crate::compaction::{self, estimate_message_tokens, is_overflow};
+use crate::compaction::{
+    build_consolidation_text, build_consolidation_prompt, save_consolidation_file,
+    apply_consolidation_to_memory, ConsolidationInput,
+};
 use crate::middleware::TruncationService;
 use crate::traits::{LlmProvider, Memory, Tool, ToolRegistry};
 use crate::types::{
@@ -296,6 +300,12 @@ impl Agent {
 
                 info!("Agent requested {} tool calls", current_tool_calls.len());
 
+                let turn_tool_budget = self.context_limit / 3;
+                let mut turn_tool_tokens: usize = 0;
+                let mut pending_consolidation_ids: Vec<String> = Vec::new();
+                let mut pending_consolidation_names: Vec<String> = Vec::new();
+                let mut pending_consolidation_contents: Vec<String> = Vec::new();
+
                 for call in current_tool_calls {
                     let tool_name = call.function.name.clone();
                     let args = call.function.arguments.clone();
@@ -361,6 +371,13 @@ impl Agent {
 
                     yield AgentEvent::ToolFinish { tool: tool_name.clone(), output: result_content.clone() };
 
+                    let result_tokens = compaction::estimate_tokens(&result_content);
+                    turn_tool_tokens += result_tokens;
+
+                    pending_consolidation_ids.push(call_id.clone());
+                    pending_consolidation_names.push(tool_name.clone());
+                    pending_consolidation_contents.push(result_content.clone());
+
                     let media_parts = extract_media_parts(&result_content);
                     self.memory.add_message(Message::Tool {
                         tool_call_id: call_id,
@@ -368,6 +385,54 @@ impl Agent {
                         content: result_content,
                         media: media_parts,
                     }).await;
+
+                    if turn_tool_tokens > turn_tool_budget && pending_consolidation_ids.len() >= 3 {
+                        info!(
+                            "Tool output consolidation triggered ({} tokens > {} budget, {} calls)",
+                            turn_tool_tokens, turn_tool_budget, pending_consolidation_ids.len()
+                        );
+
+                        let input = ConsolidationInput {
+                            tool_call_ids: pending_consolidation_ids.clone(),
+                            tool_names: pending_consolidation_names.clone(),
+                            tool_contents: pending_consolidation_contents.clone(),
+                        };
+                        let raw_text = build_consolidation_text(&input);
+                        let file_path = save_consolidation_file(&raw_text);
+                        let prompt_messages = build_consolidation_prompt(&raw_text, input.tool_call_ids.len());
+
+                        let provider = self.llm.clone();
+                        match provider.stream_response(&prompt_messages, &[]).await {
+                            Ok(mut summary_stream) => {
+                                let mut summary_text = String::new();
+                                while let Some(event_result) = summary_stream.next().await {
+                                    if let Ok(ProviderEvent::ContentDelta { delta }) = event_result {
+                                        summary_text.push_str(&delta);
+                                    }
+                                }
+
+                                if !summary_text.is_empty() {
+                                    let mut all_messages = self.memory.messages().to_vec();
+                                    apply_consolidation_to_memory(
+                                        &mut all_messages,
+                                        &pending_consolidation_ids,
+                                        &summary_text,
+                                        &file_path,
+                                    );
+                                    self.memory.replace(all_messages).await;
+                                    info!("Consolidated {} tool outputs into summary ({} chars)", pending_consolidation_ids.len(), summary_text.len());
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Consolidation summarization failed: {}, keeping original outputs", e);
+                            }
+                        }
+
+                        pending_consolidation_ids.clear();
+                        pending_consolidation_names.clear();
+                        pending_consolidation_contents.clear();
+                        turn_tool_tokens = 0;
+                    }
                 }
             }
         }
