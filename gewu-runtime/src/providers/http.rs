@@ -6,6 +6,8 @@ use schemars::schema::RootSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::manifest::schema::RuntimePluginManifest;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpProviderSpec {
     pub id: String,
@@ -37,6 +39,73 @@ pub struct HttpToolProvider {
 impl HttpToolProvider {
     pub fn from_spec(spec: HttpProviderSpec) -> Self {
         Self { spec }
+    }
+
+    pub fn from_runtime_plugin(
+        manifest: &RuntimePluginManifest,
+    ) -> Result<Option<Self>, Box<dyn std::error::Error + Send + Sync>> {
+        if manifest.tools.is_empty() {
+            return Ok(None);
+        }
+        let base_url = manifest
+            .base_url
+            .as_deref()
+            .ok_or_else(|| format!("runtime plugin '{}' is missing base_url", manifest.id))?;
+        let base_url = base_url.trim_end_matches('/');
+        let capabilities = manifest
+            .tools
+            .iter()
+            .map(|tool| HttpCapabilitySpec {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                url: format!("{}{}", base_url, normalize_endpoint(&tool.endpoint)),
+                method: tool.method.clone(),
+                headers: std::collections::HashMap::new(),
+                input_schema: tool.input_schema.clone(),
+            })
+            .collect();
+        Ok(Some(Self::from_spec(HttpProviderSpec {
+            id: manifest.id.clone(),
+            capabilities,
+        })))
+    }
+}
+
+fn normalize_endpoint(endpoint: &str) -> String {
+    if endpoint.starts_with('/') {
+        endpoint.to_string()
+    } else {
+        format!("/{}", endpoint)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_plugin_tools_convert_to_http_capabilities() {
+        let manifest: RuntimePluginManifest = serde_yaml::from_str(
+            r#"
+id: gewu-memory
+kind: http
+base_url: http://127.0.0.1:7878
+tools:
+  - name: memory_search
+    description: Search prior memory
+    endpoint: /v1/memory/search
+    method: POST
+"#,
+        )
+        .unwrap();
+
+        let provider = HttpToolProvider::from_runtime_plugin(&manifest)
+            .unwrap()
+            .unwrap();
+        let caps = provider.capabilities();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].name, "memory_search");
+        assert_eq!(caps[0].provider_kind, "http");
     }
 }
 
@@ -74,9 +143,15 @@ impl ToolProvider for HttpProviderSpec {
 }
 
 impl ToolProvider for HttpToolProvider {
-    fn kind(&self) -> &str { "http" }
-    fn id(&self) -> &str { &self.spec.id }
-    fn capabilities(&self) -> Vec<CapabilityDescriptor> { self.spec.capabilities() }
+    fn kind(&self) -> &str {
+        "http"
+    }
+    fn id(&self) -> &str {
+        &self.spec.id
+    }
+    fn capabilities(&self) -> Vec<CapabilityDescriptor> {
+        self.spec.capabilities()
+    }
     fn build_tools(
         &self,
         capability: &str,
@@ -92,8 +167,12 @@ struct HttpTool {
 
 #[async_trait::async_trait]
 impl Tool for HttpTool {
-    fn name(&self) -> &str { &self.cap.name }
-    fn description(&self) -> &str { &self.cap.description }
+    fn name(&self) -> &str {
+        &self.cap.name
+    }
+    fn description(&self) -> &str {
+        &self.cap.description
+    }
     fn schema(&self) -> RootSchema {
         serde_json::from_value(self.cap.input_schema.clone()).unwrap_or_default()
     }
