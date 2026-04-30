@@ -2002,6 +2002,7 @@ name = "gewu-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "dirs 6.0.0",
  "futures",

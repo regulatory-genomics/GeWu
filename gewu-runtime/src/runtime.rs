@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{StreamExt, stream::BoxStream};
 use gewu_core::Agent;
 use gewu_core::traits::{AssemblyContext, LlmProvider, Plugin, Tool, ToolFactory, ToolRegistry};
 use gewu_core::types::{
@@ -32,6 +32,12 @@ pub struct GeWuRuntime {
     hook_registry: Arc<HookRegistry>,
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
+}
+
+#[derive(Debug, Clone)]
+pub enum SpecialistExecutionEvent {
+    Agent(AgentEvent),
+    Completed(SpecialistExecutionEnvelope),
 }
 
 impl GeWuRuntime {
@@ -303,6 +309,22 @@ impl GeWuRuntime {
         request: &SpecialistExecutionRequest,
         additional_tools: Vec<Arc<dyn Tool>>,
     ) -> Result<SpecialistExecutionEnvelope> {
+        let mut stream = self.execute_request_stream(request.clone(), additional_tools);
+        let mut completed = None;
+        while let Some(event) = stream.next().await {
+            if let SpecialistExecutionEvent::Completed(envelope) = event? {
+                completed = Some(envelope);
+            }
+        }
+        completed.ok_or_else(|| anyhow!("specialist execution stream ended without completion"))
+    }
+
+    pub fn execute_request_stream(
+        &self,
+        request: SpecialistExecutionRequest,
+        additional_tools: Vec<Arc<dyn Tool>>,
+    ) -> BoxStream<'_, Result<SpecialistExecutionEvent>> {
+        Box::pin(async_stream::try_stream! {
         let store = TaskStore::new(self.pool.clone()).await?;
         let existing = store.get_task(&request.task_id).await?;
         if existing.is_none() {
@@ -365,6 +387,8 @@ impl GeWuRuntime {
             .await?;
         store.increment_attempt(&request.task_id).await?;
 
+        self.emit_user_prompt_hook(descriptor, &request).await;
+
         let mut stream = Box::pin(agent.ask(&request.prompt));
         let mut output_json: Option<Value> = None;
         let mut result_text = String::new();
@@ -384,10 +408,11 @@ impl GeWuRuntime {
                             tool_name: None,
                             payload_json: serde_json::json!({ "delta": delta.clone() }),
                         };
-                        self.emit_agent_event_hook(descriptor, request, &record)
+                        self.emit_agent_event_hook(descriptor, &request, &record)
                             .await;
                         events.push(record);
                         result_text.push_str(&delta);
+                        yield SpecialistExecutionEvent::Agent(AgentEvent::ContentDelta { delta });
                     }
                     AgentEvent::ReasoningDelta { delta } => {
                         let record = SpecialistAgentEventRecord {
@@ -395,19 +420,21 @@ impl GeWuRuntime {
                             tool_name: None,
                             payload_json: serde_json::json!({ "delta": delta.clone() }),
                         };
-                        self.emit_agent_event_hook(descriptor, request, &record)
+                        self.emit_agent_event_hook(descriptor, &request, &record)
                             .await;
                         events.push(record);
+                        yield SpecialistExecutionEvent::Agent(AgentEvent::ReasoningDelta { delta });
                     }
                     AgentEvent::ToolStart { tool, input } => {
                         let record = SpecialistAgentEventRecord {
                             event_type: "tool_start".to_string(),
-                            tool_name: Some(tool),
-                            payload_json: serde_json::json!({ "input": input }),
+                            tool_name: Some(tool.clone()),
+                            payload_json: serde_json::json!({ "input": input.clone() }),
                         };
-                        self.emit_agent_event_hook(descriptor, request, &record)
+                        self.emit_agent_event_hook(descriptor, &request, &record)
                             .await;
                         events.push(record);
+                        yield SpecialistExecutionEvent::Agent(AgentEvent::ToolStart { tool, input });
                     }
                     AgentEvent::Finish { response } => {
                         let record = SpecialistAgentEventRecord {
@@ -415,12 +442,13 @@ impl GeWuRuntime {
                             tool_name: None,
                             payload_json: serde_json::json!({ "response": response.clone() }),
                         };
-                        self.emit_agent_event_hook(descriptor, request, &record)
+                        self.emit_agent_event_hook(descriptor, &request, &record)
                             .await;
                         events.push(record);
                         if !report_received {
-                            result_text = response;
+                            result_text = response.clone();
                         }
+                        yield SpecialistExecutionEvent::Agent(AgentEvent::Finish { response });
                     }
                     AgentEvent::ToolFinish { tool, output } if tool == "report_result" => {
                         let record = SpecialistAgentEventRecord {
@@ -428,7 +456,7 @@ impl GeWuRuntime {
                             tool_name: Some(tool.clone()),
                             payload_json: serde_json::json!({ "output": output.clone() }),
                         };
-                        self.emit_agent_event_hook(descriptor, request, &record)
+                        self.emit_agent_event_hook(descriptor, &request, &record)
                             .await;
                         events.push(record);
                         tool_outputs.push(ToolExecutionRecord {
@@ -450,6 +478,7 @@ impl GeWuRuntime {
                                 }
                             }
                         }
+                        yield SpecialistExecutionEvent::Agent(AgentEvent::ToolFinish { tool, output });
                     }
                     AgentEvent::ToolFinish { tool, output } => {
                         let record = SpecialistAgentEventRecord {
@@ -457,13 +486,14 @@ impl GeWuRuntime {
                             tool_name: Some(tool.clone()),
                             payload_json: serde_json::json!({ "output": output.clone() }),
                         };
-                        self.emit_agent_event_hook(descriptor, request, &record)
+                        self.emit_agent_event_hook(descriptor, &request, &record)
                             .await;
                         events.push(record);
                         tool_outputs.push(ToolExecutionRecord {
-                            tool_name: tool,
-                            output,
+                            tool_name: tool.clone(),
+                            output: output.clone(),
                         });
+                        yield SpecialistExecutionEvent::Agent(AgentEvent::ToolFinish { tool, output });
                     }
                     AgentEvent::Error { error } => {
                         let record = SpecialistAgentEventRecord {
@@ -471,14 +501,15 @@ impl GeWuRuntime {
                             tool_name: None,
                             payload_json: serde_json::json!({ "error": error.clone() }),
                         };
-                        self.emit_agent_event_hook(descriptor, request, &record)
+                        self.emit_agent_event_hook(descriptor, &request, &record)
                             .await;
                         events.push(record);
                         final_status = TaskStatus::Blocked;
                         block_reason = Some(error.clone());
                         final_error = Some(error.clone());
-                        result_text = error;
+                        result_text = error.clone();
                         output_json = None;
+                        yield SpecialistExecutionEvent::Agent(AgentEvent::Error { error });
                     }
                 },
                 Err(e) => {
@@ -507,7 +538,7 @@ impl GeWuRuntime {
             .map(|r| r.attempt)
             .unwrap_or(0);
 
-        Ok(SpecialistExecutionEnvelope {
+        yield SpecialistExecutionEvent::Completed(SpecialistExecutionEnvelope {
             task_id: request.task_id.clone(),
             session_id: request.session_id.clone(),
             specialist_id: request.specialist_id.clone(),
@@ -527,6 +558,7 @@ impl GeWuRuntime {
                 final_response: Some(result_text),
                 error: final_error,
             }],
+        });
         })
     }
 
@@ -616,12 +648,17 @@ impl GeWuRuntime {
             "event_kind": event_kind,
             "user_id": request.metadata_json.get("user_id").and_then(Value::as_str).unwrap_or("default"),
             "project_id": request.metadata_json.get("project_id").and_then(Value::as_str),
+            "workspace_root": std::env::current_dir().ok().map(|p| p.display().to_string()),
             "agent_id": descriptor.id.clone(),
             "specialist_id": descriptor.id.clone(),
             "session_id": request.session_id.clone(),
+            "host": "gewu",
+            "role": if event_kind == "assistant_response" { "assistant" } else if event_kind == "tool_result" { "tool" } else { "system" },
+            "layer": "raw",
             "agent_event_type": record.event_type.clone(),
             "tool_name": record.tool_name.clone(),
             "content": content,
+            "content_json": record.payload_json.clone(),
             "metadata": {
                 "host": "gewu",
                 "hook_event": RuntimeHookEvent::AgentEvent.as_str(),
@@ -636,6 +673,52 @@ impl GeWuRuntime {
             .await
         {
             tracing::warn!("agent.event hook failed: {}", err);
+        }
+    }
+
+    async fn emit_user_prompt_hook(
+        &self,
+        descriptor: &SpecialistDescriptor,
+        request: &SpecialistExecutionRequest,
+    ) {
+        if self.hook_registry.is_empty() {
+            return;
+        }
+        let payload = serde_json::json!({
+            "event": RuntimeHookEvent::AgentEvent.as_str(),
+            "event_kind": "user_message",
+            "user_id": request.metadata_json.get("user_id").and_then(Value::as_str).unwrap_or("default"),
+            "project_id": request.metadata_json.get("project_id").and_then(Value::as_str),
+            "workspace_root": std::env::current_dir().ok().map(|p| p.display().to_string()),
+            "agent_id": descriptor.id.clone(),
+            "specialist_id": descriptor.id.clone(),
+            "session_id": request.session_id.clone(),
+            "host": "gewu",
+            "role": "user",
+            "layer": "raw",
+            "agent_event_type": "user_prompt",
+            "content": request.prompt.clone(),
+            "content_json": {
+                "prompt": request.prompt.clone(),
+                "task_id": request.task_id.clone(),
+                "metadata": request.metadata_json.clone(),
+            },
+            "metadata": {
+                "host": "gewu",
+                "hook_event": RuntimeHookEvent::AgentEvent.as_str(),
+                "agent_event_type": "user_prompt",
+                "payload": {
+                    "task_id": request.task_id.clone(),
+                    "metadata": request.metadata_json.clone(),
+                },
+            },
+        });
+        if let Err(err) = self
+            .hook_registry
+            .call_event(RuntimeHookEvent::AgentEvent, payload)
+            .await
+        {
+            tracing::warn!("agent.event user prompt hook failed: {}", err);
         }
     }
 }
@@ -727,11 +810,16 @@ impl HookedTool {
             "event_kind": event_kind,
             "user_id": self.metadata_json.get("user_id").and_then(Value::as_str).unwrap_or("default"),
             "project_id": self.metadata_json.get("project_id").and_then(Value::as_str),
+            "workspace_root": std::env::current_dir().ok().map(|p| p.display().to_string()),
             "agent_id": self.specialist_id.clone(),
             "specialist_id": self.specialist_id.clone(),
             "session_id": self.session_id.clone(),
+            "host": "gewu",
+            "role": if event_kind == "tool_result" { "tool" } else { "assistant" },
+            "layer": "raw",
             "tool_name": self.inner.name(),
             "content": content,
+            "content_json": metadata.clone(),
             "metadata": {
                 "host": "gewu",
                 "hook_event": event.as_str(),

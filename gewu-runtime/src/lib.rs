@@ -36,7 +36,7 @@ pub use registry::{
     AgentConfig, BuiltinToolFactory, create_agent, find_descriptor, list_available_agents,
     resolve_tools, specialist_descriptors,
 };
-pub use runtime::{GeWuRuntime, GeWuRuntimeBuilder};
+pub use runtime::{GeWuRuntime, GeWuRuntimeBuilder, SpecialistExecutionEvent};
 pub use tools::TaskTool;
 pub use trace_diff::{DiffEntry, DiffKind, DiffOptions, diff_blackboards, format_diff};
 pub use workflow::{Predicate, WorkflowCompiler, validate as validate_workflow, validate_with_ids};

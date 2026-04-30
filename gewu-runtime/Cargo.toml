@@ -17,6 +17,7 @@ tracing = "0.1"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-native-tls"] }
 uuid = { version = "1.10", features = ["v4"] }
 futures = "0.3.32"
+async-stream = "0.3.6"
 schemars = "0.8"
 serde_yaml = "0.9"
 reqwest = { version = "0.12", features = ["json"] }
