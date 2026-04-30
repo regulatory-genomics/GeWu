@@ -18,14 +18,10 @@
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use gewu_core::traits::{AssemblyContext, LlmProvider, Plugin, Tool, ToolFactory};
-use gewu_core::types::{
-    Message, ProviderEvent, SpecialistDescriptor, ToolContext, ToolResult,
-};
+use gewu_core::types::{Message, ProviderEvent, SpecialistDescriptor, ToolContext, ToolResult};
 use gewu_graph::Blackboard;
-use gewu_runtime::{
-    DiffOptions, GeWuRuntime, WorkflowCompiler, diff_blackboards, format_diff,
-};
 use gewu_runtime::manifest::workflow::WorkflowManifest;
+use gewu_runtime::{DiffOptions, GeWuRuntime, WorkflowCompiler, diff_blackboards, format_diff};
 use schemars::schema::RootSchema;
 use serde_json::{Value, json};
 use sqlx::sqlite::SqlitePoolOptions;
@@ -64,13 +60,26 @@ macro_rules! make_tool {
         struct $name;
         #[async_trait]
         impl Tool for $name {
-            fn name(&self) -> &str { $id }
-            fn description(&self) -> &str { concat!("fw-shape test tool: ", $id) }
-            fn schema(&self) -> RootSchema { RootSchema::default() }
-            async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+            fn name(&self) -> &str {
+                $id
+            }
+            fn description(&self) -> &str {
+                concat!("fw-shape test tool: ", $id)
+            }
+            fn schema(&self) -> RootSchema {
+                RootSchema::default()
+            }
+            async fn execute(
+                &self,
+                args: Value,
+                _ctx: &ToolContext,
+            ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
                 let f = $body;
                 let out: Value = f(args);
-                Ok(ToolResult::new($id, serde_json::to_string(&out).unwrap_or_default()))
+                Ok(ToolResult::new(
+                    $id,
+                    serde_json::to_string(&out).unwrap_or_default(),
+                ))
             }
         }
     };
@@ -94,10 +103,7 @@ make_tool!(IntentTool, "fw_intent", |args: Value| {
 // `plan_tasks`: emit a SpecialistTask per requested specialist.
 make_tool!(PlanTasksTool, "fw_plan_tasks", |args: Value| {
     let intent = args;
-    let topics = intent
-        .get("topics")
-        .cloned()
-        .unwrap_or(json!([]));
+    let topics = intent.get("topics").cloned().unwrap_or(json!([]));
     json!({
         "tasks": {
             "bazi":  { "topics": topics.clone(), "kind": "bazi" },
@@ -132,9 +138,17 @@ make_tool!(ZiweiTaskTool, "fw_ziwei_task", |args: Value| {
 // `protocol_review`: signals repair if either run produced zero claims.
 // Input is the `runs` object: `{ bazi: {...}, ziwei: {...} }`.
 make_tool!(ProtocolReviewTool, "fw_protocol_review", |args: Value| {
-    let empty = args.as_object().map(|m| m.values().any(|v| {
-        v.get("claims").and_then(|c| c.as_array()).map(|a| a.is_empty()).unwrap_or(true)
-    })).unwrap_or(true);
+    let empty = args
+        .as_object()
+        .map(|m| {
+            m.values().any(|v| {
+                v.get("claims")
+                    .and_then(|c| c.as_array())
+                    .map(|a| a.is_empty())
+                    .unwrap_or(true)
+            })
+        })
+        .unwrap_or(true);
     json!({ "needs_repair": empty, "coverage": if empty { "partial" } else { "complete" } })
 });
 
@@ -158,15 +172,26 @@ make_tool!(SynthesisTool, "fw_synthesis", |args: Value| {
 
 // `fusion`: group claims by topic+polarity.
 make_tool!(FusionTool, "fw_fusion", |args: Value| {
-    let claims = args.get("claims").and_then(|c| c.as_array()).cloned().unwrap_or_default();
-    let mut groups: std::collections::BTreeMap<String, Vec<Value>> = std::collections::BTreeMap::new();
+    let claims = args
+        .get("claims")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut groups: std::collections::BTreeMap<String, Vec<Value>> =
+        std::collections::BTreeMap::new();
     for c in &claims {
         let topic = c.get("topic").and_then(|t| t.as_str()).unwrap_or("general");
-        let polarity = c.get("polarity").and_then(|t| t.as_str()).unwrap_or("neutral");
+        let polarity = c
+            .get("polarity")
+            .and_then(|t| t.as_str())
+            .unwrap_or("neutral");
         let key = format!("{}/{}", topic, polarity);
         groups.entry(key).or_default().push(c.clone());
     }
-    let grouped: Vec<Value> = groups.into_iter().map(|(k, cs)| json!({ "key": k, "claims": cs })).collect();
+    let grouped: Vec<Value> = groups
+        .into_iter()
+        .map(|(k, cs)| json!({ "key": k, "claims": cs }))
+        .collect();
     json!({ "groups": grouped, "total": claims.len() })
 });
 
@@ -178,7 +203,10 @@ make_tool!(HardReviewTool, "fw_hard_review", |args: Value| {
 
 // `agentic_review`: echoes hard review + confidence.
 make_tool!(AgenticReviewTool, "fw_agentic_review", |args: Value| {
-    let hard_pass = args.get("hard_pass").and_then(|v| v.as_bool()).unwrap_or(false);
+    let hard_pass = args
+        .get("hard_pass")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     json!({ "hard_pass": hard_pass, "confidence": if hard_pass { 0.8 } else { 0.4 } })
 });
 
@@ -291,7 +319,12 @@ async fn run_rust_reference(rt: &GeWuRuntime, input: Value) -> Blackboard {
     bb.set_path("runs.ziwei", ziwei_out);
 
     // protocol
-    let protocol = call(rt, "fw_protocol_review", bb.get_path("runs").unwrap().clone()).await;
+    let protocol = call(
+        rt,
+        "fw_protocol_review",
+        bb.get_path("runs").unwrap().clone(),
+    )
+    .await;
     bb.set_path("protocol", protocol);
 
     // synthesis (always — v1 has no repair loop)
@@ -299,15 +332,30 @@ async fn run_rust_reference(rt: &GeWuRuntime, input: Value) -> Blackboard {
     bb.set_path("synth", synth);
 
     // fusion
-    let fusion = call(rt, "fw_fusion", json!({ "claims": bb.get_path("synth.claims").unwrap() })).await;
+    let fusion = call(
+        rt,
+        "fw_fusion",
+        json!({ "claims": bb.get_path("synth.claims").unwrap() }),
+    )
+    .await;
     bb.set_path("fusion", fusion);
 
     // hard review
-    let hard = call(rt, "fw_hard_review", json!({ "total": bb.get_path("fusion.total").unwrap() })).await;
+    let hard = call(
+        rt,
+        "fw_hard_review",
+        json!({ "total": bb.get_path("fusion.total").unwrap() }),
+    )
+    .await;
     bb.set_path("hard", hard);
 
     // agentic review
-    let agentic = call(rt, "fw_agentic_review", json!({ "hard_pass": bb.get_path("hard.hard_pass").unwrap() })).await;
+    let agentic = call(
+        rt,
+        "fw_agentic_review",
+        json!({ "hard_pass": bb.get_path("hard.hard_pass").unwrap() }),
+    )
+    .await;
     bb.set_path("review", agentic);
 
     // compose answer
@@ -382,7 +430,7 @@ async fn l1_fw_shape_yaml_matches_rust_reference_on_clean_input() {
     let manifest: WorkflowManifest = serde_yaml::from_str(FW_SHAPE_YAML).unwrap();
     let compiler = WorkflowCompiler::new(rt.clone());
     let graph = compiler.compile(&manifest).unwrap();
-    let wf_bb = graph.invoke(Blackboard::from_value(input)).await.unwrap();
+    let wf_bb = graph.ainvoke(Blackboard::from_value(input)).await.unwrap();
 
     let opts = DiffOptions::ignoring(vec!["_errors".to_string(), "_loops".to_string()]);
     let diffs = diff_blackboards(&rust_bb, &wf_bb, &opts);
@@ -400,7 +448,7 @@ async fn l1_fw_shape_yaml_produces_expected_final_structure() {
     let compiler = WorkflowCompiler::new(rt.clone());
     let graph = compiler.compile(&manifest).unwrap();
     let input = json!({ "question": "love q", "horizon": "near" });
-    let out = graph.invoke(Blackboard::from_value(input)).await.unwrap();
+    let out = graph.ainvoke(Blackboard::from_value(input)).await.unwrap();
 
     // Structural invariants on the final blackboard
     assert!(out.get_path("intent.topics").is_some());
@@ -426,7 +474,7 @@ async fn fw_shape_specialist_and_tool_call_order_is_same_in_both_paths() {
     let manifest: WorkflowManifest = serde_yaml::from_str(FW_SHAPE_YAML).unwrap();
     let compiler = WorkflowCompiler::new(rt.clone());
     let graph = compiler.compile(&manifest).unwrap();
-    let wf_bb = graph.invoke(Blackboard::from_value(input)).await.unwrap();
+    let wf_bb = graph.ainvoke(Blackboard::from_value(input)).await.unwrap();
 
     // Spot-check: same final answer structure, same claim count total.
     assert_eq!(

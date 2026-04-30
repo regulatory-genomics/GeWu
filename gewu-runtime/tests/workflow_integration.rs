@@ -182,9 +182,13 @@ edges:
     let graph = compiler.compile(&m).unwrap();
 
     let input = Blackboard::from_value(json!({ "hello": "world" }));
-    let out = graph.invoke(input).await.unwrap();
+    let out = graph.ainvoke(input).await.unwrap();
     // echo returned the full input blackboard (since input: None), which was the initial Value
-    assert!(out.get_path("first").is_some(), "first missing: {:?}", out.0);
+    assert!(
+        out.get_path("first").is_some(),
+        "first missing: {:?}",
+        out.0
+    );
     assert!(
         out.get_path("second.tagged").is_some(),
         "second.tagged missing: {:?}",
@@ -212,8 +216,12 @@ edges: []
     let graph = compiler.compile(&m).unwrap();
 
     let input = Blackboard::from_value(json!({ "k": 7 }));
-    let out = graph.invoke(input).await.unwrap();
-    assert!(out.get_path("runs.left").is_some(), "left missing: {:?}", out.0);
+    let out = graph.ainvoke(input).await.unwrap();
+    assert!(
+        out.get_path("runs.left").is_some(),
+        "left missing: {:?}",
+        out.0
+    );
     assert!(
         out.get_path("runs.right.tagged").is_some(),
         "right.tagged missing: {:?}",
@@ -243,7 +251,7 @@ edges:
 
     // route = "x" → left
     let out_left = graph
-        .invoke(Blackboard::from_value(json!({ "route": "x" })))
+        .ainvoke(Blackboard::from_value(json!({ "route": "x" })))
         .await
         .unwrap();
     assert!(
@@ -255,7 +263,7 @@ edges:
 
     // route = "y" → right
     let out_right = graph
-        .invoke(Blackboard::from_value(json!({ "route": "y" })))
+        .ainvoke(Blackboard::from_value(json!({ "route": "y" })))
         .await
         .unwrap();
     assert!(

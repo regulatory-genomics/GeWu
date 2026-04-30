@@ -34,13 +34,12 @@ use gewu_core::types::{
     CapabilityDescriptor, Message, ProviderEvent, SpecialistDescriptor, ToolContext, ToolResult,
 };
 use gewu_graph::Blackboard;
+use gewu_runtime::composer::WriteWorkflowTool;
 use gewu_runtime::manifest::workflow::WorkflowManifest;
 use gewu_runtime::manifest::workflow_loader::WorkflowManifestLoader;
 use gewu_runtime::{
-    ComposerContext, DiffOptions, GeWuRuntime, WorkflowCompiler, diff_blackboards,
-    format_diff,
+    ComposerContext, DiffOptions, GeWuRuntime, WorkflowCompiler, diff_blackboards, format_diff,
 };
-use gewu_runtime::composer::WriteWorkflowTool;
 use schemars::schema::RootSchema;
 use serde_json::{Value, json};
 use sqlx::sqlite::SqlitePoolOptions;
@@ -82,13 +81,26 @@ macro_rules! make_tool {
         struct $name;
         #[async_trait]
         impl Tool for $name {
-            fn name(&self) -> &str { $id }
-            fn description(&self) -> &str { concat!("fw-shape test tool: ", $id) }
-            fn schema(&self) -> RootSchema { RootSchema::default() }
-            async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+            fn name(&self) -> &str {
+                $id
+            }
+            fn description(&self) -> &str {
+                concat!("fw-shape test tool: ", $id)
+            }
+            fn schema(&self) -> RootSchema {
+                RootSchema::default()
+            }
+            async fn execute(
+                &self,
+                args: Value,
+                _ctx: &ToolContext,
+            ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
                 let f = $body;
                 let out: Value = f(args);
-                Ok(ToolResult::new($id, serde_json::to_string(&out).unwrap_or_default()))
+                Ok(ToolResult::new(
+                    $id,
+                    serde_json::to_string(&out).unwrap_or_default(),
+                ))
             }
         }
     };
@@ -96,7 +108,11 @@ macro_rules! make_tool {
 
 make_tool!(IntentTool, "fw_intent", |args: Value| {
     let q = args.get("question").and_then(|v| v.as_str()).unwrap_or("");
-    let topic = if q.contains("love") { "love" } else { "general" };
+    let topic = if q.contains("love") {
+        "love"
+    } else {
+        "general"
+    };
     json!({
         "topics": [topic],
         "horizon": args.get("horizon").cloned().unwrap_or(json!("near")),
@@ -132,9 +148,17 @@ make_tool!(ZiweiTaskTool, "fw_ziwei_task", |args: Value| {
     })
 });
 make_tool!(ProtocolReviewTool, "fw_protocol_review", |args: Value| {
-    let empty = args.as_object().map(|m| m.values().any(|v| {
-        v.get("claims").and_then(|c| c.as_array()).map(|a| a.is_empty()).unwrap_or(true)
-    })).unwrap_or(true);
+    let empty = args
+        .as_object()
+        .map(|m| {
+            m.values().any(|v| {
+                v.get("claims")
+                    .and_then(|c| c.as_array())
+                    .map(|a| a.is_empty())
+                    .unwrap_or(true)
+            })
+        })
+        .unwrap_or(true);
     json!({ "needs_repair": empty, "coverage": if empty { "partial" } else { "complete" } })
 });
 make_tool!(SynthesisTool, "fw_synthesis", |args: Value| {
@@ -153,15 +177,26 @@ make_tool!(SynthesisTool, "fw_synthesis", |args: Value| {
     json!({ "claims": all.clone(), "count": all.len() })
 });
 make_tool!(FusionTool, "fw_fusion", |args: Value| {
-    let claims = args.get("claims").and_then(|c| c.as_array()).cloned().unwrap_or_default();
-    let mut groups: std::collections::BTreeMap<String, Vec<Value>> = std::collections::BTreeMap::new();
+    let claims = args
+        .get("claims")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut groups: std::collections::BTreeMap<String, Vec<Value>> =
+        std::collections::BTreeMap::new();
     for c in &claims {
         let topic = c.get("topic").and_then(|t| t.as_str()).unwrap_or("general");
-        let polarity = c.get("polarity").and_then(|t| t.as_str()).unwrap_or("neutral");
+        let polarity = c
+            .get("polarity")
+            .and_then(|t| t.as_str())
+            .unwrap_or("neutral");
         let key = format!("{}/{}", topic, polarity);
         groups.entry(key).or_default().push(c.clone());
     }
-    let grouped: Vec<Value> = groups.into_iter().map(|(k, cs)| json!({ "key": k, "claims": cs })).collect();
+    let grouped: Vec<Value> = groups
+        .into_iter()
+        .map(|(k, cs)| json!({ "key": k, "claims": cs }))
+        .collect();
     json!({ "groups": grouped, "total": claims.len() })
 });
 make_tool!(HardReviewTool, "fw_hard_review", |args: Value| {
@@ -169,7 +204,10 @@ make_tool!(HardReviewTool, "fw_hard_review", |args: Value| {
     json!({ "hard_pass": total > 0, "issues": [] })
 });
 make_tool!(AgenticReviewTool, "fw_agentic_review", |args: Value| {
-    let hard_pass = args.get("hard_pass").and_then(|v| v.as_bool()).unwrap_or(false);
+    let hard_pass = args
+        .get("hard_pass")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     json!({ "hard_pass": hard_pass, "confidence": if hard_pass { 0.8 } else { 0.4 } })
 });
 make_tool!(ComposeAnswerTool, "fw_compose_answer", |args: Value| {
@@ -223,7 +261,9 @@ impl ToolFactory for FwShapeFactory {
 struct FwShapePlugin;
 
 impl Plugin for FwShapePlugin {
-    fn name(&self) -> &str { "fw-shape" }
+    fn name(&self) -> &str {
+        "fw-shape"
+    }
     fn tool_factories(&self) -> Vec<Box<dyn ToolFactory>> {
         vec![Box::new(FwShapeFactory)]
     }
@@ -292,8 +332,7 @@ fn snapshot_context(rt: &GeWuRuntime, out_dir: std::path::PathBuf) -> ComposerCo
             system_prompt: String::new(),
         })
         .collect();
-    let capabilities: Vec<CapabilityDescriptor> =
-        rt.capability_registry().list_capabilities();
+    let capabilities: Vec<CapabilityDescriptor> = rt.capability_registry().list_capabilities();
     ComposerContext {
         specialists: Arc::new(specialists),
         capabilities: Arc::new(capabilities),
@@ -310,20 +349,48 @@ async fn run_rust_reference(rt: &GeWuRuntime, input: Value) -> Blackboard {
     bb.set_path("plan", plan);
     let tasks = bb.get_path("plan.tasks").cloned().unwrap_or(json!({}));
     let (bazi_out, ziwei_out) = tokio::join!(
-        call(rt, "fw_bazi_task", tasks.get("bazi").cloned().unwrap_or(json!({}))),
-        call(rt, "fw_ziwei_task", tasks.get("ziwei").cloned().unwrap_or(json!({}))),
+        call(
+            rt,
+            "fw_bazi_task",
+            tasks.get("bazi").cloned().unwrap_or(json!({}))
+        ),
+        call(
+            rt,
+            "fw_ziwei_task",
+            tasks.get("ziwei").cloned().unwrap_or(json!({}))
+        ),
     );
     bb.set_path("runs.bazi", bazi_out);
     bb.set_path("runs.ziwei", ziwei_out);
-    let protocol = call(rt, "fw_protocol_review", bb.get_path("runs").unwrap().clone()).await;
+    let protocol = call(
+        rt,
+        "fw_protocol_review",
+        bb.get_path("runs").unwrap().clone(),
+    )
+    .await;
     bb.set_path("protocol", protocol);
     let synth = call(rt, "fw_synthesis", bb.get_path("runs").unwrap().clone()).await;
     bb.set_path("synth", synth);
-    let fusion = call(rt, "fw_fusion", json!({ "claims": bb.get_path("synth.claims").unwrap() })).await;
+    let fusion = call(
+        rt,
+        "fw_fusion",
+        json!({ "claims": bb.get_path("synth.claims").unwrap() }),
+    )
+    .await;
     bb.set_path("fusion", fusion);
-    let hard = call(rt, "fw_hard_review", json!({ "total": bb.get_path("fusion.total").unwrap() })).await;
+    let hard = call(
+        rt,
+        "fw_hard_review",
+        json!({ "total": bb.get_path("fusion.total").unwrap() }),
+    )
+    .await;
     bb.set_path("hard", hard);
-    let agentic = call(rt, "fw_agentic_review", json!({ "hard_pass": bb.get_path("hard.hard_pass").unwrap() })).await;
+    let agentic = call(
+        rt,
+        "fw_agentic_review",
+        json!({ "hard_pass": bb.get_path("hard.hard_pass").unwrap() }),
+    )
+    .await;
     bb.set_path("review", agentic);
     let answer = call(
         rt, "fw_compose_answer",
@@ -421,7 +488,7 @@ async fn self_assembly_produces_sop_matching_rust_reference() {
     let compiler = WorkflowCompiler::new(rt.clone());
     let graph = compiler.compile(&composed).unwrap();
     let composed_bb = graph
-        .invoke(Blackboard::from_value(input.clone()))
+        .ainvoke(Blackboard::from_value(input.clone()))
         .await
         .unwrap();
 
@@ -559,7 +626,7 @@ async fn reusing_composed_workflow_via_workflow_registry_path() {
         .compile(manifests.get("fateweaver").unwrap())
         .unwrap();
     let out = graph
-        .invoke(Blackboard::from_value(input.clone()))
+        .ainvoke(Blackboard::from_value(input.clone()))
         .await
         .unwrap();
 
