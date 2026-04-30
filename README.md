@@ -60,6 +60,18 @@ The CLI uses a JSON config file to configure the LLM provider. By default, it lo
 
 GeWu supports domain plugins that contribute specialist agents and tools. Plugins are loaded at startup via the `PluginHost`, driven by the `plugins` section in your config file.
 
+GeWu also supports YAML runtime plugins for HTTP-backed tools and lifecycle hooks. Runtime plugins do not require recompiling GeWu: place `*.yaml` manifests in `.gewu/runtime-plugins/`, `~/.gewu/runtime-plugins/`, or directories listed in `runtimePluginDirs`.
+
+```jsonc
+{
+  "runtimePluginDirs": [
+    "/home/gilberthan/disk1/projects/gewu-memory/examples"
+  ]
+}
+```
+
+A runtime plugin can expose tools such as `memory_search` and hook into lifecycle events such as `specialist.system_prompt.transform`, `agent.event`, and `tool.execute.after`. See `examples/gewu-memory-runtime-plugin.yaml` for a memory daemon configuration.
+
 ### Configuring a Plugin
 
 Add a `plugins` block to your `config.json`:

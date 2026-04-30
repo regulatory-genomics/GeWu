@@ -1,0 +1,89 @@
+id: gewu-memory
+kind: http
+enabled: true
+base_url: http://127.0.0.1:7878
+timeout_ms: 1500
+on_error: continue
+
+tools:
+  - name: memory_search
+    description: Search prior raw conversation memory.
+    endpoint: /v1/memory/search
+    method: POST
+    input_schema:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+        project_id:
+          type: string
+        limit:
+          type: number
+
+  - name: wiki_search
+    description: Search configured project wiki.
+    endpoint: /v1/wiki/search
+    method: POST
+    input_schema:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+        project_id:
+          type: string
+        limit:
+          type: number
+
+  - name: wiki_open
+    description: Open a cited wiki result.
+    endpoint: /v1/wiki/open
+    method: POST
+    input_schema:
+      type: object
+      required: [source]
+      properties:
+        source:
+          type: string
+        section:
+          type: string
+        project_id:
+          type: string
+
+  - name: fact_query
+    description: Query stable facts.
+    endpoint: /v1/facts/query
+    method: POST
+    input_schema:
+      type: object
+      required: [entity]
+      properties:
+        entity:
+          type: string
+        project_id:
+          type: string
+        direction:
+          type: string
+
+hooks:
+  - name: prepare_memory_context
+    event: specialist.system_prompt.transform
+    endpoint: /v1/context/prepare
+    method: POST
+    timeout_ms: 1500
+    on_error: continue
+
+  - name: remember_agent_event
+    event: agent.event
+    endpoint: /v1/events/remember
+    method: POST
+    timeout_ms: 1000
+    on_error: continue
+
+  - name: remember_tool_result
+    event: tool.execute.after
+    endpoint: /v1/events/remember
+    method: POST
+    timeout_ms: 1000
+    on_error: continue
