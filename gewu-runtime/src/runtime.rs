@@ -1133,6 +1133,16 @@ impl HookedTool {
     }
 }
 
+fn append_runtime_context(system_prompt: String) -> String {
+    let now = chrono::Local::now();
+    format!(
+        "{}\n\n<runtime_context>\nCurrent date: {}\nCurrent weekday: {}\nTimezone: local server timezone\n</runtime_context>",
+        system_prompt.trim_end(),
+        now.format("%Y-%m-%d"),
+        now.format("%A")
+    )
+}
+
 struct RuntimeToolRegistry {
     tools: Arc<Vec<Arc<dyn Tool>>>,
 }

@@ -43,12 +43,12 @@
 
         #app {
             display: grid;
-            grid-template-columns: var(--sidebar-width) minmax(0, 1fr) 360px;
+            grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
             grid-template-rows: var(--header-height) 1fr var(--input-height);
             grid-template-areas:
-                "header header header"
-                "sidebar chat trace"
-                "input input input";
+                "header header"
+                "sidebar chat"
+                "input input";
             height: 100vh;
             width: 100vw;
         }
@@ -282,8 +282,7 @@
         }
 
         #trace-panel {
-            grid-area: trace;
-            display: flex;
+            display: none;
             flex-direction: column;
             background: var(--bg-secondary);
             border-left: 1px solid var(--border-color);
@@ -349,6 +348,60 @@
 
         .assistant-tools {
             margin-top: 8px;
+        }
+
+        .assistant-tools:empty { display: none; }
+
+        .trace-actions {
+            margin-top: 8px;
+            display: flex;
+            justify-content: flex-end;
+        }
+
+        .trace-toggle-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: #1f6feb18;
+            border: 1px solid #58a6ff45;
+            color: var(--accent-blue);
+            border-radius: 999px;
+            padding: 5px 10px;
+            font-size: 11px;
+            font-weight: 700;
+            cursor: pointer;
+            letter-spacing: 0.02em;
+            transition: background var(--transition-fast), border-color var(--transition-fast), transform var(--transition-fast);
+        }
+
+        .trace-toggle-btn:hover {
+            background: #1f6feb30;
+            border-color: var(--accent-blue);
+            transform: translateY(-1px);
+        }
+
+        .message-trace-panel {
+            margin-top: 10px;
+            padding: 12px;
+            background: linear-gradient(135deg, #0b1220 0%, #0f1b2d 55%, #111827 100%);
+            border: 1px solid #58a6ff35;
+            border-radius: var(--radius-lg);
+            box-shadow: 0 12px 30px #00000030 inset;
+        }
+
+        .trace-graph-title {
+            color: var(--accent-blue);
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: 0.06em;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+        }
+
+        .trace-graph {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
         }
 
         /* Markdown rendered content */
@@ -545,6 +598,23 @@
             padding-left: 8px;
         }
 
+        .message-trace-panel .run-node {
+            border-left-color: #58a6ff40;
+            position: relative;
+        }
+
+        .message-trace-panel .run-node::before {
+            content: '';
+            position: absolute;
+            left: -5px;
+            top: 13px;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--accent-blue);
+            box-shadow: 0 0 12px #58a6ff80;
+        }
+
         .run-node summary {
             cursor: pointer;
             list-style: none;
@@ -584,6 +654,33 @@
             white-space: pre-wrap;
             word-break: break-word;
         }
+
+        .run-event-panel {
+            margin-top: 8px;
+            background: #23863610;
+            border: 1px solid #23863630;
+            border-radius: var(--radius-md);
+            padding: 8px;
+            font-size: 11px;
+        }
+
+        .run-event-title {
+            color: var(--accent-green);
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+
+        .run-open-session {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--accent-blue);
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            font-size: 10px;
+            padding: 2px 6px;
+        }
+
+        .run-open-session:hover { background: var(--border-color); }
 
         /* Input Area */
         #input-area {
@@ -748,7 +845,6 @@
         // DOM Elements
         const sidebar = document.getElementById('sidebar');
         const chatContainer = document.getElementById('chat-container');
-        const traceContainer = document.getElementById('trace-container');
         const messageInput = document.getElementById('message-input');
         const sendBtn = document.getElementById('send-btn');
         const sessionList = document.getElementById('session-list');
@@ -764,7 +860,8 @@
 
         let token = '';
         let isLoading = false;
-        let activeToolCallEl = null;
+        let activeToolCallEls = [];
+        const activeToolCallsByName = new Map();
         let currentMarkdownBuffer = '';
         let currentAssistantToolsEl = null;
 
@@ -958,7 +1055,6 @@
 
         function clearChat() {
             chatContainer.innerHTML = '';
-            traceContainer.innerHTML = '<div class="trace-empty">Run a workflow or tool call to inspect its execution tree here.</div>';
         }
 
         function addMessage(role, content) {
@@ -993,8 +1089,8 @@
             });
         }
 
-        async function switchSession(session) {
-            if (state.currentSession?.id === session.id) return;
+        async function switchSession(session, forceReload = false) {
+            if (!forceReload && state.currentSession?.id === session.id) return;
             state.currentSession = session;
             state.currentSessionId = session.id;
             agentSelector.value = session.agent_type;
@@ -1008,9 +1104,7 @@
                 if (resp.ok) {
                     const data = await resp.json();
                     if (data.messages && data.messages.length > 0) {
-                        for (const msg of data.messages) {
-                            renderMessage(msg);
-                        }
+                        renderMessageHistory(data.messages);
                     } else {
                         addMessage('assistant', 'Session ready. How can I help you?');
                     }
@@ -1021,10 +1115,52 @@
                 addMessage('assistant', 'Session ready. How can I help you?');
             }
 
-            await loadRunTree(session.id);
-
             renderSessions();
             setStatus('Ready');
+        }
+
+        function renderMessageHistory(messages) {
+            const toolCallHosts = new Map();
+            let lastAssistantDiv = null;
+            let lastAssistantToolsEl = null;
+            for (const msg of messages) {
+                if (msg.role === 'system') continue;
+
+                if (msg.role === 'assistant') {
+                    const host = renderMessage(msg);
+                    lastAssistantDiv = host;
+                    lastAssistantToolsEl = ensureToolsContainer(host);
+                    for (const call of msg.tool_calls || []) {
+                        if (call.id) {
+                            toolCallHosts.set(call.id, {
+                                toolName: call.function?.name || 'tool',
+                                input: call.function?.arguments || '',
+                                toolsEl: lastAssistantToolsEl,
+                                messageDiv: host
+                            });
+                        }
+                    }
+                } else if (msg.role === 'tool') {
+                    const host = toolCallHosts.get(msg.tool_call_id);
+                    if (host) {
+                        const details = createPersistedToolCall(host.toolName || msg.tool_name || 'tool', host.input, msg.content || '');
+                        host.toolsEl.appendChild(details);
+                        addTraceRunFromToolOutput(host.messageDiv, msg.content || '');
+                    } else if (lastAssistantToolsEl) {
+                        const details = createPersistedToolCall(msg.tool_name || 'tool', '', msg.content || '');
+                        lastAssistantToolsEl.appendChild(details);
+                        addTraceRunFromToolOutput(lastAssistantDiv, msg.content || '');
+                    } else {
+                        renderMessage(msg);
+                    }
+                } else {
+                    renderMessage(msg);
+                    if (msg.role === 'user') {
+                        lastAssistantDiv = null;
+                        lastAssistantToolsEl = null;
+                    }
+                }
+            }
         }
 
         function renderMessage(msg) {
@@ -1044,46 +1180,131 @@
                     content = renderMarkdown(msg.content || '');
                 }
             } else if (msg.role === 'assistant') {
-                content = renderMarkdown(msg.content || '');
-                if (msg.tool_calls && msg.tool_calls.length > 0) {
-                    content += '<div class="tool-calls-info">Tool calls: ' + msg.tool_calls.map(tc => tc.function.name).join(', ') + '</div>';
-                }
+                const assistantContent = msg.content || '';
+                content = renderMarkdown(assistantContent);
             } else if (msg.role === 'tool') {
                 content = `<span class="tool-label">[${msg.tool_name || 'tool'}]</span> ${escapeHtml(msg.content)}`;
             }
 
             div.innerHTML = `<div class="role">${msg.role}</div><div class="content">${content}</div>`;
+            if (msg.role === 'assistant') {
+                div.querySelector('.content').dataset.markdown = msg.content || '';
+            }
             chatContainer.appendChild(div);
             chatContainer.scrollTop = chatContainer.scrollHeight;
+            return div;
         }
 
-        async function loadRunTree(sessionId) {
-            if (!sessionId) return;
-            try {
-                const resp = await fetch(`/api/runs?session_id=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(token)}`);
-                if (!resp.ok) return;
-                const data = await resp.json();
-                const runs = data.runs || [];
-                if (!runs.length) return;
-                traceContainer.innerHTML = '';
-                const tree = document.createElement('div');
-                tree.className = 'run-tree';
-                tree.innerHTML = '<div class="run-tree-title">Execution Trace</div>';
-                for (const run of runs) {
-                    tree.appendChild(await renderRunNode(run));
-                }
-                traceContainer.appendChild(tree);
-            } catch (e) {
-                console.warn('Failed to load run tree', e);
+        function ensureToolsContainer(messageDiv) {
+            let toolsEl = messageDiv.querySelector('.assistant-tools');
+            if (!toolsEl) {
+                toolsEl = document.createElement('div');
+                toolsEl.className = 'assistant-tools';
+                messageDiv.appendChild(toolsEl);
             }
+            return toolsEl;
+        }
+
+        function extractRootRunId(output) {
+            try {
+                const value = JSON.parse(output || 'null');
+                return value?._trace?.root_run_id || value?._trace?.current_run_id || null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function getTraceRunIds(messageDiv) {
+            try {
+                return JSON.parse(messageDiv.dataset.traceRunIds || '[]');
+            } catch (e) {
+                return [];
+            }
+        }
+
+        function addTraceRunFromToolOutput(messageDiv, output) {
+            if (!messageDiv) return;
+            const runId = extractRootRunId(output);
+            if (!runId) return;
+            const runIds = getTraceRunIds(messageDiv);
+            if (!runIds.includes(runId)) {
+                runIds.push(runId);
+                messageDiv.dataset.traceRunIds = JSON.stringify(runIds);
+            }
+            ensureTraceAction(messageDiv);
+        }
+
+        function ensureTraceAction(messageDiv) {
+            if (messageDiv.querySelector(':scope > .trace-actions')) return;
+            const actions = document.createElement('div');
+            actions.className = 'trace-actions';
+            actions.innerHTML = '<button type="button" class="trace-toggle-btn">⟡ Trace graph</button>';
+            actions.querySelector('button').addEventListener('click', async () => {
+                await toggleMessageTrace(messageDiv);
+            });
+            messageDiv.appendChild(actions);
+        }
+
+        async function toggleMessageTrace(messageDiv) {
+            const existing = messageDiv.querySelector(':scope > .message-trace-panel');
+            if (existing) {
+                existing.remove();
+                return;
+            }
+
+            const panel = document.createElement('div');
+            panel.className = 'message-trace-panel';
+            panel.innerHTML = '<div class="trace-graph-title">Execution graph</div><div class="trace-graph">Loading trace…</div>';
+            messageDiv.appendChild(panel);
+
+            const graph = panel.querySelector('.trace-graph');
+            graph.innerHTML = '';
+            const runIds = getTraceRunIds(messageDiv);
+            for (const runId of runIds) {
+                try {
+                    const resp = await fetch(`/api/runs/${encodeURIComponent(runId)}?token=${encodeURIComponent(token)}`);
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        if (data.run) graph.appendChild(await renderRunNode(data.run));
+                    }
+                } catch (e) {
+                    console.warn('Failed to load trace run', e);
+                }
+            }
+            if (!graph.children.length) {
+                graph.textContent = 'No trace run is available for this turn.';
+            }
+        }
+
+        function createPersistedToolCall(toolName, input, output) {
+            const details = document.createElement('details');
+            details.className = 'tool-call';
+            details.innerHTML = `
+                <summary>
+                    <span class="tool-icon">▶</span>
+                    <span class="tool-name">${escapeHtml(toolName)}</span>
+                    <span class="tool-status done">done ✓</span>
+                </summary>
+                <div class="tool-body">
+                    <div class="tool-field">
+                        <div class="tool-field-label">Input</div>
+                        <div class="tool-field-content">${escapeHtml(input || '')}</div>
+                    </div>
+                    <div class="tool-field">
+                        <div class="tool-field-label">Output</div>
+                        <div class="tool-field-content tool-output">${escapeHtml(output || '')}</div>
+                    </div>
+                </div>
+            `;
+            return details;
         }
 
         async function renderRunNode(run) {
             const node = document.createElement('details');
             node.className = 'run-node';
-            node.open = run.status === 'failed' || run.kind === 'workflow';
+            node.open = run.status === 'failed' || run.kind === 'workflow' || run.kind === 'workflow_node';
             const sessionLink = run.session_id && run.kind === 'specialist'
-                ? ` <button type="button" class="run-open-session" data-session-id="${escapeHtml(run.session_id)}">Open session</button>`
+                ? ` <button type="button" class="run-open-session" data-action="session" data-session-id="${escapeHtml(run.session_id)}">Open session</button> <button type="button" class="run-open-session" data-action="details" data-session-id="${escapeHtml(run.session_id)}">Details</button>`
                 : '';
             node.innerHTML = `
                 <summary>
@@ -1094,11 +1315,15 @@
                 </summary>
                 <div class="run-json">${escapeHtml(runDetails(run))}</div>
             `;
-            const openButton = node.querySelector('.run-open-session');
-            if (openButton) {
-                openButton.addEventListener('click', (e) => {
+            for (const openButton of node.querySelectorAll('.run-open-session')) {
+                openButton.addEventListener('click', async (e) => {
+                    e.preventDefault();
                     e.stopPropagation();
-                    openSyntheticSession(openButton.dataset.sessionId, run.name);
+                    if (openButton.dataset.action === 'session') {
+                        await openSyntheticSession(openButton.dataset.sessionId, run.name);
+                    } else {
+                        await openRunDetails(run, node);
+                    }
                 });
             }
             try {
@@ -1111,6 +1336,41 @@
                 }
             } catch (e) {}
             return node;
+        }
+
+        async function openRunDetails(run, node) {
+            const existing = node.querySelector(':scope > .run-event-panel');
+            if (existing) {
+                existing.remove();
+                return;
+            }
+
+            node.open = true;
+            let events = [];
+            try {
+                const resp = await fetch(`/api/runs/${encodeURIComponent(run.id)}/events?token=${encodeURIComponent(token)}`);
+                if (resp.ok) {
+                    const data = await resp.json();
+                    events = data.events || [];
+                }
+            } catch (e) {
+                console.warn('Failed to load run events', e);
+            }
+
+            const panel = document.createElement('div');
+            panel.className = 'run-event-panel';
+            panel.innerHTML = `
+                <div class="run-event-title">Specialist details</div>
+                <div class="run-json">${escapeHtml(JSON.stringify({
+                    run_id: run.id,
+                    session_id: run.session_id,
+                    input_json: run.input_json,
+                    output_json: run.output_json,
+                    error: run.error,
+                    events
+                }, null, 2))}</div>
+            `;
+            node.appendChild(panel);
         }
 
         function runDetails(run) {
@@ -1135,7 +1395,7 @@
             if (!state.sessions.some(s => s.id === sessionId)) {
                 state.sessions.unshift(session);
             }
-            await switchSession(session);
+            await switchSession(session, true);
         }
 
         async function deleteSession(sessionId) {
@@ -1228,6 +1488,35 @@
         }
 
         // Tool Call Display (inline in chat)
+        function rememberActiveToolCall(toolName, details) {
+            activeToolCallEls.push(details);
+            const key = toolName || 'tool';
+            const queue = activeToolCallsByName.get(key) || [];
+            queue.push(details);
+            activeToolCallsByName.set(key, queue);
+        }
+
+        function takeActiveToolCall(toolName) {
+            const key = toolName || 'tool';
+            const queue = activeToolCallsByName.get(key);
+            if (queue && queue.length > 0) {
+                const details = queue.shift();
+                if (queue.length === 0) activeToolCallsByName.delete(key);
+                activeToolCallEls = activeToolCallEls.filter(el => el !== details);
+                return details;
+            }
+            return activeToolCallEls.shift() || null;
+        }
+
+        function resetStreamingTurn() {
+            currentAssistantDiv = null;
+            currentReasoningDiv = null;
+            currentAssistantToolsEl = null;
+            currentMarkdownBuffer = '';
+            activeToolCallEls = [];
+            activeToolCallsByName.clear();
+        }
+
         function createToolCall(toolName, input) {
             ensureAssistantTurn();
             const details = document.createElement('details');
@@ -1251,6 +1540,7 @@
             `;
             currentAssistantToolsEl.appendChild(details);
             details.open = true;
+            rememberActiveToolCall(toolName, details);
             chatContainer.scrollTop = chatContainer.scrollHeight;
             return details;
         }
@@ -1263,6 +1553,7 @@
             summary.querySelector('.tool-icon').textContent = '▶';
             details.querySelector('.tool-output').textContent = output;
             details.open = false;
+            addTraceRunFromToolOutput(details.closest('.message'), output);
             chatContainer.scrollTop = chatContainer.scrollHeight;
         }
 
@@ -1323,30 +1614,32 @@
                     appendToDiv(currentReasoningDiv, 'reasoning', event.data.delta);
                     break;
                 case 'content_delta':
+                    if (currentAssistantToolsEl && currentAssistantToolsEl.children.length > 0) {
+                        currentAssistantDiv = null;
+                        currentAssistantToolsEl = null;
+                        currentMarkdownBuffer = '';
+                    }
                     if (!currentAssistantDiv) {
                         currentAssistantDiv = createAssistantDiv();
                     }
                     appendToDiv(currentAssistantDiv, 'assistant', event.data.delta);
                     break;
                 case 'tool_start':
-                    activeToolCallEl = createToolCall(event.data.tool, event.data.input);
+                    createToolCall(event.data.tool, event.data.input);
                     break;
                 case 'tool_finish':
-                    if (activeToolCallEl) {
-                        finishToolCall(activeToolCallEl, event.data.output);
-                        activeToolCallEl = null;
+                    {
+                        const toolCallEl = takeActiveToolCall(event.data.tool);
+                        if (toolCallEl) {
+                            finishToolCall(toolCallEl, event.data.output);
+                        }
                     }
                     break;
                 case 'finish':
-                    currentMarkdownBuffer = '';
                     if (currentReasoningDiv) {
                         currentReasoningDiv.open = false;
-                        currentReasoningDiv = null;
                     }
-                    if (currentAssistantDiv) {
-                        currentAssistantDiv = null;
-                        currentAssistantToolsEl = null;
-                    }
+                    resetStreamingTurn();
                     break;
                 case 'error':
                     showError(event.data.error);
@@ -1368,9 +1661,7 @@
 
             addMessage('user', message);
 
-            currentAssistantDiv = null;
-            currentReasoningDiv = null;
-            currentAssistantToolsEl = null;
+            resetStreamingTurn();
 
             try {
                 const resp = await fetch(`/api/chat?token=${encodeURIComponent(token)}`, {
@@ -1408,7 +1699,6 @@
             } finally {
                 isLoading = false;
                 sendBtn.disabled = false;
-                await loadRunTree(state.currentSession.id);
                 setStatus('Ready');
             }
         }
@@ -1482,7 +1772,7 @@
                 }
                 renderSessions();
                 if (state.currentSession) {
-                    switchSession(state.currentSession);
+                    switchSession(state.currentSession, true);
                 } else {
                     addMessage('assistant', 'Select a session or create a new one to start.');
                 }

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{SpecialistExecutionRequest, ToolContext, ToolResult};
+use gewu_core::types::{ExecutionRunKind, SpecialistExecutionRequest, ToolContext, ToolResult};
 use schemars::schema::RootSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -81,21 +81,46 @@ impl Tool for TaskTool {
     async fn execute(
         &self,
         args: Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: TaskArgsJson = serde_json::from_value(args)?;
         let task_id = match &input.task_id {
             Some(id) => id.clone(),
             None => Uuid::new_v4().to_string(),
         };
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("description".to_string(), Value::String(input.description));
+        metadata.insert(
+            "parent_session_id".to_string(),
+            Value::String(ctx.session_id.clone()),
+        );
+        metadata.insert(
+            "parent_message_id".to_string(),
+            Value::String(ctx.message_id.clone()),
+        );
+        if let Some(root_run_id) = ctx.metadata.get("trace_root_run_id").and_then(Value::as_str) {
+            metadata.insert(
+                "trace_root_run_id".to_string(),
+                Value::String(root_run_id.to_string()),
+            );
+        }
+        if let Some(current_run_id) = ctx
+            .metadata
+            .get("trace_current_run_id")
+            .and_then(Value::as_str)
+        {
+            metadata.insert(
+                "trace_current_run_id".to_string(),
+                Value::String(current_run_id.to_string()),
+            );
+        }
+
         let request = SpecialistExecutionRequest {
             task_id: task_id.clone(),
             specialist_id: input.subagent_type.clone(),
             session_id: task_id.clone(),
             prompt: input.prompt.clone(),
-            metadata_json: json!({
-                "description": input.description,
-            }),
+            metadata_json: Value::Object(metadata),
         };
 
         info!(
@@ -137,6 +162,28 @@ impl Tool for TaskTool {
             .await
             .map_err(|e| format!("Failed to execute request: {}", e))?;
 
-        Ok(ToolResult::new("task", serde_json::to_string(&envelope)?))
+        let trace_store = gewu_storage::ExecutionTraceStore::new(self.pool.clone()).await?;
+        let root_run = trace_store
+            .runs_for_session(&task_id)
+            .await?
+            .into_iter()
+            .find(|run| run.kind == ExecutionRunKind::Specialist);
+
+        let mut output = serde_json::to_value(&envelope)?;
+        if let Some(root_run) = root_run {
+            if let Some(object) = output.as_object_mut() {
+                object.insert(
+                    "_trace".to_string(),
+                    json!({
+                        "root_run_id": root_run.id,
+                        "current_run_id": root_run.id,
+                        "session_id": task_id,
+                        "specialist_id": request.specialist_id,
+                    }),
+                );
+            }
+        }
+
+        Ok(ToolResult::new("task", serde_json::to_string(&output)?))
     }
 }
