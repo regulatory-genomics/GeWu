@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{SpecialistExecutionRequest, ToolContext, ToolResult};
+use gewu_core::types::{ExecutionRunKind, SpecialistExecutionRequest, ToolContext, ToolResult};
 use gewu_graph::Blackboard;
 use schemars::schema::RootSchema;
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::manifest::workflow_loader::WorkflowManifestLoader;
+use crate::execution_trace::StartTraceRun;
 use crate::workflow::WorkflowCompiler;
 
 // ---------------------------------------------------------------------------
@@ -50,7 +51,7 @@ fn default_source() -> String {
 }
 
 fn default_day_query_limit() -> usize {
-    2000
+    200
 }
 
 #[async_trait]
@@ -60,7 +61,7 @@ impl Tool for MemoryDayQueryTool {
     }
 
     fn description(&self) -> &str {
-        "Build a memory_sql_query request for one local-date/source/timezone/workspace."
+        "Build a compact memory_sql_query request for one local-date/source/timezone/workspace."
     }
 
     fn schema(&self) -> RootSchema {
@@ -72,7 +73,7 @@ impl Tool for MemoryDayQueryTool {
                 "timezone": {"type": "string"},
                 "workspace_root": {"type": "string"},
                 "source": {"type": "string", "default": "opencode"},
-                "limit": {"type": "integer", "default": 2000}
+                "limit": {"type": "integer", "default": 200}
             }
         }))
         .unwrap()
@@ -84,13 +85,16 @@ impl Tool for MemoryDayQueryTool {
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: MemoryDayQueryArgs = serde_json::from_value(args)?;
-        let limit = input.limit.clamp(1, 5000);
+        let limit = input.limit.clamp(1, 500);
         let output = MemoryDayQueryOutput {
-            sql: "SELECT event_id, session_id, event_kind, content, created_at, json_extract(metadata_json, '$.opencode.session_title') AS session_title, json_extract(metadata_json, '$.opencode.directory') AS workspace_root FROM memory_events WHERE json_extract(metadata_json, '$.host') = ? AND json_extract(metadata_json, '$.import.local_date') = ? AND json_extract(metadata_json, '$.import.timezone') = ? AND json_extract(metadata_json, '$.opencode.directory') = ? ORDER BY created_at LIMIT ?".into(),
-            params: vec![input.source, input.date, input.timezone, input.workspace_root, limit.to_string()],
+            sql: "SELECT event_id, session_id, event_kind, substr(content, 1, 1200) AS content, created_at, json_extract(metadata_json, '$.opencode.session_title') AS session_title, json_extract(metadata_json, '$.opencode.directory') AS workspace_root FROM memory_events WHERE json_extract(metadata_json, '$.host') = ? AND json_extract(metadata_json, '$.import.local_date') = ? AND json_extract(metadata_json, '$.import.timezone') = ? AND (? = '' OR json_extract(metadata_json, '$.opencode.directory') = ?) ORDER BY created_at LIMIT ?".into(),
+            params: vec![input.source, input.date, input.timezone, input.workspace_root.clone(), input.workspace_root, limit.to_string()],
             limit,
         };
-        Ok(ToolResult::new("memory_day_query", serde_json::to_string(&output)?))
+        Ok(ToolResult::new(
+            "memory_day_query",
+            serde_json::to_string(&output)?,
+        ))
     }
 }
 
@@ -332,7 +336,25 @@ impl Tool for RunWorkflowTool {
             .build()
             .map_err(|e| format!("Failed to build runtime: {}", e))?;
 
-        let compiler = WorkflowCompiler::new(Arc::new(runtime)).with_workflows(manifests);
+        let runtime = Arc::new(runtime);
+
+        let parent_run_id = _ctx
+            .metadata
+            .get("trace_current_run_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let workflow_run = runtime
+            .start_trace_run(StartTraceRun {
+                parent_id: parent_run_id,
+                session_id: Some(_ctx.session_id.clone()),
+                kind: ExecutionRunKind::Workflow,
+                name: input.workflow_id.clone(),
+                input_json: Some(input.input.clone()),
+            })
+            .await
+            .map_err(|e| format!("Start workflow trace run: {}", e))?;
+
+        let compiler = WorkflowCompiler::new(Arc::clone(&runtime)).with_workflows(manifests);
         let graph = compiler
             .compile(&manifest)
             .map_err(|e| format!("Compile workflow '{}': {}", input.workflow_id, e))?;
@@ -341,13 +363,29 @@ impl Tool for RunWorkflowTool {
         if input.input.is_object() {
             bb.set_path("input", input.input);
         }
-        let out = graph
-            .ainvoke(bb)
-            .await
-            .map_err(|e| format!("Invoke workflow '{}': {}", input.workflow_id, e))?;
+        bb.set_path("_trace.root_run_id", Value::String(workflow_run.id.clone()));
+        bb.set_path("_trace.current_run_id", Value::String(workflow_run.id.clone()));
+        let out = match graph.ainvoke(bb).await {
+            Ok(out) => out,
+            Err(e) => {
+                let message = format!("Invoke workflow '{}': {}", input.workflow_id, e);
+                if let Err(err) = runtime.fail_trace_run(&workflow_run.id, &message).await {
+                    tracing::warn!("failed to fail workflow trace run: {}", err);
+                }
+                return Err(message.into());
+            }
+        };
 
         let output =
             serde_json::to_string_pretty(out.as_value()).unwrap_or_else(|_| "{}".to_string());
+
+        let output_value = out.as_value().clone();
+        if let Err(err) = runtime
+            .finish_trace_run(&workflow_run.id, Some(&output_value))
+            .await
+        {
+            tracing::warn!("failed to finish workflow trace run: {}", err);
+        }
 
         Ok(ToolResult::new("run_workflow", output))
     }

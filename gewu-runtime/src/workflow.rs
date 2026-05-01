@@ -7,7 +7,7 @@
 
 use anyhow::{Result, anyhow};
 use futures::future::join_all;
-use gewu_core::types::{SpecialistExecutionRequest, ToolContext};
+use gewu_core::types::{ExecutionRunKind, SpecialistExecutionRequest, ToolContext};
 use gewu_graph::{Blackboard, CompiledGraph, END, NodeResult, StateGraph};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -17,6 +17,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::manifest::workflow::{EdgeSpec, NodeSpec, SpecialistRef, WorkflowManifest};
+use crate::execution_trace::StartTraceRun;
 use crate::runtime::GeWuRuntime;
 
 use gewu_core::types::SpecialistDescriptor;
@@ -197,6 +198,27 @@ impl WorkflowCompiler {
             let node_id = node_id.clone();
             Box::pin(async move {
                 let input_val = extract_input(&bb, input_path.as_deref());
+                let parent_run_id = bb
+                    .get_path("_trace.current_run_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let root_run_id = bb
+                    .get_path("_trace.root_run_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let node_run = match runtime
+                    .start_trace_run(StartTraceRun {
+                        parent_id: parent_run_id,
+                        session_id: Some(session_id.clone()),
+                        kind: ExecutionRunKind::WorkflowNode,
+                        name: node_id.clone(),
+                        input_json: Some(input_val.clone()),
+                    })
+                    .await
+                {
+                    Ok(run) => run,
+                    Err(e) => return error_partial(&write_path, e.to_string()),
+                };
                 let prompt_text =
                     build_prompt(prompt_template.as_deref(), tool_hint.as_deref(), &input_val);
 
@@ -208,29 +230,61 @@ impl WorkflowCompiler {
                         Ok(t) => t,
                         Err(e) => return error_partial(&write_path, e.to_string()),
                     };
+                    let mut metadata = match input_val.clone() {
+                        Value::Object(map) => Value::Object(map),
+                        other => serde_json::json!({ "input": other }),
+                    };
+                    attach_trace_metadata(&mut metadata, root_run_id.as_deref(), &node_run.id);
                     let result = runtime
-                        .execute_inline_specialist(&effective_desc, &prompt_text, &session, tools, input_val)
+                        .execute_inline_specialist(
+                            &effective_desc,
+                            &prompt_text,
+                            &session,
+                            tools,
+                            metadata,
+                        )
                         .await;
                     return match result {
-                        Ok(output) => to_partial(&write_path, Ok(output)),
-                        Err(e) => error_partial(&write_path, e.to_string()),
+                        Ok(output) => {
+                            let _ = runtime.finish_trace_run(&node_run.id, Some(&output)).await;
+                            to_partial(&write_path, Ok(output))
+                        }
+                        Err(e) => {
+                            let message = e.to_string();
+                            let _ = runtime.fail_trace_run(&node_run.id, &message).await;
+                            error_partial(&write_path, message)
+                        }
                     };
                 }
 
                 let task_id = format!("{}:{}", node_id, Uuid::new_v4());
+                let mut metadata = match input_val {
+                    Value::Object(map) => Value::Object(map),
+                    other => serde_json::json!({ "input": other }),
+                };
+                attach_trace_metadata(&mut metadata, root_run_id.as_deref(), &node_run.id);
                 let req = SpecialistExecutionRequest {
                     task_id,
                     specialist_id: specialist_id.clone(),
                     session_id: format!("{}:{}", session_id, node_id),
                     prompt: prompt_text,
-                    metadata_json: input_val,
+                    metadata_json: metadata,
                 };
                 let result = runtime
                     .execute_request(&req, Vec::new())
                     .await
                     .map(|e| e.output_json.unwrap_or(Value::Null))
                     .map_err(|e| e.to_string());
-                to_partial(&write_path, result)
+                match result {
+                    Ok(output) => {
+                        let _ = runtime.finish_trace_run(&node_run.id, Some(&output)).await;
+                        to_partial(&write_path, Ok(output))
+                    }
+                    Err(message) => {
+                        let _ = runtime.fail_trace_run(&node_run.id, &message).await;
+                        error_partial(&write_path, message)
+                    }
+                }
             })
         }))
     }
@@ -261,6 +315,27 @@ impl WorkflowCompiler {
             let node_id = node_id.clone();
             Box::pin(async move {
                 let input_val = extract_input(&bb, input_path.as_deref());
+                let parent_run_id = bb
+                    .get_path("_trace.current_run_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let root_run_id = bb
+                    .get_path("_trace.root_run_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let node_run = match runtime
+                    .start_trace_run(StartTraceRun {
+                        parent_id: parent_run_id,
+                        session_id: Some(session_id.clone()),
+                        kind: ExecutionRunKind::WorkflowNode,
+                        name: node_id.clone(),
+                        input_json: Some(input_val.clone()),
+                    })
+                    .await
+                {
+                    Ok(run) => run,
+                    Err(e) => return error_partial(&write_path, e.to_string()),
+                };
                 let tool = match runtime.resolve_capabilities(&[cap.clone()]) {
                     Ok(mut ts) => match ts.pop() {
                         Some(t) => t,
@@ -273,14 +348,23 @@ impl WorkflowCompiler {
                     },
                     Err(e) => return error_partial(&write_path, e.to_string()),
                 };
-                let ctx = ToolContext::new(session_id.clone(), node_id.clone());
+                let mut ctx = ToolContext::new(session_id.clone(), node_id.clone());
+                if let Some(root_run_id) = root_run_id {
+                    ctx.metadata.insert("trace_root_run_id".to_string(), Value::String(root_run_id));
+                }
+                ctx.metadata.insert("trace_current_run_id".to_string(), Value::String(node_run.id.clone()));
                 match tool.execute(input_val, &ctx).await {
                     Ok(tr) => {
                         let value = serde_json::from_str::<Value>(&tr.output)
                             .unwrap_or(Value::String(tr.output));
+                        let _ = runtime.finish_trace_run(&node_run.id, Some(&value)).await;
                         to_partial(&write_path, Ok(value))
                     }
-                    Err(e) => error_partial(&write_path, e.to_string()),
+                    Err(e) => {
+                        let message = e.to_string();
+                        let _ = runtime.fail_trace_run(&node_run.id, &message).await;
+                        error_partial(&write_path, message)
+                    }
                 }
             })
         }))
@@ -390,6 +474,24 @@ fn error_partial(write_path: &str, msg: String) -> Blackboard {
     let key = write_path.replace('.', "_");
     bb.set_path(&format!("_errors.{}", key), Value::String(msg));
     bb
+}
+
+fn attach_trace_metadata(metadata: &mut Value, root_run_id: Option<&str>, current_run_id: &str) {
+    if !metadata.is_object() {
+        let previous = std::mem::take(metadata);
+        *metadata = serde_json::json!({ "input": previous });
+    }
+    let map = metadata.as_object_mut().expect("metadata must be object");
+    if let Some(root_run_id) = root_run_id {
+        map.insert(
+            "trace_root_run_id".to_string(),
+            Value::String(root_run_id.to_string()),
+        );
+    }
+    map.insert(
+        "trace_current_run_id".to_string(),
+        Value::String(current_run_id.to_string()),
+    );
 }
 
 fn build_prompt(template: Option<&str>, tool_hint: Option<&str>, input: &Value) -> String {
