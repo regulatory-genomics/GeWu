@@ -4,8 +4,8 @@ use futures::{StreamExt, stream::BoxStream};
 use gewu_core::Agent;
 use gewu_core::traits::{AssemblyContext, LlmProvider, Plugin, Tool, ToolFactory, ToolRegistry};
 use gewu_core::types::{
-    AgentEvent, SpecialistAgentEventRecord, SpecialistDescriptor, SpecialistExecutionEnvelope,
-    SpecialistExecutionRequest, SpecialistLlmIoRecord, TaskStatus, ToolContext,
+    AgentEvent, ExecutionRunKind, SpecialistAgentEventRecord, SpecialistDescriptor,
+    SpecialistExecutionEnvelope, SpecialistExecutionRequest, SpecialistLlmIoRecord, TaskStatus, ToolContext,
     ToolExecutionRecord, ToolResult,
 };
 use gewu_storage::{SqliteMemory, TaskStore};
@@ -21,6 +21,7 @@ use crate::capability::{CapabilityRegistry, ToolFactoryProvider};
 use crate::command_tool_registry::CommandToolRegistry;
 use crate::composer::{ComposerContext, ComposerToolFactory, composer_specialist_descriptor};
 use crate::hooks::{HookRegistry, HttpHookProvider};
+use crate::execution_trace::{StartTraceRun, TraceContext, TraceSink, trace_sink_from_pool};
 use crate::manifest::runtime_plugin_loader::RuntimePluginManifestLoader;
 use crate::manifest::schema::RuntimeHookEvent;
 use crate::registry::{AgentConfig, BuiltinToolFactory};
@@ -40,6 +41,7 @@ pub struct GeWuRuntime {
     runtime_plugin_dirs: Vec<PathBuf>,
     skill_dirs: Vec<PathBuf>,
     workflow_dirs: Vec<PathBuf>,
+    trace_sink: Arc<dyn TraceSink>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,15 +93,46 @@ impl GeWuRuntime {
         &self.sop_registry
     }
 
-    pub(crate) fn descriptor_with_skills(&self, descriptor: &SpecialistDescriptor) -> SpecialistDescriptor {
+    pub(crate) async fn start_trace_run(&self, input: StartTraceRun) -> Result<gewu_core::types::ExecutionRun> {
+        self.trace_sink.start_run(input).await
+    }
+
+    pub(crate) async fn finish_trace_run(
+        &self,
+        run_id: &str,
+        output_json: Option<&Value>,
+    ) -> Result<gewu_core::types::ExecutionRun> {
+        self.trace_sink.finish_run(run_id, output_json).await
+    }
+
+    pub(crate) async fn fail_trace_run(
+        &self,
+        run_id: &str,
+        error: &str,
+    ) -> Result<gewu_core::types::ExecutionRun> {
+        self.trace_sink.fail_run(run_id, error).await
+    }
+
+    pub(crate) fn descriptor_with_skills(
+        &self,
+        descriptor: &SpecialistDescriptor,
+    ) -> SpecialistDescriptor {
         let mut descriptor = descriptor.clone();
         for skill_id in &descriptor.skills {
             let Some(skill) = self.skill_registry.get(skill_id) else {
-                tracing::warn!("Specialist '{}' references unknown skill '{}'", descriptor.id, skill_id);
+                tracing::warn!(
+                    "Specialist '{}' references unknown skill '{}'",
+                    descriptor.id,
+                    skill_id
+                );
                 continue;
             };
             for capability in &skill.capabilities {
-                if !descriptor.capabilities.iter().any(|existing| existing == capability) {
+                if !descriptor
+                    .capabilities
+                    .iter()
+                    .any(|existing| existing == capability)
+                {
                     descriptor.capabilities.push(capability.clone());
                 }
             }
@@ -107,7 +140,11 @@ impl GeWuRuntime {
         descriptor
     }
 
-    fn append_skill_prompt(&self, descriptor: &SpecialistDescriptor, system_prompt: String) -> String {
+    fn append_skill_prompt(
+        &self,
+        descriptor: &SpecialistDescriptor,
+        system_prompt: String,
+    ) -> String {
         if descriptor.skills.is_empty() || self.skill_registry.is_empty() {
             return system_prompt;
         }
@@ -136,9 +173,16 @@ impl GeWuRuntime {
         )
     }
 
-    fn append_sop_prompt(&self, descriptor: &SpecialistDescriptor, system_prompt: String) -> String {
+    fn append_sop_prompt(
+        &self,
+        descriptor: &SpecialistDescriptor,
+        system_prompt: String,
+    ) -> String {
         if self.sop_registry.is_empty()
-            || !descriptor.capabilities.iter().any(|cap| cap == "run_workflow")
+            || !descriptor
+                .capabilities
+                .iter()
+                .any(|cap| cap == "run_workflow")
         {
             return system_prompt;
         }
@@ -168,7 +212,11 @@ impl GeWuRuntime {
         )
     }
 
-    fn apply_prompt_packs(&self, descriptor: &SpecialistDescriptor, system_prompt: String) -> String {
+    fn apply_prompt_packs(
+        &self,
+        descriptor: &SpecialistDescriptor,
+        system_prompt: String,
+    ) -> String {
         let with_skills = self.append_skill_prompt(descriptor, system_prompt);
         self.append_sop_prompt(descriptor, with_skills)
     }
@@ -339,6 +387,7 @@ impl GeWuRuntime {
             .with_tools(all_tools)
             .memory(Box::new(memory))
             .system_prompt(&system_prompt)
+            .session_id(session_id.to_string())
             .build()?;
 
         let mut stream = Box::pin(agent.ask(prompt));
@@ -440,6 +489,7 @@ impl GeWuRuntime {
             .with_tools(all_tools)
             .memory(Box::new(memory))
             .system_prompt(&system_prompt)
+            .session_id(session_id.clone())
             .build()?;
 
         Ok((agent, registry))
@@ -517,11 +567,40 @@ impl GeWuRuntime {
             )
             .await?;
 
+        let specialist_run = self.trace_sink.start_run(StartTraceRun {
+            parent_id: request
+                .metadata_json
+                .get("trace_current_run_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            session_id: Some(request.session_id.clone()),
+            kind: ExecutionRunKind::Specialist,
+            name: request.specialist_id.clone(),
+            input_json: Some(serde_json::json!({
+                "task_id": request.task_id,
+                "specialist_id": request.specialist_id,
+                "prompt": request.prompt,
+                "metadata": request.metadata_json,
+            })),
+        }).await?;
+        let trace_context = TraceContext {
+            root_run_id: request
+                .metadata_json
+                .get("trace_root_run_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .or_else(|| Some(specialist_run.id.clone())),
+            current_run_id: Some(specialist_run.id.clone()),
+            session_id: request.session_id.clone(),
+        };
+
         let mut agent = Agent::builder()
             .llm(self.provider.clone())
             .with_tools(all_tools)
             .memory(Box::new(memory))
             .system_prompt(&system_prompt)
+            .session_id(request.session_id.clone())
+            .tool_context_metadata(trace_context.to_metadata_map())
             .build()?;
 
         store
@@ -674,6 +753,34 @@ impl GeWuRuntime {
             store.set_result_json(&request.task_id, &stored).await?;
         }
 
+        if let Some(error) = &final_error {
+            if let Err(err) = self.trace_sink.fail_run(&specialist_run.id, error).await {
+                tracing::warn!("failed to mark specialist trace run failed: {}", err);
+            }
+        } else if final_status == TaskStatus::Blocked {
+            if let Err(err) = self
+                .trace_sink
+                .fail_run(
+                    &specialist_run.id,
+                    block_reason.as_deref().unwrap_or("specialist blocked"),
+                )
+                .await
+            {
+                tracing::warn!("failed to mark specialist trace run blocked: {}", err);
+            }
+        } else {
+            let trace_output = output_json
+                .clone()
+                .unwrap_or_else(|| Value::String(result_text.clone()));
+            if let Err(err) = self
+                .trace_sink
+                .finish_run(&specialist_run.id, Some(&trace_output))
+                .await
+            {
+                tracing::warn!("failed to finish specialist trace run: {}", err);
+            }
+        }
+
         let attempt = store
             .get_task(&request.task_id)
             .await?
@@ -742,15 +849,13 @@ impl GeWuRuntime {
         session_id: String,
         metadata_json: Value,
     ) -> Vec<Arc<dyn Tool>> {
-        if self.hook_registry.is_empty() {
-            return tools;
-        }
         tools
             .into_iter()
             .map(|tool| {
                 Arc::new(HookedTool {
                     inner: tool,
                     hook_registry: self.hook_registry.clone(),
+                    trace_sink: self.trace_sink.clone(),
                     specialist_id: specialist_id.clone(),
                     session_id: session_id.clone(),
                     metadata_json: metadata_json.clone(),
@@ -868,6 +973,7 @@ impl GeWuRuntime {
 struct HookedTool {
     inner: Arc<dyn Tool>,
     hook_registry: Arc<HookRegistry>,
+    trace_sink: Arc<dyn TraceSink>,
     specialist_id: String,
     session_id: String,
     metadata_json: Value,
@@ -892,19 +998,44 @@ impl Tool for HookedTool {
         args: Value,
         ctx: &ToolContext,
     ) -> std::result::Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
-        let before_payload = self.tool_hook_payload(
-            RuntimeHookEvent::ToolExecuteBefore,
-            "tool_call",
-            args.to_string(),
-            serde_json::json!({ "args": args.clone() }),
-            ctx,
-        );
-        if let Err(err) = self
-            .hook_registry
-            .call_event(RuntimeHookEvent::ToolExecuteBefore, before_payload)
+        let parent_id = ctx
+            .metadata
+            .get("trace_current_run_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let run = match self
+            .trace_sink
+            .start_run(StartTraceRun {
+                parent_id,
+                session_id: Some(ctx.session_id.clone()),
+                kind: ExecutionRunKind::Tool,
+                name: self.inner.name().to_string(),
+                input_json: Some(args.clone()),
+            })
             .await
         {
-            tracing::warn!("tool.execute.before hook failed: {}", err);
+            Ok(run) => Some(run),
+            Err(err) => {
+                tracing::warn!("failed to start tool trace run: {}", err);
+                None
+            }
+        };
+
+        if !self.hook_registry.is_empty() {
+            let before_payload = self.tool_hook_payload(
+                RuntimeHookEvent::ToolExecuteBefore,
+                "tool_call",
+                args.to_string(),
+                serde_json::json!({ "args": args.clone() }),
+                ctx,
+            );
+            if let Err(err) = self
+                .hook_registry
+                .call_event(RuntimeHookEvent::ToolExecuteBefore, before_payload)
+                .await
+            {
+                tracing::warn!("tool.execute.before hook failed: {}", err);
+            }
         }
 
         let result = self.inner.execute(args.clone(), ctx).await;
@@ -919,19 +1050,39 @@ impl Tool for HookedTool {
                 serde_json::json!({ "args": args, "status": "error" }),
             ),
         };
-        let after_payload = self.tool_hook_payload(
-            RuntimeHookEvent::ToolExecuteAfter,
-            "tool_result",
-            content,
-            metadata,
-            ctx,
-        );
-        if let Err(err) = self
-            .hook_registry
-            .call_event(RuntimeHookEvent::ToolExecuteAfter, after_payload)
-            .await
-        {
-            tracing::warn!("tool.execute.after hook failed: {}", err);
+        if let Some(run) = &run {
+            let finish = match &result {
+                Ok(output) => self
+                    .trace_sink
+                    .finish_run(&run.id, Some(&serde_json::json!({
+                        "title": output.title,
+                        "output": output.output,
+                        "truncated": output.truncated,
+                        "output_path": output.output_path.as_ref().map(|p| p.display().to_string()),
+                    })))
+                    .await,
+                Err(err) => self.trace_sink.fail_run(&run.id, &err.to_string()).await,
+            };
+            if let Err(err) = finish {
+                tracing::warn!("failed to finish tool trace run: {}", err);
+            }
+        }
+
+        if !self.hook_registry.is_empty() {
+            let after_payload = self.tool_hook_payload(
+                RuntimeHookEvent::ToolExecuteAfter,
+                "tool_result",
+                content,
+                metadata,
+                ctx,
+            );
+            if let Err(err) = self
+                .hook_registry
+                .call_event(RuntimeHookEvent::ToolExecuteAfter, after_payload)
+                .await
+            {
+                tracing::warn!("tool.execute.after hook failed: {}", err);
+            }
         }
 
         result
@@ -1323,6 +1474,8 @@ impl GeWuRuntimeBuilder {
         )));
         specialists.push(composer_desc);
 
+        let trace_sink = trace_sink_from_pool(pool.clone());
+
         Ok(GeWuRuntime {
             factories,
             capability_registry: Arc::new(registry),
@@ -1335,6 +1488,7 @@ impl GeWuRuntimeBuilder {
             runtime_plugin_dirs: self.runtime_plugin_dirs,
             skill_dirs: self.skill_dirs,
             workflow_dirs: self.workflow_dirs,
+            trace_sink,
         })
     }
 }

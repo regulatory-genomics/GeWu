@@ -3,6 +3,7 @@ pub mod command_tool;
 pub mod command_tool_registry;
 pub mod composer;
 pub mod factory;
+pub mod execution_trace;
 pub mod hooks;
 pub mod manifest;
 pub mod plugin_host;
@@ -25,6 +26,7 @@ pub use composer::{
     WriteSpecialistTool, composer_specialist_descriptor,
 };
 pub use factory::RuntimeFactory;
+pub use execution_trace::{NoopTraceSink, SqliteTraceSink, StartTraceRun, TraceContext, TraceSink};
 pub use hooks::{HookRegistry, HttpHookProvider};
 pub use manifest::loader::SpecialistManifestLoader;
 pub use manifest::runtime_plugin_loader::RuntimePluginManifestLoader;

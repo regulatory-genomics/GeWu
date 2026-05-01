@@ -39,8 +39,8 @@
 
 use crate::compaction::{self, estimate_message_tokens, is_overflow};
 use crate::compaction::{
-    build_consolidation_text, build_consolidation_prompt, save_consolidation_file,
-    apply_consolidation_to_memory, ConsolidationInput,
+    ConsolidationInput, apply_consolidation_to_memory, build_consolidation_prompt,
+    build_consolidation_text, save_consolidation_file,
 };
 use crate::middleware::TruncationService;
 use crate::traits::{LlmProvider, Memory, Tool, ToolRegistry};
@@ -55,7 +55,7 @@ use serde::Deserialize;
 use std::any::Any;
 use std::collections::VecDeque;
 use std::error::Error;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
 use tracing::{debug, info, warn};
@@ -97,6 +97,7 @@ pub struct Agent {
     pub context_limit: usize,
     truncation: TruncationService,
     session_id: String,
+    tool_context_metadata: serde_json::Map<String, serde_json::Value>,
 }
 
 pub struct AgentBuilder {
@@ -106,6 +107,8 @@ pub struct AgentBuilder {
     max_turns: Option<usize>,
     memory: Option<Box<dyn Memory>>,
     context_limit: usize,
+    session_id: Option<String>,
+    tool_context_metadata: serde_json::Map<String, serde_json::Value>,
 }
 
 fn extract_panic_message(panic_payload: Box<dyn Any + Send>) -> String {
@@ -132,7 +135,8 @@ async fn execute_tool_with_panic_recovery(
             let rt = tokio::runtime::Handle::current();
             rt.block_on(tool.execute(args, &ctx))
         }))
-    }).await;
+    })
+    .await;
 
     match result {
         Ok(Ok(res)) => res,
@@ -163,12 +167,13 @@ async fn execute_tool_with_panic_recovery(
                             ),
                         )) as Box<dyn Error + Send + Sync>)
                     }
-                    Err(_) => {
-                        Err(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Tool '{}' panicked but could not retrieve panic payload", tool_name),
-                        )) as Box<dyn Error + Send + Sync>)
-                    }
+                    Err(_) => Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "Tool '{}' panicked but could not retrieve panic payload",
+                            tool_name
+                        ),
+                    )) as Box<dyn Error + Send + Sync>),
                 }
             } else {
                 Err(Box::new(std::io::Error::new(
@@ -189,6 +194,8 @@ impl Default for AgentBuilder {
             max_turns: None,
             memory: None,
             context_limit: 128_000,
+            session_id: None,
+            tool_context_metadata: Default::default(),
         }
     }
 }
@@ -331,7 +338,8 @@ impl Agent {
 
                     yield AgentEvent::ToolStart { tool: tool_name.clone(), input: args.clone() };
 
-                    let ctx = ToolContext::new(&self.session_id, &message_id);
+                    let mut ctx = ToolContext::new(&self.session_id, &message_id);
+                    ctx.metadata.extend(self.tool_context_metadata.clone());
                     message_id = Uuid::new_v4().to_string();
 
                     let tool = self.tools.iter().find(|t| t.name() == tool_name);
@@ -577,7 +585,7 @@ impl ToolRegistry for Agent {
         name: &str,
         args: serde_json::Value,
         ctx: &ToolContext,
-) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let tool = self.tools.iter().find(|t| t.name() == name);
         match tool {
             Some(t) => t.execute(args, ctx).await,
@@ -616,6 +624,19 @@ impl AgentBuilder {
         self
     }
 
+    pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn tool_context_metadata(
+        mut self,
+        metadata: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        self.tool_context_metadata = metadata;
+        self
+    }
+
     pub fn memory(mut self, memory: Box<dyn Memory>) -> Self {
         self.memory = Some(memory);
         self
@@ -631,7 +652,8 @@ impl AgentBuilder {
             memory: self.memory.unwrap_or_else(|| Box::new(Vec::new())),
             context_limit: self.context_limit,
             truncation: TruncationService::new(),
-            session_id: Uuid::new_v4().to_string(),
+            session_id: self.session_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+            tool_context_metadata: self.tool_context_metadata,
         };
         Ok(agent)
     }
