@@ -7,8 +7,72 @@ on_error: continue
 
 tools:
   - name: memory_search
-    description: Search prior raw conversation memory.
+    description: Search curated memory summaries by default; set include_raw for raw audit/deep recall.
     endpoint: /v1/memory/search
+    method: POST
+    input_schema:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+        project_id:
+          type: string
+        include_raw:
+          type: boolean
+        layers:
+          type: array
+          items:
+            type: string
+        limit:
+          type: number
+
+  - name: memory_sql_query
+    description: Run a safe read-only SQL query against the GeWu memory database.
+    endpoint: /v1/sql/query
+    method: POST
+    input_schema:
+      type: object
+      required: [sql]
+      properties:
+        sql:
+          type: string
+        params:
+          type: array
+          items: {}
+        limit:
+          type: number
+        timeout_ms:
+          type: number
+
+  - name: memory_summary_write
+    description: Persist a summary with raw-event provenance.
+    endpoint: /v1/summaries/write
+    method: POST
+    input_schema:
+      type: object
+      required: [summary_kind, title, content]
+      properties:
+        summary_kind:
+          type: string
+        title:
+          type: string
+        content:
+          type: string
+        derived_from:
+          type: array
+          items:
+            type: string
+        metadata:
+          type: object
+        idempotency_key:
+          type: string
+        mode:
+          type: string
+
+  - name: summary_search
+    description: Search curated memory summaries derived from raw events.
+    endpoint: /v1/summaries/search
     method: POST
     input_schema:
       type: object

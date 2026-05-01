@@ -1,0 +1,6 @@
+{
+  "specialistDirs": ["./examples/specialists"],
+  "runtimePluginDirs": ["./examples/runtime-plugins-e2e"],
+  "workflowDirs": ["./examples/workflows"],
+  "skillDirs": ["./.gewu/skills"]
+}
