@@ -5,8 +5,8 @@ use gewu_core::Agent;
 use gewu_core::traits::{AssemblyContext, LlmProvider, Plugin, Tool, ToolFactory, ToolRegistry};
 use gewu_core::types::{
     AgentEvent, ExecutionRunKind, SpecialistAgentEventRecord, SpecialistDescriptor,
-    SpecialistExecutionEnvelope, SpecialistExecutionRequest, SpecialistLlmIoRecord, TaskStatus, ToolContext,
-    ToolExecutionRecord, ToolResult,
+    SpecialistExecutionEnvelope, SpecialistExecutionRequest, SpecialistLlmIoRecord, TaskStatus,
+    ToolContext, ToolExecutionRecord, ToolResult,
 };
 use gewu_storage::{SqliteMemory, TaskStore};
 use gewu_tools::{BatchTool, report_result::ReportResultArgs};
@@ -20,8 +20,8 @@ use std::sync::Arc;
 use crate::capability::{CapabilityRegistry, ToolFactoryProvider};
 use crate::command_tool_registry::CommandToolRegistry;
 use crate::composer::{ComposerContext, ComposerToolFactory, composer_specialist_descriptor};
-use crate::hooks::{HookRegistry, HttpHookProvider};
 use crate::execution_trace::{StartTraceRun, TraceContext, TraceSink, trace_sink_from_pool};
+use crate::hooks::{HookRegistry, HttpHookProvider};
 use crate::manifest::runtime_plugin_loader::RuntimePluginManifestLoader;
 use crate::manifest::schema::RuntimeHookEvent;
 use crate::registry::{AgentConfig, BuiltinToolFactory};
@@ -79,6 +79,10 @@ impl GeWuRuntime {
             .collect()
     }
 
+    pub fn list_specialist_descriptors(&self) -> Vec<SpecialistDescriptor> {
+        self.specialists.clone()
+    }
+
     /// Access the runtime's capability registry. Used by manifest-driven paths
     /// and for diagnostics (e.g. `gewu list capabilities`).
     pub fn capability_registry(&self) -> &CapabilityRegistry {
@@ -93,7 +97,10 @@ impl GeWuRuntime {
         &self.sop_registry
     }
 
-    pub(crate) async fn start_trace_run(&self, input: StartTraceRun) -> Result<gewu_core::types::ExecutionRun> {
+    pub(crate) async fn start_trace_run(
+        &self,
+        input: StartTraceRun,
+    ) -> Result<gewu_core::types::ExecutionRun> {
         self.trace_sink.start_run(input).await
     }
 
@@ -217,7 +224,8 @@ impl GeWuRuntime {
         descriptor: &SpecialistDescriptor,
         system_prompt: String,
     ) -> String {
-        let with_skills = self.append_skill_prompt(descriptor, system_prompt);
+        let with_runtime_context = append_runtime_context(system_prompt);
+        let with_skills = self.append_skill_prompt(descriptor, with_runtime_context);
         self.append_sop_prompt(descriptor, with_skills)
     }
 
