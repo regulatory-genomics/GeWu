@@ -5,6 +5,7 @@ members = ["gewu-cli",
     "gewu-tools",
     "gewu-runtime",
     "gewu-web",
+    "gewu-gateway",
     "gewu-graph",
     "gewu-rag",
 ]
