@@ -488,6 +488,67 @@
             line-height: 1.4;
         }
 
+        .run-tree {
+            margin: 12px 0;
+            padding: 10px 12px;
+            background: #1f6feb10;
+            border: 1px solid #1f6feb30;
+            border-radius: var(--radius-md);
+            font-size: 12px;
+        }
+
+        .run-tree-title {
+            font-weight: 700;
+            color: var(--accent-blue);
+            margin-bottom: 8px;
+        }
+
+        .run-node {
+            margin: 4px 0 4px 14px;
+            border-left: 1px solid var(--border-color);
+            padding-left: 8px;
+        }
+
+        .run-node summary {
+            cursor: pointer;
+            list-style: none;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .run-node summary::-webkit-details-marker { display: none; }
+
+        .run-kind {
+            color: var(--text-muted);
+            font-size: 10px;
+            text-transform: uppercase;
+        }
+
+        .run-status {
+            margin-left: auto;
+            font-size: 9px;
+            padding: 2px 6px;
+            border-radius: 8px;
+            color: white;
+        }
+
+        .run-status.running { background: var(--accent-orange); }
+        .run-status.succeeded { background: var(--accent-green); }
+        .run-status.failed { background: var(--accent-red); }
+        .run-status.cancelled, .run-status.skipped { background: var(--text-muted); }
+
+        .run-json {
+            margin-top: 6px;
+            max-height: 180px;
+            overflow: auto;
+            background: var(--bg-primary);
+            border-radius: var(--radius-sm);
+            padding: 8px;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
         /* Input Area */
         #input-area {
             grid-area: input;
@@ -914,6 +975,8 @@
                 addMessage('assistant', 'Session ready. How can I help you?');
             }
 
+            await loadRunTree(session.id);
+
             renderSessions();
             setStatus('Ready');
         }
@@ -946,6 +1009,64 @@
             div.innerHTML = `<div class="role">${msg.role}</div><div class="content">${content}</div>`;
             chatContainer.appendChild(div);
             chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        async function loadRunTree(sessionId) {
+            if (!sessionId) return;
+            try {
+                const resp = await fetch(`/api/runs?session_id=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(token)}`);
+                if (!resp.ok) return;
+                const data = await resp.json();
+                const runs = data.runs || [];
+                if (!runs.length) return;
+                const tree = document.createElement('div');
+                tree.className = 'run-tree';
+                tree.innerHTML = '<div class="run-tree-title">Execution Trace</div>';
+                for (const run of runs) {
+                    tree.appendChild(await renderRunNode(run));
+                }
+                chatContainer.appendChild(tree);
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+            } catch (e) {
+                console.warn('Failed to load run tree', e);
+            }
+        }
+
+        async function renderRunNode(run) {
+            const node = document.createElement('details');
+            node.className = 'run-node';
+            node.open = run.status === 'failed' || run.kind === 'workflow';
+            node.innerHTML = `
+                <summary>
+                    <span class="run-kind">${escapeHtml(run.kind)}</span>
+                    <span>${escapeHtml(run.name)}</span>
+                    <span class="run-status ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span>
+                </summary>
+                <div class="run-json">${escapeHtml(runDetails(run))}</div>
+            `;
+            try {
+                const childResp = await fetch(`/api/runs/${encodeURIComponent(run.id)}/children?token=${encodeURIComponent(token)}`);
+                if (childResp.ok) {
+                    const data = await childResp.json();
+                    for (const child of data.children || []) {
+                        node.appendChild(await renderRunNode(child));
+                    }
+                }
+            } catch (e) {}
+            return node;
+        }
+
+        function runDetails(run) {
+            return JSON.stringify({
+                id: run.id,
+                parent_id: run.parent_id,
+                session_id: run.session_id,
+                input_json: run.input_json,
+                output_json: run.output_json,
+                error: run.error,
+                started_at: run.started_at,
+                finished_at: run.finished_at
+            }, null, 2);
         }
 
         async function deleteSession(sessionId) {
@@ -1203,6 +1324,7 @@
             } finally {
                 isLoading = false;
                 sendBtn.disabled = false;
+                await loadRunTree(state.currentSession.id);
                 setStatus('Ready');
             }
         }

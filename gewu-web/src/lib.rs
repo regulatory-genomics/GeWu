@@ -99,6 +99,7 @@ where
         db_path,
         plugins: loaded_config.config.plugins,
         runtime_plugin_dirs: loaded_config.config.runtime_plugin_dirs,
+        skill_dirs: loaded_config.config.skill_dirs,
     };
 
     let mcp_tools = mcp_loader::load_mcp_tools(mcp_servers).await?;
@@ -122,6 +123,16 @@ where
         .route("/api/info", get(routes::sessions::handle_server_info))
         .route("/api/agents", get(routes::sessions::handle_list_agents))
         .route("/api/chat", post(routes::chat::handle_chat))
+        .route("/api/runs", get(routes::runs::handle_list_runs))
+        .route("/api/runs/{id}", get(routes::runs::handle_get_run))
+        .route(
+            "/api/runs/{id}/children",
+            get(routes::runs::handle_get_run_children),
+        )
+        .route(
+            "/api/runs/{id}/events",
+            get(routes::runs::handle_get_run_events),
+        )
         .route("/api/sessions", get(routes::sessions::handle_list_sessions))
         .route(
             "/api/sessions",
