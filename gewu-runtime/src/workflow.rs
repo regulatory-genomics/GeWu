@@ -226,9 +226,35 @@ impl WorkflowCompiler {
                 if let Some(desc) = &inline_desc {
                     let session = format!("{}:{}", session_id, node_id);
                     let effective_desc = runtime.descriptor_with_skills(desc);
+                    let specialist_run = match runtime
+                        .start_trace_run(StartTraceRun {
+                            parent_id: Some(node_run.id.clone()),
+                            session_id: Some(session.clone()),
+                            kind: ExecutionRunKind::Specialist,
+                            name: effective_desc.id.clone(),
+                            input_json: Some(serde_json::json!({
+                                "specialist_id": effective_desc.id,
+                                "prompt": prompt_text,
+                                "input": input_val,
+                            })),
+                        })
+                        .await
+                    {
+                        Ok(run) => run,
+                        Err(e) => {
+                            let message = e.to_string();
+                            let _ = runtime.fail_trace_run(&node_run.id, &message).await;
+                            return error_partial(&write_path, message);
+                        }
+                    };
                     let tools = match runtime.resolve_capabilities(&effective_desc.capabilities) {
                         Ok(t) => t,
-                        Err(e) => return error_partial(&write_path, e.to_string()),
+                        Err(e) => {
+                            let message = e.to_string();
+                            let _ = runtime.fail_trace_run(&specialist_run.id, &message).await;
+                            let _ = runtime.fail_trace_run(&node_run.id, &message).await;
+                            return error_partial(&write_path, message);
+                        }
                     };
                     let mut metadata = match input_val.clone() {
                         Value::Object(map) => Value::Object(map),
@@ -246,11 +272,13 @@ impl WorkflowCompiler {
                         .await;
                     return match result {
                         Ok(output) => {
+                            let _ = runtime.finish_trace_run(&specialist_run.id, Some(&output)).await;
                             let _ = runtime.finish_trace_run(&node_run.id, Some(&output)).await;
                             to_partial(&write_path, Ok(output))
                         }
                         Err(e) => {
                             let message = e.to_string();
+                            let _ = runtime.fail_trace_run(&specialist_run.id, &message).await;
                             let _ = runtime.fail_trace_run(&node_run.id, &message).await;
                             error_partial(&write_path, message)
                         }
