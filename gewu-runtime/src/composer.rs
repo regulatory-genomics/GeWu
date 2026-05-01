@@ -18,9 +18,7 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use gewu_core::traits::{AssemblyContext, Tool, ToolFactory};
-use gewu_core::types::{
-    CapabilityDescriptor, SpecialistDescriptor, ToolContext, ToolResult,
-};
+use gewu_core::types::{CapabilityDescriptor, SpecialistDescriptor, ToolContext, ToolResult};
 use schemars::schema::RootSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -227,8 +225,8 @@ impl Tool for WriteWorkflowTool {
         args: Value,
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
-        let args: WriteArgs = serde_json::from_value(args)
-            .map_err(|e| format!("invalid args: {}", e))?;
+        let args: WriteArgs =
+            serde_json::from_value(args).map_err(|e| format!("invalid args: {}", e))?;
 
         let result = do_write(&self.ctx, args).await;
         match result {
@@ -256,7 +254,9 @@ async fn do_write(ctx: &ComposerContext, args: WriteArgs) -> Result<Value> {
     } else if let Some(obj) = args.manifest_json {
         serde_json::from_value(obj).map_err(|e| anyhow!("parse manifest_json: {}", e))?
     } else {
-        return Err(anyhow!("must provide either `manifest_yaml` or `manifest_json`"));
+        return Err(anyhow!(
+            "must provide either `manifest_yaml` or `manifest_json`"
+        ));
     };
 
     if manifest.id != args.id {
@@ -357,8 +357,8 @@ impl Tool for RegisterToolTool {
         args: Value,
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
-        let a: RegisterToolArgs = serde_json::from_value(args)
-            .map_err(|e| format!("invalid args: {}", e))?;
+        let a: RegisterToolArgs =
+            serde_json::from_value(args).map_err(|e| format!("invalid args: {}", e))?;
 
         let def = CommandToolDef {
             name: a.name.clone(),
@@ -459,12 +459,15 @@ impl Tool for WriteSpecialistTool {
         args: Value,
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
-        let a: WriteSpecialistArgs = serde_json::from_value(args)
-            .map_err(|e| format!("invalid args: {}", e))?;
+        let a: WriteSpecialistArgs =
+            serde_json::from_value(args).map_err(|e| format!("invalid args: {}", e))?;
 
         if a.id.is_empty() {
-            return Ok(ToolResult::new("write_specialist",
-                serde_json::to_string(&json!({"ok": false, "error": "id cannot be empty"})).unwrap()));
+            return Ok(ToolResult::new(
+                "write_specialist",
+                serde_json::to_string(&json!({"ok": false, "error": "id cannot be empty"}))
+                    .unwrap(),
+            ));
         }
 
         std::fs::create_dir_all(&self.specialists_dir)
@@ -485,10 +488,8 @@ impl Tool for WriteSpecialistTool {
             "prompt": { "inline": a.system_prompt },
             "capabilities": a.capabilities,
         });
-        let yaml = serde_yaml::to_string(&manifest)
-            .map_err(|e| format!("serialize: {}", e))?;
-        std::fs::write(&path, yaml)
-            .map_err(|e| format!("write {}: {}", path.display(), e))?;
+        let yaml = serde_yaml::to_string(&manifest).map_err(|e| format!("serialize: {}", e))?;
+        std::fs::write(&path, yaml).map_err(|e| format!("write {}: {}", path.display(), e))?;
 
         let out = json!({
             "ok": true,
@@ -496,8 +497,10 @@ impl Tool for WriteSpecialistTool {
             "path": path.to_string_lossy(),
             "capabilities": a.capabilities,
         });
-        Ok(ToolResult::new("write_specialist",
-            serde_json::to_string(&out).unwrap_or_default()))
+        Ok(ToolResult::new(
+            "write_specialist",
+            serde_json::to_string(&out).unwrap_or_default(),
+        ))
     }
 }
 
@@ -505,11 +508,8 @@ impl Tool for WriteSpecialistTool {
 // ToolFactory wrapping the composer tools as capabilities.
 // ---------------------------------------------------------------------------
 
-pub const COMPOSER_CAPABILITIES: &[&str] = &[
-    "list_specialists",
-    "list_capabilities",
-    "write_workflow",
-];
+pub const COMPOSER_CAPABILITIES: &[&str] =
+    &["list_specialists", "list_capabilities", "write_workflow"];
 
 pub struct ComposerToolFactory {
     ctx: ComposerContext,
@@ -521,7 +521,11 @@ impl ComposerToolFactory {
     pub fn new(ctx: ComposerContext) -> Self {
         let tools_dir = crate::command_tool_registry::CommandToolRegistry::default_dir();
         let specialists_dir = default_specialists_dir();
-        Self { ctx, tools_dir, specialists_dir }
+        Self {
+            ctx,
+            tools_dir,
+            specialists_dir,
+        }
     }
 
     pub fn with_tools_dir(mut self, dir: PathBuf) -> Self {
@@ -539,7 +543,10 @@ pub fn default_specialists_dir() -> PathBuf {
 
 impl ToolFactory for ComposerToolFactory {
     fn capabilities(&self) -> Vec<String> {
-        COMPOSER_CAPABILITIES.iter().map(|s| s.to_string()).collect()
+        COMPOSER_CAPABILITIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
     fn create_tools(
         &self,
@@ -551,7 +558,9 @@ impl ToolFactory for ComposerToolFactory {
             "list_capabilities" => vec![Box::new(ListCapabilitiesTool::new(self.ctx.clone()))],
             "write_workflow" => vec![Box::new(WriteWorkflowTool::new(self.ctx.clone()))],
             "register_tool" => vec![Box::new(RegisterToolTool::new(self.tools_dir.clone()))],
-            "write_specialist" => vec![Box::new(WriteSpecialistTool::new(self.specialists_dir.clone()))],
+            "write_specialist" => vec![Box::new(WriteSpecialistTool::new(
+                self.specialists_dir.clone(),
+            ))],
             _ => vec![],
         })
     }
@@ -569,7 +578,11 @@ pub fn composer_specialist_descriptor() -> SpecialistDescriptor {
                       achieves a user-supplied goal, and persists it via \
                       write_workflow."
             .to_string(),
-        capabilities: COMPOSER_CAPABILITIES.iter().map(|s| s.to_string()).collect(),
+        capabilities: COMPOSER_CAPABILITIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        skills: Vec::new(),
         system_prompt: include_str!("composer_prompt.md").to_string(),
     }
 }
@@ -585,6 +598,7 @@ mod tests {
                 id: "bazi".into(),
                 description: "b".into(),
                 capabilities: vec!["fw_bazi_task".into()],
+                skills: Vec::new(),
                 system_prompt: "".into(),
             }]),
             capabilities: Arc::new(vec![

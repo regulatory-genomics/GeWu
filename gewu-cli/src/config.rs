@@ -24,6 +24,8 @@ pub struct Config {
     pub tool_provider_dirs: Vec<String>,
     #[serde(rename = "runtimePluginDirs", default)]
     pub runtime_plugin_dirs: Vec<String>,
+    #[serde(rename = "skillDirs", default)]
+    pub skill_dirs: Vec<String>,
 }
 
 #[derive(Debug)]

@@ -9,6 +9,8 @@ pub mod plugin_host;
 pub mod providers;
 pub mod registry;
 pub mod runtime;
+pub mod skill_registry;
+pub mod sop_registry;
 pub mod tools;
 pub mod trace_diff;
 pub mod workflow;
@@ -27,6 +29,8 @@ pub use hooks::{HookRegistry, HttpHookProvider};
 pub use manifest::loader::SpecialistManifestLoader;
 pub use manifest::runtime_plugin_loader::RuntimePluginManifestLoader;
 pub use manifest::schema::{PromptSource, SpecialistManifest};
+pub use manifest::skill::{SkillFrontmatter, SkillManifest};
+pub use manifest::skill_loader::SkillManifestLoader;
 pub use manifest::workflow::{
     ConditionalEdgeSpec, EdgeSpec, InlineSpecialist, NodeSpec, SpecialistRef, WorkflowManifest,
 };
@@ -37,6 +41,8 @@ pub use registry::{
     resolve_tools, specialist_descriptors,
 };
 pub use runtime::{GeWuRuntime, GeWuRuntimeBuilder, SpecialistExecutionEvent};
+pub use skill_registry::SkillRegistry;
+pub use sop_registry::{SopDescriptor, SopMetadata, SopRegistry};
 pub use tools::TaskTool;
 pub use trace_diff::{DiffEntry, DiffKind, DiffOptions, diff_blackboards, format_diff};
 pub use workflow::{Predicate, WorkflowCompiler, validate as validate_workflow, validate_with_ids};

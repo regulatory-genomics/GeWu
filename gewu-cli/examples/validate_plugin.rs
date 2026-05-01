@@ -97,6 +97,7 @@ impl Plugin for ExamplePlugin {
                 "count_lines".into(),
                 "report_result".into(),
             ],
+            skills: Vec::new(),
             system_prompt:
                 "You count lines in files. Use count_lines and call report_result when done.".into(),
         }]

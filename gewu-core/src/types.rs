@@ -334,6 +334,7 @@ pub struct SpecialistDescriptor {
     pub id: String,
     pub description: String,
     pub capabilities: Vec<String>,
+    pub skills: Vec<String>,
     pub system_prompt: String,
 }
 

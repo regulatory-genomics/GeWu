@@ -33,6 +33,8 @@ impl RuntimeFactory {
             plugin_host,
             manifest_dirs,
             &[],
+            &[],
+            &[],
         )
     }
 
@@ -43,6 +45,8 @@ impl RuntimeFactory {
         plugin_host: &PluginHost,
         manifest_dirs: &[PathBuf],
         runtime_plugin_dirs: &[PathBuf],
+        skill_dirs: &[PathBuf],
+        workflow_dirs: &[PathBuf],
     ) -> Result<GeWuRuntime> {
         let mut builder = GeWuRuntime::builder()
             .provider(provider)
@@ -63,6 +67,14 @@ impl RuntimeFactory {
 
         for dir in runtime_plugin_dirs {
             builder = builder.with_runtime_plugin_dir(dir);
+        }
+
+        for dir in skill_dirs {
+            builder = builder.with_skill_dir(dir);
+        }
+
+        for dir in workflow_dirs {
+            builder = builder.with_workflow_dir(dir);
         }
 
         let home_specialists = dirs::home_dir()

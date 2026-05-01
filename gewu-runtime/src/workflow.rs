@@ -5,10 +5,10 @@
 //! predicate parser because they share small helper types and the whole
 //! surface fits in under ~500 LOC.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use futures::future::join_all;
 use gewu_core::types::{SpecialistExecutionRequest, ToolContext};
-use gewu_graph::{Blackboard, CompiledGraph, NodeResult, StateGraph, END};
+use gewu_graph::{Blackboard, CompiledGraph, END, NodeResult, StateGraph};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -58,7 +58,12 @@ impl WorkflowCompiler {
         };
         collect_inline_specialists(&m.nodes, &mut compiler.inline_specialists);
 
-        validate_with_inline(m, &compiler.runtime, &compiler.workflows, &compiler.inline_specialists)?;
+        validate_with_inline(
+            m,
+            &compiler.runtime,
+            &compiler.workflows,
+            &compiler.inline_specialists,
+        )?;
 
         let session_id = format!("workflow:{}:{}", m.id, Uuid::new_v4());
         let mut graph: StateGraph<Blackboard> = StateGraph::new();
@@ -134,26 +139,15 @@ impl WorkflowCompiler {
                 prompt.as_deref(),
                 session_id,
             ),
-            NodeSpec::Tool { tool, input, write } => self.compile_tool_node(
-                id,
-                tool,
-                input.as_deref(),
-                write.as_deref(),
-                session_id,
-            ),
-            NodeSpec::Parallel { branches } => {
-                self.compile_parallel_node(id, branches, session_id)
+            NodeSpec::Tool { tool, input, write } => {
+                self.compile_tool_node(id, tool, input.as_deref(), write.as_deref(), session_id)
             }
+            NodeSpec::Parallel { branches } => self.compile_parallel_node(id, branches, session_id),
             NodeSpec::Workflow {
                 workflow,
                 input,
                 write,
-            } => self.compile_workflow_node(
-                id,
-                workflow,
-                input.as_deref(),
-                write.as_deref(),
-            ),
+            } => self.compile_workflow_node(id, workflow, input.as_deref(), write.as_deref()),
         }
     }
 
@@ -176,6 +170,7 @@ impl WorkflowCompiler {
                 id: inline.id.clone(),
                 description: inline.description.clone(),
                 capabilities: inline.capabilities.clone(),
+                skills: inline.skills.clone(),
                 system_prompt: inline.system_prompt.clone(),
             }),
             SpecialistRef::ById(_) => None,
@@ -183,7 +178,9 @@ impl WorkflowCompiler {
 
         let tool_hint = tool_hint.map(|s| s.to_string());
         let input_path = input.map(|s| s.to_string());
-        let write_path = write.map(|s| s.to_string()).unwrap_or_else(|| id.to_string());
+        let write_path = write
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| id.to_string());
         let prompt_template = prompt.map(|s| s.to_string());
         let session_id = session_id.to_string();
         let node_id = id.to_string();
@@ -200,21 +197,19 @@ impl WorkflowCompiler {
             let node_id = node_id.clone();
             Box::pin(async move {
                 let input_val = extract_input(&bb, input_path.as_deref());
-                let prompt_text = build_prompt(
-                    prompt_template.as_deref(),
-                    tool_hint.as_deref(),
-                    &input_val,
-                );
+                let prompt_text =
+                    build_prompt(prompt_template.as_deref(), tool_hint.as_deref(), &input_val);
 
                 // For inline specialists, build directly with the descriptor
                 if let Some(desc) = &inline_desc {
                     let session = format!("{}:{}", session_id, node_id);
-                    let tools = match runtime.resolve_capabilities(&desc.capabilities) {
+                    let effective_desc = runtime.descriptor_with_skills(desc);
+                    let tools = match runtime.resolve_capabilities(&effective_desc.capabilities) {
                         Ok(t) => t,
                         Err(e) => return error_partial(&write_path, e.to_string()),
                     };
                     let result = runtime
-                        .execute_inline_specialist(desc, &prompt_text, &session, tools, input_val)
+                        .execute_inline_specialist(&effective_desc, &prompt_text, &session, tools, input_val)
                         .await;
                     return match result {
                         Ok(output) => to_partial(&write_path, Ok(output)),
@@ -251,7 +246,9 @@ impl WorkflowCompiler {
         let runtime = Arc::clone(&self.runtime);
         let cap = cap.to_string();
         let input_path = input.map(|s| s.to_string());
-        let write_path = write.map(|s| s.to_string()).unwrap_or_else(|| id.to_string());
+        let write_path = write
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| id.to_string());
         let session_id = session_id.to_string();
         let node_id = id.to_string();
 
@@ -337,7 +334,9 @@ impl WorkflowCompiler {
             .clone();
         let subgraph = self.compile(&sub_manifest)?;
         let input_path = input.map(|s| s.to_string());
-        let write_path = write.map(|s| s.to_string()).unwrap_or_else(|| id.to_string());
+        let write_path = write
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| id.to_string());
         let subgraph = Arc::new(subgraph);
 
         Ok(Arc::new(move |bb: Blackboard| -> NodeFut {
@@ -533,13 +532,20 @@ fn collect_inline_specialists(
 ) {
     for spec in nodes.values() {
         match spec {
-            NodeSpec::Specialist { specialist: SpecialistRef::Inline(inline), .. } => {
-                out.insert(inline.id.clone(), SpecialistDescriptor {
-                    id: inline.id.clone(),
-                    description: inline.description.clone(),
-                    capabilities: inline.capabilities.clone(),
-                    system_prompt: inline.system_prompt.clone(),
-                });
+            NodeSpec::Specialist {
+                specialist: SpecialistRef::Inline(inline),
+                ..
+            } => {
+                out.insert(
+                    inline.id.clone(),
+                    SpecialistDescriptor {
+                        id: inline.id.clone(),
+                        description: inline.description.clone(),
+                        capabilities: inline.capabilities.clone(),
+                        skills: inline.skills.clone(),
+                        system_prompt: inline.system_prompt.clone(),
+                    },
+                );
             }
             NodeSpec::Parallel { branches } => {
                 collect_inline_specialists(branches, out);
@@ -585,31 +591,29 @@ fn validate_node_refs_with_ids(
     workflows: &HashMap<String, WorkflowManifest>,
 ) -> Result<()> {
     match spec {
-        NodeSpec::Specialist { specialist, .. } => {
-            match specialist {
-                SpecialistRef::ById(id) => {
-                    if !known_specialists.contains(id) {
+        NodeSpec::Specialist { specialist, .. } => match specialist {
+            SpecialistRef::ById(id) => {
+                if !known_specialists.contains(id) {
+                    return Err(anyhow!(
+                        "node '{}' references unknown specialist: {}",
+                        node_id,
+                        id
+                    ));
+                }
+            }
+            SpecialistRef::Inline(inline) => {
+                for cap in &inline.capabilities {
+                    if !known_capabilities.contains(cap) {
                         return Err(anyhow!(
-                            "node '{}' references unknown specialist: {}",
+                            "inline specialist '{}' in node '{}' references unknown capability: {}",
+                            inline.id,
                             node_id,
-                            id
+                            cap
                         ));
                     }
                 }
-                SpecialistRef::Inline(inline) => {
-                    for cap in &inline.capabilities {
-                        if !known_capabilities.contains(cap) {
-                            return Err(anyhow!(
-                                "inline specialist '{}' in node '{}' references unknown capability: {}",
-                                inline.id,
-                                node_id,
-                                cap
-                            ));
-                        }
-                    }
-                }
             }
-        }
+        },
         NodeSpec::Tool { tool, .. } => {
             if !known_capabilities.contains(tool) {
                 return Err(anyhow!(
@@ -663,29 +667,29 @@ fn validate_node_refs(
     workflows: &HashMap<String, WorkflowManifest>,
 ) -> Result<()> {
     match spec {
-        NodeSpec::Specialist { specialist, .. } => {
-            match specialist {
-                SpecialistRef::ById(sid) => {
-                    if runtime.find_specialist(sid).is_none() {
+        NodeSpec::Specialist { specialist, .. } => match specialist {
+            SpecialistRef::ById(sid) => {
+                if runtime.find_specialist(sid).is_none() {
+                    return Err(anyhow!(
+                        "node '{}' references unknown specialist: {}",
+                        id,
+                        sid
+                    ));
+                }
+            }
+            SpecialistRef::Inline(inline) => {
+                for cap in &inline.capabilities {
+                    if !runtime.capability_registry().contains(cap) {
                         return Err(anyhow!(
-                            "node '{}' references unknown specialist: {}",
+                            "inline specialist '{}' in node '{}' references unknown capability: {}",
+                            inline.id,
                             id,
-                            sid
+                            cap
                         ));
                     }
                 }
-                SpecialistRef::Inline(inline) => {
-                    for cap in &inline.capabilities {
-                        if !runtime.capability_registry().contains(cap) {
-                            return Err(anyhow!(
-                                "inline specialist '{}' in node '{}' references unknown capability: {}",
-                                inline.id, id, cap
-                            ));
-                        }
-                    }
-                }
             }
-        }
+        },
         NodeSpec::Tool { tool, .. } => {
             if !runtime.capability_registry().contains(tool) {
                 return Err(anyhow!(

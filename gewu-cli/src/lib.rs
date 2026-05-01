@@ -234,6 +234,10 @@ fn resolve_runtime_plugin_dirs(config: &config::Config) -> Vec<PathBuf> {
         .collect()
 }
 
+fn resolve_skill_dirs(config: &config::Config) -> Vec<PathBuf> {
+    config.skill_dirs.iter().map(|s| expand_config_path(s)).collect()
+}
+
 fn parse_workflow_input(raw: Option<&str>) -> Result<serde_json::Value> {
     let s = match raw {
         None => return Ok(serde_json::json!({})),
@@ -290,6 +294,8 @@ where
         &plugin_host,
         &resolve_manifest_dirs(&loaded_config.config),
         &resolve_runtime_plugin_dirs(&loaded_config.config),
+        &resolve_skill_dirs(&loaded_config.config),
+        &resolve_workflow_dirs(&loaded_config.config, &[]),
     )?;
 
     println!("Available Agents:");
@@ -493,6 +499,7 @@ where
 
     let manifest_dirs = resolve_manifest_dirs(&file_config);
     let runtime_plugin_dirs = resolve_runtime_plugin_dirs(&file_config);
+    let skill_dirs = resolve_skill_dirs(&file_config);
     let workflow_dirs = resolve_workflow_dirs(&file_config, &cli.workflow_dirs);
     let mcp_tools = mcp_loader::load_mcp_tools(file_config.mcp_servers).await?;
     let plugin_host = build_plugin_host_with(
@@ -508,6 +515,8 @@ where
         &plugin_host,
         &manifest_dirs,
         &runtime_plugin_dirs,
+        &skill_dirs,
+        &workflow_dirs,
     )?;
 
     if let Some(workflow_id) = cli.workflow.as_deref() {

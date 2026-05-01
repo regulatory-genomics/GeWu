@@ -24,14 +24,22 @@ use crate::hooks::{HookRegistry, HttpHookProvider};
 use crate::manifest::runtime_plugin_loader::RuntimePluginManifestLoader;
 use crate::manifest::schema::RuntimeHookEvent;
 use crate::registry::{AgentConfig, BuiltinToolFactory};
+use crate::skill_registry::SkillRegistry;
+use crate::sop_registry::SopRegistry;
+use crate::workflow_registry::WorkflowRegistry;
 
 pub struct GeWuRuntime {
     factories: Vec<Box<dyn ToolFactory>>,
     capability_registry: Arc<CapabilityRegistry>,
     specialists: Vec<SpecialistDescriptor>,
+    skill_registry: Arc<SkillRegistry>,
+    sop_registry: Arc<SopRegistry>,
     hook_registry: Arc<HookRegistry>,
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
+    runtime_plugin_dirs: Vec<PathBuf>,
+    skill_dirs: Vec<PathBuf>,
+    workflow_dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +56,8 @@ impl GeWuRuntime {
             specialists: Vec::new(),
             manifest_dirs: Vec::new(),
             runtime_plugin_dirs: Vec::new(),
+            skill_dirs: Vec::new(),
+            workflow_dirs: Vec::new(),
             provider: None,
             pool: None,
         }
@@ -73,6 +83,135 @@ impl GeWuRuntime {
         &self.capability_registry
     }
 
+    pub fn skill_registry(&self) -> &SkillRegistry {
+        &self.skill_registry
+    }
+
+    pub fn sop_registry(&self) -> &SopRegistry {
+        &self.sop_registry
+    }
+
+    pub(crate) fn descriptor_with_skills(&self, descriptor: &SpecialistDescriptor) -> SpecialistDescriptor {
+        let mut descriptor = descriptor.clone();
+        for skill_id in &descriptor.skills {
+            let Some(skill) = self.skill_registry.get(skill_id) else {
+                tracing::warn!("Specialist '{}' references unknown skill '{}'", descriptor.id, skill_id);
+                continue;
+            };
+            for capability in &skill.capabilities {
+                if !descriptor.capabilities.iter().any(|existing| existing == capability) {
+                    descriptor.capabilities.push(capability.clone());
+                }
+            }
+        }
+        descriptor
+    }
+
+    fn append_skill_prompt(&self, descriptor: &SpecialistDescriptor, system_prompt: String) -> String {
+        if descriptor.skills.is_empty() || self.skill_registry.is_empty() {
+            return system_prompt;
+        }
+        let mut available = Vec::new();
+        let mut loaded = Vec::new();
+        for skill_id in &descriptor.skills {
+            let Some(skill) = self.skill_registry.get(skill_id) else {
+                continue;
+            };
+            available.push(format!("- {}: {}", skill.name, skill.description));
+            loaded.push(format!(
+                "<skill_content name=\"{}\" location=\"{}\">\n{}\n</skill_content>",
+                skill.name,
+                skill.location.display(),
+                skill.content
+            ));
+        }
+        if available.is_empty() {
+            return system_prompt;
+        }
+        format!(
+            "{}\n\n<available_skills>\n{}\n</available_skills>\n\n<loaded_skill_instructions>\n{}\n</loaded_skill_instructions>",
+            system_prompt.trim_end(),
+            available.join("\n"),
+            loaded.join("\n\n")
+        )
+    }
+
+    fn append_sop_prompt(&self, descriptor: &SpecialistDescriptor, system_prompt: String) -> String {
+        if self.sop_registry.is_empty()
+            || !descriptor.capabilities.iter().any(|cap| cap == "run_workflow")
+        {
+            return system_prompt;
+        }
+        let entries = self
+            .sop_registry
+            .visible_to(&descriptor.id)
+            .into_iter()
+            .map(|sop| {
+                let triggers = if sop.triggers.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n  triggers: {}", sop.triggers.join(", "))
+                };
+                format!(
+                    "- {} ({}) — {}{}",
+                    sop.workflow_id, sop.name, sop.description, triggers
+                )
+            })
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return system_prompt;
+        }
+        format!(
+            "{}\n\n<available_sops>\n{}\n\nIf the user request clearly matches an available SOP, prefer calling run_workflow with the matching workflow_id and a structured input object instead of performing the procedure manually.\n</available_sops>",
+            system_prompt.trim_end(),
+            entries.join("\n")
+        )
+    }
+
+    fn apply_prompt_packs(&self, descriptor: &SpecialistDescriptor, system_prompt: String) -> String {
+        let with_skills = self.append_skill_prompt(descriptor, system_prompt);
+        self.append_sop_prompt(descriptor, with_skills)
+    }
+
+    fn with_runtime_dir_metadata(&self, metadata_json: Value) -> Value {
+        let mut metadata = match metadata_json {
+            Value::Object(map) => map,
+            other => {
+                let mut map = serde_json::Map::new();
+                map.insert("request_metadata".into(), other);
+                map
+            }
+        };
+        metadata.insert(
+            "runtime_plugin_dirs".into(),
+            Value::Array(
+                self.runtime_plugin_dirs
+                    .iter()
+                    .map(|p| Value::String(p.to_string_lossy().to_string()))
+                    .collect(),
+            ),
+        );
+        metadata.insert(
+            "skill_dirs".into(),
+            Value::Array(
+                self.skill_dirs
+                    .iter()
+                    .map(|p| Value::String(p.to_string_lossy().to_string()))
+                    .collect(),
+            ),
+        );
+        metadata.insert(
+            "workflow_dirs".into(),
+            Value::Array(
+                self.workflow_dirs
+                    .iter()
+                    .map(|p| Value::String(p.to_string_lossy().to_string()))
+                    .collect(),
+            ),
+        );
+        Value::Object(metadata)
+    }
+
     fn resolve_capabilities_with_working_directory(
         &self,
         caps: &[String],
@@ -83,7 +222,7 @@ impl GeWuRuntime {
             working_directory,
             provider: self.provider.clone(),
             pool: self.pool.clone(),
-            metadata_json,
+            metadata_json: self.with_runtime_dir_metadata(metadata_json),
         };
 
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
@@ -158,6 +297,7 @@ impl GeWuRuntime {
     ) -> Result<Value> {
         let memory = SqliteMemory::new(self.pool.clone(), session_id.to_string()).await?;
 
+        let descriptor = self.descriptor_with_skills(descriptor);
         let tools_arc: Vec<Arc<dyn Tool>> = tools
             .into_iter()
             .map(|t| Arc::from(t) as Arc<dyn Tool>)
@@ -186,8 +326,8 @@ impl GeWuRuntime {
         };
         let system_prompt = self
             .transform_system_prompt(
-                descriptor,
-                system_prompt,
+                &descriptor,
+                self.apply_prompt_packs(&descriptor, system_prompt),
                 session_id,
                 Some(prompt),
                 &_metadata_json,
@@ -255,6 +395,7 @@ impl GeWuRuntime {
             .find_specialist(name)
             .ok_or_else(|| anyhow!("Unknown specialist: {}", name))?;
 
+        let descriptor = self.descriptor_with_skills(descriptor);
         let tools = self.resolve_capabilities_with_metadata(
             &descriptor.capabilities,
             &std::env::current_dir()?,
@@ -286,8 +427,8 @@ impl GeWuRuntime {
 
         let system_prompt = self
             .transform_system_prompt(
-                descriptor,
-                descriptor.system_prompt.clone(),
+                &descriptor,
+                self.apply_prompt_packs(&descriptor, descriptor.system_prompt.clone()),
                 &session_id,
                 None,
                 &metadata_json,
@@ -336,6 +477,7 @@ impl GeWuRuntime {
         let descriptor = self
             .find_specialist(&request.specialist_id)
             .ok_or_else(|| anyhow!("Unknown specialist: {}", request.specialist_id))?;
+        let descriptor = self.descriptor_with_skills(descriptor);
         let tools = self.resolve_capabilities_with_metadata(
             &descriptor.capabilities,
             &std::env::current_dir()?,
@@ -367,8 +509,8 @@ impl GeWuRuntime {
 
         let system_prompt = self
             .transform_system_prompt(
-                descriptor,
-                descriptor.system_prompt.clone(),
+                &descriptor,
+                self.apply_prompt_packs(&descriptor, descriptor.system_prompt.clone()),
                 &request.session_id,
                 Some(&request.prompt),
                 &request.metadata_json,
@@ -387,7 +529,7 @@ impl GeWuRuntime {
             .await?;
         store.increment_attempt(&request.task_id).await?;
 
-        self.emit_user_prompt_hook(descriptor, &request).await;
+        self.emit_user_prompt_hook(&descriptor, &request).await;
 
         let mut stream = Box::pin(agent.ask(&request.prompt));
         let mut output_json: Option<Value> = None;
@@ -408,7 +550,7 @@ impl GeWuRuntime {
                             tool_name: None,
                             payload_json: serde_json::json!({ "delta": delta.clone() }),
                         };
-                        self.emit_agent_event_hook(descriptor, &request, &record)
+                        self.emit_agent_event_hook(&descriptor, &request, &record)
                             .await;
                         events.push(record);
                         result_text.push_str(&delta);
@@ -420,7 +562,7 @@ impl GeWuRuntime {
                             tool_name: None,
                             payload_json: serde_json::json!({ "delta": delta.clone() }),
                         };
-                        self.emit_agent_event_hook(descriptor, &request, &record)
+                        self.emit_agent_event_hook(&descriptor, &request, &record)
                             .await;
                         events.push(record);
                         yield SpecialistExecutionEvent::Agent(AgentEvent::ReasoningDelta { delta });
@@ -431,7 +573,7 @@ impl GeWuRuntime {
                             tool_name: Some(tool.clone()),
                             payload_json: serde_json::json!({ "input": input.clone() }),
                         };
-                        self.emit_agent_event_hook(descriptor, &request, &record)
+                        self.emit_agent_event_hook(&descriptor, &request, &record)
                             .await;
                         events.push(record);
                         yield SpecialistExecutionEvent::Agent(AgentEvent::ToolStart { tool, input });
@@ -442,7 +584,7 @@ impl GeWuRuntime {
                             tool_name: None,
                             payload_json: serde_json::json!({ "response": response.clone() }),
                         };
-                        self.emit_agent_event_hook(descriptor, &request, &record)
+                        self.emit_agent_event_hook(&descriptor, &request, &record)
                             .await;
                         events.push(record);
                         if !report_received {
@@ -456,7 +598,7 @@ impl GeWuRuntime {
                             tool_name: Some(tool.clone()),
                             payload_json: serde_json::json!({ "output": output.clone() }),
                         };
-                        self.emit_agent_event_hook(descriptor, &request, &record)
+                        self.emit_agent_event_hook(&descriptor, &request, &record)
                             .await;
                         events.push(record);
                         tool_outputs.push(ToolExecutionRecord {
@@ -486,7 +628,7 @@ impl GeWuRuntime {
                             tool_name: Some(tool.clone()),
                             payload_json: serde_json::json!({ "output": output.clone() }),
                         };
-                        self.emit_agent_event_hook(descriptor, &request, &record)
+                        self.emit_agent_event_hook(&descriptor, &request, &record)
                             .await;
                         events.push(record);
                         tool_outputs.push(ToolExecutionRecord {
@@ -501,7 +643,7 @@ impl GeWuRuntime {
                             tool_name: None,
                             payload_json: serde_json::json!({ "error": error.clone() }),
                         };
-                        self.emit_agent_event_hook(descriptor, &request, &record)
+                        self.emit_agent_event_hook(&descriptor, &request, &record)
                             .await;
                         events.push(record);
                         final_status = TaskStatus::Blocked;
@@ -862,6 +1004,8 @@ pub struct GeWuRuntimeBuilder {
     specialists: Vec<SpecialistDescriptor>,
     manifest_dirs: Vec<PathBuf>,
     runtime_plugin_dirs: Vec<PathBuf>,
+    skill_dirs: Vec<PathBuf>,
+    workflow_dirs: Vec<PathBuf>,
     provider: Option<Arc<dyn LlmProvider>>,
     pool: Option<SqlitePool>,
 }
@@ -900,6 +1044,31 @@ impl GeWuRuntimeBuilder {
 
     pub fn with_runtime_plugin_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.runtime_plugin_dirs.push(dir.into());
+        self
+    }
+
+    pub fn with_runtime_plugin_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.runtime_plugin_dirs.extend(dirs);
+        self
+    }
+
+    pub fn with_skill_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.skill_dirs.push(dir.into());
+        self
+    }
+
+    pub fn with_skill_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.skill_dirs.extend(dirs);
+        self
+    }
+
+    pub fn with_workflow_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.workflow_dirs.push(dir.into());
+        self
+    }
+
+    pub fn with_workflow_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.workflow_dirs.extend(dirs);
         self
     }
 
@@ -943,6 +1112,9 @@ impl GeWuRuntimeBuilder {
         }
 
         let mut specialists = self.specialists;
+        let skill_registry = Arc::new(SkillRegistry::from_dirs(&self.skill_dirs)?);
+        let workflow_registry = WorkflowRegistry::from_dirs(&self.workflow_dirs)?;
+        let sop_registry = Arc::new(SopRegistry::from_workflows(workflow_registry.as_map()));
         let mut hook_registry = HookRegistry::new();
 
         // Load command-backed tools from ~/.gewu/tools/
@@ -1155,9 +1327,14 @@ impl GeWuRuntimeBuilder {
             factories,
             capability_registry: Arc::new(registry),
             specialists,
+            skill_registry,
+            sop_registry,
             hook_registry: Arc::new(hook_registry),
             provider,
             pool,
+            runtime_plugin_dirs: self.runtime_plugin_dirs,
+            skill_dirs: self.skill_dirs,
+            workflow_dirs: self.workflow_dirs,
         })
     }
 }

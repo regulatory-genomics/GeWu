@@ -14,6 +14,8 @@ pub struct SpecialistManifest {
     #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
     pub policy: HashMap<String, Value>,
     #[serde(default)]
     pub metadata: Value,
@@ -183,6 +185,7 @@ capabilities:
         let m: SpecialistManifest = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(m.id, "test-specialist");
         assert_eq!(m.capabilities, vec!["read_file", "bash"]);
+        assert!(m.skills.is_empty());
         match &m.prompt {
             PromptSource::Inline { inline } => assert!(inline.contains("test assistant")),
             _ => panic!("expected inline prompt"),

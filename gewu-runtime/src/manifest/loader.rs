@@ -1,7 +1,7 @@
 //! Manifest loader: scans directories for YAML specialist and tool-provider manifests,
 //! validates them against a `CapabilityRegistry`, and converts them into `SpecialistDescriptor`s.
 
-use anyhow::{Result, Context, anyhow};
+use anyhow::{anyhow, Context, Result};
 use gewu_core::types::SpecialistDescriptor;
 use std::path::{Path, PathBuf};
 use tracing;
@@ -48,7 +48,11 @@ impl SpecialistManifestLoader {
                 }
                 match load_specialist_manifest(&path, registry) {
                     Ok(desc) => {
-                        tracing::info!("Loaded specialist manifest: {} ({})", desc.id, path.display());
+                        tracing::info!(
+                            "Loaded specialist manifest: {} ({})",
+                            desc.id,
+                            path.display()
+                        );
                         descriptors.push(desc);
                     }
                     Err(e) => {
@@ -65,10 +69,10 @@ fn load_specialist_manifest(
     path: &Path,
     registry: Option<&CapabilityRegistry>,
 ) -> Result<SpecialistDescriptor> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let manifest: SpecialistManifest = serde_yaml::from_str(&content)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let manifest: SpecialistManifest =
+        serde_yaml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
 
     let base_dir = path
         .parent()
@@ -97,6 +101,7 @@ fn load_specialist_manifest(
         id: manifest.id,
         description: manifest.description,
         capabilities: manifest.capabilities,
+        skills: manifest.skills,
         system_prompt,
     })
 }

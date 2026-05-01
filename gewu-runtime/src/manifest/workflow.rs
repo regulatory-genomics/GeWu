@@ -44,6 +44,8 @@ pub struct InlineSpecialist {
     pub description: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
     pub system_prompt: String,
 }
 

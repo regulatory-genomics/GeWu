@@ -30,6 +30,8 @@ pub struct ServerConfig {
     pub plugins: HashMap<String, Value>,
     #[serde(rename = "runtimePluginDirs", default)]
     pub runtime_plugin_dirs: Vec<String>,
+    #[serde(rename = "skillDirs", default)]
+    pub skill_dirs: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -41,6 +43,7 @@ impl Default for ServerConfig {
             db_path: None,
             plugins: HashMap::new(),
             runtime_plugin_dirs: Vec::new(),
+            skill_dirs: Vec::new(),
         }
     }
 }
@@ -109,6 +112,7 @@ impl AppState {
             .iter()
             .map(|s| expand_config_path(s))
             .collect();
+        let skill_dirs: Vec<PathBuf> = config.skill_dirs.iter().map(|s| expand_config_path(s)).collect();
         drop(config);
 
         let pool_guard = self.db_pool.lock().await;
@@ -125,6 +129,8 @@ impl AppState {
             &plugin_host,
             &[],
             &runtime_plugin_dirs,
+            &skill_dirs,
+            &[],
         )?;
         Ok(runtime
             .list_specialists()
@@ -174,6 +180,7 @@ impl AppState {
             .iter()
             .map(|s| expand_config_path(s))
             .collect();
+        let skill_dirs: Vec<PathBuf> = config.skill_dirs.iter().map(|s| expand_config_path(s)).collect();
         drop(config);
 
         let pool_guard = self.db_pool.lock().await;
@@ -192,6 +199,8 @@ impl AppState {
             &plugin_host,
             &[],
             &runtime_plugin_dirs,
+            &skill_dirs,
+            &[],
         )?;
         let (agent, _registry) = runtime
             .build_specialist(&agent_type, session_id.clone(), mcp_tools)
@@ -301,6 +310,7 @@ impl AppState {
             .iter()
             .map(|s| expand_config_path(s))
             .collect();
+        let skill_dirs: Vec<PathBuf> = config.skill_dirs.iter().map(|s| expand_config_path(s)).collect();
         drop(config);
 
         let pool_guard = self.db_pool.lock().await;
@@ -318,6 +328,8 @@ impl AppState {
             &plugin_host,
             &[],
             &runtime_plugin_dirs,
+            &skill_dirs,
+            &[],
         )?;
         let (agent, _registry) = runtime
             .build_specialist(&new_agent_type, session_id.to_string(), mcp_tools)

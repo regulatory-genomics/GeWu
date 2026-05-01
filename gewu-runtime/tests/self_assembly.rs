@@ -274,12 +274,14 @@ impl Plugin for FwShapePlugin {
                 id: "fateweaver_bazi".into(),
                 description: "bazi specialist".into(),
                 capabilities: vec!["fw_bazi_task".into()],
+                skills: Vec::new(),
                 system_prompt: "".into(),
             },
             SpecialistDescriptor {
                 id: "fateweaver_ziwei".into(),
                 description: "ziwei specialist".into(),
                 capabilities: vec!["fw_ziwei_task".into()],
+                skills: Vec::new(),
                 system_prompt: "".into(),
             },
             SpecialistDescriptor {
@@ -294,12 +296,14 @@ impl Plugin for FwShapePlugin {
                     "fw_hard_review".into(),
                     "fw_compose_answer".into(),
                 ],
+                skills: Vec::new(),
                 system_prompt: "".into(),
             },
             SpecialistDescriptor {
                 id: "fateweaver_reviewer".into(),
                 description: "claim reviewer".into(),
                 capabilities: vec!["fw_agentic_review".into()],
+                skills: Vec::new(),
                 system_prompt: "".into(),
             },
         ]
@@ -329,6 +333,7 @@ fn snapshot_context(rt: &GeWuRuntime, out_dir: std::path::PathBuf) -> ComposerCo
             id: a.name,
             description: a.description,
             capabilities: vec![],
+            skills: Vec::new(),
             system_prompt: String::new(),
         })
         .collect();
