@@ -24,7 +24,7 @@ metadata:
         timezone: { type: string }
         workspace_root: { type: string }
         source: { type: string, default: opencode }
-        limit: { type: integer, default: 2000 }
+        limit: { type: integer, default: 200 }
         idempotency_key: { type: string }
 nodes:
   build_query:
@@ -49,11 +49,12 @@ nodes:
       skills:
         - daily-memory-rollup
       system_prompt: |
-        Use the loaded daily-memory-rollup skill. Return only a JSON object suitable for memory_summary_write.
+        Use the loaded daily-memory-rollup skill. Call report_result with status "succeeded" and put only the memory_summary_write JSON object in the result field.
         Preserve the caller's date, timezone, workspace_root, source, and idempotency_key from the input.
         Do not derive the local date from UTC created_at values; the date in the input is authoritative.
         The output must include summary_kind, title, content, derived_from, metadata, idempotency_key, and mode.
         Do not call memory_summary_write yourself. Use report_result with the JSON object; the workflow write_summary node will persist it.
+        If no events were found, call report_result with a valid summary object whose content says no events were found and whose derived_from is empty.
     input: $
     write: summary
 
