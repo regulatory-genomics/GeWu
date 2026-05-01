@@ -9,7 +9,7 @@ use gewu_core::traits::{LlmProvider, Tool};
 use gewu_core::types::{SpecialistExecutionRequest, ToolContext, ToolResult};
 use gewu_graph::Blackboard;
 use schemars::schema::RootSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use std::error::Error;
@@ -20,6 +20,79 @@ use uuid::Uuid;
 
 use crate::manifest::workflow_loader::WorkflowManifestLoader;
 use crate::workflow::WorkflowCompiler;
+
+// ---------------------------------------------------------------------------
+// compose_workflow tool
+// ---------------------------------------------------------------------------
+
+pub struct MemoryDayQueryTool;
+
+#[derive(Debug, Deserialize)]
+struct MemoryDayQueryArgs {
+    date: String,
+    timezone: String,
+    workspace_root: String,
+    #[serde(default = "default_source")]
+    source: String,
+    #[serde(default = "default_day_query_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryDayQueryOutput {
+    sql: String,
+    params: Vec<String>,
+    limit: usize,
+}
+
+fn default_source() -> String {
+    "opencode".into()
+}
+
+fn default_day_query_limit() -> usize {
+    2000
+}
+
+#[async_trait]
+impl Tool for MemoryDayQueryTool {
+    fn name(&self) -> &str {
+        "memory_day_query"
+    }
+
+    fn description(&self) -> &str {
+        "Build a memory_sql_query request for one local-date/source/timezone/workspace."
+    }
+
+    fn schema(&self) -> RootSchema {
+        serde_json::from_value(json!({
+            "type": "object",
+            "required": ["date", "timezone", "workspace_root"],
+            "properties": {
+                "date": {"type": "string"},
+                "timezone": {"type": "string"},
+                "workspace_root": {"type": "string"},
+                "source": {"type": "string", "default": "opencode"},
+                "limit": {"type": "integer", "default": 2000}
+            }
+        }))
+        .unwrap()
+    }
+
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let input: MemoryDayQueryArgs = serde_json::from_value(args)?;
+        let limit = input.limit.clamp(1, 5000);
+        let output = MemoryDayQueryOutput {
+            sql: "SELECT event_id, session_id, event_kind, content, created_at, json_extract(metadata_json, '$.opencode.session_title') AS session_title, json_extract(metadata_json, '$.opencode.directory') AS workspace_root FROM memory_events WHERE json_extract(metadata_json, '$.host') = ? AND json_extract(metadata_json, '$.import.local_date') = ? AND json_extract(metadata_json, '$.import.timezone') = ? AND json_extract(metadata_json, '$.opencode.directory') = ? ORDER BY created_at LIMIT ?".into(),
+            params: vec![input.source, input.date, input.timezone, input.workspace_root, limit.to_string()],
+            limit,
+        };
+        Ok(ToolResult::new("memory_day_query", serde_json::to_string(&output)?))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // compose_workflow tool
@@ -97,7 +170,10 @@ impl Tool for ComposeWorkflowTool {
             metadata_json: json!({ "source": "compose_workflow_tool" }),
         };
 
-        info!("compose_workflow: delegating to composer specialist (task_id: {})", task_id);
+        info!(
+            "compose_workflow: delegating to composer specialist (task_id: {})",
+            task_id
+        );
 
         let runtime = crate::runtime::GeWuRuntime::builder()
             .provider(self.provider.clone())
@@ -128,6 +204,8 @@ pub struct RunWorkflowTool {
     pub provider: Arc<dyn LlmProvider>,
     pub pool: SqlitePool,
     pub workflow_dirs: Vec<PathBuf>,
+    pub skill_dirs: Vec<PathBuf>,
+    pub runtime_plugin_dirs: Vec<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -147,7 +225,19 @@ impl RunWorkflowTool {
             provider,
             pool,
             workflow_dirs,
+            skill_dirs: Vec::new(),
+            runtime_plugin_dirs: Vec::new(),
         }
+    }
+
+    pub fn with_skill_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.skill_dirs = dirs;
+        self
+    }
+
+    pub fn with_runtime_plugin_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.runtime_plugin_dirs = dirs;
+        self
     }
 
     fn default_dirs() -> Vec<PathBuf> {
@@ -208,11 +298,11 @@ impl Tool for RunWorkflowTool {
         for d in &dirs {
             loader.add_dir(d);
         }
-        let loaded = loader.load().map_err(|e| format!("load workflows: {}", e))?;
-        let manifests: std::collections::HashMap<String, _> = loaded
-            .into_iter()
-            .map(|(_, m)| (m.id.clone(), m))
-            .collect();
+        let loaded = loader
+            .load()
+            .map_err(|e| format!("load workflows: {}", e))?;
+        let manifests: std::collections::HashMap<String, _> =
+            loaded.into_iter().map(|(_, m)| (m.id.clone(), m)).collect();
 
         let manifest = manifests
             .get(&input.workflow_id)
@@ -225,7 +315,10 @@ impl Tool for RunWorkflowTool {
             })?
             .clone();
 
-        info!("run_workflow: compiling and invoking '{}'", input.workflow_id);
+        info!(
+            "run_workflow: compiling and invoking '{}'",
+            input.workflow_id
+        );
 
         let runtime = crate::runtime::GeWuRuntime::builder()
             .provider(self.provider.clone())
@@ -233,11 +326,13 @@ impl Tool for RunWorkflowTool {
             .register_builtin_capabilities()
             .register_builtin_specialists()
             .with_manifest_dir(crate::composer::default_specialists_dir())
+            .with_runtime_plugin_dirs(self.runtime_plugin_dirs.clone())
+            .with_skill_dirs(self.skill_dirs.clone())
+            .with_workflow_dirs(dirs.clone())
             .build()
             .map_err(|e| format!("Failed to build runtime: {}", e))?;
 
-        let compiler =
-            WorkflowCompiler::new(Arc::new(runtime)).with_workflows(manifests);
+        let compiler = WorkflowCompiler::new(Arc::new(runtime)).with_workflows(manifests);
         let graph = compiler
             .compile(&manifest)
             .map_err(|e| format!("Compile workflow '{}': {}", input.workflow_id, e))?;
@@ -251,8 +346,8 @@ impl Tool for RunWorkflowTool {
             .await
             .map_err(|e| format!("Invoke workflow '{}': {}", input.workflow_id, e))?;
 
-        let output = serde_json::to_string_pretty(out.as_value())
-            .unwrap_or_else(|_| "{}".to_string());
+        let output =
+            serde_json::to_string_pretty(out.as_value()).unwrap_or_else(|_| "{}".to_string());
 
         Ok(ToolResult::new("run_workflow", output))
     }

@@ -1,7 +1,7 @@
-use crate::composer::{RegisterToolTool, WriteSpecialistTool};
 use crate::command_tool_registry::CommandToolRegistry;
+use crate::composer::{RegisterToolTool, WriteSpecialistTool};
 use crate::tools::TaskTool;
-use crate::workflow_tools::{ComposeWorkflowTool, RunWorkflowTool};
+use crate::workflow_tools::{ComposeWorkflowTool, MemoryDayQueryTool, RunWorkflowTool};
 use anyhow::{Result, anyhow};
 use gewu_core::traits::{AssemblyContext, LlmProvider, Tool, ToolFactory, ToolRegistry};
 use gewu_core::types::SpecialistDescriptor;
@@ -29,7 +29,9 @@ pub fn specialist_descriptors() -> Vec<SpecialistDescriptor> {
                 "bash", "grep", "web_fetch", "list", "code_search",
                 "web_search", "todo", "report_result",
                 "compose_workflow", "run_workflow", "register_tool", "write_specialist",
+                "memory_day_query",
             ].into_iter().map(String::from).collect(),
+            skills: Vec::new(),
             system_prompt: include_str!("prompts/build.txt").into(),
         },
         SpecialistDescriptor {
@@ -39,6 +41,7 @@ pub fn specialist_descriptors() -> Vec<SpecialistDescriptor> {
                 "read_file", "glob", "bash_safe", "grep", "web_fetch",
                 "list", "code_search", "web_search", "report_result",
             ].into_iter().map(String::from).collect(),
+            skills: Vec::new(),
             system_prompt: include_str!("prompts/explore.txt").into(),
         },
         SpecialistDescriptor {
@@ -49,7 +52,9 @@ pub fn specialist_descriptors() -> Vec<SpecialistDescriptor> {
                 "bash", "grep", "web_fetch", "list", "code_search",
                 "web_search", "todo", "report_result",
                 "compose_workflow", "run_workflow", "register_tool", "write_specialist",
+                "memory_day_query",
             ].into_iter().map(String::from).collect(),
+            skills: Vec::new(),
             system_prompt: include_str!("prompts/general.txt").into(),
         },
     ]
@@ -75,11 +80,29 @@ pub struct BuiltinToolFactory;
 impl ToolFactory for BuiltinToolFactory {
     fn capabilities(&self) -> Vec<String> {
         vec![
-            "read_file", "write_file", "edit_file", "glob", "bash",
-            "bash_safe", "grep", "web_fetch", "web_search", "list",
-            "code_search", "todo", "task", "report_result",
-            "compose_workflow", "run_workflow", "register_tool", "write_specialist",
-        ].into_iter().map(String::from).collect()
+            "read_file",
+            "write_file",
+            "edit_file",
+            "glob",
+            "bash",
+            "bash_safe",
+            "grep",
+            "web_fetch",
+            "web_search",
+            "list",
+            "code_search",
+            "todo",
+            "task",
+            "report_result",
+            "compose_workflow",
+            "run_workflow",
+            "memory_day_query",
+            "register_tool",
+            "write_specialist",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
     }
 
     fn create_tools(
@@ -89,16 +112,34 @@ impl ToolFactory for BuiltinToolFactory {
     ) -> std::result::Result<Vec<Box<dyn Tool>>, Box<dyn std::error::Error + Send + Sync>> {
         let wd = ctx.working_directory.clone();
         match capability {
-            "read_file" => Ok(vec![Box::new(ReadFileTool { working_directory: wd })]),
-            "write_file" => Ok(vec![Box::new(WriteFileTool { working_directory: wd })]),
-            "edit_file" => Ok(vec![Box::new(EditFileTool { working_directory: wd })]),
-            "glob" => Ok(vec![Box::new(GlobTool { working_directory: wd })]),
-            "bash" => Ok(vec![Box::new(BashTool { working_directory: wd, safe_mode: false })]),
-            "bash_safe" => Ok(vec![Box::new(BashTool { working_directory: wd, safe_mode: true })]),
-            "grep" => Ok(vec![Box::new(GrepTool { working_directory: wd })]),
+            "read_file" => Ok(vec![Box::new(ReadFileTool {
+                working_directory: wd,
+            })]),
+            "write_file" => Ok(vec![Box::new(WriteFileTool {
+                working_directory: wd,
+            })]),
+            "edit_file" => Ok(vec![Box::new(EditFileTool {
+                working_directory: wd,
+            })]),
+            "glob" => Ok(vec![Box::new(GlobTool {
+                working_directory: wd,
+            })]),
+            "bash" => Ok(vec![Box::new(BashTool {
+                working_directory: wd,
+                safe_mode: false,
+            })]),
+            "bash_safe" => Ok(vec![Box::new(BashTool {
+                working_directory: wd,
+                safe_mode: true,
+            })]),
+            "grep" => Ok(vec![Box::new(GrepTool {
+                working_directory: wd,
+            })]),
             "web_fetch" => Ok(vec![Box::new(WebFetchTool)]),
             "web_search" => Ok(vec![Box::new(WebSearchTool)]),
-            "list" => Ok(vec![Box::new(ListTool { working_directory: wd })]),
+            "list" => Ok(vec![Box::new(ListTool {
+                working_directory: wd,
+            })]),
             "code_search" => Ok(vec![Box::new(CodeSearchTool)]),
             "todo" => {
                 let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
@@ -107,10 +148,25 @@ impl ToolFactory for BuiltinToolFactory {
                     Box::new(TodoReadTool::new(todos)),
                 ])
             }
-            "task" => Ok(vec![Box::new(TaskTool::new(ctx.provider.clone(), ctx.pool.clone()))]),
-            "compose_workflow" => Ok(vec![Box::new(ComposeWorkflowTool::new(ctx.provider.clone(), ctx.pool.clone()))]),
-            "run_workflow" => Ok(vec![Box::new(RunWorkflowTool::new(ctx.provider.clone(), ctx.pool.clone(), vec![]))]),
-            "register_tool" => Ok(vec![Box::new(RegisterToolTool::new(CommandToolRegistry::default_dir()))]),
+            "task" => Ok(vec![Box::new(TaskTool::new(
+                ctx.provider.clone(),
+                ctx.pool.clone(),
+            ))]),
+            "compose_workflow" => Ok(vec![Box::new(ComposeWorkflowTool::new(
+                ctx.provider.clone(),
+                ctx.pool.clone(),
+            ))]),
+            "memory_day_query" => Ok(vec![Box::new(MemoryDayQueryTool)]),
+            "run_workflow" => Ok(vec![Box::new(RunWorkflowTool::new(
+                ctx.provider.clone(),
+                ctx.pool.clone(),
+                metadata_dirs(&ctx.metadata_json, "workflow_dirs"),
+            )
+            .with_runtime_plugin_dirs(metadata_dirs(&ctx.metadata_json, "runtime_plugin_dirs"))
+            .with_skill_dirs(metadata_dirs(&ctx.metadata_json, "skill_dirs")))]),
+            "register_tool" => Ok(vec![Box::new(RegisterToolTool::new(
+                CommandToolRegistry::default_dir(),
+            ))]),
             "write_specialist" => Ok(vec![Box::new(WriteSpecialistTool::new(
                 crate::composer::default_specialists_dir(),
             ))]),
@@ -118,6 +174,20 @@ impl ToolFactory for BuiltinToolFactory {
             _ => Err(format!("Unknown capability: {}", capability).into()),
         }
     }
+}
+
+fn metadata_dirs(metadata: &serde_json::Value, key: &str) -> Vec<PathBuf> {
+    metadata
+        .get(key)
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn resolve_tools(
@@ -162,5 +232,7 @@ pub async fn create_agent(
         .build()
         .map_err(|e| anyhow!("Failed to build runtime: {}", e))?;
 
-    runtime.build_specialist(name, session_id, additional_tools).await
+    runtime
+        .build_specialist(name, session_id, additional_tools)
+        .await
 }

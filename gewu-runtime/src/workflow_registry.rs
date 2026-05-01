@@ -50,6 +50,19 @@ impl WorkflowRegistry {
         Ok(Self { manifests })
     }
 
+    pub fn from_dirs(dirs: &[PathBuf]) -> Result<Self> {
+        let mut loader = WorkflowManifestLoader::new();
+        for d in dirs {
+            loader.add_dir(d);
+        }
+        let loaded = loader.load()?;
+        let mut registry = Self::new();
+        for (_, manifest) in loaded {
+            registry.insert(manifest);
+        }
+        Ok(registry)
+    }
+
     pub fn insert(&mut self, m: WorkflowManifest) {
         self.manifests.insert(m.id.clone(), m);
     }
