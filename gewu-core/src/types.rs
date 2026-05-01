@@ -9,6 +9,7 @@
 //! - [`Capabilities`] - Model capabilities for input/output modalities
 //! - [`ToolResult`] - Structured result from tool execution
 //! - [`ToolContext`] - Execution context passed to tools
+//! - [`ExecutionRun`] / [`ExecutionEvent`] - Observable execution trace records
 //! - [`FileAttachment`] - File attachment in tool results
 //! - [`TruncationResult`] - Result of output truncation
 
@@ -231,6 +232,96 @@ pub struct ToolResult {
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionRunKind {
+    ChatMessage,
+    Tool,
+    Workflow,
+    WorkflowNode,
+    Specialist,
+}
+
+impl ExecutionRunKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ChatMessage => "chat_message",
+            Self::Tool => "tool",
+            Self::Workflow => "workflow",
+            Self::WorkflowNode => "workflow_node",
+            Self::Specialist => "specialist",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "chat_message" => Some(Self::ChatMessage),
+            "tool" => Some(Self::Tool),
+            "workflow" => Some(Self::Workflow),
+            "workflow_node" => Some(Self::WorkflowNode),
+            "specialist" => Some(Self::Specialist),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionRunStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Skipped,
+}
+
+impl ExecutionRunStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "running" => Some(Self::Running),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            "skipped" => Some(Self::Skipped),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionRun {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub session_id: Option<String>,
+    pub kind: ExecutionRunKind,
+    pub name: String,
+    pub status: ExecutionRunStatus,
+    pub input_json: Option<serde_json::Value>,
+    pub output_json: Option<serde_json::Value>,
+    pub error: Option<String>,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionEvent {
+    pub id: String,
+    pub run_id: String,
+    pub event_type: String,
+    pub payload_json: serde_json::Value,
+    pub created_at: i64,
 }
 
 impl ToolResult {

@@ -1925,6 +1925,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "gewu-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.9",
+ "clap",
+ "dirs 6.0.0",
+ "dotenvy",
+ "gewu-cli",
+ "gewu-core",
+ "gewu-providers",
+ "gewu-runtime",
+ "gewu-storage",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "gewu-graph"
 version = "0.1.0"
 dependencies = [
@@ -2034,6 +2058,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
