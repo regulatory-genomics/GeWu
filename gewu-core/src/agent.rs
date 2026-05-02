@@ -46,7 +46,7 @@ use crate::middleware::TruncationService;
 use crate::traits::{LlmProvider, Memory, Tool, ToolRegistry};
 use crate::types::{
     AgentEvent, ContentPart, FunctionCall, Message, ProviderEvent, ToolCall, ToolContext,
-    ToolResult,
+    ToolExecutionPolicy, ToolResult,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -185,6 +185,183 @@ async fn execute_tool_with_panic_recovery(
     }
 }
 
+async fn run_tool_call(
+    tools: Arc<Vec<Arc<dyn Tool>>>,
+    truncation: TruncationService,
+    tool_name: String,
+    args: String,
+    ctx: ToolContext,
+) -> String {
+    let tool = tools.iter().find(|t| t.name() == tool_name);
+    if let Some(t) = tool {
+        info!("Executing tool: {}", tool_name);
+        let args_val: serde_json::Value = match serde_json::from_str(&args) {
+            Ok(v) => v,
+            Err(e) => return format!("Error: Failed to parse arguments: {}", e),
+        };
+        match execute_tool_with_panic_recovery(t.clone(), args_val, ctx).await {
+            Ok(res) => {
+                let truncation_result = truncation.truncate(&res.output, false);
+                if truncation_result.truncated {
+                    format!(
+                        "{}\n\n[Output truncated - {} bytes saved to {}]",
+                        truncation_result.content,
+                        truncation_result.content.len(),
+                        truncation_result
+                            .output_path
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default()
+                    )
+                } else {
+                    res.output
+                }
+            }
+            Err(e) => {
+                warn!("Tool '{}' failed: {}", tool_name, e);
+                format!("Error: {}", e)
+            }
+        }
+    } else {
+        format!("Tool not found: {}", tool_name)
+    }
+}
+
+#[derive(Clone)]
+struct PreparedToolCall {
+    tool_call_id: String,
+    tool_name: String,
+    args: String,
+    ctx: ToolContext,
+    start_metadata: serde_json::Value,
+}
+
+struct CompletedToolCall {
+    tool_call_id: String,
+    tool_name: String,
+    output: String,
+}
+
+struct ToolExecutionHarness {
+    tools: Arc<Vec<Arc<dyn Tool>>>,
+    truncation: TruncationService,
+    session_id: String,
+    context_metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ToolExecutionHarness {
+    fn new(agent: &Agent) -> Self {
+        Self {
+            tools: agent.tools.clone(),
+            truncation: agent.truncation.clone(),
+            session_id: agent.session_id.clone(),
+            context_metadata: agent.tool_context_metadata.clone(),
+        }
+    }
+
+    fn policy_for(&self, tool_name: &str) -> ToolExecutionPolicy {
+        self.tools
+            .iter()
+            .find(|tool| tool.name() == tool_name)
+            .map(|tool| tool.execution_policy())
+            .unwrap_or(ToolExecutionPolicy::Serial)
+    }
+
+    fn is_parallel_safe_task(&self, call: &ToolCall) -> bool {
+        call.function.name == "task"
+            && self.policy_for(&call.function.name) == ToolExecutionPolicy::ParallelSafe
+    }
+
+    fn parallel_wave_end(&self, calls: &[ToolCall], start: usize) -> usize {
+        let mut end = start;
+        while end < calls.len() && self.is_parallel_safe_task(&calls[end]) {
+            end += 1;
+        }
+        end
+    }
+
+    fn prepare(&self, call: ToolCall, message_id: &mut String) -> PreparedToolCall {
+        let tool_name = call.function.name;
+        let args = call.function.arguments;
+        let tool_call_id = call.id;
+        let mut ctx = ToolContext::new(&self.session_id, message_id.as_str())
+            .with_tool_call_id(tool_call_id.clone());
+        ctx.metadata.extend(self.context_metadata.clone());
+        let start_metadata = self
+            .tools
+            .iter()
+            .find(|tool| tool.name() == tool_name)
+            .and_then(|tool| tool.start_metadata(&args, &ctx).ok())
+            .unwrap_or(serde_json::Value::Null);
+        if !start_metadata.is_null() {
+            ctx.metadata
+                .insert("tool_start_metadata".to_string(), start_metadata.clone());
+        }
+        *message_id = Uuid::new_v4().to_string();
+        PreparedToolCall {
+            tool_call_id,
+            tool_name,
+            args,
+            ctx,
+            start_metadata,
+        }
+    }
+
+    async fn execute_one(&self, prepared: PreparedToolCall) -> CompletedToolCall {
+        let output = run_tool_call(
+            self.tools.clone(),
+            self.truncation.clone(),
+            prepared.tool_name.clone(),
+            prepared.args,
+            prepared.ctx,
+        )
+        .await;
+        CompletedToolCall {
+            tool_call_id: prepared.tool_call_id,
+            tool_name: prepared.tool_name,
+            output,
+        }
+    }
+
+    async fn execute_parallel(
+        &self,
+        prepared_calls: Vec<PreparedToolCall>,
+    ) -> Vec<CompletedToolCall> {
+        let mut handles = Vec::with_capacity(prepared_calls.len());
+        for prepared in prepared_calls {
+            let tools = self.tools.clone();
+            let truncation = self.truncation.clone();
+            handles.push(tokio::spawn(async move {
+                let output = run_tool_call(
+                    tools,
+                    truncation,
+                    prepared.tool_name.clone(),
+                    prepared.args,
+                    prepared.ctx,
+                )
+                .await;
+                CompletedToolCall {
+                    tool_call_id: prepared.tool_call_id,
+                    tool_name: prepared.tool_name,
+                    output,
+                }
+            }));
+        }
+
+        let mut outputs = Vec::with_capacity(handles.len());
+        for handle in handles {
+            outputs.push(match handle.await {
+                Ok(output) => output,
+                Err(err) => CompletedToolCall {
+                    tool_call_id: "unknown".to_string(),
+                    tool_name: "task".to_string(),
+                    output: format!("Error: Tool task join failed: {}", err),
+                },
+            });
+        }
+        outputs
+    }
+}
+
 impl Default for AgentBuilder {
     fn default() -> Self {
         AgentBuilder {
@@ -312,11 +489,13 @@ impl Agent {
                 let mut pending_consolidation_ids: Vec<String> = Vec::new();
                 let mut pending_consolidation_names: Vec<String> = Vec::new();
                 let mut pending_consolidation_contents: Vec<String> = Vec::new();
+                let harness = ToolExecutionHarness::new(self);
 
-                for call in current_tool_calls {
+                let mut call_index = 0usize;
+                while call_index < current_tool_calls.len() {
+                    let call = current_tool_calls[call_index].clone();
                     let tool_name = call.function.name.clone();
                     let args = call.function.arguments.clone();
-                    let call_id = call.id;
 
                     let current_call_sig = (tool_name.clone(), args.clone());
                     recent_tool_calls.push_back(current_call_sig.clone());
@@ -331,66 +510,80 @@ impl Agent {
                     }
 
                     if tool_name.is_empty() {
-                         let error_msg = "Tool name is empty, skipping execution".to_string();
-                         yield AgentEvent::Error { error: error_msg };
-                         continue;
+                          let error_msg = "Tool name is empty, skipping execution".to_string();
+                          yield AgentEvent::Error { error: error_msg };
+                          call_index += 1;
+                          continue;
+                     }
+
+                    if harness.is_parallel_safe_task(&call) {
+                        let block_start = call_index;
+                        let block_end = harness.parallel_wave_end(&current_tool_calls, block_start);
+                        let mut prepared_calls = Vec::new();
+                        for parallel_call in current_tool_calls[block_start..block_end].iter().cloned() {
+                            let prepared = harness.prepare(parallel_call, &mut message_id);
+                            yield AgentEvent::ToolStart {
+                                tool_call_id: prepared.tool_call_id.clone(),
+                                tool: prepared.tool_name.clone(),
+                                input: prepared.args.clone(),
+                                metadata: prepared.start_metadata.clone(),
+                            };
+                            prepared_calls.push(prepared);
+                        }
+
+                        for completed in harness.execute_parallel(prepared_calls).await {
+                            yield AgentEvent::ToolFinish {
+                                tool_call_id: completed.tool_call_id.clone(),
+                                tool: completed.tool_name.clone(),
+                                output: completed.output.clone(),
+                            };
+
+                            let result_tokens = compaction::estimate_tokens(&completed.output);
+                            turn_tool_tokens += result_tokens;
+                            pending_consolidation_ids.push(completed.tool_call_id.clone());
+                            pending_consolidation_names.push(completed.tool_name.clone());
+                            pending_consolidation_contents.push(completed.output.clone());
+                            let media_parts = extract_media_parts(&completed.output);
+                            self.memory.add_message(Message::Tool {
+                                tool_call_id: completed.tool_call_id,
+                                tool_name: Some(completed.tool_name),
+                                content: completed.output,
+                                media: media_parts,
+                            }).await;
+                        }
+
+                        call_index = block_end;
+                        continue;
                     }
 
-                    yield AgentEvent::ToolStart { tool: tool_name.clone(), input: args.clone() };
-
-                    let mut ctx = ToolContext::new(&self.session_id, &message_id);
-                    ctx.metadata.extend(self.tool_context_metadata.clone());
-                    message_id = Uuid::new_v4().to_string();
-
-                    let tool = self.tools.iter().find(|t| t.name() == tool_name);
-
-                    let result_content = if let Some(t) = tool {
-                        info!("Executing tool: {}", tool_name);
-                        let args_val: serde_json::Value = match serde_json::from_str(&args) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                yield AgentEvent::Error { error: format!("Failed to parse arguments: {}", e) };
-                                continue;
-                            }
-                        };
-                        match execute_tool_with_panic_recovery(t.clone(), args_val, ctx.clone()).await {
-                            Ok(res) => {
-                                let truncation_result = self.truncation.truncate(&res.output, false);
-                                let output = if truncation_result.truncated {
-                                    format!(
-                                        "{}\n\n[Output truncated - {} bytes saved to {}]",
-                                        truncation_result.content,
-                                        truncation_result.content.len(),
-                                        truncation_result.output_path.map(|p| p.display().to_string()).unwrap_or_default()
-                                    )
-                                } else {
-                                    res.output
-                                };
-                                output
-                            }
-                            Err(e) => {
-                                warn!("Tool '{}' failed: {}", tool_name, e);
-                                format!("Error: {}", e)
-                            }
-                        }
-                    } else {
-                        format!("Tool not found: {}", tool_name)
+                    let prepared = harness.prepare(call, &mut message_id);
+                    yield AgentEvent::ToolStart {
+                        tool_call_id: prepared.tool_call_id.clone(),
+                        tool: prepared.tool_name.clone(),
+                        input: prepared.args.clone(),
+                        metadata: prepared.start_metadata.clone(),
                     };
 
-                    yield AgentEvent::ToolFinish { tool: tool_name.clone(), output: result_content.clone() };
+                    let completed = harness.execute_one(prepared).await;
 
-                    let result_tokens = compaction::estimate_tokens(&result_content);
+                    yield AgentEvent::ToolFinish {
+                        tool_call_id: completed.tool_call_id.clone(),
+                        tool: completed.tool_name.clone(),
+                        output: completed.output.clone(),
+                    };
+
+                    let result_tokens = compaction::estimate_tokens(&completed.output);
                     turn_tool_tokens += result_tokens;
 
-                    pending_consolidation_ids.push(call_id.clone());
-                    pending_consolidation_names.push(tool_name.clone());
-                    pending_consolidation_contents.push(result_content.clone());
+                    pending_consolidation_ids.push(completed.tool_call_id.clone());
+                    pending_consolidation_names.push(completed.tool_name.clone());
+                    pending_consolidation_contents.push(completed.output.clone());
 
-                    let media_parts = extract_media_parts(&result_content);
+                    let media_parts = extract_media_parts(&completed.output);
                     self.memory.add_message(Message::Tool {
-                        tool_call_id: call_id,
-                        tool_name: Some(tool_name.clone()),
-                        content: result_content,
+                        tool_call_id: completed.tool_call_id,
+                        tool_name: Some(completed.tool_name.clone()),
+                        content: completed.output,
                         media: media_parts,
                     }).await;
 
@@ -441,6 +634,7 @@ impl Agent {
                         pending_consolidation_contents.clear();
                         turn_tool_tokens = 0;
                     }
+                    call_index += 1;
                 }
             }
         }
@@ -652,7 +846,9 @@ impl AgentBuilder {
             memory: self.memory.unwrap_or_else(|| Box::new(Vec::new())),
             context_limit: self.context_limit,
             truncation: TruncationService::new(),
-            session_id: self.session_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+            session_id: self
+                .session_id
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
             tool_context_metadata: self.tool_context_metadata,
         };
         Ok(agent)
