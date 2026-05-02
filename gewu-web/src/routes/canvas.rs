@@ -9,19 +9,21 @@
 //!   - `GET    /api/sessions/:sid/canvas`               -> list
 //!   - `GET    /api/sessions/:sid/canvas/:cid`          -> read
 //!   - `POST   /api/sessions/:sid/canvas/:cid/state`    -> patch
-//!   - `DELETE /api/sessions/:sid/canvas/:cid`          -> close
+//!   - `DELETE /api/sessions/:sid/canvas/:cid`          -> hide/minimize
 //!
 //! All endpoints honor the existing `?token=` auth used elsewhere in
 //! gewu-web.
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::extract::{Path, Query, RawQuery, State};
+use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::response::Response;
 use axum::Json;
 use gewu_canvas::CanvasStatePatch;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::state::AppState;
 
@@ -96,7 +98,75 @@ pub async fn handle_close(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_token(&app, &query).await?;
     match app.canvases.close(&session_id, &canvas_id).await {
-        Ok(()) => Ok(Json(json!({ "closed": true }))),
+        Ok(state) => Ok(Json(json!({ "closed": true, "state": state }))),
         Err(e) => Err((StatusCode::NOT_FOUND, e.to_string())),
     }
+}
+
+pub async fn handle_browser_get(
+    State(app): State<Arc<AppState>>,
+    Path(path): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Response, (StatusCode, String)> {
+    let target = browser_target_url(&app, &path, raw_query.as_deref()).await?;
+    proxy_browser_request(Method::GET, target, None).await
+}
+
+pub async fn handle_browser_post(
+    State(app): State<Arc<AppState>>,
+    Path(path): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Response, (StatusCode, String)> {
+    let target = browser_target_url(&app, &path, None).await?;
+    proxy_browser_request(Method::POST, target, Some(body)).await
+}
+
+async fn browser_target_url(
+    app: &AppState,
+    path: &str,
+    raw_query: Option<&str>,
+) -> Result<String, (StatusCode, String)> {
+    if path.contains("..") || path.contains('\\') {
+        return Err((StatusCode::BAD_REQUEST, "invalid browser path".to_string()));
+    }
+    let config = app.config.read().await;
+    let Some(base) = config.tachyon_browser_url.as_deref() else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "tachyon-browser is not configured".to_string()));
+    };
+    let mut target = format!("{}/api/browser/{}", base.trim_end_matches('/'), path);
+    if let Some(query) = raw_query.filter(|query| !query.is_empty()) {
+        target.push('?');
+        target.push_str(query);
+    }
+    Ok(target)
+}
+
+async fn proxy_browser_request(
+    method: Method,
+    target: String,
+    body: Option<Value>,
+) -> Result<Response, (StatusCode, String)> {
+    let client = reqwest::Client::new();
+    let request = match method {
+        Method::GET => client.get(&target),
+        Method::POST => client.post(&target).json(&body.unwrap_or(Value::Null)),
+        _ => return Err((StatusCode::METHOD_NOT_ALLOWED, "unsupported method".to_string())),
+    };
+    let upstream = request
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("tachyon-browser fetch failed: {e}")))?;
+    let status = upstream.status();
+    let bytes = upstream
+        .bytes()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("tachyon-browser response read failed: {e}")))?;
+
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
 }
