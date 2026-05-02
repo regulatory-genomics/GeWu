@@ -17,6 +17,8 @@ pub async fn serve_static(req: Request) -> Response {
             "application/wasm"
         } else if full_path.extension().map_or(false, |e| e == "js") {
             "application/javascript"
+        } else if full_path.extension().map_or(false, |e| e == "css") {
+            "text/css"
         } else if full_path.extension().map_or(false, |e| e == "html") {
             "text/html"
         } else {
