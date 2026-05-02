@@ -93,6 +93,7 @@ fn minimal_cli(workflow_dir: &str) -> Cli {
         api_key: Some("dummy".into()),
         endpoint: Some("http://localhost:9".into()),
         model: Some("dummy".into()),
+        max_output_tokens: None,
         agent: "build".into(),
         log_level: "warn".into(),
         list_agents: false,
