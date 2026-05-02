@@ -39,6 +39,9 @@ let currentAssistantToolsEl = null;
 let recoveryPollTimer = null;
 let sessionEventSource = null;
 const autoResumedGroups = new Set();
+const pendingBackgroundCompletions = new Map();
+const seenBackgroundCompletionGroups = new Set();
+let suppressChatAutoScroll = false;
 
 // Configure marked
 marked.setOptions({
@@ -516,13 +519,39 @@ function clearChat() {
     chatContainer.innerHTML = '';
 }
 
-function addMessage(role, content) {
+function isChatNearBottom(threshold = 80) {
+    return chatContainer.scrollHeight - chatContainer.scrollTop - chatContainer.clientHeight <= threshold;
+}
+
+function scrollChatToBottom() {
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+function shouldAutoScrollChat(options = {}) {
+    return !suppressChatAutoScroll && (options.forceScroll || isChatNearBottom());
+}
+
+function preserveChatFollow(shouldFollow, renderFn) {
+    const follow = shouldFollow ?? isChatNearBottom();
+    const previousSuppress = suppressChatAutoScroll;
+    suppressChatAutoScroll = true;
+    let result;
+    try {
+        result = renderFn();
+    } finally {
+        suppressChatAutoScroll = previousSuppress;
+    }
+    if (follow) scrollChatToBottom();
+    return result;
+}
+
+function addMessage(role, content, options = {}) {
     const div = document.createElement('div');
     div.className = `message ${role}`;
     const renderedContent = (role === 'user' || role === 'assistant') ? renderMarkdown(content) : escapeHtml(content);
     div.innerHTML = `<div class="role">${role}</div><div class="content">${renderedContent}</div>`;
     chatContainer.appendChild(div);
-    chatContainer.scrollTop = chatContainer.scrollHeight;
+    if (shouldAutoScrollChat(options)) scrollChatToBottom();
 }
 
 // Session Management
@@ -591,14 +620,16 @@ async function switchSession(session, forceReload = false) {
     clearChat();
     renderSessions();
     setStatus('Loading...', true);
+    let messages = [];
 
     // Load messages for this session
     try {
         const resp = await fetch(`/api/sessions/${session.id}/messages?token=${encodeURIComponent(token)}`);
         if (resp.ok) {
             const data = await resp.json();
-            if (data.messages && data.messages.length > 0) {
-                renderMessageHistory(data.messages);
+            messages = data.messages || [];
+            if (messages.length > 0) {
+                renderMessageHistory(messages);
             } else {
                 addMessage('assistant', 'Session ready. How can I help you?');
             }
@@ -613,25 +644,69 @@ async function switchSession(session, forceReload = false) {
     setStatus('Ready');
     await refreshSessionTree();
     await loadWorkGraph(session.id);
+    queueUnresumedPersistedBackgroundCompletions(messages);
     startRecoveryPollingIfActive();
     startSessionEvents();
+    await drainPendingBackgroundCompletions();
 }
 
 async function reloadCurrentSessionMessages() {
     if (!state.currentSession) return;
+    const shouldFollow = isChatNearBottom();
     try {
         const resp = await fetch(`/api/sessions/${state.currentSession.id}/messages?token=${encodeURIComponent(token)}`);
         if (!resp.ok) return;
         const data = await resp.json();
-        clearChat();
-        if (data.messages && data.messages.length > 0) {
-            renderMessageHistory(data.messages);
-        } else {
-            addMessage('assistant', 'Session ready. How can I help you?');
-        }
+        const messages = data.messages || [];
+        preserveChatFollow(shouldFollow, () => {
+            clearChat();
+            if (messages.length > 0) {
+                renderMessageHistory(messages, { autoScroll: false });
+            } else {
+                addMessage('assistant', 'Session ready. How can I help you?', { forceScroll: false });
+            }
+        });
+        queueUnresumedPersistedBackgroundCompletions(messages);
     } catch (e) {
         console.warn('Failed to reload current session messages', e);
     }
+}
+
+function parseBackgroundCompletionMessage(msg) {
+    if (msg?.role !== 'system' || typeof msg.content !== 'string') return null;
+    if (!msg.content.startsWith('[background_tasks.completed]')) return null;
+    const match = msg.content.match(/^\[background_tasks\.completed\]\s+group_id=([^\s]+)/);
+    if (!match) return null;
+    const summary = msg.content.split('\n').find(line => line.startsWith('Background tasks completed:')) || 'Background tasks completed';
+    return {
+        group_id: match[1],
+        parent_session_id: state.currentSession?.id,
+        summary,
+    };
+}
+
+function queueUnresumedPersistedBackgroundCompletions(messages) {
+    if (!state.currentSession) return;
+    let completionIndex = -1;
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+        if (parseBackgroundCompletionMessage(messages[i])) {
+            completionIndex = i;
+            break;
+        }
+    }
+    if (completionIndex < 0) return;
+
+    const hasLaterConversation = messages
+        .slice(completionIndex + 1)
+        .some(msg => msg?.role === 'user' || msg?.role === 'assistant');
+    if (hasLaterConversation) return;
+
+    const lastCompletion = parseBackgroundCompletionMessage(messages[completionIndex]);
+    if (!lastCompletion?.group_id) return;
+    if (seenBackgroundCompletionGroups.has(lastCompletion.group_id)) return;
+    if (autoResumedGroups.has(lastCompletion.group_id)) return;
+    seenBackgroundCompletionGroups.add(lastCompletion.group_id);
+    rememberPendingBackgroundCompletion(lastCompletion);
 }
 
 function graphHasActiveWork(graph = state.workGraph) {
@@ -670,8 +745,35 @@ function startSessionEvents() {
     });
 }
 
-async function autoResumeAfterBackgroundCompletion(payload) {
+function rememberPendingBackgroundCompletion(payload) {
+    const sessionId = payload?.parent_session_id || state.currentSession?.id;
+    if (!sessionId) return;
+    const key = payload?.group_id || `completion:${Date.now()}`;
+    const pending = pendingBackgroundCompletions.get(sessionId) || new Map();
+    pending.set(key, payload || {});
+    pendingBackgroundCompletions.set(sessionId, pending);
+}
+
+async function drainPendingBackgroundCompletions() {
     if (!state.currentSession || isLoading) return;
+    const pending = pendingBackgroundCompletions.get(state.currentSession.id);
+    if (!pending || pending.size === 0) return;
+
+    const [, payload] = pending.entries().next().value;
+    const groupId = payload?.group_id;
+    if (groupId) pending.delete(groupId);
+    else pending.clear();
+    if (pending.size === 0) pendingBackgroundCompletions.delete(state.currentSession.id);
+
+    await autoResumeAfterBackgroundCompletion(payload);
+}
+
+async function autoResumeAfterBackgroundCompletion(payload) {
+    if (!state.currentSession) return;
+    if (isLoading) {
+        rememberPendingBackgroundCompletion(payload);
+        return;
+    }
     const groupId = payload?.group_id;
     if (groupId) {
         if (autoResumedGroups.has(groupId)) return;
@@ -701,7 +803,12 @@ function startRecoveryPollingIfActive() {
     }, 2500);
 }
 
-function renderMessageHistory(messages) {
+function renderMessageHistory(messages, options = {}) {
+    const shouldFollow = options.autoScroll ?? isChatNearBottom();
+    preserveChatFollow(shouldFollow, () => renderMessageHistoryContent(messages));
+}
+
+function renderMessageHistoryContent(messages) {
     const toolCallHosts = new Map();
     let lastAssistantDiv = null;
     let lastAssistantToolsEl = null;
@@ -789,7 +896,7 @@ function renderEmptyAssistantTurn(msg) {
     return div;
 }
 
-function renderMessage(msg) {
+function renderMessage(msg, options = {}) {
     const div = document.createElement('div');
     div.className = `message ${msg.role}`;
     if (msg.active_turn) div.classList.add('active-turn');
@@ -818,7 +925,7 @@ function renderMessage(msg) {
         div.querySelector('.content').dataset.markdown = msg.content || '';
     }
     chatContainer.appendChild(div);
-    chatContainer.scrollTop = chatContainer.scrollHeight;
+    if (shouldAutoScrollChat(options)) scrollChatToBottom();
     return div;
 }
 
@@ -1258,6 +1365,7 @@ function markActiveToolCallsCanceled() {
 }
 
 function createToolCall(toolCallId, toolName, input, metadata = null) {
+    const shouldFollow = isChatNearBottom();
     ensureAssistantTurn();
     const details = document.createElement('details');
     details.className = 'tool-call';
@@ -1286,7 +1394,7 @@ function createToolCall(toolCallId, toolName, input, metadata = null) {
     }
     details.open = true;
     rememberActiveToolCall(toolCallId, toolName, details);
-    chatContainer.scrollTop = chatContainer.scrollHeight;
+    if (shouldFollow) scrollChatToBottom();
     return details;
 }
 
@@ -1357,6 +1465,7 @@ function upsertChildSessionFromMetadata(metadata, childSessionId) {
 }
 
 function finishToolCall(details, output) {
+    const shouldFollow = isChatNearBottom();
     const summary = details.querySelector('summary');
     const status = summary.querySelector('.tool-status');
     status.className = 'tool-status done';
@@ -1375,7 +1484,7 @@ function finishToolCall(details, output) {
     } catch (e) { /* tool output not JSON; ignore */ }
     refreshSessionTree();
     loadWorkGraph();
-    chatContainer.scrollTop = chatContainer.scrollHeight;
+    if (shouldFollow) scrollChatToBottom();
 }
 
 // Streaming Message Elements
@@ -1415,6 +1524,7 @@ function createReasoningDiv() {
 }
 
 function appendToDiv(div, role, text) {
+    const shouldFollow = isChatNearBottom();
     if (role === 'assistant') {
         currentMarkdownBuffer += text;
         const html = DOMPurify.sanitize(marked.parse(currentMarkdownBuffer));
@@ -1422,7 +1532,7 @@ function appendToDiv(div, role, text) {
     } else {
         div.querySelector('.reasoning-content').textContent += text;
     }
-    chatContainer.scrollTop = chatContainer.scrollHeight;
+    if (shouldFollow) scrollChatToBottom();
 }
 
 // SSE Handler
@@ -1476,7 +1586,7 @@ async function sendMessageText(message, options = {}) {
     activeChatAbortController = new AbortController();
     setSendButtonMode('stop');
     setStatus(options.internal ? 'Continuing...' : 'Thinking...', true);
-    if (!options.internal) addMessage('user', message);
+    if (!options.internal) addMessage('user', message, { forceScroll: true });
     resetStreamingTurn();
     try {
         const resp = await fetch(`/api/chat?token=${encodeURIComponent(token)}`, {
@@ -1529,6 +1639,7 @@ async function sendMessageText(message, options = {}) {
         setSendButtonMode('send');
         if (statusText.textContent !== 'Stopped') setStatus('Ready');
         startRecoveryPollingIfActive();
+        await drainPendingBackgroundCompletions();
     }
 }
 
