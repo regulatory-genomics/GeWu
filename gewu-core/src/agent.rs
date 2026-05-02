@@ -290,12 +290,22 @@ impl ToolExecutionHarness {
     }
 
     fn prepare(&self, call: ToolCall, message_id: &mut String) -> PreparedToolCall {
+        self.prepare_with_metadata(call, message_id, serde_json::Map::new())
+    }
+
+    fn prepare_with_metadata(
+        &self,
+        call: ToolCall,
+        message_id: &mut String,
+        extra_metadata: serde_json::Map<String, serde_json::Value>,
+    ) -> PreparedToolCall {
         let tool_name = call.function.name;
         let args = call.function.arguments;
         let tool_call_id = call.id;
         let mut ctx = ToolContext::new(&self.session_id, message_id.as_str())
             .with_tool_call_id(tool_call_id.clone());
         ctx.metadata.extend(self.context_metadata.clone());
+        ctx.metadata.extend(extra_metadata);
         let start_metadata = self
             .tools
             .iter()
@@ -538,9 +548,24 @@ impl Agent {
                     if harness.is_parallel_safe_task(&call) {
                         let block_start = call_index;
                         let block_end = harness.parallel_wave_end(&current_tool_calls, block_start);
+                        let wave_parent_message_id = message_id.clone();
+                        let wave_expected_count = (block_end - block_start) as i64;
                         let mut prepared_calls = Vec::new();
                         for parallel_call in current_tool_calls[block_start..block_end].iter().cloned() {
-                            let prepared = harness.prepare(parallel_call, &mut message_id);
+                            let mut extra_metadata = serde_json::Map::new();
+                            extra_metadata.insert(
+                                "parallel_wave_parent_message_id".to_string(),
+                                serde_json::Value::String(wave_parent_message_id.clone()),
+                            );
+                            extra_metadata.insert(
+                                "parallel_wave_expected_count".to_string(),
+                                serde_json::Value::Number(wave_expected_count.into()),
+                            );
+                            let prepared = harness.prepare_with_metadata(
+                                parallel_call,
+                                &mut message_id,
+                                extra_metadata,
+                            );
                             yield AgentEvent::ToolStart {
                                 tool_call_id: prepared.tool_call_id.clone(),
                                 tool: prepared.tool_name.clone(),

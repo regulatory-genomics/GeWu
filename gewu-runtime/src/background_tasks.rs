@@ -86,7 +86,13 @@ impl BackgroundTaskCoordinator {
             return Ok(false);
         }
         let members = store.list_group_members(&group.group_id).await?;
-        if members.is_empty() || members.iter().any(|t| !is_settled(&t.execution_status)) {
+        if members.is_empty() {
+            return Ok(false);
+        }
+        if group.expected_member_count > 0 && members.len() < group.expected_member_count as usize {
+            return Ok(false);
+        }
+        if members.iter().any(|t| !is_settled(&t.execution_status)) {
             return Ok(false);
         }
         if !store.mark_injected(&group.group_id).await? {
@@ -278,6 +284,7 @@ mod tests {
             group_id: "g1".into(),
             parent_session_id: "parent".into(),
             parent_message_id: "msg".into(),
+            expected_member_count: 0,
             status: "running".into(),
             injected_at: None,
             created_at: 1,

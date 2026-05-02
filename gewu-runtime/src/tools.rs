@@ -177,6 +177,17 @@ impl Tool for TaskTool {
             .or_else(|| input.task_id.clone())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let mut metadata = serde_json::Map::new();
+        let parent_message_id = ctx
+            .metadata
+            .get("parallel_wave_parent_message_id")
+            .and_then(Value::as_str)
+            .unwrap_or(&ctx.message_id)
+            .to_string();
+        let expected_member_count = ctx
+            .metadata
+            .get("parallel_wave_expected_count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         metadata.insert("description".to_string(), Value::String(input.description));
         metadata.insert(
             "parent_session_id".to_string(),
@@ -184,7 +195,7 @@ impl Tool for TaskTool {
         );
         metadata.insert(
             "parent_message_id".to_string(),
-            Value::String(ctx.message_id.clone()),
+            Value::String(parent_message_id.clone()),
         );
         if let Some(root_run_id) = ctx
             .metadata
@@ -251,10 +262,13 @@ impl Tool for TaskTool {
 
         if input.mode == TaskMode::Async {
             let parent_session_id = ctx.session_id.clone();
-            let parent_message_id = ctx.message_id.clone();
             let group_store = AsyncTaskGroupStore::new(self.pool.clone()).await?;
             let group = group_store
-                .create_or_get_group(&parent_session_id, &parent_message_id)
+                .create_or_get_group_with_expected_count(
+                    &parent_session_id,
+                    &parent_message_id,
+                    expected_member_count,
+                )
                 .await?;
             group_store
                 .add_member(&group.group_id, &task_id, &request.session_id)

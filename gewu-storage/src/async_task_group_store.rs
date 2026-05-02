@@ -9,6 +9,7 @@ pub struct AsyncTaskGroup {
     pub group_id: String,
     pub parent_session_id: String,
     pub parent_message_id: String,
+    pub expected_member_count: i64,
     pub status: String,
     pub injected_at: Option<i64>,
     pub created_at: i64,
@@ -33,6 +34,7 @@ impl AsyncTaskGroupStore {
                 group_id TEXT PRIMARY KEY,
                 parent_session_id TEXT NOT NULL,
                 parent_message_id TEXT NOT NULL,
+                expected_member_count INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'running',
                 injected_at INTEGER,
                 created_at INTEGER DEFAULT (unixepoch()),
@@ -43,6 +45,14 @@ impl AsyncTaskGroupStore {
         .execute(&self.pool)
         .await
         .context("create async_task_groups")?;
+
+        sqlx::query(
+            r#"ALTER TABLE async_task_groups
+               ADD COLUMN expected_member_count INTEGER NOT NULL DEFAULT 0"#,
+        )
+        .execute(&self.pool)
+        .await
+        .ok();
 
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS async_task_group_members (
@@ -73,16 +83,29 @@ impl AsyncTaskGroupStore {
         parent_session_id: &str,
         parent_message_id: &str,
     ) -> Result<AsyncTaskGroup> {
+        self.create_or_get_group_with_expected_count(parent_session_id, parent_message_id, 0)
+            .await
+    }
+
+    pub async fn create_or_get_group_with_expected_count(
+        &self,
+        parent_session_id: &str,
+        parent_message_id: &str,
+        expected_member_count: i64,
+    ) -> Result<AsyncTaskGroup> {
         let group_id = format!("async_group_{}", Uuid::new_v4());
         sqlx::query(
-            r#"INSERT INTO async_task_groups (group_id, parent_session_id, parent_message_id)
-               VALUES (?, ?, ?)
+            r#"INSERT INTO async_task_groups (group_id, parent_session_id, parent_message_id, expected_member_count)
+               VALUES (?, ?, ?, ?)
                ON CONFLICT(parent_session_id, parent_message_id)
-               DO UPDATE SET updated_at = unixepoch()"#,
+               DO UPDATE SET
+                   expected_member_count = MAX(async_task_groups.expected_member_count, excluded.expected_member_count),
+                   updated_at = unixepoch()"#,
         )
         .bind(&group_id)
         .bind(parent_session_id)
         .bind(parent_message_id)
+        .bind(expected_member_count.max(0))
         .execute(&self.pool)
         .await?;
 
@@ -112,8 +135,9 @@ impl AsyncTaskGroupStore {
 
     pub async fn get_group_for_task(&self, task_id: &str) -> Result<Option<AsyncTaskGroup>> {
         let row = sqlx::query(
-            r#"SELECT g.group_id, g.parent_session_id, g.parent_message_id, g.status,
-                      g.injected_at, g.created_at, g.updated_at
+            r#"SELECT g.group_id, g.parent_session_id, g.parent_message_id,
+                      g.expected_member_count, g.status, g.injected_at,
+                      g.created_at, g.updated_at
                FROM async_task_groups g
                JOIN async_task_group_members m ON m.group_id = g.group_id
                WHERE m.task_id = ?"#,
@@ -143,8 +167,8 @@ impl AsyncTaskGroupStore {
 
     pub async fn list_uninjected_groups(&self) -> Result<Vec<AsyncTaskGroup>> {
         let rows = sqlx::query(
-            r#"SELECT group_id, parent_session_id, parent_message_id, status,
-                      injected_at, created_at, updated_at
+            r#"SELECT group_id, parent_session_id, parent_message_id,
+                      expected_member_count, status, injected_at, created_at, updated_at
                FROM async_task_groups WHERE injected_at IS NULL ORDER BY created_at"#,
         )
         .fetch_all(&self.pool)
@@ -170,8 +194,8 @@ impl AsyncTaskGroupStore {
         parent_message_id: &str,
     ) -> Result<Option<AsyncTaskGroup>> {
         let row = sqlx::query(
-            r#"SELECT group_id, parent_session_id, parent_message_id, status,
-                      injected_at, created_at, updated_at
+            r#"SELECT group_id, parent_session_id, parent_message_id,
+                      expected_member_count, status, injected_at, created_at, updated_at
                FROM async_task_groups
                WHERE parent_session_id = ? AND parent_message_id = ?"#,
         )
@@ -188,6 +212,7 @@ fn row_to_group(row: sqlx::sqlite::SqliteRow) -> Result<AsyncTaskGroup> {
         group_id: row.try_get("group_id")?,
         parent_session_id: row.try_get("parent_session_id")?,
         parent_message_id: row.try_get("parent_message_id")?,
+        expected_member_count: row.try_get("expected_member_count")?,
         status: row.try_get("status")?,
         injected_at: row.try_get("injected_at")?,
         created_at: row.try_get("created_at")?,
@@ -233,6 +258,22 @@ mod tests {
         let first = store.create_or_get_group("parent", "msg").await?;
         let second = store.create_or_get_group("parent", "msg").await?;
         assert_eq!(first.group_id, second.group_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_or_get_group_keeps_largest_expected_count() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        let store = AsyncTaskGroupStore::new(pool).await?;
+        let first = store
+            .create_or_get_group_with_expected_count("parent", "msg", 3)
+            .await?;
+        let second = store
+            .create_or_get_group_with_expected_count("parent", "msg", 1)
+            .await?;
+
+        assert_eq!(first.group_id, second.group_id);
+        assert_eq!(second.expected_member_count, 3);
         Ok(())
     }
 
