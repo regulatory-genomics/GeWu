@@ -68,9 +68,7 @@ impl ToolProvider for CliToolProvider {
             .iter()
             .find(|c| c.name == capability)
             .ok_or_else(|| format!("unknown cli capability: {}", capability))?;
-        Ok(vec![Box::new(CliTool {
-            cap: cap.clone(),
-        })])
+        Ok(vec![Box::new(CliTool { cap: cap.clone() })])
     }
 }
 

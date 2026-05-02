@@ -248,7 +248,11 @@ async fn benchmark_2(provider: &Arc<dyn LlmProvider>, pool: &sqlx::SqlitePool) -
     let output2 = envelope2["output_json"]
         .as_str()
         .map(str::to_string)
-        .or_else(|| envelope2["output_json"]["result"].as_str().map(str::to_string))
+        .or_else(|| {
+            envelope2["output_json"]["result"]
+                .as_str()
+                .map(str::to_string)
+        })
         .unwrap_or_default();
 
     // ── Final verification ──

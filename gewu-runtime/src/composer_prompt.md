@@ -28,7 +28,9 @@ synthesis:
 
 Use inline specialists when the specialist is workflow-specific and doesn't need to be reused. Use `write_specialist` when you want the specialist to be available across workflows.
 
-## Manifest schema (excerpt)
+## Manifest schema (canonical)
+
+Use this exact shape. The most common failure is using `nodes` as a list or string; it must be a **map keyed by node id**. `entry` must be a string node id. `finish` must be a list of terminal node ids. `edges` must be a list of two-item arrays or conditional objects.
 
 ```yaml
 id: <string>              # unique workflow id
@@ -52,6 +54,22 @@ edges:
   - { from: X, to: Y, when: "$.path == value" }      # conditional; value: true/false/null/<int>/"<str>"
 ```
 
+Minimal valid manifest:
+
+```yaml
+id: example_workflow
+description: One deterministic tool step.
+entry: query
+finish: [query]
+nodes:
+  query:
+    kind: tool
+    tool: memory_day_query
+    input: $
+    write: query
+edges: []
+```
+
 Node kinds:
 - `specialist`: runs the named specialist via the agent runtime; useful when LLM reasoning is needed.
 - `tool`: calls a raw capability directly (no LLM); useful for deterministic steps.
@@ -63,15 +81,24 @@ Node kinds:
 1. Call `list_specialists` and `list_capabilities`.
 2. Read the user goal. Identify the required steps and the order they should run.
 3. For each step, decide whether it is a specialist (LLM-driven), a tool (deterministic), a parallel fan-out, or a nested workflow.
-4. Draft the YAML manifest. Use explicit `write:` paths where steps need to feed later steps via `input: $.<path>`.
-5. Call `write_workflow` with the draft. If it rejects, read the error and try again.
-6. Only after `write_workflow` returns `{ ok: true, ... }`, report the workflow id back to the user with a brief explanation of the topology.
+4. Draft the YAML manifest using the canonical map-based schema above. Use explicit `write:` paths where steps need to feed later steps via `input: $.<path>`.
+5. Before calling `write_workflow`, check your draft against this checklist:
+   - `entry` names an existing node.
+   - every `finish` item names an existing node.
+   - `nodes` is a map, not a list/string.
+   - every `tool` appeared in `list_capabilities`.
+   - every specialist id appeared in `list_specialists`, unless defined inline.
+   - large reports are persisted by a final writer tool and the workflow returns IDs/metadata, not huge bodies.
+6. Call `write_workflow` with the draft. If it rejects, read the error and make one targeted schema correction; do not try random alternate shapes.
+7. Only after `write_workflow` returns `{ ok: true, ... }`, report the workflow id back to the user with a brief explanation of the topology.
 
 ## Hard rules
 
 - **Never** reference a specialist or capability that did not appear in the `list_*` outputs. If a required piece is missing, say so explicitly — do not fabricate names.
 - **Never** invent manifest fields. Stick to the schema above.
+- **Never** use `nodes: [ ... ]`, `nodes: "a->b"`, or `entry: { ... }`; these are invalid. Use `entry: a` and `nodes: { a: ... }` YAML map form.
 - **Never** produce a workflow with unreachable nodes, duplicate parallel write keys, or conditional loops (`max_loops > 0` is not yet supported).
+- **Never** embed very large final prose/results in the `run_workflow` tool return path. Persist large artifacts in a writer node and return compact identifiers/metadata.
 - When in doubt about control flow, prefer fewer nodes and explicit data flow via `input:`/`write:` over implicit coupling.
 
 ## Blackboard initial state

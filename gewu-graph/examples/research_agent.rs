@@ -26,8 +26,12 @@ impl State for ResearchState {
     fn merge(&self, update: Self::Partial) -> Self {
         Self {
             query: update.query.unwrap_or_else(|| self.query.clone()),
-            search_queries: update.search_queries.unwrap_or_else(|| self.search_queries.clone()),
-            search_results: update.search_results.unwrap_or_else(|| self.search_results.clone()),
+            search_queries: update
+                .search_queries
+                .unwrap_or_else(|| self.search_queries.clone()),
+            search_results: update
+                .search_results
+                .unwrap_or_else(|| self.search_results.clone()),
             synthesized_report: update
                 .synthesized_report
                 .unwrap_or_else(|| self.synthesized_report.clone()),
@@ -80,7 +84,12 @@ async fn call_llm(
     Ok(content)
 }
 
-async fn generate_search_queries(state: ResearchState, provider: &str, api_key: &str, model: &str) -> PartialResearchState {
+async fn generate_search_queries(
+    state: ResearchState,
+    provider: &str,
+    api_key: &str,
+    model: &str,
+) -> PartialResearchState {
     let system = r#"Given a research query, generate exactly 2 search queries that would help gather information on this topic.
 Output ONLY a JSON array with 2 strings. Example: ["query 1", "query 2"]"#;
 
@@ -90,13 +99,12 @@ Output ONLY a JSON array with 2 strings. Example: ["query 1", "query 2"]"#;
             return PartialResearchState {
                 query: Some(state.query),
                 ..Default::default()
-            }
+            };
         }
     };
 
-    let search_queries: Vec<String> = serde_json::from_str(&queries).unwrap_or_else(|_| {
-        vec![state.query.clone(), state.query.clone()]
-    });
+    let search_queries: Vec<String> = serde_json::from_str(&queries)
+        .unwrap_or_else(|_| vec![state.query.clone(), state.query.clone()]);
 
     PartialResearchState {
         query: Some(state.query),
@@ -105,7 +113,12 @@ Output ONLY a JSON array with 2 strings. Example: ["query 1", "query 2"]"#;
     }
 }
 
-async fn perform_searches(state: ResearchState, provider: &str, api_key: &str, model: &str) -> PartialResearchState {
+async fn perform_searches(
+    state: ResearchState,
+    provider: &str,
+    api_key: &str,
+    model: &str,
+) -> PartialResearchState {
     let queries = state.search_queries.clone();
     let mut results = Vec::new();
 
@@ -126,7 +139,12 @@ as if you were searching the web. Include relevant facts, opinions, and details.
     }
 }
 
-async fn synthesize(state: ResearchState, provider: &str, api_key: &str, model: &str) -> PartialResearchState {
+async fn synthesize(
+    state: ResearchState,
+    provider: &str,
+    api_key: &str,
+    model: &str,
+) -> PartialResearchState {
     let results_text = state
         .search_results
         .iter()
@@ -139,7 +157,10 @@ async fn synthesize(state: ResearchState, provider: &str, api_key: &str, model: 
 create a well-structured, comprehensive report that synthesizes all the information.
 Format with clear sections and key findings."#;
 
-    let user = format!("Research Query: {}\n\nSearch Results:\n{}", state.query, results_text);
+    let user = format!(
+        "Research Query: {}\n\nSearch Results:\n{}",
+        state.query, results_text
+    );
 
     let report = match call_llm(provider, api_key, model, system, &user).await {
         Ok(r) => r,
@@ -152,7 +173,12 @@ Format with clear sections and key findings."#;
     }
 }
 
-async fn format_response(state: ResearchState, provider: &str, api_key: &str, model: &str) -> PartialResearchState {
+async fn format_response(
+    state: ResearchState,
+    provider: &str,
+    api_key: &str,
+    model: &str,
+) -> PartialResearchState {
     let system = r#"You are a research assistant presenting findings to a user.
 Given a research query and a synthesized report, format it into a clear, engaging response
 that addresses the original query. Use bullet points, headings, and keep it accessible."#;
@@ -173,7 +199,11 @@ that addresses the original query. Use bullet points, headings, and keep it acce
     }
 }
 
-fn build_research_graph(endpoint: &str, api_key: &str, model: &str) -> CompiledGraph<ResearchState> {
+fn build_research_graph(
+    endpoint: &str,
+    api_key: &str,
+    model: &str,
+) -> CompiledGraph<ResearchState> {
     let mut graph = StateGraph::<ResearchState>::new();
 
     let p1 = endpoint.to_string();
@@ -277,9 +307,7 @@ async fn main() -> Result<()> {
     println!("Research tool created: {}\n", research_tool.tool_name());
     println!("Running research queries...\n");
 
-    let test_queries = vec![
-        "What are the benefits of Rust for systems programming?",
-    ];
+    let test_queries = vec!["What are the benefits of Rust for systems programming?"];
 
     for (i, query) in test_queries.iter().enumerate() {
         println!("========================================");

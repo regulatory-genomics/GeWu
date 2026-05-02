@@ -50,8 +50,8 @@ use gewu_core::types::Message;
 use sqlx::{Row, sqlite::SqlitePool};
 use tracing::{error, info};
 
-pub mod task_store;
 pub mod execution_trace_store;
+pub mod task_store;
 pub use execution_trace_store::{ExecutionTraceStore, StartExecutionRun};
 pub use task_store::TaskStore;
 

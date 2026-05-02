@@ -16,8 +16,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::manifest::workflow::{EdgeSpec, NodeSpec, SpecialistRef, WorkflowManifest};
 use crate::execution_trace::StartTraceRun;
+use crate::manifest::workflow::{EdgeSpec, NodeSpec, SpecialistRef, WorkflowManifest};
 use crate::runtime::GeWuRuntime;
 
 use gewu_core::types::SpecialistDescriptor;
@@ -272,7 +272,9 @@ impl WorkflowCompiler {
                         .await;
                     return match result {
                         Ok(output) => {
-                            let _ = runtime.finish_trace_run(&specialist_run.id, Some(&output)).await;
+                            let _ = runtime
+                                .finish_trace_run(&specialist_run.id, Some(&output))
+                                .await;
                             let _ = runtime.finish_trace_run(&node_run.id, Some(&output)).await;
                             to_partial(&write_path, Ok(output))
                         }
@@ -378,9 +380,13 @@ impl WorkflowCompiler {
                 };
                 let mut ctx = ToolContext::new(session_id.clone(), node_id.clone());
                 if let Some(root_run_id) = root_run_id {
-                    ctx.metadata.insert("trace_root_run_id".to_string(), Value::String(root_run_id));
+                    ctx.metadata
+                        .insert("trace_root_run_id".to_string(), Value::String(root_run_id));
                 }
-                ctx.metadata.insert("trace_current_run_id".to_string(), Value::String(node_run.id.clone()));
+                ctx.metadata.insert(
+                    "trace_current_run_id".to_string(),
+                    Value::String(node_run.id.clone()),
+                );
                 match tool.execute(input_val, &ctx).await {
                     Ok(tr) => {
                         let value = serde_json::from_str::<Value>(&tr.output)

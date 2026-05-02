@@ -1,6 +1,6 @@
 //! Core state management traits and built-in reducers.
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::fmt::Debug;
 
 /// The core trait for graph state.

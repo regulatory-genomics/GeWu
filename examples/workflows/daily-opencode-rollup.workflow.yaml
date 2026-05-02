@@ -54,6 +54,7 @@ nodes:
         Do not derive the local date from UTC created_at values; the date in the input is authoritative.
         The output must include summary_kind, title, content, derived_from, metadata, idempotency_key, and mode.
         Do not call memory_summary_write yourself. Use report_result with the JSON object; the workflow write_summary node will persist it.
+        Keep the returned JSON focused on the persistable summary object. Do not include raw event dumps or trace/debug blobs in the summary content.
         If no events were found, call report_result with a valid summary object whose content says no events were found and whose derived_from is empty.
     input: $
     write: summary

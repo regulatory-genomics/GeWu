@@ -27,6 +27,7 @@ pub fn specialist_descriptors() -> Vec<SpecialistDescriptor> {
                 "bash", "grep", "web_fetch", "list", "code_search",
                 "web_search", "todo", "report_result",
             ].into_iter().map(String::from).collect(),
+            skills: Vec::new(),
             system_prompt: include_str!("prompts/build.txt").into(),
         },
         SpecialistDescriptor {
@@ -36,6 +37,7 @@ pub fn specialist_descriptors() -> Vec<SpecialistDescriptor> {
                 "read_file", "glob", "bash_safe", "grep", "web_fetch",
                 "list", "code_search", "web_search", "report_result",
             ].into_iter().map(String::from).collect(),
+            skills: Vec::new(),
             system_prompt: include_str!("prompts/explore.txt").into(),
         },
         SpecialistDescriptor {
@@ -46,6 +48,7 @@ pub fn specialist_descriptors() -> Vec<SpecialistDescriptor> {
                 "bash", "grep", "web_fetch", "list", "code_search",
                 "web_search", "todo", "report_result",
             ].into_iter().map(String::from).collect(),
+            skills: Vec::new(),
             system_prompt: include_str!("prompts/general.txt").into(),
         },
     ]

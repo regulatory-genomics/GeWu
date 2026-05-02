@@ -67,7 +67,8 @@ impl TruncationService {
             "The tool call succeeded but the output was truncated ({} → {} bytes). \
             Full output saved to the file above. \
             Use grep to search the full content or read with offset/limit to view specific sections.",
-            total_bytes, preview.len()
+            total_bytes,
+            preview.len()
         );
 
         let truncated_content = format!("{}\n\n{}", preview, hint);

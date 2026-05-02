@@ -44,32 +44,22 @@ impl DiffOptions {
     }
 
     pub fn is_ignored(&self, path: &str) -> bool {
-        self.ignore_prefixes.iter().any(|p| {
-            path == p || path.starts_with(&format!("{}.", p))
-        })
+        self.ignore_prefixes
+            .iter()
+            .any(|p| path == p || path.starts_with(&format!("{}.", p)))
     }
 }
 
 /// Produce a list of differences between two blackboards. Empty result means
 /// they are structurally equal (modulo `opts.ignore_prefixes`).
-pub fn diff_blackboards(
-    lhs: &Blackboard,
-    rhs: &Blackboard,
-    opts: &DiffOptions,
-) -> Vec<DiffEntry> {
+pub fn diff_blackboards(lhs: &Blackboard, rhs: &Blackboard, opts: &DiffOptions) -> Vec<DiffEntry> {
     let mut out = Vec::new();
     walk_diff(lhs.as_value(), rhs.as_value(), "", opts, &mut out);
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 
-fn walk_diff(
-    lhs: &Value,
-    rhs: &Value,
-    path: &str,
-    opts: &DiffOptions,
-    out: &mut Vec<DiffEntry>,
-) {
+fn walk_diff(lhs: &Value, rhs: &Value, path: &str, opts: &DiffOptions, out: &mut Vec<DiffEntry>) {
     if opts.is_ignored(path) {
         return;
     }
@@ -182,11 +172,7 @@ mod tests {
     fn ignore_prefix_suppresses_subtree() {
         let a = Blackboard(json!({ "x": 1, "_errors": { "a": "boom" } }));
         let b = Blackboard(json!({ "x": 1 }));
-        let d = diff_blackboards(
-            &a,
-            &b,
-            &DiffOptions::ignoring(vec!["_errors".to_string()]),
-        );
+        let d = diff_blackboards(&a, &b, &DiffOptions::ignoring(vec!["_errors".to_string()]));
         assert!(d.is_empty(), "got: {:?}", d);
     }
 

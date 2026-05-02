@@ -357,7 +357,11 @@ mod tests {
             .await?;
 
         store
-            .record_event(&node.id, "tool_start", &serde_json::json!({"tool":"memory_sql_query"}))
+            .record_event(
+                &node.id,
+                "tool_start",
+                &serde_json::json!({"tool":"memory_sql_query"}),
+            )
             .await?;
         store
             .finish_run(&node.id, Some(&serde_json::json!({"row_count": 10})))

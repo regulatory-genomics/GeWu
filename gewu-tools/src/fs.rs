@@ -150,15 +150,21 @@ impl Tool for ReadFileTool {
                 }
 
                 if !suggestions.is_empty() {
-                    return Ok(ToolResult::new("read_file", format!(
-                        "File not found: {}\n\nDid you mean one of these?\n{}",
-                        input.file_path,
-                        suggestions.join("\n")
-                    )));
+                    return Ok(ToolResult::new(
+                        "read_file",
+                        format!(
+                            "File not found: {}\n\nDid you mean one of these?\n{}",
+                            input.file_path,
+                            suggestions.join("\n")
+                        ),
+                    ));
                 }
             }
 
-            return Ok(ToolResult::new("read_file", format!("File not found: {}", input.file_path)));
+            return Ok(ToolResult::new(
+                "read_file",
+                format!("File not found: {}", input.file_path),
+            ));
         }
 
         let meta = metadata.unwrap();
@@ -255,7 +261,10 @@ impl Tool for ReadFileTool {
             .await
             .map_err(into_tool_error)?;
         if is_binary {
-            return Ok(ToolResult::new("read_file", format!("Cannot read binary file: {}", input.file_path)));
+            return Ok(ToolResult::new(
+                "read_file",
+                format!("Cannot read binary file: {}", input.file_path),
+            ));
         }
 
         let start = input.offset.saturating_sub(1);
@@ -410,8 +419,13 @@ impl Tool for EditFileTool {
 
         let content = read_text(&file_path).await.map_err(into_tool_error)?;
 
-        let new_content = smart_replace(&content, &input.old_string, &input.new_string, input.replace_all)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let new_content = smart_replace(
+            &content,
+            &input.old_string,
+            &input.new_string,
+            input.replace_all,
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         write(&file_path, new_content.as_bytes())
             .await

@@ -27,8 +27,7 @@ impl PluginRegistry {
     where
         F: Fn(&PluginPlatformContext) -> Result<Box<dyn Plugin>> + Send + Sync + 'static,
     {
-        self.constructors
-            .insert(name.into(), Box::new(constructor));
+        self.constructors.insert(name.into(), Box::new(constructor));
     }
 
     pub fn has(&self, name: &str) -> bool {

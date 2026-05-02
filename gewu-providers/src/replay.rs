@@ -14,8 +14,8 @@
 //!   out such files from live runs.
 
 use async_trait::async_trait;
-use futures::stream::{self, BoxStream};
 use futures::StreamExt;
+use futures::stream::{self, BoxStream};
 use gewu_core::traits::{LlmProvider, Tool};
 use gewu_core::types::{Message, ProviderEvent};
 use parking_lot::Mutex;
@@ -180,9 +180,7 @@ mod tests {
     async fn scripted_returns_batches_in_order() {
         let p = ScriptedLlmProvider::new(
             vec![
-                vec![ProviderEvent::ContentDelta {
-                    delta: "hi".into(),
-                }],
+                vec![ProviderEvent::ContentDelta { delta: "hi".into() }],
                 vec![ProviderEvent::ContentDelta {
                     delta: "bye".into(),
                 }],
@@ -256,9 +254,7 @@ mod tests {
     #[test]
     fn replay_key_is_stable_for_same_input() {
         let msgs = vec![Message::User {
-            content: vec![gewu_core::types::ContentPart::Text {
-                text: "x".into(),
-            }],
+            content: vec![gewu_core::types::ContentPart::Text { text: "x".into() }],
         }];
         let k1 = ReplayLlmProvider::key(&msgs, &[]);
         let k2 = ReplayLlmProvider::key(&msgs, &[]);

@@ -1,7 +1,7 @@
 //! Manifest loader: scans directories for YAML specialist and tool-provider manifests,
 //! validates them against a `CapabilityRegistry`, and converts them into `SpecialistDescriptor`s.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use gewu_core::types::SpecialistDescriptor;
 use std::path::{Path, PathBuf};
 use tracing;

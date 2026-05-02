@@ -3,7 +3,7 @@
 //! Provides the core channel types for inter-node communication.
 
 use async_trait::async_trait;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -88,9 +88,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> BaseChanne
 ///
 /// After the first read, the internal value is consumed and subsequent
 /// reads will return `serde_json::Value::Null` until a new value is written.
-pub struct EphemeralValueChannel<
-    T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-> {
+pub struct EphemeralValueChannel<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> {
     value: Arc<RwLock<Option<T>>>,
 }
 

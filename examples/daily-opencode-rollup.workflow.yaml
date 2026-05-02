@@ -1,0 +1,53 @@
+id: daily_opencode_rollup
+description: Summarize one local-day OpenCode activity into memory_summaries.
+entry: fetch_events
+finish: [write_summary]
+metadata:
+  sop:
+    name: Daily OpenCode Rollup
+    description: Summarize OpenCode records for one local date/timezone/workspace and persist a provenance-backed memory summary.
+    visible_to:
+      - general
+      - build
+      - memory-orchestrator
+    triggers:
+      - summarize opencode day
+      - daily memory rollup
+      - summarize what I did that day
+      - 总结某天的 OpenCode 记录
+      - 回顾某天做了什么
+    input_schema:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: object
+          description: Prebuilt memory_sql_query request for the target local date/timezone/workspace.
+nodes:
+  fetch_events:
+    kind: tool
+    tool: memory_sql_query
+    input: $.query
+    write: events
+
+  summarize_day:
+    kind: specialist
+    specialist:
+      id: daily-memory-rollup-agent
+      description: Summarizes raw memory events into daily rollups.
+      capabilities: []
+      skills:
+        - daily-memory-rollup
+      system_prompt: |
+        Use the loaded daily-memory-rollup skill. Return a JSON object suitable for memory_summary_write.
+    input: $.events
+    write: summary
+
+  write_summary:
+    kind: tool
+    tool: memory_summary_write
+    input: $.summary
+    write: write_result
+edges:
+  - [fetch_events, summarize_day]
+  - [summarize_day, write_summary]

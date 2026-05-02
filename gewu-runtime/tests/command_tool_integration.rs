@@ -116,9 +116,7 @@ async fn provider_creates_working_tool() {
     let assembly_ctx = gewu_core::traits::AssemblyContext {
         working_directory: tmp.path().to_path_buf(),
         provider: std::sync::Arc::new(DummyProvider),
-        pool: sqlx::SqlitePool::connect("sqlite::memory:")
-            .await
-            .unwrap(),
+        pool: sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap(),
         metadata_json: json!(null),
     };
     let tools = provider.build_tools("mock_bazi", &assembly_ctx).unwrap();
@@ -192,7 +190,12 @@ async fn register_tool_rejects_missing_command() {
 
     let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
     assert_eq!(output["ok"], json!(false));
-    assert!(output["error"].as_str().unwrap().contains("Command not found"));
+    assert!(
+        output["error"]
+            .as_str()
+            .unwrap()
+            .contains("Command not found")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -247,9 +250,7 @@ async fn full_pipeline_register_reload_execute() {
     let assembly_ctx = gewu_core::traits::AssemblyContext {
         working_directory: tmp.path().to_path_buf(),
         provider: std::sync::Arc::new(DummyProvider),
-        pool: sqlx::SqlitePool::connect("sqlite::memory:")
-            .await
-            .unwrap(),
+        pool: sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap(),
         metadata_json: json!(null),
     };
     use gewu_core::traits::ToolProvider;

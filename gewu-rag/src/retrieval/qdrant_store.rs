@@ -1,12 +1,12 @@
 use crate::config::Config;
-use crate::document::chunker::{ChildChunk, Bm25SparseVector};
+use crate::document::chunker::{Bm25SparseVector, ChildChunk};
 use embed_anything::embeddings::embed::{Embedder, EmbeddingResult};
+use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
     Datatype, Distance, Fusion, Modifier, NamedVectors, PointStruct, Query, QueryPointsBuilder,
-    SparseIndexConfigBuilder, SparseVectorParamsBuilder, SparseVectorBuilder, Value, Vector,
+    SparseIndexConfigBuilder, SparseVectorBuilder, SparseVectorParamsBuilder, Value, Vector,
     VectorInput, VectorParamsBuilder,
 };
-use qdrant_client::Qdrant;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -49,12 +49,8 @@ impl QdrantStore {
         }
         let client = builder.build()?;
 
-        let embedding_model = Embedder::from_pretrained_hf(
-            "BAAI/bge-base-en-v1.5",
-            None,
-            None,
-            None,
-        )?;
+        let embedding_model =
+            Embedder::from_pretrained_hf("BAAI/bge-base-en-v1.5", None, None, None)?;
 
         let embedding_dimension = 768;
 
@@ -92,12 +88,13 @@ impl QdrantStore {
                 VectorParamsBuilder::new(self.embedding_dimension as u64, Distance::Cosine).build(),
             );
             let vectors_config = VectorsConfig {
-                config: Some(
-                    qdrant_client::qdrant::vectors_config::Config::from(VectorParamsMap { map: vectors_map })
-                ),
+                config: Some(qdrant_client::qdrant::vectors_config::Config::from(
+                    VectorParamsMap { map: vectors_map },
+                )),
             };
 
-            let mut sparse_map: HashMap<String, qdrant_client::qdrant::SparseVectorParams> = HashMap::new();
+            let mut sparse_map: HashMap<String, qdrant_client::qdrant::SparseVectorParams> =
+                HashMap::new();
             sparse_map.insert(
                 self.config.sparse_vector_name.clone(),
                 SparseVectorParamsBuilder::default()
@@ -139,17 +136,30 @@ impl QdrantStore {
         Bm25SparseVector { indices, values }
     }
 
-    pub async fn compute_sparse_from_text(&self, text: &str) -> Result<Bm25SparseVector, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn compute_sparse_from_text(
+        &self,
+        text: &str,
+    ) -> Result<Bm25SparseVector, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(ref sparse_embedder) = self.sparse_embedder {
-            let raw_results = sparse_embedder.read().await
-                .embed(&[text], None, None).await?;
+            let raw_results = sparse_embedder
+                .read()
+                .await
+                .embed(&[text], None, None)
+                .await?;
             if let Some(EmbeddingResult::DenseVector(v)) = raw_results.first() {
                 let sparse = Self::convert_dense_to_sparse(v, 0.0);
-                tracing::debug!("SPLADE sparse: {} non-zero values out of {}", sparse.values.len(), v.len());
+                tracing::debug!(
+                    "SPLADE sparse: {} non-zero values out of {}",
+                    sparse.values.len(),
+                    v.len()
+                );
                 return Ok(sparse);
             }
         }
-        Ok(Bm25SparseVector { indices: vec![], values: vec![] })
+        Ok(Bm25SparseVector {
+            indices: vec![],
+            values: vec![],
+        })
     }
 
     pub async fn add_chunks(
@@ -166,8 +176,12 @@ impl QdrantStore {
         let collection_name = &self.config.child_collection;
 
         let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
-        let raw_results = self.embedding_model.read().await
-            .embed(&texts, None, None).await?;
+        let raw_results = self
+            .embedding_model
+            .read()
+            .await
+            .embed(&texts, None, None)
+            .await?;
         let vectors: Vec<Vec<f32>> = raw_results
             .into_iter()
             .map(|r| match r {
@@ -186,8 +200,10 @@ impl QdrantStore {
                 if i < sparse_vecs.len() {
                     let sparse = &sparse_vecs[i];
                     if !sparse.indices.is_empty() {
-                        let indices_u32: Vec<u32> = sparse.indices.iter().map(|&x| x as u32).collect();
-                        let sparse_vector = SparseVectorBuilder::new(indices_u32, sparse.values.clone()).build();
+                        let indices_u32: Vec<u32> =
+                            sparse.indices.iter().map(|&x| x as u32).collect();
+                        let sparse_vector =
+                            SparseVectorBuilder::new(indices_u32, sparse.values.clone()).build();
                         named_vectors = named_vectors.add_vector(
                             &self.config.sparse_vector_name,
                             Vector::from(sparse_vector),
@@ -223,8 +239,12 @@ impl QdrantStore {
         let collection_name = &self.config.child_collection;
 
         let query_text = "query: ".to_string() + query;
-        let raw_results = self.embedding_model.read().await
-            .embed(&[query_text.as_str()], None, None).await?;
+        let raw_results = self
+            .embedding_model
+            .read()
+            .await
+            .embed(&[query_text.as_str()], None, None)
+            .await?;
         let query_vector: Vec<f32> = match &raw_results[0] {
             EmbeddingResult::DenseVector(v) => v.clone(),
             EmbeddingResult::MultiVector(vecs) => vecs.iter().flatten().cloned().collect(),
@@ -239,8 +259,12 @@ impl QdrantStore {
 
         let search_result = self.client.query(request).await?;
 
-        tracing::debug!("Qdrant search for query '{}' returned {} raw points (threshold: {})",
-            query, search_result.result.len(), score_threshold);
+        tracing::debug!(
+            "Qdrant search for query '{}' returned {} raw points (threshold: {})",
+            query,
+            search_result.result.len(),
+            score_threshold
+        );
         for point in &search_result.result {
             tracing::debug!("  point score: {}", point.score);
         }
@@ -279,8 +303,12 @@ impl QdrantStore {
         let collection_name = &self.config.child_collection;
 
         let query_text = "query: ".to_string() + query;
-        let raw_results = self.embedding_model.read().await
-            .embed(&[query_text.as_str()], None, None).await?;
+        let raw_results = self
+            .embedding_model
+            .read()
+            .await
+            .embed(&[query_text.as_str()], None, None)
+            .await?;
         let dense_query: Vec<f32> = match &raw_results[0] {
             EmbeddingResult::DenseVector(v) => v.clone(),
             EmbeddingResult::MultiVector(vecs) => vecs.iter().flatten().cloned().collect(),

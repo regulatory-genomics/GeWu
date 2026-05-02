@@ -21,7 +21,7 @@ pub async fn handle_get_work_graph(
     State(app): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<WorkGraphResponse>, AppError> {
-    let session = resolve_session(&app, &id).await;
+    let (session_id, session) = resolve_session(&app, &id).await;
     let pool_guard = app.db_pool.lock().await;
     let pool = pool_guard
         .as_ref()
@@ -31,16 +31,20 @@ pub async fn handle_get_work_graph(
 
     let task_store = TaskStore::new(pool.clone()).await?;
     let trace_store = ExecutionTraceStore::new(pool).await?;
-    let tasks = task_store.list_child_tasks(&id).await?;
-    let runs = trace_store.runs_for_session(&id).await?;
+    let tasks = task_store.list_child_tasks(&session_id).await?;
+    let runs = trace_store.runs_for_session(&session_id).await?;
 
     let mut graph = WorkGraph {
-        root_node_id: session_node_id(&id),
-        nodes: vec![session_node(&id, session.as_ref())],
+        root_node_id: session_node_id(&session_id),
+        nodes: vec![session_node(&session_id, session.as_ref())],
         edges: Vec::new(),
         events: Vec::new(),
         artifacts: Vec::new(),
     };
+
+    if let Some(turn) = app.get_active_turn(&session_id).await {
+        append_active_turn(&mut graph, turn);
+    }
 
     for task in tasks {
         append_task(&mut graph, task);
@@ -58,8 +62,49 @@ pub async fn handle_get_work_graph(
     Ok(Json(WorkGraphResponse { graph }))
 }
 
-async fn resolve_session(app: &AppState, id: &str) -> Option<SessionInfo> {
-    app.sessions.read().await.get(id).cloned()
+async fn resolve_session(app: &AppState, id: &str) -> (String, Option<SessionInfo>) {
+    let resolved_id = app
+        .resolve_session_id(id)
+        .await
+        .unwrap_or_else(|_| id.to_string());
+    let sessions = app.sessions.read().await;
+    if let Some(session) = sessions.get(&resolved_id).cloned() {
+        return (session.id.clone(), Some(session));
+    }
+    (resolved_id, None)
+}
+
+fn append_active_turn(graph: &mut WorkGraph, turn: crate::state::ActiveTurnInfo) {
+    let node_id = format!("turn:{}:{}", turn.session_id, turn.started_at);
+    let mut node = WorkNode::new(
+        node_id.clone(),
+        WorkNodeKind::AssistantTurn,
+        "Active assistant turn",
+        WorkStatus::Running,
+    );
+    node.session_id = Some(turn.session_id.clone());
+    node.started_at = Some(turn.started_at);
+    node.summary = Some(format!("{} streamed events", turn.event_count));
+    node.metadata = json!({
+        "source": "active_turn",
+        "last_event_at": turn.last_event_at,
+        "event_count": turn.event_count,
+    });
+    graph.nodes.push(node);
+    graph.edges.push(WorkEdge::new(
+        graph.root_node_id.clone(),
+        node_id.clone(),
+        WorkEdgeKind::Contains,
+    ));
+    graph.events.push(WorkEvent {
+        id: format!("event:{node_id}:running"),
+        node_id,
+        kind: WorkEventKind::Started,
+        title: "Assistant turn is running".to_string(),
+        summary: Some(format!("last event at {}", turn.last_event_at)),
+        created_at: turn.started_at,
+        payload: Value::Null,
+    });
 }
 
 fn append_task(graph: &mut WorkGraph, task: TaskRecord) {
@@ -329,9 +374,14 @@ fn task_work_status(task: &TaskRecord) -> WorkStatus {
                 WorkStatus::NeedsReview
             }
         },
-        TaskExecutionStatus::Failed
-        | TaskExecutionStatus::Timeout
-        | TaskExecutionStatus::Interrupted => WorkStatus::Failed,
+        TaskExecutionStatus::Failed => match task.result_status {
+            TaskResultStatus::Invalid
+            | TaskResultStatus::Incomplete
+            | TaskResultStatus::NeedsReview
+            | TaskResultStatus::Empty => WorkStatus::NeedsReview,
+            TaskResultStatus::Accepted | TaskResultStatus::Pending => WorkStatus::Failed,
+        },
+        TaskExecutionStatus::Timeout | TaskExecutionStatus::Interrupted => WorkStatus::Failed,
         TaskExecutionStatus::Canceled => WorkStatus::Canceled,
     }
 }
@@ -477,6 +527,55 @@ mod tests {
 
         assert_eq!(task_work_status(&task), WorkStatus::NeedsReview);
         task.execution_status = TaskExecutionStatus::Failed;
+        task.result_status = TaskResultStatus::Accepted;
         assert_eq!(task_work_status(&task), WorkStatus::Failed);
+    }
+
+    #[test]
+    fn maps_completed_invalid_task_to_needs_review_not_failed() {
+        let task = TaskRecord {
+            task_id: "task_c".into(),
+            specialist_id: "general".into(),
+            prompt: String::new(),
+            status: TaskStatus::Blocked,
+            execution_status: TaskExecutionStatus::Completed,
+            result_status: TaskResultStatus::Invalid,
+            attempt: 1,
+            block_reason: Some("tool protocol error".into()),
+            result_json: None,
+            finish_reason: Some("stop".into()),
+            error: Some("tool protocol error".into()),
+            parent_session_id: None,
+            child_session_id: None,
+            root_run_id: None,
+            started_at: None,
+            finished_at: None,
+        };
+
+        assert_eq!(task_work_status(&task), WorkStatus::NeedsReview);
+    }
+
+    #[test]
+    fn maps_legacy_failed_invalid_task_to_needs_review() {
+        let task = TaskRecord {
+            task_id: "task_d".into(),
+            specialist_id: "general".into(),
+            prompt: String::new(),
+            status: TaskStatus::Failed,
+            execution_status: TaskExecutionStatus::Failed,
+            result_status: TaskResultStatus::Invalid,
+            attempt: 1,
+            block_reason: None,
+            result_json: None,
+            finish_reason: Some("error".into()),
+            error: Some("API tool protocol error".into()),
+            parent_session_id: None,
+            child_session_id: None,
+            root_run_id: None,
+            started_at: None,
+            finished_at: None,
+        };
+
+        assert_eq!(task_work_status(&task), WorkStatus::NeedsReview);
     }
 }

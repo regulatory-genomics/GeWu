@@ -109,6 +109,8 @@ pub async fn handle_chat(
 
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let message = req.message.clone();
+    let session_id = req.session_id.clone();
+    app.start_active_turn(&session_id).await;
 
     tokio::spawn(async move {
         let mut agent = agent_handle.agent.lock().await;
@@ -119,13 +121,16 @@ pub async fn handle_chat(
         let mut client_connected = true;
         while let Some(result) = stream.next().await {
             event_count += 1;
+            app.touch_active_turn(&session_id, event_count).await;
             debug!("Stream received event #{}: {:?}", event_count, result);
             let sse_event = match result {
                 Ok(event) => match event {
                     gewu_core::types::AgentEvent::ReasoningDelta { delta } => {
+                        app.append_active_turn_reasoning(&session_id, &delta).await;
                         SseEvent::reasoning_delta(delta).to_sse_event()
                     }
                     gewu_core::types::AgentEvent::ContentDelta { delta } => {
+                        app.append_active_turn_content(&session_id, &delta).await;
                         SseEvent::content_delta(delta).to_sse_event()
                     }
                     gewu_core::types::AgentEvent::ToolStart {
@@ -169,6 +174,7 @@ pub async fn handle_chat(
                 client_connected = false;
             }
         }
+        app.finish_active_turn(&session_id).await;
         info!("Stream finished for session ({} events sent)", event_count);
     });
 

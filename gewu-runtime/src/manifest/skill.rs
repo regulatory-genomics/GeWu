@@ -1,6 +1,6 @@
 //! YAML-frontmatter skill manifests.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 

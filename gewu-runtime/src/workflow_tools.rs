@@ -18,9 +18,11 @@ use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::manifest::workflow_loader::WorkflowManifestLoader;
 use crate::execution_trace::StartTraceRun;
+use crate::manifest::workflow_loader::WorkflowManifestLoader;
 use crate::workflow::WorkflowCompiler;
+
+const WORKFLOW_OUTPUT_PREVIEW_LIMIT: usize = 2_000;
 
 // ---------------------------------------------------------------------------
 // compose_workflow tool
@@ -87,8 +89,8 @@ impl Tool for MemoryDayQueryTool {
         let input: MemoryDayQueryArgs = serde_json::from_value(args)?;
         let limit = input.limit.clamp(1, 500);
         let output = MemoryDayQueryOutput {
-            sql: "SELECT event_id, session_id, event_kind, substr(content, 1, 1200) AS content, created_at, json_extract(metadata_json, '$.opencode.session_title') AS session_title, json_extract(metadata_json, '$.opencode.directory') AS workspace_root FROM memory_events WHERE json_extract(metadata_json, '$.host') = ? AND json_extract(metadata_json, '$.import.local_date') = ? AND json_extract(metadata_json, '$.import.timezone') = ? AND (? = '' OR json_extract(metadata_json, '$.opencode.directory') = ?) ORDER BY created_at LIMIT ?".into(),
-            params: vec![input.source, input.date, input.timezone, input.workspace_root.clone(), input.workspace_root, limit.to_string()],
+            sql: "SELECT event_id, session_id, event_kind, substr(content, 1, 1200) AS content, created_at, json_extract(metadata_json, '$.opencode.session_title') AS session_title, COALESCE(workspace_root, json_extract(metadata_json, '$.opencode.directory')) AS workspace_root FROM memory_events WHERE (agent_id = ? OR host = ? OR json_extract(metadata_json, '$.host') = ?) AND (date(created_at) = ? OR json_extract(metadata_json, '$.import.local_date') = ?) AND (? = 'local' OR COALESCE(json_extract(metadata_json, '$.import.timezone'), ?) = ?) AND (? = '' OR COALESCE(workspace_root, json_extract(metadata_json, '$.opencode.directory'), '') IN (?, '')) ORDER BY created_at LIMIT ?".into(),
+            params: vec![input.source.clone(), input.source.clone(), input.source, input.date.clone(), input.date, input.timezone.clone(), input.timezone.clone(), input.timezone, input.workspace_root.clone(), input.workspace_root, limit.to_string()],
             limit,
         };
         Ok(ToolResult::new(
@@ -128,9 +130,10 @@ impl Tool for ComposeWorkflowTool {
 
     fn description(&self) -> &str {
         "Create a new reusable workflow from a natural-language goal description. \
-         The composer specialist will inspect available specialists and capabilities, \
-         then emit and persist a WorkflowManifest YAML file. Returns the workflow id \
-         and path on success. Use `run_workflow` to execute it afterwards."
+          The composer specialist will inspect available specialists and capabilities, \
+         then emit and persist a WorkflowManifest YAML file using the canonical \
+         `entry` + map-shaped `nodes` + `finish` + `edges` schema. Returns the \
+         workflow id and path on success. Use `run_workflow` to execute it afterwards."
     }
 
     fn schema(&self) -> RootSchema {
@@ -262,8 +265,10 @@ impl Tool for RunWorkflowTool {
 
     fn description(&self) -> &str {
         "Execute an existing workflow by id. The workflow must have been previously \
-         created (e.g. via compose_workflow or manually placed in ~/.gewu/workflows/). \
-         Returns the full output blackboard as JSON."
+          created (e.g. via compose_workflow or manually placed in ~/.gewu/workflows/). \
+         Returns a compact JSON envelope with status, trace ids, workflow result metadata, \
+         and a bounded preview. Large artifacts should be persisted by workflow nodes and \
+         returned by id, not embedded in the tool output."
     }
 
     fn schema(&self) -> RootSchema {
@@ -364,7 +369,10 @@ impl Tool for RunWorkflowTool {
             bb.set_path("input", input.input);
         }
         bb.set_path("_trace.root_run_id", Value::String(workflow_run.id.clone()));
-        bb.set_path("_trace.current_run_id", Value::String(workflow_run.id.clone()));
+        bb.set_path(
+            "_trace.current_run_id",
+            Value::String(workflow_run.id.clone()),
+        );
         let out = match graph.ainvoke(bb).await {
             Ok(out) => out,
             Err(e) => {
@@ -376,9 +384,6 @@ impl Tool for RunWorkflowTool {
             }
         };
 
-        let output =
-            serde_json::to_string_pretty(out.as_value()).unwrap_or_else(|_| "{}".to_string());
-
         let output_value = out.as_value().clone();
         if let Err(err) = runtime
             .finish_trace_run(&workflow_run.id, Some(&output_value))
@@ -387,6 +392,119 @@ impl Tool for RunWorkflowTool {
             tracing::warn!("failed to finish workflow trace run: {}", err);
         }
 
+        let output = workflow_output_envelope(&input.workflow_id, &workflow_run.id, &output_value);
         Ok(ToolResult::new("run_workflow", output))
     }
+}
+
+fn workflow_output_envelope(workflow_id: &str, run_id: &str, value: &Value) -> String {
+    let errors = value.get("_errors").cloned().unwrap_or(Value::Null);
+    let write_result = value.get("write_result").cloned().unwrap_or(Value::Null);
+    let summary = value.get("summary").cloned().unwrap_or(Value::Null);
+    let event_count = value
+        .get("events")
+        .and_then(extract_row_count)
+        .or_else(|| value.get("event_count").and_then(Value::as_u64));
+
+    let envelope = json!({
+        "ok": errors.is_null(),
+        "workflow_id": workflow_id,
+        "status": if errors.is_null() { "succeeded" } else { "completed_with_errors" },
+        "_trace": {
+            "root_run_id": run_id,
+            "current_run_id": run_id,
+        },
+        "event_count": event_count,
+        "write_result": compact_value(write_result),
+        "summary": compact_summary(summary),
+        "errors": errors,
+        "preview": truncate_value_preview(value, WORKFLOW_OUTPUT_PREVIEW_LIMIT),
+        "note": "Workflow output is compact by design. Inspect the trace graph for full blackboard and node outputs.",
+    });
+
+    serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn extract_row_count(value: &Value) -> Option<u64> {
+    match value {
+        Value::Object(map) => map.get("row_count").and_then(Value::as_u64),
+        Value::String(text) => parse_wrapped_json(text).ok().and_then(|parsed| {
+            parsed.get("row_count").and_then(Value::as_u64).or_else(|| {
+                parsed
+                    .get("rows")
+                    .and_then(Value::as_array)
+                    .map(|rows| rows.len() as u64)
+            })
+        }),
+        _ => None,
+    }
+}
+
+fn parse_wrapped_json(text: &str) -> Result<Value, serde_json::Error> {
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        return Ok(value);
+    }
+
+    let Some(start) = text.find('{').or_else(|| text.find('[')) else {
+        return serde_json::from_str(text);
+    };
+    serde_json::from_str(&text[start..])
+}
+
+fn compact_summary(value: Value) -> Value {
+    match value {
+        Value::Object(mut map) => {
+            if let Some(content) = map.get_mut("content") {
+                *content = Value::String(truncate_text(&value_to_text(content), 700));
+            }
+            Value::Object(map)
+        }
+        Value::String(text) => Value::String(truncate_text(&text, 700)),
+        other => other,
+    }
+}
+
+fn compact_value(value: Value) -> Value {
+    match value {
+        Value::String(text) => serde_json::from_str::<Value>(&text)
+            .map(compact_value)
+            .unwrap_or_else(|_| Value::String(truncate_text(&text, 700))),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    let compacted = if key == "content" || key == "output" {
+                        Value::String(truncate_text(&value_to_text(&value), 700))
+                    } else {
+                        compact_value(value)
+                    };
+                    (key, compacted)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => {
+            Value::Array(items.into_iter().take(20).map(compact_value).collect())
+        }
+        other => other,
+    }
+}
+
+fn truncate_value_preview(value: &Value, limit: usize) -> String {
+    let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value_to_text(value));
+    truncate_text(&text, limit)
+}
+
+fn value_to_text(value: &Value) -> String {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| serde_json::to_string_pretty(value).unwrap_or_default())
+}
+
+fn truncate_text(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut out = text.chars().take(limit).collect::<String>();
+    out.push_str("…");
+    out
 }

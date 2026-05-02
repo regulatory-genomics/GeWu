@@ -86,12 +86,9 @@ impl Tool for CommandTool {
             cmd.env(k, v);
         }
 
-        let mut child = cmd.spawn().map_err(|e| {
-            format!(
-                "Failed to spawn command '{}': {}",
-                self.def.command, e
-            )
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn command '{}': {}", self.def.command, e))?;
 
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(input_json.as_bytes()).await?;
@@ -187,10 +184,7 @@ mod tests {
             input_schema: None,
         };
         let tool = CommandTool::new(def);
-        let err = tool
-            .execute(json!({}), &test_ctx())
-            .await
-            .unwrap_err();
+        let err = tool.execute(json!({}), &test_ctx()).await.unwrap_err();
         assert!(err.to_string().contains("oops"));
     }
 
@@ -207,10 +201,7 @@ mod tests {
             input_schema: None,
         };
         let tool = CommandTool::new(def);
-        let err = tool
-            .execute(json!({}), &test_ctx())
-            .await
-            .unwrap_err();
+        let err = tool.execute(json!({}), &test_ctx()).await.unwrap_err();
         assert!(err.to_string().contains("timed out"));
     }
 }

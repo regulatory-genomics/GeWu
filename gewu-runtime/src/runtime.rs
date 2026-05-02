@@ -803,8 +803,8 @@ impl GeWuRuntime {
         }
 
         let execution_status = match final_status {
-            TaskStatus::Succeeded => TaskExecutionStatus::Completed,
-            TaskStatus::Failed | TaskStatus::Blocked => TaskExecutionStatus::Failed,
+            TaskStatus::Succeeded | TaskStatus::Blocked => TaskExecutionStatus::Completed,
+            TaskStatus::Failed => TaskExecutionStatus::Failed,
             TaskStatus::Ready | TaskStatus::Running => TaskExecutionStatus::Interrupted,
         };
         let result_status = classify_task_result(final_status.clone(), &result_text, &output_json);
@@ -1198,6 +1198,9 @@ fn classify_task_result(
     result_text: &str,
     output_json: &Option<Value>,
 ) -> TaskResultStatus {
+    if final_status == TaskStatus::Blocked {
+        return TaskResultStatus::Invalid;
+    }
     if final_status != TaskStatus::Succeeded {
         return TaskResultStatus::Invalid;
     }
@@ -1225,6 +1228,31 @@ fn classify_task_result(
         return TaskResultStatus::Incomplete;
     }
     TaskResultStatus::Accepted
+}
+
+#[cfg(test)]
+mod task_result_tests {
+    use super::*;
+
+    #[test]
+    fn blocked_specialist_is_completed_execution_with_invalid_result() {
+        let final_status = TaskStatus::Blocked;
+        let execution_status = match final_status {
+            TaskStatus::Succeeded | TaskStatus::Blocked => TaskExecutionStatus::Completed,
+            TaskStatus::Failed => TaskExecutionStatus::Failed,
+            TaskStatus::Ready | TaskStatus::Running => TaskExecutionStatus::Interrupted,
+        };
+
+        assert_eq!(execution_status, TaskExecutionStatus::Completed);
+        assert_eq!(
+            classify_task_result(
+                final_status,
+                "API error: invalid params, tool result's tool id not found",
+                &None,
+            ),
+            TaskResultStatus::Invalid
+        );
+    }
 }
 
 struct RuntimeToolRegistry {

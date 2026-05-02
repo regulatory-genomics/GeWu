@@ -113,6 +113,7 @@ where
         plugins: loaded_config.config.plugins,
         runtime_plugin_dirs: loaded_config.config.runtime_plugin_dirs,
         skill_dirs: loaded_config.config.skill_dirs,
+        tachyon_browser_url: std::env::var("TACHYON_BROWSER_URL").ok(),
     };
 
     let mcp_tools = mcp_loader::load_mcp_tools(mcp_servers).await?;
@@ -170,6 +171,18 @@ where
         .route(
             "/api/sessions/{id}/switch-agent",
             post(routes::sessions::handle_switch_agent),
+        )
+        .route(
+            "/api/sessions/{id}/canvas",
+            get(routes::canvas::handle_list),
+        )
+        .route(
+            "/api/sessions/{id}/canvas/{canvas_id}",
+            get(routes::canvas::handle_get).delete(routes::canvas::handle_close),
+        )
+        .route(
+            "/api/sessions/{id}/canvas/{canvas_id}/state",
+            post(routes::canvas::handle_patch),
         )
         .route("/index.html", get(fallback::serve_index))
         .fallback(fallback::serve_static)

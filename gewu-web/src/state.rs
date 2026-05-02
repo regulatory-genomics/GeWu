@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use gewu_canvas::{canvas_tools, genome_tools, CanvasManager, GenomeToolsConfig};
 use gewu_core::traits::Tool;
 use gewu_providers::OpenAIProvider;
 use gewu_runtime::{PluginHost, PluginRegistry, RuntimeFactory};
@@ -38,6 +39,13 @@ pub struct ServerConfig {
     pub runtime_plugin_dirs: Vec<String>,
     #[serde(rename = "skillDirs", default)]
     pub skill_dirs: Vec<String>,
+    /// Optional base URL of a tachyon-browser instance (e.g. http://127.0.0.1:8400).
+    /// When set, the genome.* tools (inspect_region, compare_samples, local_qc,
+    /// scan_candidates, explain_region) are registered for every session. When
+    /// absent, only canvas.* is available — the genome canvas works as a
+    /// viewer but the agent cannot run genome analyses.
+    #[serde(default, alias = "tachyonBrowserUrl")]
+    pub tachyon_browser_url: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -51,6 +59,7 @@ impl Default for ServerConfig {
             plugins: HashMap::new(),
             runtime_plugin_dirs: Vec::new(),
             skill_dirs: Vec::new(),
+            tachyon_browser_url: None,
         }
     }
 }
@@ -70,6 +79,16 @@ pub struct AgentHandle {
     pub agent_type: String,
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ActiveTurnInfo {
+    pub session_id: String,
+    pub started_at: i64,
+    pub last_event_at: i64,
+    pub event_count: usize,
+    pub reasoning: String,
+    pub content: String,
+}
+
 pub type PluginRegistrar = Arc<dyn Fn(&mut PluginRegistry) + Send + Sync>;
 
 #[derive(Clone)]
@@ -77,10 +96,23 @@ pub struct AppState {
     pub auth_token: Arc<RwLock<crate::auth::AuthState>>,
     pub sessions: Arc<RwLock<HashMap<String, SessionInfo>>>,
     pub agents: Arc<RwLock<HashMap<String, Arc<AgentHandle>>>>,
+    pub active_turns: Arc<RwLock<HashMap<String, ActiveTurnInfo>>>,
     pub config: Arc<RwLock<ServerConfig>>,
     pub db_pool: Arc<Mutex<Option<SqlitePool>>>,
     pub mcp_tools: Arc<Vec<Arc<dyn Tool>>>,
     pub plugin_registrar: PluginRegistrar,
+    /// Per-session canvas registry. Constructed once and shared via the
+    /// six canvas.* tools, which are merged into mcp_tools at session
+    /// creation time. The same handle is exposed on AppState so the
+    /// browser-side inverse channel (/api/sessions/:id/canvas/...) can
+    /// read/write canvas state without going through the agent.
+    pub canvases: CanvasManager,
+    /// Pre-built canvas tools sharing `canvases`. Cloned into every new
+    /// session's agent. We hold them as Arc<Vec<Arc<dyn Tool>>> so the
+    /// existing per-session merge in create_session/switch_agent can
+    /// concatenate them with mcp_tools without re-allocating the manager
+    /// on every request.
+    pub canvas_tools: Arc<Vec<Arc<dyn Tool>>>,
 }
 
 impl AppState {
@@ -165,14 +197,39 @@ impl AppState {
             Some(create_db_pool(&db_path).await?)
         };
 
+        let canvases = CanvasManager::new();
+        let mut canvas_tools_vec = canvas_tools(Arc::new(canvases.clone()));
+
+        // Register genome.* tools when tachyon-browser is configured. They
+        // join the canvas.* tools in the per-session tool list, so the agent
+        // can fluidly mix `canvas.get_state` → `genome.inspect_region` →
+        // `canvas.set_state` without crossing crate boundaries.
+        let tachyon_url = config
+            .tachyon_browser_url
+            .clone()
+            .or_else(|| std::env::var("TACHYON_BROWSER_URL").ok())
+            .unwrap_or_default();
+        if !tachyon_url.trim().is_empty() {
+            let genome = genome_tools(GenomeToolsConfig {
+                base_url: tachyon_url,
+                timeout: std::time::Duration::from_secs(60),
+            });
+            info!("registering {} genome.* tools", genome.len());
+            canvas_tools_vec.extend(genome);
+        }
+        let canvas_tools = Arc::new(canvas_tools_vec);
+
         Ok(Self {
             auth_token: Arc::new(RwLock::new(auth_token)),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             agents: Arc::new(RwLock::new(HashMap::new())),
+            active_turns: Arc::new(RwLock::new(HashMap::new())),
             config: Arc::new(RwLock::new(config)),
             db_pool: Arc::new(Mutex::new(db_pool)),
             mcp_tools: Arc::new(mcp_tools),
             plugin_registrar,
+            canvases,
+            canvas_tools,
         })
     }
 
@@ -210,7 +267,8 @@ impl AppState {
                 .with_max_output_tokens(max_output_tokens),
         );
 
-        let mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
+        let mut mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
+        mcp_tools.extend(self.canvas_tools.iter().cloned());
         let plugin_host = self.build_plugin_host(provider.clone(), pool.clone(), plugins)?;
         let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs(
             provider.clone(),
@@ -257,6 +315,61 @@ impl AppState {
         self.sessions.read().await.get(session_id).cloned()
     }
 
+    pub async fn resolve_session_id(&self, id: &str) -> Result<String> {
+        let sessions = self.sessions.read().await;
+        if sessions.contains_key(id) {
+            return Ok(id.to_string());
+        }
+        let matches = sessions
+            .keys()
+            .filter(|session_id| session_id.starts_with(id))
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(sessions);
+        if matches.len() == 1 {
+            return Ok(matches[0].clone());
+        }
+
+        let pool_guard = self.db_pool.lock().await;
+        let pool = pool_guard.as_ref().context("Database not initialized")?;
+        let pattern = format!("{id}%");
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT session_id FROM memory_messages WHERE session_id LIKE ?
+            UNION
+            SELECT DISTINCT session_id FROM execution_runs WHERE session_id LIKE ?
+            UNION
+            SELECT DISTINCT parent_session_id FROM tasks WHERE parent_session_id LIKE ?
+            UNION
+            SELECT DISTINCT child_session_id FROM tasks WHERE child_session_id LIKE ?
+            UNION
+            SELECT DISTINCT task_id FROM tasks WHERE task_id LIKE ?
+            "#,
+        )
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(&pattern)
+        .fetch_all(pool)
+        .await
+        .context("Failed to resolve session id")?;
+
+        let matches = rows
+            .into_iter()
+            .filter_map(|row| {
+                row.try_get::<Option<String>, _>("session_id")
+                    .ok()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            Ok(matches[0].clone())
+        } else {
+            Ok(id.to_string())
+        }
+    }
+
     pub async fn list_sessions(&self) -> Vec<SessionInfo> {
         self.sessions.read().await.values().cloned().collect()
     }
@@ -264,7 +377,57 @@ impl AppState {
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
         self.sessions.write().await.remove(session_id);
         self.agents.write().await.remove(session_id);
+        self.active_turns.write().await.remove(session_id);
+        self.canvases.drop_session(session_id).await;
         Ok(())
+    }
+
+    pub async fn start_active_turn(&self, session_id: &str) {
+        let now = unix_timestamp();
+        self.active_turns.write().await.insert(
+            session_id.to_string(),
+            ActiveTurnInfo {
+                session_id: session_id.to_string(),
+                started_at: now,
+                last_event_at: now,
+                event_count: 0,
+                reasoning: String::new(),
+                content: String::new(),
+            },
+        );
+    }
+
+    pub async fn touch_active_turn(&self, session_id: &str, event_count: usize) {
+        if let Some(turn) = self.active_turns.write().await.get_mut(session_id) {
+            turn.last_event_at = unix_timestamp();
+            turn.event_count = event_count;
+        }
+    }
+
+    pub async fn append_active_turn_reasoning(&self, session_id: &str, delta: &str) {
+        if let Some(turn) = self.active_turns.write().await.get_mut(session_id) {
+            turn.last_event_at = unix_timestamp();
+            turn.reasoning.push_str(delta);
+        }
+    }
+
+    pub async fn append_active_turn_content(&self, session_id: &str, delta: &str) {
+        if let Some(turn) = self.active_turns.write().await.get_mut(session_id) {
+            turn.last_event_at = unix_timestamp();
+            turn.content.push_str(delta);
+        }
+    }
+
+    pub async fn finish_active_turn(&self, session_id: &str) {
+        self.active_turns.write().await.remove(session_id);
+    }
+
+    pub async fn get_active_turn(&self, session_id: &str) -> Option<ActiveTurnInfo> {
+        let resolved = self
+            .resolve_session_id(session_id)
+            .await
+            .unwrap_or_else(|_| session_id.to_string());
+        self.active_turns.read().await.get(&resolved).cloned()
     }
 
     pub async fn get_agent(&self, session_id: &str) -> Option<Arc<AgentHandle>> {
@@ -275,12 +438,13 @@ impl AppState {
         &self,
         session_id: &str,
     ) -> Result<Vec<gewu_core::types::Message>> {
+        let session_id = self.resolve_session_id(session_id).await?;
         let pool_guard = self.db_pool.lock().await;
         let pool = pool_guard.as_ref().context("Database not initialized")?;
 
         let rows =
             sqlx::query("SELECT content FROM memory_messages WHERE session_id = ? ORDER BY id ASC")
-                .bind(session_id)
+                .bind(&session_id)
                 .fetch_all(pool)
                 .await
                 .context("Failed to load messages from DB")?;
@@ -345,7 +509,8 @@ impl AppState {
                 .with_max_output_tokens(max_output_tokens),
         );
 
-        let mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
+        let mut mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
+        mcp_tools.extend(self.canvas_tools.iter().cloned());
         let plugin_host = self.build_plugin_host(provider.clone(), pool.clone(), plugins)?;
         let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs(
             provider.clone(),
@@ -403,6 +568,13 @@ impl AppState {
     pub async fn get_config(&self) -> ServerConfig {
         self.config.read().await.clone()
     }
+}
+
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn get_default_db_path() -> Result<String> {

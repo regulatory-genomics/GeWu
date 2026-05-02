@@ -34,7 +34,10 @@ impl TraceContext {
     pub fn to_metadata_map(&self) -> serde_json::Map<String, Value> {
         let mut map = serde_json::Map::new();
         if let Some(root_run_id) = &self.root_run_id {
-            map.insert("trace_root_run_id".to_string(), Value::String(root_run_id.clone()));
+            map.insert(
+                "trace_root_run_id".to_string(),
+                Value::String(root_run_id.clone()),
+            );
         }
         if let Some(current_run_id) = &self.current_run_id {
             map.insert(

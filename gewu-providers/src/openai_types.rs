@@ -753,9 +753,7 @@ mod tests {
         )
     }
 
-    fn bytes_stream(
-        chunks: Vec<&str>,
-    ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> {
+    fn bytes_stream(chunks: Vec<&str>) -> impl Stream<Item = Result<Bytes, reqwest::Error>> {
         futures::stream::iter(
             chunks
                 .into_iter()
@@ -791,7 +789,10 @@ mod tests {
         let items: Vec<_> = stream.collect().await;
         assert_eq!(items.len(), 1);
         assert_eq!(
-            items[0].as_ref().unwrap().choices[0].delta.content.as_deref(),
+            items[0].as_ref().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
             Some("joined")
         );
     }
@@ -806,7 +807,10 @@ mod tests {
         let items: Vec<_> = stream.collect().await;
         assert_eq!(items.len(), 1);
         assert_eq!(
-            items[0].as_ref().unwrap().choices[0].delta.content.as_deref(),
+            items[0].as_ref().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
             Some("ok")
         );
     }
@@ -818,7 +822,10 @@ mod tests {
         let items: Vec<_> = stream.collect().await;
         assert_eq!(items.len(), 1);
         assert_eq!(
-            items[0].as_ref().unwrap().choices[0].delta.content.as_deref(),
+            items[0].as_ref().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
             Some("last")
         );
     }
@@ -833,7 +840,10 @@ mod tests {
         let items: Vec<_> = stream.collect().await;
         assert_eq!(items.len(), 1);
         assert_eq!(
-            items[0].as_ref().unwrap().choices[0].delta.content.as_deref(),
+            items[0].as_ref().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
             Some("split")
         );
     }
@@ -849,7 +859,10 @@ mod tests {
         let items: Vec<_> = stream.collect().await;
         assert_eq!(items.len(), 1);
         assert_eq!(
-            items[0].as_ref().unwrap().choices[0].delta.content.as_deref(),
+            items[0].as_ref().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
             Some("before")
         );
     }

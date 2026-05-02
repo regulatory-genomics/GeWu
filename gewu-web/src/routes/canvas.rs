@@ -1,0 +1,102 @@
+//! Canvas inverse channel.
+//!
+//! These endpoints let the browser-side canvas push state changes back to
+//! the server. They are NOT tools — the agent calls `canvas.set_state`; the
+//! frontend posts here. This split keeps the agent's audit trail (tool
+//! calls) separate from raw user pans/zooms.
+//!
+//! Endpoints:
+//!   - `GET    /api/sessions/:sid/canvas`               -> list
+//!   - `GET    /api/sessions/:sid/canvas/:cid`          -> read
+//!   - `POST   /api/sessions/:sid/canvas/:cid/state`    -> patch
+//!   - `DELETE /api/sessions/:sid/canvas/:cid`          -> close
+//!
+//! All endpoints honor the existing `?token=` auth used elsewhere in
+//! gewu-web.
+
+use std::sync::Arc;
+
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::Json;
+use gewu_canvas::CanvasStatePatch;
+use serde::Deserialize;
+use serde_json::json;
+
+use crate::state::AppState;
+
+#[derive(Deserialize)]
+pub struct TokenQuery {
+    token: Option<String>,
+}
+
+async fn require_token(state: &AppState, query: &TokenQuery) -> Result<(), (StatusCode, String)> {
+    let auth = state.auth_token.read().await;
+    let valid = query
+        .token
+        .as_ref()
+        .map(|t| auth.validate(t))
+        .unwrap_or(false);
+    if valid {
+        Ok(())
+    } else {
+        Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string()))
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PatchBody {
+    pub patch: CanvasStatePatch,
+}
+
+pub async fn handle_list(
+    State(app): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Query(query): Query<TokenQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_token(&app, &query).await?;
+    let canvases = app.canvases.list(&session_id).await;
+    Ok(Json(json!({ "canvases": canvases })))
+}
+
+pub async fn handle_get(
+    State(app): State<Arc<AppState>>,
+    Path((session_id, canvas_id)): Path<(String, String)>,
+    Query(query): Query<TokenQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_token(&app, &query).await?;
+    let state = app.canvases.get_state(&session_id, &canvas_id).await;
+    match state {
+        Some(s) => Ok(Json(json!({ "state": s }))),
+        None => Err((StatusCode::NOT_FOUND, "canvas not found".to_string())),
+    }
+}
+
+pub async fn handle_patch(
+    State(app): State<Arc<AppState>>,
+    Path((session_id, canvas_id)): Path<(String, String)>,
+    Query(query): Query<TokenQuery>,
+    Json(body): Json<PatchBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_token(&app, &query).await?;
+    match app
+        .canvases
+        .set_state(&session_id, &canvas_id, body.patch)
+        .await
+    {
+        Ok(state) => Ok(Json(json!({ "state": state }))),
+        Err(e) => Err((StatusCode::NOT_FOUND, e.to_string())),
+    }
+}
+
+pub async fn handle_close(
+    State(app): State<Arc<AppState>>,
+    Path((session_id, canvas_id)): Path<(String, String)>,
+    Query(query): Query<TokenQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_token(&app, &query).await?;
+    match app.canvases.close(&session_id, &canvas_id).await {
+        Ok(()) => Ok(Json(json!({ "closed": true }))),
+        Err(e) => Err((StatusCode::NOT_FOUND, e.to_string())),
+    }
+}

@@ -1,9 +1,9 @@
 use crate::config::Config;
-use crate::retrieval::qdrant_store::{QdrantStore, SearchResult};
 use crate::retrieval::parent_store::ParentStore;
+use crate::retrieval::qdrant_store::{QdrantStore, SearchResult};
 use async_trait::async_trait;
-use gewu_core::types::{ToolContext, ToolResult};
 use gewu_core::Tool;
+use gewu_core::types::{ToolContext, ToolResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -99,13 +99,22 @@ impl Tool for SearchChildChunksTool {
             return Ok(ToolResult::new("Search Results", "NO_RELEVANT_CHUNKS"));
         }
 
-        tracing::debug!("search_child_chunks executing: query='{}', limit={}, threshold={}",
-            query, limit, self.config.similarity_threshold as f32);
+        tracing::debug!(
+            "search_child_chunks executing: query='{}', limit={}, threshold={}",
+            query,
+            limit,
+            self.config.similarity_threshold as f32
+        );
 
         let search_result = if self.config.enable_sparse {
             let sparse_vec = self.store.compute_sparse_from_text(query).await?;
             self.store
-                .hybrid_search(query, limit, self.config.similarity_threshold as f32, &sparse_vec)
+                .hybrid_search(
+                    query,
+                    limit,
+                    self.config.similarity_threshold as f32,
+                    &sparse_vec,
+                )
                 .await
         } else {
             self.store
@@ -123,7 +132,11 @@ impl Tool for SearchChildChunksTool {
             return Ok(ToolResult::new("Search Results", "NO_RELEVANT_CHUNKS"));
         }
 
-        tracing::debug!("search returned {} results for query: {}", results.len(), query);
+        tracing::debug!(
+            "search returned {} results for query: {}",
+            results.len(),
+            query
+        );
         let formatted = format_search_results_with_parent(&self.parent_store, &results);
 
         Ok(ToolResult::new("Search Results", formatted))
@@ -173,11 +186,13 @@ impl Tool for RetrieveParentChunksTool {
         let parent_id = input.parent_id.trim();
 
         if parent_id.is_empty() {
-            return Err(Box::new(RetrievalToolError::ParentNotFound("Empty parent_id".to_string())));
+            return Err(Box::new(RetrievalToolError::ParentNotFound(
+                "Empty parent_id".to_string(),
+            )));
         }
 
         let load_result = self.store.load(parent_id);
-        
+
         let parent = load_result.map_err(|e| {
             let err_str = e.to_string();
             Box::new(RetrievalToolError::Store(err_str)) as Box<dyn std::error::Error + Send + Sync>
@@ -229,9 +244,11 @@ impl Tool for RetrieveManyParentChunksTool {
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
         let input: RetrieveManyParentChunksInput = serde_json::from_value(args)?;
-        
+
         if input.parent_ids.is_empty() {
-            return Err(Box::new(RetrievalToolError::ParentNotFound("Empty parent_ids list".to_string())));
+            return Err(Box::new(RetrievalToolError::ParentNotFound(
+                "Empty parent_ids list".to_string(),
+            )));
         }
 
         let mut results = Vec::new();
@@ -240,7 +257,11 @@ impl Tool for RetrieveManyParentChunksTool {
         for parent_id in &input.parent_ids {
             match self.store.load(parent_id) {
                 Ok(parent) => {
-                    results.push(format_parent_single(&parent.id, &parent.metadata, &parent.content));
+                    results.push(format_parent_single(
+                        &parent.id,
+                        &parent.metadata,
+                        &parent.content,
+                    ));
                 }
                 Err(e) => {
                     errors.push(format!("Failed to load {}: {}", parent_id, e));
@@ -263,22 +284,36 @@ impl Tool for RetrieveManyParentChunksTool {
     }
 }
 
-fn format_parent_single(id: &str, metadata: &std::collections::HashMap<String, String>, content: &str) -> String {
+fn format_parent_single(
+    id: &str,
+    metadata: &std::collections::HashMap<String, String>,
+    content: &str,
+) -> String {
     format!(
         "Parent ID: {}\nFile Name: {}\nContent: {}",
         id,
-        metadata.get("source").cloned().unwrap_or_else(|| "unknown".to_string()),
+        metadata
+            .get("source")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string()),
         content.trim()
     )
 }
 
-fn format_search_results_with_parent(parent_store: &ParentStore, results: &[SearchResult]) -> String {
+fn format_search_results_with_parent(
+    parent_store: &ParentStore,
+    results: &[SearchResult],
+) -> String {
     let mut formatted_parts = Vec::new();
 
     for r in results {
         let parent_id = r.metadata.get("parent_id").cloned().unwrap_or_default();
         if parent_id.is_empty() {
-            tracing::warn!("Search result missing parent_id: id={}, score={}", r.id, r.score);
+            tracing::warn!(
+                "Search result missing parent_id: id={}, score={}",
+                r.id,
+                r.score
+            );
             continue;
         }
         match parent_store.load(&parent_id) {
@@ -286,7 +321,11 @@ fn format_search_results_with_parent(parent_store: &ParentStore, results: &[Sear
                 formatted_parts.push(format!(
                     "Parent ID: {}\nFile Name: {}\nContent: {}",
                     parent.id,
-                    parent.metadata.get("source").cloned().unwrap_or_else(|| "unknown".to_string()),
+                    parent
+                        .metadata
+                        .get("source")
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_string()),
                     parent.content.trim()
                 ));
             }

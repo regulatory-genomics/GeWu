@@ -7,6 +7,8 @@ const state = {
     workGraph: null,
     workTab: 'timeline'
 };
+// Expose to canvas.js so the inverse-channel POST can find the session id.
+window.state = state;
 
 // DOM Elements
 const sidebar = document.getElementById('sidebar');
@@ -45,6 +47,7 @@ marked.setOptions({
 // URL params
 const urlParams = new URLSearchParams(window.location.search);
 token = urlParams.get('token') || '';
+window.token = token;
 
 // Load persisted state
 function loadState() {
@@ -1234,6 +1237,15 @@ function createToolCall(toolCallId, toolName, input, metadata = null) {
 }
 
 function attachToolStartMetadata(details, metadata) {
+    // Canvas events ride on tool_start.metadata. If we recognise one, hand
+    // off to the canvas controller and skip the trace/session UI for this
+    // tool call (the canvas controller manages its own surface).
+    if (metadata && typeof metadata.event === 'string' && metadata.event.startsWith('canvas:')) {
+        if (window.canvasController) {
+            try { window.canvasController.handle(metadata); } catch (e) { console.warn('canvas handle failed', e); }
+        }
+        return;
+    }
     const childSessionId = metadata.child_session_id || metadata.session_id || metadata.task_id;
     const rootRunId = metadata.root_run_id || metadata.current_run_id;
     if (childSessionId) {
@@ -1299,6 +1311,14 @@ function finishToolCall(details, output) {
     details.querySelector('.tool-output').textContent = output;
     details.open = false;
     addTraceRunFromToolOutput(details.closest('.message'), output);
+    // Route canvas events that ride on tool_finish.output.
+    try {
+        const parsed = parseToolOutputJson(output);
+        if (parsed && typeof parsed.event === 'string' && parsed.event.startsWith('canvas:') && window.canvasController) {
+            // Use the richer event_payload when present (carries patch/state).
+            window.canvasController.handle(parsed.event_payload || parsed);
+        }
+    } catch (e) { /* tool output not JSON; ignore */ }
     refreshSessionTree();
     loadWorkGraph();
     chatContainer.scrollTop = chatContainer.scrollHeight;

@@ -204,8 +204,10 @@ impl Tool for WriteWorkflowTool {
          `manifest_yaml` (string, preferred) or `manifest_json` (object). \
          The `id` must match the manifest's own `id`. On success the file is \
          written to the composer's output directory and its path is \
-         returned. On validation failure a structured error is returned so \
-         you can revise and retry."
+         returned. The manifest must use `entry: <node_id>`, map-shaped \
+         `nodes:`, `finish: [<node_id>]`, and `edges: [[from, to]]`. On \
+         validation failure a structured error is returned so you can revise \
+         one specific issue and retry."
     }
     fn schema(&self) -> RootSchema {
         serde_json::from_value(json!({

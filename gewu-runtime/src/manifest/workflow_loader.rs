@@ -42,7 +42,10 @@ impl WorkflowManifestLoader {
         let mut out = Vec::new();
         for dir in &self.dirs {
             if !dir.exists() {
-                tracing::debug!("Workflow manifest dir does not exist, skipping: {}", dir.display());
+                tracing::debug!(
+                    "Workflow manifest dir does not exist, skipping: {}",
+                    dir.display()
+                );
                 continue;
             }
             let entries = std::fs::read_dir(dir)
@@ -60,7 +63,11 @@ impl WorkflowManifestLoader {
                         out.push((path, m));
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to load workflow manifest {}: {}", path.display(), e);
+                        tracing::warn!(
+                            "Failed to load workflow manifest {}: {}",
+                            path.display(),
+                            e
+                        );
                     }
                 }
             }
@@ -72,8 +79,8 @@ impl WorkflowManifestLoader {
 fn load_workflow_manifest(path: &Path) -> Result<WorkflowManifest> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let m: WorkflowManifest = serde_yaml::from_str(&content)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let m: WorkflowManifest =
+        serde_yaml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
     Ok(m)
 }
 
@@ -117,8 +124,11 @@ mod tests {
     #[test]
     fn malformed_file_is_skipped_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("good.yaml"),
-            "id: g\nentry: x\nfinish: [x]\nnodes: { x: { kind: tool, tool: t } }\n").unwrap();
+        fs::write(
+            dir.path().join("good.yaml"),
+            "id: g\nentry: x\nfinish: [x]\nnodes: { x: { kind: tool, tool: t } }\n",
+        )
+        .unwrap();
         fs::write(dir.path().join("bad.yaml"), "not: [valid: yaml").unwrap();
 
         let mut loader = WorkflowManifestLoader::new();

@@ -127,7 +127,8 @@ impl CapabilityRegistry {
     }
 
     pub fn list_capabilities(&self) -> Vec<CapabilityDescriptor> {
-        let mut out: Vec<CapabilityDescriptor> = self.index.values().map(|(_, d)| d.clone()).collect();
+        let mut out: Vec<CapabilityDescriptor> =
+            self.index.values().map(|(_, d)| d.clone()).collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
@@ -211,7 +212,11 @@ mod tests {
         )));
         assert!(reg.contains("alpha"));
         assert!(reg.contains("beta"));
-        let names: Vec<String> = reg.list_capabilities().into_iter().map(|d| d.name).collect();
+        let names: Vec<String> = reg
+            .list_capabilities()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
         assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
     }
 

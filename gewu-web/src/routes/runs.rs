@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use axum::{
-    Json,
     extract::{Path, Query, State},
+    Json,
 };
 use gewu_storage::ExecutionTraceStore;
 use serde::Deserialize;
@@ -31,10 +31,7 @@ pub async fn handle_get_run(
     Path(path): Path<RunPath>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let store = trace_store(&app).await?;
-    let run = store
-        .get_run(&path.id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let run = store.get_run(&path.id).await?.ok_or(AppError::NotFound)?;
     Ok(Json(serde_json::json!({ "run": run })))
 }
 

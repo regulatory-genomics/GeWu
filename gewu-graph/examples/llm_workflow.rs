@@ -1,6 +1,6 @@
 use anyhow::Result;
-use gewu_graph::graph::{CompiledGraph, NodeResult, StateGraph};
 use gewu_graph::State;
+use gewu_graph::graph::{CompiledGraph, NodeResult, StateGraph};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -93,15 +93,30 @@ async fn call_llm(
 async fn classify_intent(state: AgentState) -> PartialAgentState {
     let provider = match state.provider.as_ref() {
         Some(p) => p,
-        None => return PartialAgentState { error: Some("Provider not set".to_string()), ..Default::default() },
+        None => {
+            return PartialAgentState {
+                error: Some("Provider not set".to_string()),
+                ..Default::default()
+            };
+        }
     };
     let api_key = match state.api_key.as_ref() {
         Some(k) => k,
-        None => return PartialAgentState { error: Some("API key not set".to_string()), ..Default::default() },
+        None => {
+            return PartialAgentState {
+                error: Some("API key not set".to_string()),
+                ..Default::default()
+            };
+        }
     };
     let model = match state.model.as_ref() {
         Some(m) => m,
-        None => return PartialAgentState { error: Some("Model not set".to_string()), ..Default::default() },
+        None => {
+            return PartialAgentState {
+                error: Some("Model not set".to_string()),
+                ..Default::default()
+            };
+        }
     };
 
     let system = r#"You are an intent classifier. Analyze the user input and classify it into one of three categories:
@@ -134,15 +149,30 @@ Respond with ONLY a single word: either "code", "qa", or "general"."#;
 async fn code_assist(state: AgentState) -> PartialAgentState {
     let provider = match state.provider.as_ref() {
         Some(p) => p,
-        None => return PartialAgentState { error: Some("Provider not set".to_string()), ..Default::default() },
+        None => {
+            return PartialAgentState {
+                error: Some("Provider not set".to_string()),
+                ..Default::default()
+            };
+        }
     };
     let api_key = match state.api_key.as_ref() {
         Some(k) => k,
-        None => return PartialAgentState { error: Some("API key not set".to_string()), ..Default::default() },
+        None => {
+            return PartialAgentState {
+                error: Some("API key not set".to_string()),
+                ..Default::default()
+            };
+        }
     };
     let model = match state.model.as_ref() {
         Some(m) => m,
-        None => return PartialAgentState { error: Some("Model not set".to_string()), ..Default::default() },
+        None => {
+            return PartialAgentState {
+                error: Some("Model not set".to_string()),
+                ..Default::default()
+            };
+        }
     };
 
     let system = r#"You are an expert programming assistant. Help the user with their coding task.
@@ -163,15 +193,30 @@ Provide clear, concise code examples and explanations. Focus on best practices a
 async fn qa_assist(state: AgentState) -> PartialAgentState {
     let provider = match state.provider.as_ref() {
         Some(p) => p,
-        None => return PartialAgentState { error: Some("Provider not set".to_string()), ..Default::default() },
+        None => {
+            return PartialAgentState {
+                error: Some("Provider not set".to_string()),
+                ..Default::default()
+            };
+        }
     };
     let api_key = match state.api_key.as_ref() {
         Some(k) => k,
-        None => return PartialAgentState { error: Some("API key not set".to_string()), ..Default::default() },
+        None => {
+            return PartialAgentState {
+                error: Some("API key not set".to_string()),
+                ..Default::default()
+            };
+        }
     };
     let model = match state.model.as_ref() {
         Some(m) => m,
-        None => return PartialAgentState { error: Some("Model not set".to_string()), ..Default::default() },
+        None => {
+            return PartialAgentState {
+                error: Some("Model not set".to_string()),
+                ..Default::default()
+            };
+        }
     };
 
     let system = r#"You are a knowledgeable Q&A assistant. Answer the user's question with accurate,
@@ -192,15 +237,30 @@ well-researched information. Provide context and explanations where helpful."#;
 async fn general_assist(state: AgentState) -> PartialAgentState {
     let provider = match state.provider.as_ref() {
         Some(p) => p,
-        None => return PartialAgentState { error: Some("Provider not set".to_string()), ..Default::default() },
+        None => {
+            return PartialAgentState {
+                error: Some("Provider not set".to_string()),
+                ..Default::default()
+            };
+        }
     };
     let api_key = match state.api_key.as_ref() {
         Some(k) => k,
-        None => return PartialAgentState { error: Some("API key not set".to_string()), ..Default::default() },
+        None => {
+            return PartialAgentState {
+                error: Some("API key not set".to_string()),
+                ..Default::default()
+            };
+        }
     };
     let model = match state.model.as_ref() {
         Some(m) => m,
-        None => return PartialAgentState { error: Some("Model not set".to_string()), ..Default::default() },
+        None => {
+            return PartialAgentState {
+                error: Some("Model not set".to_string()),
+                ..Default::default()
+            };
+        }
     };
 
     let system = r#"You are a helpful conversational assistant. Engage with the user in a friendly
@@ -239,11 +299,15 @@ async fn synthesizer(state: AgentState) -> PartialAgentState {
 fn build_graph() -> CompiledGraph<AgentState> {
     let mut graph = StateGraph::<AgentState>::new();
 
-    let classify_intent = |state: AgentState| async move { NodeResult::Partial(classify_intent(state).await) };
-    let code_assist = |state: AgentState| async move { NodeResult::Partial(code_assist(state).await) };
+    let classify_intent =
+        |state: AgentState| async move { NodeResult::Partial(classify_intent(state).await) };
+    let code_assist =
+        |state: AgentState| async move { NodeResult::Partial(code_assist(state).await) };
     let qa_assist = |state: AgentState| async move { NodeResult::Partial(qa_assist(state).await) };
-    let general_assist = |state: AgentState| async move { NodeResult::Partial(general_assist(state).await) };
-    let synthesizer = |state: AgentState| async move { NodeResult::Partial(synthesizer(state).await) };
+    let general_assist =
+        |state: AgentState| async move { NodeResult::Partial(general_assist(state).await) };
+    let synthesizer =
+        |state: AgentState| async move { NodeResult::Partial(synthesizer(state).await) };
 
     graph.add_node("classify_intent", classify_intent);
     graph.add_node("code_assist", code_assist);

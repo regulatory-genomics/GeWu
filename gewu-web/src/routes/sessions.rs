@@ -3,6 +3,9 @@ use axum::{
     extract::{Query, State},
     Json,
 };
+use serde_json::{json, Value};
+use sqlx::Row;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 #[derive(Debug, serde::Deserialize)]
@@ -92,9 +95,314 @@ pub async fn handle_get_messages(
         .into_iter()
         .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
         .collect();
+    let messages_json = attach_missing_workflow_trace_messages(&app, &id, messages_json).await?;
+    let messages_json = attach_active_turn_message(&app, &id, messages_json).await;
     Ok(Json(MessagesResponse {
         messages: messages_json,
     }))
+}
+
+async fn attach_active_turn_message(
+    app: &AppState,
+    session_id: &str,
+    mut messages: Vec<Value>,
+) -> Vec<Value> {
+    let Some(turn) = app.get_active_turn(session_id).await else {
+        return messages;
+    };
+    if turn.reasoning.is_empty() && turn.content.is_empty() {
+        return messages;
+    }
+    messages.push(json!({
+        "role": "assistant",
+        "content": turn.content,
+        "tool_calls": null,
+        "active_turn": true,
+        "reasoning": turn.reasoning,
+        "started_at": turn.started_at,
+        "last_event_at": turn.last_event_at,
+        "event_count": turn.event_count,
+    }));
+    messages
+}
+
+async fn attach_missing_workflow_trace_messages(
+    app: &AppState,
+    session_id: &str,
+    messages: Vec<Value>,
+) -> Result<Vec<Value>, AppError> {
+    let missing_calls = missing_run_workflow_calls(&messages);
+    if missing_calls.is_empty() {
+        return Ok(messages);
+    }
+
+    let pool_guard = app.db_pool.lock().await;
+    let pool = pool_guard
+        .as_ref()
+        .ok_or_else(|| AppError::InternalError("Database is not initialized".to_string()))?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            tool.id AS tool_run_id,
+            tool.name AS tool_name,
+            tool.status AS tool_status,
+            tool.started_at AS tool_started_at,
+            tool.finished_at AS tool_finished_at,
+            tool.error AS tool_error,
+            workflow.id AS workflow_run_id,
+            workflow.name AS workflow_name,
+            workflow.status AS workflow_status,
+            workflow.started_at AS workflow_started_at,
+            workflow.finished_at AS workflow_finished_at,
+            workflow.error AS workflow_error
+        FROM execution_runs tool
+        LEFT JOIN execution_runs workflow
+            ON workflow.session_id = tool.session_id
+           AND workflow.kind = 'workflow'
+           AND workflow.started_at = tool.started_at
+        WHERE tool.session_id = ?
+          AND tool.kind = 'tool'
+          AND tool.name = 'run_workflow'
+        ORDER BY tool.started_at ASC, tool.id ASC
+        "#,
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::InternalError(format!("Failed to load workflow trace runs: {e}")))?;
+
+    let mut traces = rows
+        .into_iter()
+        .map(|row| WorkflowTraceMessage {
+            tool_run_id: row.try_get("tool_run_id").unwrap_or_default(),
+            tool_name: row
+                .try_get("tool_name")
+                .unwrap_or_else(|_| "run_workflow".to_string()),
+            tool_status: row.try_get("tool_status").unwrap_or_default(),
+            tool_started_at: row.try_get("tool_started_at").unwrap_or_default(),
+            tool_finished_at: row.try_get("tool_finished_at").ok(),
+            tool_error: row.try_get("tool_error").ok(),
+            workflow_run_id: row.try_get("workflow_run_id").ok(),
+            workflow_name: row.try_get("workflow_name").ok(),
+            workflow_status: row.try_get("workflow_status").ok(),
+            workflow_started_at: row.try_get("workflow_started_at").ok(),
+            workflow_finished_at: row.try_get("workflow_finished_at").ok(),
+            workflow_error: row.try_get("workflow_error").ok(),
+        })
+        .collect::<VecDeque<_>>();
+
+    if traces.is_empty() {
+        return Ok(messages);
+    }
+
+    let missing_call_ids: HashSet<String> = missing_calls.into_iter().collect();
+    let mut enriched = Vec::with_capacity(messages.len() + missing_call_ids.len());
+    for message in messages {
+        let synthetic_tools =
+            synthetic_workflow_tools_after_message(&message, &missing_call_ids, &mut traces);
+        enriched.push(message);
+        enriched.extend(synthetic_tools);
+    }
+
+    Ok(enriched)
+}
+
+fn missing_run_workflow_calls(messages: &[Value]) -> Vec<String> {
+    let mut run_workflow_calls = Vec::new();
+    let mut tool_results = HashSet::new();
+
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) == Some("assistant") {
+            for call in message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let name = call
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str);
+                if name == Some("run_workflow") {
+                    if let Some(id) = call.get("id").and_then(Value::as_str) {
+                        run_workflow_calls.push(id.to_string());
+                    }
+                }
+            }
+        } else if message.get("role").and_then(Value::as_str) == Some("tool") {
+            if let Some(id) = message.get("tool_call_id").and_then(Value::as_str) {
+                tool_results.insert(id.to_string());
+            }
+        }
+    }
+
+    run_workflow_calls
+        .into_iter()
+        .filter(|id| !tool_results.contains(id))
+        .collect()
+}
+
+fn synthetic_workflow_tools_after_message(
+    message: &Value,
+    missing_call_ids: &HashSet<String>,
+    traces: &mut VecDeque<WorkflowTraceMessage>,
+) -> Vec<Value> {
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Vec::new();
+    }
+
+    let mut synthetic = Vec::new();
+    for call in message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let call_id = call.get("id").and_then(Value::as_str);
+        let name = call
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str);
+        if name != Some("run_workflow") || !call_id.is_some_and(|id| missing_call_ids.contains(id))
+        {
+            continue;
+        }
+
+        let Some(trace) = traces.pop_front() else {
+            break;
+        };
+        let Some(call_id) = call_id else {
+            continue;
+        };
+
+        synthetic.push(json!({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "tool_name": trace.tool_name,
+            "content": trace.to_output_json(),
+        }));
+    }
+
+    synthetic
+}
+
+#[derive(Clone)]
+struct WorkflowTraceMessage {
+    tool_run_id: String,
+    tool_name: String,
+    tool_status: String,
+    tool_started_at: i64,
+    tool_finished_at: Option<i64>,
+    tool_error: Option<String>,
+    workflow_run_id: Option<String>,
+    workflow_name: Option<String>,
+    workflow_status: Option<String>,
+    workflow_started_at: Option<i64>,
+    workflow_finished_at: Option<i64>,
+    workflow_error: Option<String>,
+}
+
+impl WorkflowTraceMessage {
+    fn to_output_json(&self) -> String {
+        let trace_run_id = self.workflow_run_id.as_ref().unwrap_or(&self.tool_run_id);
+        serde_json::to_string_pretty(&json!({
+            "status": self.workflow_status.as_ref().unwrap_or(&self.tool_status),
+            "workflow_id": self.workflow_name,
+            "tool_run_id": self.tool_run_id,
+            "tool_status": self.tool_status,
+            "tool_started_at": self.tool_started_at,
+            "tool_finished_at": self.tool_finished_at,
+            "tool_error": self.tool_error,
+            "workflow_run_id": self.workflow_run_id,
+            "workflow_started_at": self.workflow_started_at,
+            "workflow_finished_at": self.workflow_finished_at,
+            "workflow_error": self.workflow_error,
+            "_trace": {
+                "root_run_id": trace_run_id,
+                "current_run_id": trace_run_id,
+            }
+        }))
+        .unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_run_workflow_calls_missing_tool_results() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_missing",
+                    "type": "function",
+                    "function": { "name": "run_workflow", "arguments": "{}" }
+                }]
+            }),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_present",
+                    "type": "function",
+                    "function": { "name": "run_workflow", "arguments": "{}" }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_present",
+                "tool_name": "run_workflow",
+                "content": "{}"
+            }),
+        ];
+
+        assert_eq!(missing_run_workflow_calls(&messages), vec!["call_missing"]);
+    }
+
+    #[test]
+    fn synthesizes_trace_tool_message_after_matching_assistant_call() {
+        let message = json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_workflow",
+                "type": "function",
+                "function": { "name": "run_workflow", "arguments": "{}" }
+            }]
+        });
+        let missing_call_ids = HashSet::from(["call_workflow".to_string()]);
+        let trace = WorkflowTraceMessage {
+            tool_run_id: "run_tool".to_string(),
+            tool_name: "run_workflow".to_string(),
+            tool_status: "succeeded".to_string(),
+            tool_started_at: 1,
+            tool_finished_at: Some(2),
+            tool_error: None,
+            workflow_run_id: Some("run_workflow_trace".to_string()),
+            workflow_name: Some("daily_opencode_rollup".to_string()),
+            workflow_status: Some("succeeded".to_string()),
+            workflow_started_at: Some(1),
+            workflow_finished_at: Some(2),
+            workflow_error: None,
+        };
+        let mut traces = VecDeque::from([trace]);
+
+        let synthetic =
+            synthetic_workflow_tools_after_message(&message, &missing_call_ids, &mut traces);
+
+        assert_eq!(synthetic.len(), 1);
+        assert_eq!(synthetic[0]["role"], "tool");
+        assert_eq!(synthetic[0]["tool_call_id"], "call_workflow");
+        assert_eq!(synthetic[0]["tool_name"], "run_workflow");
+        let content: Value =
+            serde_json::from_str(synthetic[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(content["_trace"]["root_run_id"], "run_workflow_trace");
+        assert_eq!(content["workflow_id"], "daily_opencode_rollup");
+    }
 }
 
 pub async fn handle_validate(

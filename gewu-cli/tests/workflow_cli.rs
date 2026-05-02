@@ -5,11 +5,11 @@
 //! pass dummy credentials so the OpenAI client is constructed but never
 //! called.
 
-use gewu_cli::{Cli, LoadedConfig, run_parsed_with_plugins};
 use gewu_cli::config::Config;
+use gewu_cli::{Cli, LoadedConfig, run_parsed_with_plugins};
+use gewu_core::traits::PluginPlatformContext;
 use gewu_core::traits::{AssemblyContext, Plugin, Tool, ToolFactory};
 use gewu_core::types::{SpecialistDescriptor, ToolContext, ToolResult};
-use gewu_core::traits::PluginPlatformContext;
 use schemars::schema::RootSchema;
 use serde_json::Value;
 use std::error::Error;

@@ -248,7 +248,10 @@ pub fn build_consolidation_prompt(raw_text: &str, n_results: usize) -> Vec<Messa
         },
         Message::User {
             content: vec![ContentPart::Text {
-                text: format!("Summarize these {} tool results:\n\n{}", n_results, raw_text),
+                text: format!(
+                    "Summarize these {} tool results:\n\n{}",
+                    n_results, raw_text
+                ),
             }],
         },
     ]

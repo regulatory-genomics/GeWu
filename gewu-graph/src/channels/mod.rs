@@ -34,9 +34,9 @@
 //! ```
 
 pub mod base;
-pub mod topic;
 #[cfg(test)]
 mod tests;
+pub mod topic;
 
 pub use base::{
     AnyValueChannel, BaseChannel, BinaryOperatorChannel, EphemeralValueChannel, LastValueChannel,
