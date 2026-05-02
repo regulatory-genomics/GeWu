@@ -42,7 +42,8 @@
 //! ```
 
 use crate::types::{
-    CapabilityDescriptor, Message, ProviderEvent, SpecialistDescriptor, ToolContext, ToolResult,
+    CapabilityDescriptor, Message, ProviderEvent, SpecialistDescriptor, ToolContext,
+    ToolExecutionPolicy, ToolResult,
 };
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -60,6 +61,18 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
 
     fn schema(&self) -> RootSchema;
+
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::Serial
+    }
+
+    fn start_metadata(
+        &self,
+        _args: &str,
+        _ctx: &ToolContext,
+    ) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
+        Ok(serde_json::Value::Null)
+    }
 
     async fn init(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok(())

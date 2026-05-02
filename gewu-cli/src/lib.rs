@@ -135,10 +135,10 @@ async fn run_runtime_agent(
                     print!("{}{}", delta, RESET);
                     std::io::stdout().flush()?;
                 }
-                AgentEvent::ToolStart { tool, input } => {
+                AgentEvent::ToolStart { tool, input, .. } => {
                     println!("\n[Tool Start: {}] Input: {}", tool, input);
                 }
-                AgentEvent::ToolFinish { tool, output } => {
+                AgentEvent::ToolFinish { tool, output, .. } => {
                     let display_output = if output.len() > 200 {
                         let end = output
                             .char_indices()
@@ -235,7 +235,11 @@ fn resolve_runtime_plugin_dirs(config: &config::Config) -> Vec<PathBuf> {
 }
 
 fn resolve_skill_dirs(config: &config::Config) -> Vec<PathBuf> {
-    config.skill_dirs.iter().map(|s| expand_config_path(s)).collect()
+    config
+        .skill_dirs
+        .iter()
+        .map(|s| expand_config_path(s))
+        .collect()
 }
 
 fn parse_workflow_input(raw: Option<&str>) -> Result<serde_json::Value> {

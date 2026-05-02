@@ -158,7 +158,7 @@ impl Tool for TaskTool {
                             result = response;
                         }
                     }
-                    AgentEvent::ToolFinish { tool, output } if tool == "report_result" => {
+                    AgentEvent::ToolFinish { tool, output, .. } if tool == "report_result" => {
                         report_received = true;
                         if let Ok(report) = serde_json::from_str::<ReportResultArgs>(&output) {
                             match report.status.as_str() {

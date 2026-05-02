@@ -160,9 +160,19 @@ pub enum AgentEvent {
     /// A delta of text content from the model.
     ContentDelta { delta: String },
     /// The agent has started executing a tool.
-    ToolStart { tool: String, input: String },
+    ToolStart {
+        tool_call_id: String,
+        tool: String,
+        input: String,
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        metadata: serde_json::Value,
+    },
     /// A tool has finished executing.
-    ToolFinish { tool: String, output: String },
+    ToolFinish {
+        tool_call_id: String,
+        tool: String,
+        output: String,
+    },
     /// The agent has finished with a final response.
     Finish { response: String },
     /// An error occurred during agent execution.
@@ -232,6 +242,13 @@ pub struct ToolResult {
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolExecutionPolicy {
+    Serial,
+    ParallelSafe,
+    Exclusive,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -341,6 +358,7 @@ impl ToolResult {
 pub struct ToolContext {
     pub session_id: String,
     pub message_id: String,
+    pub tool_call_id: Option<String>,
     pub abort: Arc<std::sync::atomic::AtomicBool>,
     pub metadata: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -350,9 +368,15 @@ impl ToolContext {
         Self {
             session_id: session_id.into(),
             message_id: message_id.into(),
+            tool_call_id: None,
             abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metadata: Default::default(),
         }
+    }
+
+    pub fn with_tool_call_id(mut self, tool_call_id: impl Into<String>) -> Self {
+        self.tool_call_id = Some(tool_call_id.into());
+        self
     }
 
     pub fn is_aborted(&self) -> bool {
@@ -519,6 +543,85 @@ impl TaskStatus {
     }
 }
 
+/// Runtime-level task execution state. This answers whether execution is still
+/// running, ended normally, or ended through an operational failure/cancel path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskExecutionStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+    Timeout,
+    Interrupted,
+}
+
+impl TaskExecutionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+            Self::Timeout => "timeout",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "canceled" => Some(Self::Canceled),
+            "timeout" => Some(Self::Timeout),
+            "interrupted" => Some(Self::Interrupted),
+            _ => None,
+        }
+    }
+}
+
+/// Result-level task quality state. This answers whether a completed execution
+/// actually produced a usable task result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskResultStatus {
+    Pending,
+    Accepted,
+    Empty,
+    Incomplete,
+    Invalid,
+    NeedsReview,
+}
+
+impl TaskResultStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+            Self::Empty => "empty",
+            Self::Incomplete => "incomplete",
+            Self::Invalid => "invalid",
+            Self::NeedsReview => "needs_review",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "accepted" => Some(Self::Accepted),
+            "empty" => Some(Self::Empty),
+            "incomplete" => Some(Self::Incomplete),
+            "invalid" => Some(Self::Invalid),
+            "needs_review" => Some(Self::NeedsReview),
+            _ => None,
+        }
+    }
+}
+
 /// Persisted record for a durable task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
@@ -526,7 +629,16 @@ pub struct TaskRecord {
     pub specialist_id: String,
     pub prompt: String,
     pub status: TaskStatus,
+    pub execution_status: TaskExecutionStatus,
+    pub result_status: TaskResultStatus,
     pub attempt: u32,
     pub block_reason: Option<String>,
     pub result_json: Option<String>,
+    pub finish_reason: Option<String>,
+    pub error: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub child_session_id: Option<String>,
+    pub root_run_id: Option<String>,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
 }
