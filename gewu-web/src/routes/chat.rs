@@ -42,17 +42,22 @@ impl SseEvent {
         }
     }
 
-    pub fn tool_start(tool: String, input: String) -> Self {
+    pub fn tool_start(
+        tool_call_id: String,
+        tool: String,
+        input: String,
+        metadata: serde_json::Value,
+    ) -> Self {
         Self {
             event_type: "tool_start".to_string(),
-            data: serde_json::json!({ "tool": tool, "input": input }),
+            data: serde_json::json!({ "tool_call_id": tool_call_id, "tool": tool, "input": input, "metadata": metadata }),
         }
     }
 
-    pub fn tool_finish(tool: String, output: String) -> Self {
+    pub fn tool_finish(tool_call_id: String, tool: String, output: String) -> Self {
         Self {
             event_type: "tool_finish".to_string(),
-            data: serde_json::json!({ "tool": tool, "output": output }),
+            data: serde_json::json!({ "tool_call_id": tool_call_id, "tool": tool, "output": output }),
         }
     }
 
@@ -122,13 +127,22 @@ pub async fn handle_chat(
                     gewu_core::types::AgentEvent::ContentDelta { delta } => {
                         SseEvent::content_delta(delta).to_sse_event()
                     }
-                    gewu_core::types::AgentEvent::ToolStart { tool, input } => {
+                    gewu_core::types::AgentEvent::ToolStart {
+                        tool_call_id,
+                        tool,
+                        input,
+                        metadata,
+                    } => {
                         info!("tool_start: {} - {}", tool, input);
-                        SseEvent::tool_start(tool, input).to_sse_event()
+                        SseEvent::tool_start(tool_call_id, tool, input, metadata).to_sse_event()
                     }
-                    gewu_core::types::AgentEvent::ToolFinish { tool, output } => {
+                    gewu_core::types::AgentEvent::ToolFinish {
+                        tool_call_id,
+                        tool,
+                        output,
+                    } => {
                         info!("tool_finish: {} - {}", tool, output);
-                        SseEvent::tool_finish(tool, output).to_sse_event()
+                        SseEvent::tool_finish(tool_call_id, tool, output).to_sse_event()
                     }
                     gewu_core::types::AgentEvent::Finish { response } => {
                         info!("finish: {}", response);
@@ -144,7 +158,11 @@ pub async fn handle_chat(
                     SseEvent::error(e.to_string()).to_sse_event()
                 }
             };
-            if tx.send(Ok::<Event, std::convert::Infallible>(sse_event)).await.is_err() {
+            if tx
+                .send(Ok::<Event, std::convert::Infallible>(sse_event))
+                .await
+                .is_err()
+            {
                 warn!("SSE channel closed, stopping stream");
                 break;
             }

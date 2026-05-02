@@ -135,6 +135,10 @@ where
         )
         .route("/api/sessions", get(routes::sessions::handle_list_sessions))
         .route(
+            "/api/sessions/tree",
+            get(routes::sessions::handle_sessions_tree),
+        )
+        .route(
             "/api/sessions",
             post(routes::sessions::handle_create_session),
         )

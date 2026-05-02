@@ -31,6 +31,27 @@ pub struct SessionsListResponse {
 }
 
 #[derive(Debug, serde::Serialize)]
+pub struct SessionChildInfo {
+    pub id: String,
+    pub agent_type: String,
+    pub title: Option<String>,
+    pub execution_status: Option<String>,
+    pub result_status: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SessionTreeNode {
+    pub session: SessionInfo,
+    pub children: Vec<SessionChildInfo>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SessionsTreeResponse {
+    pub sessions: Vec<SessionTreeNode>,
+}
+
+#[derive(Debug, serde::Serialize)]
 pub struct MessageResponse {
     pub message: String,
 }
@@ -90,9 +111,7 @@ pub async fn handle_validate(
 
 /// Returns the auth token without requiring authentication.
 /// Safe for local dev servers; allows cross-origin frontends to auto-connect.
-pub async fn handle_get_token(
-    State(app): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+pub async fn handle_get_token(State(app): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let auth = app.auth_token.read().await;
     Json(serde_json::json!({ "token": auth.valid_token }))
 }
@@ -124,6 +143,55 @@ pub async fn handle_list_sessions(
 ) -> Result<Json<SessionsListResponse>, AppError> {
     let sessions = app.list_sessions().await;
     Ok(Json(SessionsListResponse { sessions }))
+}
+
+pub async fn handle_sessions_tree(
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<SessionsTreeResponse>, AppError> {
+    let sessions = app.list_sessions().await;
+    let pool_guard = app.db_pool.lock().await;
+    let pool = pool_guard
+        .as_ref()
+        .ok_or_else(|| AppError::InternalError("Database is not initialized".to_string()))?;
+
+    let mut nodes = Vec::new();
+    for session in sessions {
+        let rows = sqlx::query(
+            r#"
+            SELECT task_id, specialist_id, prompt, execution_status, result_status, child_session_id, started_at
+            FROM tasks
+            WHERE parent_session_id = ? AND child_session_id IS NOT NULL
+            ORDER BY COALESCE(started_at, 0), task_id
+            "#,
+        )
+        .bind(&session.id)
+        .fetch_all(pool)
+        .await
+        .map_err(|err| AppError::InternalError(err.to_string()))?;
+
+        let children = rows
+            .into_iter()
+            .filter_map(|row| {
+                let id: Option<String> = sqlx::Row::try_get(&row, "child_session_id").ok();
+                Some(SessionChildInfo {
+                    id: id?,
+                    agent_type: sqlx::Row::try_get(&row, "specialist_id")
+                        .unwrap_or_else(|_| "specialist".to_string()),
+                    title: sqlx::Row::try_get(&row, "prompt").ok(),
+                    execution_status: sqlx::Row::try_get(&row, "execution_status").ok(),
+                    result_status: sqlx::Row::try_get(&row, "result_status").ok(),
+                    created_at: sqlx::Row::try_get(&row, "started_at")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(session.created_at),
+                })
+            })
+            .collect();
+
+        nodes.push(SessionTreeNode { session, children });
+    }
+
+    Ok(Json(SessionsTreeResponse { sessions: nodes }))
 }
 
 pub async fn handle_create_session(

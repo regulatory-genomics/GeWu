@@ -112,7 +112,11 @@ impl AppState {
             .iter()
             .map(|s| expand_config_path(s))
             .collect();
-        let skill_dirs: Vec<PathBuf> = config.skill_dirs.iter().map(|s| expand_config_path(s)).collect();
+        let skill_dirs: Vec<PathBuf> = config
+            .skill_dirs
+            .iter()
+            .map(|s| expand_config_path(s))
+            .collect();
         drop(config);
 
         let pool_guard = self.db_pool.lock().await;
@@ -180,7 +184,11 @@ impl AppState {
             .iter()
             .map(|s| expand_config_path(s))
             .collect();
-        let skill_dirs: Vec<PathBuf> = config.skill_dirs.iter().map(|s| expand_config_path(s)).collect();
+        let skill_dirs: Vec<PathBuf> = config
+            .skill_dirs
+            .iter()
+            .map(|s| expand_config_path(s))
+            .collect();
         drop(config);
 
         let pool_guard = self.db_pool.lock().await;
@@ -310,7 +318,11 @@ impl AppState {
             .iter()
             .map(|s| expand_config_path(s))
             .collect();
-        let skill_dirs: Vec<PathBuf> = config.skill_dirs.iter().map(|s| expand_config_path(s)).collect();
+        let skill_dirs: Vec<PathBuf> = config
+            .skill_dirs
+            .iter()
+            .map(|s| expand_config_path(s))
+            .collect();
         drop(config);
 
         let pool_guard = self.db_pool.lock().await;
