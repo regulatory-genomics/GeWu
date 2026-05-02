@@ -96,6 +96,32 @@ impl SharedClient {
     }
 }
 
+fn normalize_assay(assay: &str) -> String {
+    assay.trim().to_ascii_lowercase()
+}
+
+fn normalize_sample_ref(mut sample: SampleRefArg) -> SampleRefArg {
+    sample.assay = normalize_assay(&sample.assay);
+    sample
+}
+
+fn normalize_sample_refs(samples: &mut Vec<SampleRefArg>) {
+    for sample in samples {
+        sample.assay = normalize_assay(&sample.assay);
+    }
+}
+
+fn normalize_sample_ref_values(args: &mut Value) {
+    if let Some(samples) = args.get_mut("samples").and_then(Value::as_array_mut) {
+        for sample in samples {
+            if let Some(assay) = sample.get("assay").and_then(Value::as_str) {
+                let normalized = normalize_assay(assay);
+                sample["assay"] = Value::String(normalized);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum GenomeToolError {
     Transport(String),
@@ -203,6 +229,8 @@ impl Tool for GenomeInspectRegionTool {
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let parsed: InspectArgs = serde_json::from_value(args).map_err(box_err)?;
+        let mut parsed = parsed;
+        normalize_sample_refs(&mut parsed.samples);
         let body = serde_json::to_value(&parsed).map_err(box_err)?;
         match self.shared.post_json("/api/tools/genome/inspect_region", &body).await {
             Ok(v) => Ok(ToolResult::new("genome.inspect_region", v.to_string())),
@@ -266,6 +294,9 @@ impl Tool for GenomeCompareSamplesTool {
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let parsed: CompareArgs = serde_json::from_value(args).map_err(box_err)?;
+        let mut parsed = parsed;
+        parsed.sample_a = normalize_sample_ref(parsed.sample_a);
+        parsed.sample_b = normalize_sample_ref(parsed.sample_b);
         let body = serde_json::to_value(&parsed).map_err(box_err)?;
         match self.shared.post_json("/api/tools/genome/compare_samples", &body).await {
             Ok(v) => Ok(ToolResult::new("genome.compare_samples", v.to_string())),
@@ -307,7 +338,11 @@ impl Tool for GenomeLocalQcTool {
         args: Value,
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
-        match self.shared.post_json("/api/tools/genome/local_qc", &args).await {
+        let parsed: InspectArgs = serde_json::from_value(args).map_err(box_err)?;
+        let mut parsed = parsed;
+        normalize_sample_refs(&mut parsed.samples);
+        let body = serde_json::to_value(&parsed).map_err(box_err)?;
+        match self.shared.post_json("/api/tools/genome/local_qc", &body).await {
             Ok(v) => Ok(ToolResult::new("genome.local_qc", v.to_string())),
             Err(e) => Ok(e.into_tool_output("genome.local_qc")),
         }
@@ -348,6 +383,8 @@ impl Tool for GenomeScanCandidatesTool {
         args: Value,
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let mut args = args;
+        normalize_sample_ref_values(&mut args);
         match self.shared.post_json("/api/tools/genome/scan_candidates", &args).await {
             Ok(v) => Ok(ToolResult::new("genome.scan_candidates", v.to_string())),
             Err(e) => Ok(e.into_tool_output("genome.scan_candidates")),
@@ -390,6 +427,8 @@ impl Tool for GenomeExplainRegionTool {
         args: Value,
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let mut args = args;
+        normalize_sample_ref_values(&mut args);
         match self.shared.post_json("/api/tools/genome/explain_region", &args).await {
             Ok(v) => Ok(ToolResult::new("genome.explain_region", v.to_string())),
             Err(e) => Ok(e.into_tool_output("genome.explain_region")),
