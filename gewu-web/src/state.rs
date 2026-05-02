@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use gewu_canvas::{canvas_tools, genome_tools, CanvasManager, GenomeToolsConfig};
 use gewu_core::traits::Tool;
 use gewu_providers::OpenAIProvider;
-use gewu_runtime::{PluginHost, PluginRegistry, RuntimeFactory};
+use gewu_runtime::{BackgroundTaskCoordinator, PluginHost, PluginRegistry, RuntimeFactory};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -223,6 +223,19 @@ impl AppState {
             canvas_tools_vec.extend(genome);
         }
         let canvas_tools = Arc::new(canvas_tools_vec);
+
+        if let Some(pool) = db_pool.as_ref() {
+            let coordinator = BackgroundTaskCoordinator::new(pool.clone());
+            match coordinator.reconcile_uninjected_groups().await {
+                Ok(count) if count > 0 => {
+                    info!("reconciled {count} async task completion group(s)");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!("failed to reconcile async task groups: {err}");
+                }
+            }
+        }
 
         Ok(Self {
             auth_token: Arc::new(RwLock::new(auth_token)),

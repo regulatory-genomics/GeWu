@@ -1,3 +1,4 @@
+pub mod background_tasks;
 pub mod capability;
 pub mod command_tool;
 pub mod command_tool_registry;
@@ -18,6 +19,10 @@ pub mod workflow;
 pub mod workflow_registry;
 pub mod workflow_tools;
 
+pub use background_tasks::{
+    BackgroundGroupCompletedEvent, BackgroundTaskCoordinator, TaskSettledEvent,
+    subscribe_background_events,
+};
 pub use capability::{CapabilityRegistry, ToolFactoryProvider};
 pub use command_tool::{CommandTool, CommandToolDef};
 pub use command_tool_registry::{CommandToolProvider, CommandToolRegistry};

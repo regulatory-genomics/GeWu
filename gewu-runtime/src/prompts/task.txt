@@ -22,3 +22,10 @@ Usage notes:
 4. The agent's outputs should generally be trusted
 5. Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, web fetches, etc.), since it is not aware of the user's intent. Tell it how to verify its work if possible (e.g., relevant test commands).
 6. If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
+
+Async mode behavior:
+When you launch a task with mode="async", the system will automatically notify you when all background tasks complete. You MUST:
+- End your turn immediately after launching async tasks. Do NOT call get_task_status or list_child_tasks to poll.
+- Do NOT use sleep or any waiting loop. The system injects a completion summary into your session automatically.
+- Simply tell the user that background tasks have been launched and you will continue when they finish.
+- When you receive a system message starting with [background_tasks.completed], review the results and continue your work.

@@ -37,6 +37,8 @@ const activeToolCallsById = new Map();
 let currentMarkdownBuffer = '';
 let currentAssistantToolsEl = null;
 let recoveryPollTimer = null;
+let sessionEventSource = null;
+const autoResumedGroups = new Set();
 
 // Configure marked
 marked.setOptions({
@@ -612,6 +614,7 @@ async function switchSession(session, forceReload = false) {
     await refreshSessionTree();
     await loadWorkGraph(session.id);
     startRecoveryPollingIfActive();
+    startSessionEvents();
 }
 
 async function reloadCurrentSessionMessages() {
@@ -641,6 +644,41 @@ function stopRecoveryPolling() {
         clearInterval(recoveryPollTimer);
         recoveryPollTimer = null;
     }
+}
+
+function stopSessionEvents() {
+    if (sessionEventSource) {
+        sessionEventSource.close();
+        sessionEventSource = null;
+    }
+}
+
+function startSessionEvents() {
+    stopSessionEvents();
+    if (!state.currentSession || !token) return;
+    const sessionId = state.currentSession.id;
+    sessionEventSource = new EventSource(`/api/events?token=${encodeURIComponent(token)}&session_id=${encodeURIComponent(sessionId)}`);
+    sessionEventSource.addEventListener('background_group.completed', async (event) => {
+        if (!state.currentSession || state.currentSession.id !== sessionId) return;
+        let payload = {};
+        try { payload = JSON.parse(event.data || '{}'); } catch (e) { /* ignore */ }
+        await refreshSessionTree();
+        await loadWorkGraph(sessionId);
+        await reloadCurrentSessionMessages();
+        setStatus(payload.summary || 'Background tasks completed');
+        await autoResumeAfterBackgroundCompletion(payload);
+    });
+}
+
+async function autoResumeAfterBackgroundCompletion(payload) {
+    if (!state.currentSession || isLoading) return;
+    const groupId = payload?.group_id;
+    if (groupId) {
+        if (autoResumedGroups.has(groupId)) return;
+        autoResumedGroups.add(groupId);
+    }
+    const message = 'Background tasks have completed. Review the injected completion summary in your session context and continue your work. Do not call get_task_status or list_child_tasks.';
+    await sendMessageText(message, { internal: true });
 }
 
 function startRecoveryPollingIfActive() {
@@ -1432,26 +1470,14 @@ function handleSSEEvent(event) {
 }
 
 // Send Message
-async function sendMessage() {
-    if (isLoading) {
-        activeChatAbortController?.abort();
-        return;
-    }
-    if (!state.currentSession) return;
-
-    const message = messageInput.value.trim();
-    if (!message) return;
-
+async function sendMessageText(message, options = {}) {
+    if (!state.currentSession || !message) return;
     isLoading = true;
     activeChatAbortController = new AbortController();
     setSendButtonMode('stop');
-    messageInput.value = '';
-    setStatus('Thinking...', true);
-
-    addMessage('user', message);
-
+    setStatus(options.internal ? 'Continuing...' : 'Thinking...', true);
+    if (!options.internal) addMessage('user', message);
     resetStreamingTurn();
-
     try {
         const resp = await fetch(`/api/chat?token=${encodeURIComponent(token)}`, {
             method: 'POST',
@@ -1459,19 +1485,15 @@ async function sendMessage() {
             signal: activeChatAbortController.signal,
             body: JSON.stringify({ session_id: state.currentSession.id, message })
         });
-
         const reader = resp.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
-
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split('\n');
             buffer = lines.pop();
-
             for (const line of lines) {
                 if (line.startsWith('data: ')) {
                     try {
@@ -1495,11 +1517,21 @@ async function sendMessage() {
         isLoading = false;
         activeChatAbortController = null;
         setSendButtonMode('send');
-        if (statusText.textContent !== 'Stopped') {
-            setStatus('Ready');
-        }
+        if (statusText.textContent !== 'Stopped') setStatus('Ready');
         startRecoveryPollingIfActive();
     }
+}
+
+async function sendMessage() {
+    if (isLoading) {
+        activeChatAbortController?.abort();
+        return;
+    }
+    if (!state.currentSession) return;
+    const message = messageInput.value.trim();
+    if (!message) return;
+    messageInput.value = '';
+    await sendMessageText(message);
 }
 
 // Event Listeners

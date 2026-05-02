@@ -108,10 +108,9 @@ where
 
     let mcp_servers = loaded_config.config.mcp_servers;
 
-    let tachyon_browser_cfg: sidecar::TachyonBrowserConfig = serde_json::from_value(
-        loaded_config.config.tachyon_browser.clone(),
-    )
-    .context("Failed to parse tachyonBrowser config")?;
+    let tachyon_browser_cfg: sidecar::TachyonBrowserConfig =
+        serde_json::from_value(loaded_config.config.tachyon_browser.clone())
+            .context("Failed to parse tachyonBrowser config")?;
 
     let env_tachyon_url = std::env::var("TACHYON_BROWSER_URL").ok();
     let mut config = state::ServerConfig {
@@ -129,11 +128,9 @@ where
 
     let mcp_tools = mcp_loader::load_mcp_tools(mcp_servers).await?;
 
-    let managed_tachyon_browser = sidecar::ensure_tachyon_browser(
-        &config.tachyon_browser,
-        env_tachyon_url.as_deref(),
-    )
-    .await?;
+    let managed_tachyon_browser =
+        sidecar::ensure_tachyon_browser(&config.tachyon_browser, env_tachyon_url.as_deref())
+            .await?;
     if let Some(sidecar) = managed_tachyon_browser.as_ref() {
         config.tachyon_browser_url = Some(sidecar.url().to_string());
         // Browser clients may run on a different machine over SSH tunnels, so
@@ -186,6 +183,7 @@ where
         .route("/api/info", get(routes::sessions::handle_server_info))
         .route("/api/agents", get(routes::sessions::handle_list_agents))
         .route("/api/chat", post(routes::chat::handle_chat))
+        .route("/api/events", get(routes::events::handle_events))
         .route("/api/runs", get(routes::runs::handle_list_runs))
         .route("/api/runs/{id}", get(routes::runs::handle_get_run))
         .route(
@@ -280,7 +278,9 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        if let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
             let _ = signal.recv().await;
         }
     };
@@ -301,12 +301,7 @@ async fn shutdown_signal() {
 fn build_cors_layer() -> CorsLayer {
     use axum::http::{header, HeaderValue, Method};
 
-    let methods = [
-        Method::GET,
-        Method::POST,
-        Method::DELETE,
-        Method::OPTIONS,
-    ];
+    let methods = [Method::GET, Method::POST, Method::DELETE, Method::OPTIONS];
     let headers = [header::CONTENT_TYPE, header::ACCEPT];
     let base = CorsLayer::new()
         .allow_methods(methods)

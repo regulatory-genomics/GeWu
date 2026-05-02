@@ -827,6 +827,19 @@ impl GeWuRuntime {
             )
             .await?;
 
+        if let Err(err) = crate::background_tasks::BackgroundTaskCoordinator::new(self.pool.clone())
+            .on_task_settled(crate::background_tasks::TaskSettledEvent {
+                task_id: request.task_id.clone(),
+            })
+            .await
+        {
+            tracing::warn!(
+                "failed to process async task completion for {}: {}",
+                request.task_id,
+                err
+            );
+        }
+
         let attempt = store
             .get_task(&request.task_id)
             .await?

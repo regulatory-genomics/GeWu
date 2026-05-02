@@ -5,6 +5,7 @@ use gewu_core::types::{
     ExecutionRunKind, SpecialistExecutionRequest, TaskRecord, ToolContext, ToolExecutionPolicy,
     ToolResult,
 };
+use gewu_storage::AsyncTaskGroupStore;
 use schemars::schema::RootSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -249,10 +250,21 @@ impl Tool for TaskTool {
             .map_err(|e| format!("Failed to build runtime: {}", e))?;
 
         if input.mode == TaskMode::Async {
+            let parent_session_id = ctx.session_id.clone();
+            let parent_message_id = ctx.message_id.clone();
+            let group_store = AsyncTaskGroupStore::new(self.pool.clone()).await?;
+            let group = group_store
+                .create_or_get_group(&parent_session_id, &parent_message_id)
+                .await?;
+            group_store
+                .add_member(&group.group_id, &task_id, &request.session_id)
+                .await?;
+
             let request_for_task = request.clone();
             let runtime_for_task = runtime;
             let task_id_for_output = task_id.clone();
             let specialist_id_for_output = request.specialist_id.clone();
+            let group_id_for_output = group.group_id.clone();
             tokio::spawn(async move {
                 if let Err(err) = runtime_for_task
                     .execute_request(&request_for_task, Vec::new())
@@ -270,10 +282,13 @@ impl Tool for TaskTool {
                 "task_id": task_id_for_output,
                 "child_session_id": task_id,
                 "specialist_id": specialist_id_for_output,
+                "group_id": group_id_for_output,
+                "parent_session_id": parent_session_id,
+                "parent_message_id": parent_message_id,
                 "mode": input.mode.as_str(),
                 "execution_status": "running",
                 "result_status": "pending",
-                "message": "Task launched in background"
+                "message": "Task launched in background. Do NOT poll for status — you will be notified automatically when all background tasks complete. End your turn now."
             });
             return Ok(ToolResult::new("task", serde_json::to_string(&output)?));
         }
