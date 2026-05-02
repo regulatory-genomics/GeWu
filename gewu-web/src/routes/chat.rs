@@ -116,6 +116,7 @@ pub async fn handle_chat(
         let stream = agent.ask(&message);
         futures::pin_mut!(stream);
         let mut event_count = 0usize;
+        let mut client_connected = true;
         while let Some(result) = stream.next().await {
             event_count += 1;
             debug!("Stream received event #{}: {:?}", event_count, result);
@@ -158,13 +159,14 @@ pub async fn handle_chat(
                     SseEvent::error(e.to_string()).to_sse_event()
                 }
             };
-            if tx
-                .send(Ok::<Event, std::convert::Infallible>(sse_event))
-                .await
-                .is_err()
+            if client_connected
+                && tx
+                    .send(Ok::<Event, std::convert::Infallible>(sse_event))
+                    .await
+                    .is_err()
             {
-                warn!("SSE channel closed, stopping stream");
-                break;
+                warn!("SSE channel closed; continuing agent execution without client stream");
+                client_connected = false;
             }
         }
         info!("Stream finished for session ({} events sent)", event_count);

@@ -43,12 +43,12 @@
 
         #app {
             display: grid;
-            grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+            grid-template-columns: var(--sidebar-width) minmax(0, 1fr) 360px;
             grid-template-rows: var(--header-height) 1fr var(--input-height);
             grid-template-areas:
-                "header header"
-                "sidebar chat"
-                "input input";
+                "header header header"
+                "sidebar chat trace"
+                "input input input";
             height: 100vh;
             width: 100vw;
         }
@@ -311,7 +311,8 @@
         }
 
         #trace-panel {
-            display: none;
+            grid-area: trace;
+            display: flex;
             flex-direction: column;
             background: var(--bg-secondary);
             border-left: 1px solid var(--border-color);
@@ -334,11 +335,147 @@
             padding: 10px;
         }
 
+        .work-tabs {
+            display: flex;
+            gap: 4px;
+            padding: 8px 10px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .work-tab {
+            flex: 1;
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 6px 8px;
+        }
+
+        .work-tab.active {
+            border-color: #58a6ff60;
+            color: var(--accent-blue);
+            background: #1f6feb18;
+        }
+
         .trace-empty {
             color: var(--text-muted);
             font-size: 12px;
             line-height: 1.5;
             padding: 8px;
+        }
+
+        .work-section {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .work-card {
+            background: #0d111780;
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            padding: 9px 10px;
+            font-size: 12px;
+        }
+
+        .work-card-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+        }
+
+        .work-kind {
+            color: var(--accent-blue);
+            background: #1f6feb18;
+            border: 1px solid #58a6ff25;
+            border-radius: 999px;
+            padding: 2px 7px;
+            font-size: 9px;
+            font-weight: 800;
+            text-transform: uppercase;
+            white-space: nowrap;
+        }
+
+        .work-title {
+            color: var(--text-primary);
+            flex: 1;
+            font-weight: 700;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .work-status {
+            border-radius: 999px;
+            color: white;
+            font-size: 9px;
+            padding: 2px 6px;
+            white-space: nowrap;
+        }
+
+        .work-status.running { background: var(--accent-orange); }
+        .work-status.succeeded { background: var(--accent-green); }
+        .work-status.failed { background: var(--accent-red); }
+        .work-status.canceled,
+        .work-status.cancelled,
+        .work-status.skipped { background: var(--text-muted); }
+        .work-status.needs_review,
+        .work-status.blocked,
+        .work-status.pending { background: #8b6914; }
+
+        .work-meta {
+            color: var(--text-muted);
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 6px;
+            font-size: 10px;
+        }
+
+        .work-actions {
+            display: flex;
+            gap: 6px;
+            margin-top: 8px;
+        }
+
+        .work-action {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--accent-blue);
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            font-size: 10px;
+            padding: 3px 7px;
+        }
+
+        .work-action:hover { background: var(--border-color); }
+
+        .timeline-event {
+            position: relative;
+            margin-left: 8px;
+            padding-left: 14px;
+            border-left: 1px solid #58a6ff30;
+        }
+
+        .timeline-event::before {
+            content: '';
+            position: absolute;
+            left: -4px;
+            top: 14px;
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--accent-blue);
+        }
+
+        @media (max-width: 900px) {
+            #app {
+                grid-template-columns: var(--sidebar-width) minmax(0, 1fr) 320px;
+            }
         }
 
         .message {
@@ -622,9 +759,9 @@
         }
 
         .run-node {
-            margin: 4px 0 4px 14px;
-            border-left: 1px solid var(--border-color);
-            padding-left: 8px;
+            margin: 6px 0 6px 14px;
+            border-left: 1px solid #58a6ff25;
+            padding-left: 10px;
         }
 
         .message-trace-panel .run-node {
@@ -647,21 +784,61 @@
         .run-node summary {
             cursor: pointer;
             list-style: none;
-            display: flex;
+            display: grid;
+            grid-template-columns: auto minmax(0, 1fr) auto;
             gap: 8px;
             align-items: center;
+            min-height: 30px;
+            padding: 4px 6px;
+            border-radius: var(--radius-md);
+        }
+
+        .run-node summary:hover {
+            background: #58a6ff10;
         }
 
         .run-node summary::-webkit-details-marker { display: none; }
 
         .run-kind {
-            color: var(--text-muted);
+            color: var(--accent-blue);
+            background: #1f6feb18;
+            border: 1px solid #58a6ff25;
+            border-radius: 999px;
+            padding: 2px 7px;
             font-size: 10px;
+            font-weight: 800;
             text-transform: uppercase;
         }
 
-        .run-status {
+        .run-main {
+            min-width: 0;
+        }
+
+        .run-name {
+            font-weight: 700;
+            color: var(--text-primary);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .run-meta {
+            margin-top: 2px;
+            color: var(--text-muted);
+            font-size: 10px;
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .run-actions {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
             margin-left: auto;
+        }
+
+        .run-status {
             font-size: 9px;
             padding: 2px 6px;
             border-radius: 8px;
@@ -675,13 +852,50 @@
 
         .run-json {
             margin-top: 6px;
-            max-height: 180px;
+            max-height: 260px;
             overflow: auto;
             background: var(--bg-primary);
+            border: 1px solid var(--border-color);
             border-radius: var(--radius-sm);
             padding: 8px;
             white-space: pre-wrap;
             word-break: break-word;
+            font-size: 11px;
+        }
+
+        .run-details-toggle {
+            margin-top: 6px;
+            color: var(--text-secondary);
+            font-size: 11px;
+        }
+
+        .run-details-toggle > summary {
+            display: inline-flex;
+            min-height: 0;
+            padding: 2px 0;
+            color: var(--accent-blue);
+            cursor: pointer;
+            font-weight: 700;
+            list-style: none;
+        }
+
+        .run-details-toggle > summary::-webkit-details-marker { display: none; }
+
+        .run-details-toggle > summary:hover { text-decoration: underline; }
+
+        .run-io-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 8px;
+            margin-top: 8px;
+        }
+
+        .run-io-label {
+            color: var(--text-muted);
+            font-size: 10px;
+            font-weight: 800;
+            margin-bottom: 4px;
+            text-transform: uppercase;
         }
 
         .run-event-panel {
@@ -851,9 +1065,15 @@
         </main>
 
         <aside id="trace-panel">
-            <div id="trace-header">Execution Trace</div>
+            <div id="trace-header">Work Panel</div>
+            <div class="work-tabs">
+                <button type="button" class="work-tab active" data-work-tab="timeline">Timeline</button>
+                <button type="button" class="work-tab" data-work-tab="todo">Todo</button>
+                <button type="button" class="work-tab" data-work-tab="tasks">Tasks</button>
+                <button type="button" class="work-tab" data-work-tab="trace">Trace</button>
+            </div>
             <div id="trace-container">
-                <div class="trace-empty">Run a workflow or tool call to inspect its execution tree here.</div>
+                <div class="trace-empty">Select a session to inspect its work timeline.</div>
             </div>
         </aside>
 
@@ -870,7 +1090,9 @@
             sidebar: { width: 220, collapsed: false },
             sessions: [],
             currentSession: null,
-            currentSessionId: null
+            currentSessionId: null,
+            workGraph: null,
+            workTab: 'timeline'
         };
 
         // DOM Elements
@@ -888,6 +1110,8 @@
         const newSessionBtn = document.getElementById('new-session-btn');
         const sidebarHandle = document.getElementById('sidebar-handle');
         const agentSelector = document.getElementById('agent-selector');
+        const traceContainer = document.getElementById('trace-container');
+        const workTabs = Array.from(document.querySelectorAll('.work-tab'));
 
         let token = '';
         let isLoading = false;
@@ -1079,6 +1303,229 @@
             return DOMPurify.sanitize(html);
         }
 
+        function setWorkTab(tab) {
+            state.workTab = tab;
+            for (const button of workTabs) {
+                button.classList.toggle('active', button.dataset.workTab === tab);
+            }
+            renderWorkPanel();
+        }
+
+        for (const button of workTabs) {
+            button.addEventListener('click', () => setWorkTab(button.dataset.workTab));
+        }
+
+        async function loadWorkGraph(sessionId = state.currentSession?.id) {
+            if (!sessionId) {
+                state.workGraph = null;
+                renderWorkPanel();
+                return;
+            }
+            try {
+                const resp = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/work-graph?token=${encodeURIComponent(token)}`);
+                if (!resp.ok) throw new Error('Failed to load work graph');
+                const data = await resp.json();
+                state.workGraph = data.graph || null;
+            } catch (e) {
+                console.warn('Failed to load work graph', e);
+                state.workGraph = null;
+            }
+            renderWorkPanel();
+        }
+
+        function renderWorkPanel() {
+            if (!traceContainer) return;
+            traceContainer.innerHTML = '';
+            const graph = state.workGraph;
+            if (!graph) {
+                traceContainer.innerHTML = '<div class="trace-empty">No work graph is available for this session yet.</div>';
+                return;
+            }
+            if (state.workTab === 'todo') {
+                renderWorkTodos(graph);
+            } else if (state.workTab === 'tasks') {
+                renderWorkTasks(graph);
+            } else if (state.workTab === 'trace') {
+                renderWorkTrace(graph);
+            } else {
+                renderWorkTimeline(graph);
+            }
+        }
+
+        function renderWorkTimeline(graph) {
+            const events = [...(graph.events || [])].sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
+            if (!events.length) {
+                renderWorkNodesFallback(graph);
+                return;
+            }
+            const section = document.createElement('div');
+            section.className = 'work-section';
+            const nodesById = new Map((graph.nodes || []).map(node => [node.id, node]));
+            for (const event of events.slice(-40)) {
+                const node = nodesById.get(event.node_id) || {};
+                const card = document.createElement('div');
+                card.className = 'work-card timeline-event';
+                card.innerHTML = `
+                    <div class="work-card-header">
+                        <span class="work-kind">${escapeHtml(event.kind || node.kind || 'event')}</span>
+                        <span class="work-title" title="${escapeHtml(event.title || node.title || '')}">${escapeHtml(event.title || node.title || 'Work event')}</span>
+                    </div>
+                    <div class="work-meta">
+                        <span>${escapeHtml(node.kind || 'node')}</span>
+                        <span>${escapeHtml(formatTimestamp(event.created_at))}</span>
+                        ${event.summary ? `<span>${escapeHtml(String(event.summary).slice(0, 96))}</span>` : ''}
+                    </div>
+                `;
+                section.appendChild(card);
+            }
+            traceContainer.appendChild(section);
+        }
+
+        function renderWorkNodesFallback(graph) {
+            const nodes = (graph.nodes || []).filter(node => node.id !== graph.root_node_id);
+            if (!nodes.length) {
+                traceContainer.innerHTML = '<div class="trace-empty">This session has no work events yet.</div>';
+                return;
+            }
+            const section = document.createElement('div');
+            section.className = 'work-section';
+            for (const node of nodes) section.appendChild(createWorkNodeCard(node));
+            traceContainer.appendChild(section);
+        }
+
+        function renderWorkTasks(graph) {
+            const tasks = (graph.nodes || []).filter(node => node.kind === 'task' || node.kind === 'subagent');
+            if (!tasks.length) {
+                traceContainer.innerHTML = '<div class="trace-empty">No child tasks or subagents for this session yet.</div>';
+                return;
+            }
+            const section = document.createElement('div');
+            section.className = 'work-section';
+            for (const task of tasks) section.appendChild(createWorkNodeCard(task));
+            traceContainer.appendChild(section);
+        }
+
+        function renderWorkTodos(graph) {
+            const todos = currentTodoNodes(graph);
+            if (!todos.length) {
+                traceContainer.innerHTML = '<div class="trace-empty">No todo nodes for this session yet. Todo nodes are created from todowrite calls.</div>';
+                return;
+            }
+            const section = document.createElement('div');
+            section.className = 'work-section';
+            for (const todo of todos) section.appendChild(createWorkNodeCard(todo));
+            traceContainer.appendChild(section);
+        }
+
+        function currentTodoNodes(graph) {
+            const latest = new Map();
+            for (const node of graph.nodes || []) {
+                if (node.kind !== 'todo') continue;
+                const todoId = normalizedTodoKey(node);
+                const previous = latest.get(todoId);
+                const previousTime = previous?.started_at || 0;
+                const currentTime = node.started_at || 0;
+                if (!previous || currentTime >= previousTime) latest.set(todoId, node);
+            }
+            return Array.from(latest.values()).sort((a, b) => {
+                const ap = Number(a.metadata?.priority ?? 9999);
+                const bp = Number(b.metadata?.priority ?? 9999);
+                if (ap !== bp) return ap - bp;
+                return String(a.title || '').localeCompare(String(b.title || ''));
+            });
+        }
+
+        function normalizedTodoKey(node) {
+            const title = String(node.title || '').trim().replace(/\s+/g, ' ');
+            if (title) return title;
+            return node.metadata?.todo_id || node.id;
+        }
+
+        function renderWorkTrace(graph) {
+            const runs = (graph.nodes || []).filter(node => node.trace_run_id && ['tool', 'workflow', 'workflow_node', 'subagent', 'assistant_turn', 'trace_run'].includes(node.kind));
+            if (!runs.length) {
+                traceContainer.innerHTML = '<div class="trace-empty">No execution trace runs for this session yet.</div>';
+                return;
+            }
+            const section = document.createElement('div');
+            section.className = 'work-section';
+            for (const run of runs) section.appendChild(createWorkNodeCard(run));
+            traceContainer.appendChild(section);
+        }
+
+        function createWorkNodeCard(node) {
+            const card = document.createElement('div');
+            card.className = 'work-card';
+            card.innerHTML = `
+                <div class="work-card-header">
+                    <span class="work-kind">${escapeHtml(node.kind || 'node')}</span>
+                    <span class="work-title" title="${escapeHtml(node.title || '')}">${escapeHtml(node.title || node.id)}</span>
+                    <span class="work-status ${escapeHtml(node.status || 'pending')}">${escapeHtml(node.status || 'pending')}</span>
+                </div>
+                <div class="work-meta">
+                    ${node.started_at ? `<span>${escapeHtml(formatTimestamp(node.started_at))}</span>` : ''}
+                    ${node.finished_at ? `<span>${escapeHtml(formatDuration(node.started_at, node.finished_at))}</span>` : ''}
+                    ${node.summary ? `<span>${escapeHtml(String(node.summary).slice(0, 96))}</span>` : ''}
+                </div>
+                <div class="work-actions"></div>
+            `;
+            const actions = card.querySelector('.work-actions');
+            if (node.session_id && node.kind !== 'session') {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'work-action';
+                button.textContent = 'Open session';
+                button.addEventListener('click', () => openSyntheticSession(node.session_id, node.title || 'subagent'));
+                actions.appendChild(button);
+            }
+            if (node.trace_run_id) {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'work-action';
+                button.textContent = 'Trace';
+                button.addEventListener('click', () => openWorkTraceNode(node.trace_run_id, card));
+                actions.appendChild(button);
+            }
+            if (!actions.children.length) actions.remove();
+            return card;
+        }
+
+        async function openWorkTraceNode(runId, card) {
+            let panel = card.querySelector(':scope > .run-event-panel');
+            if (panel) {
+                panel.remove();
+                return;
+            }
+            panel = document.createElement('div');
+            panel.className = 'run-event-panel';
+            panel.innerHTML = '<div class="run-event-title">Trace</div><div class="trace-graph">Loading trace…</div>';
+            card.appendChild(panel);
+            const graph = panel.querySelector('.trace-graph');
+            graph.innerHTML = '';
+            try {
+                const resp = await fetch(`/api/runs/${encodeURIComponent(runId)}?token=${encodeURIComponent(token)}`);
+                if (resp.ok) {
+                    const data = await resp.json();
+                    if (data.run) graph.appendChild(await renderRunNode(data.run));
+                }
+            } catch (e) {
+                console.warn('Failed to open work trace node', e);
+            }
+            if (!graph.children.length) graph.textContent = 'Trace run is not available.';
+        }
+
+        function formatTimestamp(value) {
+            if (!value) return '—';
+            return new Date(Number(value) * 1000).toLocaleTimeString();
+        }
+
+        function formatDuration(startedAt, finishedAt) {
+            if (!startedAt || !finishedAt) return 'running';
+            const seconds = Math.max(0, Number(finishedAt) - Number(startedAt));
+            if (seconds < 60) return `${seconds}s`;
+            return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+        }
+
         function showError(msg) {
             errorContainer.innerHTML = `
                 <div class="error">
@@ -1193,6 +1640,7 @@
             renderSessions();
             setStatus('Ready');
             await refreshSessionTree();
+            await loadWorkGraph(session.id);
         }
 
         function renderMessageHistory(messages) {
@@ -1282,12 +1730,55 @@
         }
 
         function extractRootRunId(output) {
+            const value = parseToolOutputJson(output);
+            return value?._trace?.root_run_id || value?._trace?.current_run_id || null;
+        }
+
+        function parseToolOutputJson(output) {
+            const text = output || '';
             try {
-                const value = JSON.parse(output || 'null');
-                return value?._trace?.root_run_id || value?._trace?.current_run_id || null;
-            } catch (e) {
-                return null;
+                return JSON.parse(text || 'null');
+            } catch (e) {}
+
+            const start = text.search(/[\[{]/);
+            if (start < 0) return null;
+
+            const opener = text[start];
+            const closer = opener === '{' ? '}' : ']';
+            let depth = 0;
+            let inString = false;
+            let escaped = false;
+
+            for (let i = start; i < text.length; i++) {
+                const ch = text[i];
+                if (inString) {
+                    if (escaped) {
+                        escaped = false;
+                    } else if (ch === '\\') {
+                        escaped = true;
+                    } else if (ch === '"') {
+                        inString = false;
+                    }
+                    continue;
+                }
+
+                if (ch === '"') {
+                    inString = true;
+                } else if (ch === opener) {
+                    depth += 1;
+                } else if (ch === closer) {
+                    depth -= 1;
+                    if (depth === 0) {
+                        try {
+                            return JSON.parse(text.slice(start, i + 1));
+                        } catch (e) {
+                            return null;
+                        }
+                    }
+                }
             }
+
+            return null;
         }
 
         function getTraceRunIds(messageDiv) {
@@ -1379,17 +1870,40 @@
             const node = document.createElement('details');
             node.className = 'run-node';
             node.open = run.status === 'failed' || run.kind === 'workflow' || run.kind === 'workflow_node';
+            const duration = formatRunDuration(run);
+            const childLabel = run.kind === 'workflow' || run.kind === 'workflow_node' ? 'graph root' : 'node';
             const sessionLink = run.session_id && run.kind === 'specialist'
-                ? ` <button type="button" class="run-open-session" data-action="session" data-session-id="${escapeHtml(run.session_id)}">Open session</button> <button type="button" class="run-open-session" data-action="details" data-session-id="${escapeHtml(run.session_id)}">Details</button>`
+                ? `<button type="button" class="run-open-session" data-action="session" data-session-id="${escapeHtml(run.session_id)}">Open session</button>`
                 : '';
             node.innerHTML = `
                 <summary>
                     <span class="run-kind">${escapeHtml(run.kind)}</span>
-                    <span>${escapeHtml(run.name)}</span>
-                    ${sessionLink}
-                    <span class="run-status ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span>
+                    <span class="run-main">
+                        <span class="run-name">${escapeHtml(run.name)}</span>
+                        <span class="run-meta">
+                            <span>${escapeHtml(childLabel)}</span>
+                            <span>${escapeHtml(duration)}</span>
+                        </span>
+                    </span>
+                    <span class="run-actions">
+                        ${sessionLink}
+                        <button type="button" class="run-open-session" data-action="details" data-session-id="${escapeHtml(run.session_id || '')}">Details</button>
+                        <span class="run-status ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span>
+                    </span>
                 </summary>
-                <div class="run-json">${escapeHtml(runDetails(run))}</div>
+                <details class="run-details-toggle">
+                    <summary>Raw input/output</summary>
+                    <div class="run-io-grid">
+                        <div>
+                            <div class="run-io-label">Input</div>
+                            <div class="run-json">${escapeHtml(formatJson(run.input_json))}</div>
+                        </div>
+                        <div>
+                            <div class="run-io-label">Output</div>
+                            <div class="run-json">${escapeHtml(formatJson(run.output_json || run.error || null))}</div>
+                        </div>
+                    </div>
+                </details>
             `;
             for (const openButton of node.querySelectorAll('.run-open-session')) {
                 openButton.addEventListener('click', async (e) => {
@@ -1449,17 +1963,26 @@
             node.appendChild(panel);
         }
 
-        function runDetails(run) {
-            return JSON.stringify({
-                id: run.id,
-                parent_id: run.parent_id,
-                session_id: run.session_id,
-                input_json: run.input_json,
-                output_json: run.output_json,
-                error: run.error,
-                started_at: run.started_at,
-                finished_at: run.finished_at
-            }, null, 2);
+        function formatJson(value) {
+            if (value === undefined || value === null || value === '') return '—';
+            if (typeof value === 'string') {
+                try {
+                    return JSON.stringify(JSON.parse(value), null, 2);
+                } catch (e) {
+                    return value;
+                }
+            }
+            return JSON.stringify(value, null, 2);
+        }
+
+        function formatRunDuration(run) {
+            if (!run.started_at || !run.finished_at) return run.started_at ? 'running' : 'not started';
+            const seconds = Math.max(0, Number(run.finished_at) - Number(run.started_at));
+            if (seconds < 1) return '<1s';
+            if (seconds < 60) return `${seconds}s`;
+            const minutes = Math.floor(seconds / 60);
+            const rest = seconds % 60;
+            return `${minutes}m ${rest}s`;
         }
 
         async function openSyntheticSession(sessionId, agentType) {
@@ -1727,6 +2250,7 @@
             details.open = false;
             addTraceRunFromToolOutput(details.closest('.message'), output);
             refreshSessionTree();
+            loadWorkGraph();
             chatContainer.scrollTop = chatContainer.scrollHeight;
         }
 
@@ -1813,6 +2337,7 @@
                         currentReasoningDiv.open = false;
                     }
                     resetStreamingTurn();
+                    loadWorkGraph();
                     break;
                 case 'error':
                     showError(event.data.error);
