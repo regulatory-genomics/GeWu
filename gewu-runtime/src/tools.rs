@@ -1,7 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{ExecutionRunKind, SpecialistExecutionRequest, ToolContext, ToolResult};
+use gewu_core::types::{
+    ExecutionRunKind, SpecialistExecutionRequest, TaskRecord, ToolContext, ToolExecutionPolicy,
+    ToolResult,
+};
 use schemars::schema::RootSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -11,10 +14,40 @@ use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum TaskMode {
+    Barrier,
+    Async,
+}
+
+impl TaskMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Barrier => "barrier",
+            Self::Async => "async",
+        }
+    }
+}
+
+impl Default for TaskMode {
+    fn default() -> Self {
+        Self::Barrier
+    }
+}
+
 pub struct TaskTool {
     pub provider: Arc<dyn LlmProvider>,
     pub pool: SqlitePool,
     description: String,
+}
+
+pub struct GetTaskStatusTool {
+    pub pool: SqlitePool,
+}
+
+pub struct ListChildTasksTool {
+    pub pool: SqlitePool,
 }
 
 #[derive(Deserialize)]
@@ -24,6 +57,8 @@ struct TaskArgsJson {
     subagent_type: String,
     #[serde(default)]
     task_id: Option<String>,
+    #[serde(default)]
+    mode: TaskMode,
 }
 
 impl TaskTool {
@@ -57,11 +92,37 @@ impl TaskTool {
                 "task_id": {
                     "type": "string",
                     "description": "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["barrier", "async"],
+                    "description": "Use barrier when the parent needs the subagent result before answering. Use async to launch the subagent in the background and return a task handle immediately. Defaults to barrier."
                 }
             },
             "required": ["description", "prompt", "subagent_type"]
         })).unwrap()
     }
+}
+
+fn task_record_json(record: TaskRecord) -> Value {
+    json!({
+        "task_id": record.task_id,
+        "specialist_id": record.specialist_id,
+        "prompt": record.prompt,
+        "status": record.status.as_str(),
+        "execution_status": record.execution_status.as_str(),
+        "result_status": record.result_status.as_str(),
+        "attempt": record.attempt,
+        "block_reason": record.block_reason,
+        "result_json": record.result_json,
+        "finish_reason": record.finish_reason,
+        "error": record.error,
+        "parent_session_id": record.parent_session_id,
+        "child_session_id": record.child_session_id,
+        "root_run_id": record.root_run_id,
+        "started_at": record.started_at,
+        "finished_at": record.finished_at,
+    })
 }
 
 #[async_trait]
@@ -78,16 +139,42 @@ impl Tool for TaskTool {
         Self::build_schema()
     }
 
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::ParallelSafe
+    }
+
+    fn start_metadata(
+        &self,
+        args: &str,
+        ctx: &ToolContext,
+    ) -> Result<Value, Box<dyn Error + Send + Sync>> {
+        let input: TaskArgsJson = serde_json::from_str(args)?;
+        let task_id = input.task_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        Ok(json!({
+            "task_id": task_id,
+            "child_session_id": task_id,
+            "specialist_id": input.subagent_type,
+            "description": input.description,
+            "mode": input.mode.as_str(),
+            "parent_session_id": ctx.session_id,
+            "parent_message_id": ctx.message_id,
+        }))
+    }
+
     async fn execute(
         &self,
         args: Value,
         ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: TaskArgsJson = serde_json::from_value(args)?;
-        let task_id = match &input.task_id {
-            Some(id) => id.clone(),
-            None => Uuid::new_v4().to_string(),
-        };
+        let task_id = ctx
+            .metadata
+            .get("tool_start_metadata")
+            .and_then(|metadata| metadata.get("task_id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| input.task_id.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let mut metadata = serde_json::Map::new();
         metadata.insert("description".to_string(), Value::String(input.description));
         metadata.insert(
@@ -98,7 +185,11 @@ impl Tool for TaskTool {
             "parent_message_id".to_string(),
             Value::String(ctx.message_id.clone()),
         );
-        if let Some(root_run_id) = ctx.metadata.get("trace_root_run_id").and_then(Value::as_str) {
+        if let Some(root_run_id) = ctx
+            .metadata
+            .get("trace_root_run_id")
+            .and_then(Value::as_str)
+        {
             metadata.insert(
                 "trace_root_run_id".to_string(),
                 Value::String(root_run_id.to_string()),
@@ -157,6 +248,36 @@ impl Tool for TaskTool {
             .build()
             .map_err(|e| format!("Failed to build runtime: {}", e))?;
 
+        if input.mode == TaskMode::Async {
+            let request_for_task = request.clone();
+            let runtime_for_task = runtime;
+            let task_id_for_output = task_id.clone();
+            let specialist_id_for_output = request.specialist_id.clone();
+            tokio::spawn(async move {
+                if let Err(err) = runtime_for_task
+                    .execute_request(&request_for_task, Vec::new())
+                    .await
+                {
+                    tracing::warn!(
+                        "background task {} failed: {}",
+                        request_for_task.task_id,
+                        err
+                    );
+                }
+            });
+
+            let output = json!({
+                "task_id": task_id_for_output,
+                "child_session_id": task_id,
+                "specialist_id": specialist_id_for_output,
+                "mode": input.mode.as_str(),
+                "execution_status": "running",
+                "result_status": "pending",
+                "message": "Task launched in background"
+            });
+            return Ok(ToolResult::new("task", serde_json::to_string(&output)?));
+        }
+
         let envelope = runtime
             .execute_request(&request, Vec::new())
             .await
@@ -185,5 +306,96 @@ impl Tool for TaskTool {
         }
 
         Ok(ToolResult::new("task", serde_json::to_string(&output)?))
+    }
+}
+
+#[derive(Deserialize)]
+struct GetTaskStatusArgs {
+    task_id: String,
+}
+
+#[async_trait]
+impl Tool for GetTaskStatusTool {
+    fn name(&self) -> &str {
+        "get_task_status"
+    }
+
+    fn description(&self) -> &str {
+        "Get the persisted runtime/result status for one child task by task_id. Use this when users ask about progress or whether a subagent finished."
+    }
+
+    fn schema(&self) -> RootSchema {
+        serde_json::from_value(json!({
+            "type": "object",
+            "properties": { "task_id": { "type": "string" } },
+            "required": ["task_id"]
+        }))
+        .unwrap()
+    }
+
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let input: GetTaskStatusArgs = serde_json::from_value(args)?;
+        let store = gewu_storage::TaskStore::new(self.pool.clone()).await?;
+        let output = match store.get_task(&input.task_id).await? {
+            Some(record) => task_record_json(record),
+            None => json!({ "task_id": input.task_id, "error": "task not found" }),
+        };
+        Ok(ToolResult::new(
+            "get_task_status",
+            serde_json::to_string(&output)?,
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+struct ListChildTasksArgs {
+    #[serde(default)]
+    parent_session_id: Option<String>,
+}
+
+#[async_trait]
+impl Tool for ListChildTasksTool {
+    fn name(&self) -> &str {
+        "list_child_tasks"
+    }
+
+    fn description(&self) -> &str {
+        "List child tasks for a parent session, including execution_status/result_status and child_session_id. Use this instead of guessing progress."
+    }
+
+    fn schema(&self) -> RootSchema {
+        serde_json::from_value(json!({
+            "type": "object",
+            "properties": { "parent_session_id": { "type": "string", "description": "Defaults to the current session when omitted" } }
+        })).unwrap()
+    }
+
+    async fn execute(
+        &self,
+        args: Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let input: ListChildTasksArgs = serde_json::from_value(args)?;
+        let parent_session_id = input
+            .parent_session_id
+            .unwrap_or_else(|| ctx.session_id.clone());
+        let store = gewu_storage::TaskStore::new(self.pool.clone()).await?;
+        let tasks = store
+            .list_child_tasks(&parent_session_id)
+            .await?
+            .into_iter()
+            .map(task_record_json)
+            .collect::<Vec<_>>();
+        Ok(ToolResult::new(
+            "list_child_tasks",
+            serde_json::to_string(&json!({
+                "parent_session_id": parent_session_id,
+                "tasks": tasks,
+            }))?,
+        ))
     }
 }

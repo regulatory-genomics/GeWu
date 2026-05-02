@@ -1,6 +1,6 @@
 use crate::command_tool_registry::CommandToolRegistry;
 use crate::composer::{RegisterToolTool, WriteSpecialistTool};
-use crate::tools::TaskTool;
+use crate::tools::{GetTaskStatusTool, ListChildTasksTool, TaskTool};
 use crate::workflow_tools::{ComposeWorkflowTool, MemoryDayQueryTool, RunWorkflowTool};
 use anyhow::{Result, anyhow};
 use gewu_core::traits::{AssemblyContext, LlmProvider, Tool, ToolFactory, ToolRegistry};
@@ -27,7 +27,7 @@ pub fn specialist_descriptors() -> Vec<SpecialistDescriptor> {
             capabilities: vec![
                 "task", "read_file", "write_file", "edit_file", "glob",
                 "bash", "grep", "web_fetch", "list", "code_search",
-                "web_search", "todo", "report_result",
+                "web_search", "todo", "report_result", "get_task_status", "list_child_tasks",
                 "compose_workflow", "run_workflow", "register_tool", "write_specialist",
                 "memory_day_query",
             ].into_iter().map(String::from).collect(),
@@ -50,7 +50,7 @@ pub fn specialist_descriptors() -> Vec<SpecialistDescriptor> {
             capabilities: vec![
                 "task", "read_file", "write_file", "edit_file", "glob",
                 "bash", "grep", "web_fetch", "list", "code_search",
-                "web_search", "todo", "report_result",
+                "web_search", "todo", "report_result", "get_task_status", "list_child_tasks",
                 "compose_workflow", "run_workflow", "register_tool", "write_specialist",
                 "memory_day_query",
             ].into_iter().map(String::from).collect(),
@@ -93,6 +93,8 @@ impl ToolFactory for BuiltinToolFactory {
             "code_search",
             "todo",
             "task",
+            "get_task_status",
+            "list_child_tasks",
             "report_result",
             "compose_workflow",
             "run_workflow",
@@ -152,18 +154,26 @@ impl ToolFactory for BuiltinToolFactory {
                 ctx.provider.clone(),
                 ctx.pool.clone(),
             ))]),
+            "get_task_status" => Ok(vec![Box::new(GetTaskStatusTool {
+                pool: ctx.pool.clone(),
+            })]),
+            "list_child_tasks" => Ok(vec![Box::new(ListChildTasksTool {
+                pool: ctx.pool.clone(),
+            })]),
             "compose_workflow" => Ok(vec![Box::new(ComposeWorkflowTool::new(
                 ctx.provider.clone(),
                 ctx.pool.clone(),
             ))]),
             "memory_day_query" => Ok(vec![Box::new(MemoryDayQueryTool)]),
-            "run_workflow" => Ok(vec![Box::new(RunWorkflowTool::new(
-                ctx.provider.clone(),
-                ctx.pool.clone(),
-                metadata_dirs(&ctx.metadata_json, "workflow_dirs"),
-            )
-            .with_runtime_plugin_dirs(metadata_dirs(&ctx.metadata_json, "runtime_plugin_dirs"))
-            .with_skill_dirs(metadata_dirs(&ctx.metadata_json, "skill_dirs")))]),
+            "run_workflow" => Ok(vec![Box::new(
+                RunWorkflowTool::new(
+                    ctx.provider.clone(),
+                    ctx.pool.clone(),
+                    metadata_dirs(&ctx.metadata_json, "workflow_dirs"),
+                )
+                .with_runtime_plugin_dirs(metadata_dirs(&ctx.metadata_json, "runtime_plugin_dirs"))
+                .with_skill_dirs(metadata_dirs(&ctx.metadata_json, "skill_dirs")),
+            )]),
             "register_tool" => Ok(vec![Box::new(RegisterToolTool::new(
                 CommandToolRegistry::default_dir(),
             ))]),
@@ -235,4 +245,38 @@ pub async fn create_agent(
     runtime
         .build_specialist(name, session_id, additional_tools)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BuiltinToolFactory, specialist_descriptors};
+    use gewu_core::traits::ToolFactory;
+
+    #[test]
+    fn builtin_factory_exposes_task_status_tools() {
+        let capabilities = BuiltinToolFactory.capabilities();
+        assert!(capabilities.contains(&"get_task_status".to_string()));
+        assert!(capabilities.contains(&"list_child_tasks".to_string()));
+    }
+
+    #[test]
+    fn primary_agents_can_query_child_task_status() {
+        let descriptors = specialist_descriptors();
+        for agent_id in ["build", "general"] {
+            let descriptor = descriptors
+                .iter()
+                .find(|descriptor| descriptor.id == agent_id)
+                .expect("primary agent descriptor exists");
+            assert!(
+                descriptor
+                    .capabilities
+                    .contains(&"get_task_status".to_string())
+            );
+            assert!(
+                descriptor
+                    .capabilities
+                    .contains(&"list_child_tasks".to_string())
+            );
+        }
+    }
 }

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use gewu_core::types::{TaskRecord, TaskStatus};
+use gewu_core::types::{TaskExecutionStatus, TaskRecord, TaskResultStatus, TaskStatus};
 use serde_json::Value;
 use sqlx::Row;
 use sqlx::sqlite::SqlitePool;
@@ -18,9 +18,18 @@ impl TaskStore {
                 specialist_id TEXT NOT NULL,
                 prompt TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'ready',
+                execution_status TEXT NOT NULL DEFAULT 'pending',
+                result_status TEXT NOT NULL DEFAULT 'pending',
                 attempt INTEGER NOT NULL DEFAULT 0,
                 block_reason TEXT,
                 result_json TEXT,
+                finish_reason TEXT,
+                error TEXT,
+                parent_session_id TEXT,
+                child_session_id TEXT,
+                root_run_id TEXT,
+                started_at INTEGER,
+                finished_at INTEGER,
                 created_at INTEGER DEFAULT (unixepoch()),
                 updated_at INTEGER DEFAULT (unixepoch())
             )
@@ -29,6 +38,8 @@ impl TaskStore {
         .execute(&pool)
         .await
         .context("Failed to create tasks table")?;
+
+        self_migrate_task_columns(&pool).await?;
 
         Ok(Self { pool })
     }
@@ -54,15 +65,24 @@ impl TaskStore {
             specialist_id: specialist_id.to_string(),
             prompt: prompt.to_string(),
             status: TaskStatus::Ready,
+            execution_status: TaskExecutionStatus::Pending,
+            result_status: TaskResultStatus::Pending,
             attempt: 0,
             block_reason: None,
             result_json: None,
+            finish_reason: None,
+            error: None,
+            parent_session_id: None,
+            child_session_id: None,
+            root_run_id: None,
+            started_at: None,
+            finished_at: None,
         })
     }
 
     pub async fn get_task(&self, task_id: &str) -> Result<Option<TaskRecord>> {
         let row = sqlx::query(
-            "SELECT task_id, specialist_id, prompt, status, attempt, block_reason, result_json FROM tasks WHERE task_id = ?",
+            "SELECT task_id, specialist_id, prompt, status, execution_status, result_status, attempt, block_reason, result_json, finish_reason, error, parent_session_id, child_session_id, root_run_id, started_at, finished_at FROM tasks WHERE task_id = ?",
         )
         .bind(task_id)
         .fetch_optional(&self.pool)
@@ -71,20 +91,20 @@ impl TaskStore {
 
         match row {
             None => Ok(None),
-            Some(row) => {
-                let status_str: String = row.try_get("status")?;
-                let status = TaskStatus::from_str(&status_str).unwrap_or(TaskStatus::Failed);
-                Ok(Some(TaskRecord {
-                    task_id: row.try_get("task_id")?,
-                    specialist_id: row.try_get("specialist_id")?,
-                    prompt: row.try_get("prompt")?,
-                    status,
-                    attempt: row.try_get::<i32, _>("attempt")? as u32,
-                    block_reason: row.try_get("block_reason")?,
-                    result_json: row.try_get("result_json")?,
-                }))
-            }
+            Some(row) => Ok(Some(task_record_from_row(row)?)),
         }
+    }
+
+    pub async fn list_child_tasks(&self, parent_session_id: &str) -> Result<Vec<TaskRecord>> {
+        let rows = sqlx::query(
+            "SELECT task_id, specialist_id, prompt, status, execution_status, result_status, attempt, block_reason, result_json, finish_reason, error, parent_session_id, child_session_id, root_run_id, started_at, finished_at FROM tasks WHERE parent_session_id = ? ORDER BY COALESCE(started_at, 0), task_id",
+        )
+        .bind(parent_session_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list child tasks")?;
+
+        rows.into_iter().map(task_record_from_row).collect()
     }
 
     pub async fn update_status(
@@ -127,9 +147,132 @@ impl TaskStore {
     }
 
     pub async fn set_result_json(&self, task_id: &str, result_json: &Value) -> Result<()> {
-        let encoded = serde_json::to_string(result_json).context("Failed to encode task result JSON")?;
+        let encoded =
+            serde_json::to_string(result_json).context("Failed to encode task result JSON")?;
         self.set_result(task_id, &encoded).await
     }
+
+    pub async fn mark_started(
+        &self,
+        task_id: &str,
+        parent_session_id: Option<&str>,
+        child_session_id: Option<&str>,
+        root_run_id: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE tasks
+            SET execution_status = 'running',
+                result_status = 'pending',
+                parent_session_id = COALESCE(?, parent_session_id),
+                child_session_id = COALESCE(?, child_session_id),
+                root_run_id = COALESCE(?, root_run_id),
+                started_at = COALESCE(started_at, unixepoch()),
+                finished_at = NULL,
+                finish_reason = NULL,
+                error = NULL,
+                updated_at = unixepoch()
+            WHERE task_id = ?
+            "#,
+        )
+        .bind(parent_session_id)
+        .bind(child_session_id)
+        .bind(root_run_id)
+        .bind(task_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to mark task started")?;
+        Ok(())
+    }
+
+    pub async fn mark_finished(
+        &self,
+        task_id: &str,
+        execution_status: &TaskExecutionStatus,
+        result_status: &TaskResultStatus,
+        finish_reason: Option<&str>,
+        error: Option<&str>,
+        root_run_id: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE tasks
+            SET execution_status = ?,
+                result_status = ?,
+                finish_reason = ?,
+                error = ?,
+                root_run_id = COALESCE(?, root_run_id),
+                finished_at = unixepoch(),
+                updated_at = unixepoch()
+            WHERE task_id = ?
+            "#,
+        )
+        .bind(execution_status.as_str())
+        .bind(result_status.as_str())
+        .bind(finish_reason)
+        .bind(error)
+        .bind(root_run_id)
+        .bind(task_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to mark task finished")?;
+        Ok(())
+    }
+}
+
+fn task_record_from_row(row: sqlx::sqlite::SqliteRow) -> Result<TaskRecord> {
+    let status_str: String = row.try_get("status")?;
+    let status = TaskStatus::from_str(&status_str).unwrap_or(TaskStatus::Failed);
+    let execution_status_str: String = row.try_get("execution_status")?;
+    let execution_status = TaskExecutionStatus::from_str(&execution_status_str)
+        .unwrap_or(TaskExecutionStatus::Interrupted);
+    let result_status_str: String = row.try_get("result_status")?;
+    let result_status =
+        TaskResultStatus::from_str(&result_status_str).unwrap_or(TaskResultStatus::NeedsReview);
+
+    Ok(TaskRecord {
+        task_id: row.try_get("task_id")?,
+        specialist_id: row.try_get("specialist_id")?,
+        prompt: row.try_get("prompt")?,
+        status,
+        execution_status,
+        result_status,
+        attempt: row.try_get::<i32, _>("attempt")? as u32,
+        block_reason: row.try_get("block_reason")?,
+        result_json: row.try_get("result_json")?,
+        finish_reason: row.try_get("finish_reason")?,
+        error: row.try_get("error")?,
+        parent_session_id: row.try_get("parent_session_id")?,
+        child_session_id: row.try_get("child_session_id")?,
+        root_run_id: row.try_get("root_run_id")?,
+        started_at: row.try_get("started_at")?,
+        finished_at: row.try_get("finished_at")?,
+    })
+}
+
+async fn self_migrate_task_columns(pool: &SqlitePool) -> Result<()> {
+    let columns = [
+        ("execution_status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("result_status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("finish_reason", "TEXT"),
+        ("error", "TEXT"),
+        ("parent_session_id", "TEXT"),
+        ("child_session_id", "TEXT"),
+        ("root_run_id", "TEXT"),
+        ("started_at", "INTEGER"),
+        ("finished_at", "INTEGER"),
+    ];
+
+    for (name, definition) in columns {
+        let sql = format!("ALTER TABLE tasks ADD COLUMN {name} {definition}");
+        if let Err(err) = sqlx::query(&sql).execute(pool).await {
+            let message = err.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(err).context("Failed to migrate tasks table");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

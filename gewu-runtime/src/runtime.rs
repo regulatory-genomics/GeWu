@@ -5,8 +5,9 @@ use gewu_core::Agent;
 use gewu_core::traits::{AssemblyContext, LlmProvider, Plugin, Tool, ToolFactory, ToolRegistry};
 use gewu_core::types::{
     AgentEvent, ExecutionRunKind, SpecialistAgentEventRecord, SpecialistDescriptor,
-    SpecialistExecutionEnvelope, SpecialistExecutionRequest, SpecialistLlmIoRecord, TaskStatus,
-    ToolContext, ToolExecutionRecord, ToolResult,
+    SpecialistExecutionEnvelope, SpecialistExecutionRequest, SpecialistLlmIoRecord,
+    TaskExecutionStatus, TaskResultStatus, TaskStatus, ToolContext, ToolExecutionRecord,
+    ToolResult,
 };
 use gewu_storage::{SqliteMemory, TaskStore};
 use gewu_tools::{BatchTool, report_result::ReportResultArgs};
@@ -407,7 +408,7 @@ impl GeWuRuntime {
                     AgentEvent::Finish { response } => {
                         result_text = response;
                     }
-                    AgentEvent::ToolFinish { tool, output } if tool == "report_result" => {
+                    AgentEvent::ToolFinish { tool, output, .. } if tool == "report_result" => {
                         if let Ok(report) = serde_json::from_str::<
                             gewu_tools::report_result::ReportResultArgs,
                         >(&output)
@@ -591,6 +592,18 @@ impl GeWuRuntime {
                 "metadata": request.metadata_json,
             })),
         }).await?;
+        let parent_session_id = request
+            .metadata_json
+            .get("parent_session_id")
+            .and_then(Value::as_str);
+        store
+            .mark_started(
+                &request.task_id,
+                parent_session_id,
+                Some(&request.session_id),
+                Some(&specialist_run.id),
+            )
+            .await?;
         let trace_context = TraceContext {
             root_run_id: request
                 .metadata_json
@@ -654,16 +667,16 @@ impl GeWuRuntime {
                         events.push(record);
                         yield SpecialistExecutionEvent::Agent(AgentEvent::ReasoningDelta { delta });
                     }
-                    AgentEvent::ToolStart { tool, input } => {
+                    AgentEvent::ToolStart { tool_call_id, tool, input, metadata } => {
                         let record = SpecialistAgentEventRecord {
                             event_type: "tool_start".to_string(),
                             tool_name: Some(tool.clone()),
-                            payload_json: serde_json::json!({ "input": input.clone() }),
+                            payload_json: serde_json::json!({ "tool_call_id": tool_call_id.clone(), "input": input.clone(), "metadata": metadata.clone() }),
                         };
                         self.emit_agent_event_hook(&descriptor, &request, &record)
                             .await;
                         events.push(record);
-                        yield SpecialistExecutionEvent::Agent(AgentEvent::ToolStart { tool, input });
+                        yield SpecialistExecutionEvent::Agent(AgentEvent::ToolStart { tool_call_id, tool, input, metadata });
                     }
                     AgentEvent::Finish { response } => {
                         let record = SpecialistAgentEventRecord {
@@ -679,11 +692,11 @@ impl GeWuRuntime {
                         }
                         yield SpecialistExecutionEvent::Agent(AgentEvent::Finish { response });
                     }
-                    AgentEvent::ToolFinish { tool, output } if tool == "report_result" => {
+                    AgentEvent::ToolFinish { tool_call_id, tool, output } if tool == "report_result" => {
                         let record = SpecialistAgentEventRecord {
                             event_type: "tool_finish".to_string(),
                             tool_name: Some(tool.clone()),
-                            payload_json: serde_json::json!({ "output": output.clone() }),
+                            payload_json: serde_json::json!({ "tool_call_id": tool_call_id.clone(), "output": output.clone() }),
                         };
                         self.emit_agent_event_hook(&descriptor, &request, &record)
                             .await;
@@ -707,13 +720,13 @@ impl GeWuRuntime {
                                 }
                             }
                         }
-                        yield SpecialistExecutionEvent::Agent(AgentEvent::ToolFinish { tool, output });
+                        yield SpecialistExecutionEvent::Agent(AgentEvent::ToolFinish { tool_call_id, tool, output });
                     }
-                    AgentEvent::ToolFinish { tool, output } => {
+                    AgentEvent::ToolFinish { tool_call_id, tool, output } => {
                         let record = SpecialistAgentEventRecord {
                             event_type: "tool_finish".to_string(),
                             tool_name: Some(tool.clone()),
-                            payload_json: serde_json::json!({ "output": output.clone() }),
+                            payload_json: serde_json::json!({ "tool_call_id": tool_call_id.clone(), "output": output.clone() }),
                         };
                         self.emit_agent_event_hook(&descriptor, &request, &record)
                             .await;
@@ -722,7 +735,7 @@ impl GeWuRuntime {
                             tool_name: tool.clone(),
                             output: output.clone(),
                         });
-                        yield SpecialistExecutionEvent::Agent(AgentEvent::ToolFinish { tool, output });
+                        yield SpecialistExecutionEvent::Agent(AgentEvent::ToolFinish { tool_call_id, tool, output });
                     }
                     AgentEvent::Error { error } => {
                         let record = SpecialistAgentEventRecord {
@@ -788,6 +801,31 @@ impl GeWuRuntime {
                 tracing::warn!("failed to finish specialist trace run: {}", err);
             }
         }
+
+        let execution_status = match final_status {
+            TaskStatus::Succeeded => TaskExecutionStatus::Completed,
+            TaskStatus::Failed | TaskStatus::Blocked => TaskExecutionStatus::Failed,
+            TaskStatus::Ready | TaskStatus::Running => TaskExecutionStatus::Interrupted,
+        };
+        let result_status = classify_task_result(final_status.clone(), &result_text, &output_json);
+        let finish_reason = match execution_status {
+            TaskExecutionStatus::Completed => Some("stop"),
+            TaskExecutionStatus::Failed => Some("error"),
+            TaskExecutionStatus::Canceled => Some("canceled"),
+            TaskExecutionStatus::Timeout => Some("timeout"),
+            TaskExecutionStatus::Interrupted => Some("interrupted"),
+            TaskExecutionStatus::Pending | TaskExecutionStatus::Running => None,
+        };
+        store
+            .mark_finished(
+                &request.task_id,
+                &execution_status,
+                &result_status,
+                finish_reason,
+                final_error.as_deref().or(block_reason.as_deref()),
+                Some(&specialist_run.id),
+            )
+            .await?;
 
         let attempt = store
             .get_task(&request.task_id)
@@ -1001,6 +1039,18 @@ impl Tool for HookedTool {
         self.inner.schema()
     }
 
+    fn execution_policy(&self) -> gewu_core::types::ToolExecutionPolicy {
+        self.inner.execution_policy()
+    }
+
+    fn start_metadata(
+        &self,
+        args: &str,
+        ctx: &ToolContext,
+    ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.start_metadata(args, ctx)
+    }
+
     async fn execute(
         &self,
         args: Value,
@@ -1141,6 +1191,40 @@ fn append_runtime_context(system_prompt: String) -> String {
         now.format("%Y-%m-%d"),
         now.format("%A")
     )
+}
+
+fn classify_task_result(
+    final_status: TaskStatus,
+    result_text: &str,
+    output_json: &Option<Value>,
+) -> TaskResultStatus {
+    if final_status != TaskStatus::Succeeded {
+        return TaskResultStatus::Invalid;
+    }
+    if output_json.is_some() {
+        return TaskResultStatus::Accepted;
+    }
+    let normalized = result_text.trim().to_lowercase();
+    if normalized.is_empty() {
+        return TaskResultStatus::Empty;
+    }
+    let future_work_markers = [
+        "让我生成",
+        "我将生成",
+        "接下来我会",
+        "稍后",
+        "let me generate",
+        "i will generate",
+        "i will now",
+        "next i will",
+    ];
+    if future_work_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return TaskResultStatus::Incomplete;
+    }
+    TaskResultStatus::Accepted
 }
 
 struct RuntimeToolRegistry {
