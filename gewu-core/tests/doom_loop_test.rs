@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 struct MockLlmProvider;
 
+struct MaxTokensLlmProvider;
+
 #[async_trait]
 impl LlmProvider for MockLlmProvider {
     async fn stream_response<'a>(
@@ -38,6 +40,28 @@ impl LlmProvider for MockLlmProvider {
             yield ProviderEvent::ToolCallStart { id: call_id.clone(), name: "test_tool".to_string() };
             yield ProviderEvent::ToolCallDelta { id: call_id, delta: "{}".to_string() };
             yield ProviderEvent::Finish { reason: Some("tool_calls".to_string()) };
+        };
+        Ok(Box::pin(s))
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+        Ok(vec!["mock".to_string()])
+    }
+}
+
+#[async_trait]
+impl LlmProvider for MaxTokensLlmProvider {
+    async fn stream_response<'a>(
+        &'a self,
+        _messages: &[Message],
+        _tools: &[Arc<dyn Tool>],
+    ) -> Result<
+        BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+        Box<dyn Error + Send + Sync>,
+    > {
+        let s = async_stream::try_stream! {
+            yield ProviderEvent::ContentDelta { delta: "partial answer".to_string() };
+            yield ProviderEvent::Finish { reason: Some("max_tokens".to_string()) };
         };
         Ok(Box::pin(s))
     }
@@ -100,4 +124,37 @@ async fn test_doom_loop_detection() {
         error_text
     );
     assert!(error_text.contains("Stopping"), "Error was: {}", error_text);
+}
+
+#[tokio::test]
+async fn max_tokens_finish_is_reported_as_truncation_error() {
+    let mut agent = Agent::builder()
+        .llm(Arc::new(MaxTokensLlmProvider))
+        .build()
+        .unwrap();
+
+    let mut stream = Box::pin(agent.ask("write a long answer"));
+    let mut saw_partial = false;
+    let mut error = None;
+
+    while let Some(event) = stream.next().await {
+        match event.unwrap() {
+            AgentEvent::ContentDelta { delta } => {
+                if delta == "partial answer" {
+                    saw_partial = true;
+                }
+            }
+            AgentEvent::Error { error: message } => {
+                error = Some(message);
+                break;
+            }
+            AgentEvent::Finish { .. } => panic!("max_tokens stop must not finish successfully"),
+            _ => {}
+        }
+    }
+
+    assert!(saw_partial);
+    let error = error.expect("expected truncation error");
+    assert!(error.contains("truncated"));
+    assert!(error.contains("GEWU_MAX_OUTPUT_TOKENS"));
 }

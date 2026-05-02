@@ -11,6 +11,12 @@ pub struct Config {
     pub endpoint: Option<String>,
     pub api_key: Option<String>,
     pub model: Option<String>,
+    #[serde(
+        alias = "maxTokens",
+        alias = "max_output_tokens",
+        alias = "maxOutputTokens"
+    )]
+    pub max_output_tokens: Option<u32>,
     pub provider: Option<String>,
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,

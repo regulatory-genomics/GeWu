@@ -55,6 +55,10 @@ pub struct Cli {
     #[arg(long, short, env = "OPENAI_MODEL")]
     pub model: Option<String>,
 
+    /// Maximum model output tokens for each LLM request
+    #[arg(long = "max-output-tokens", env = "GEWU_MAX_OUTPUT_TOKENS")]
+    pub max_output_tokens: Option<u32>,
+
     /// Initial Agent (default: build)
     #[arg(long, default_value = "build")]
     pub agent: String,
@@ -470,11 +474,21 @@ where
         .or(file_config.model.clone())
         .unwrap_or_else(|| "gpt-5.3-codex".to_string());
 
+    let max_output_tokens = cli
+        .max_output_tokens
+        .or_else(|| {
+            env::var("GEWU_MAX_OUTPUT_TOKENS")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+        })
+        .or(file_config.max_output_tokens);
+
     info!("Using model: {}", model);
 
-    let provider: Arc<dyn LlmProvider> = Arc::new(OpenAIProvider::new_with_endpoint(
-        &api_key, &endpoint, &model,
-    ));
+    let provider: Arc<dyn LlmProvider> = Arc::new(
+        OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model)
+            .with_max_output_tokens(max_output_tokens),
+    );
 
     let db_path = if let Some(path) = cli.db_path {
         path

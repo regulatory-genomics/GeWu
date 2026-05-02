@@ -43,6 +43,9 @@ struct Cli {
     #[arg(long)]
     model: Option<String>,
 
+    #[arg(long = "max-output-tokens", env = "GEWU_MAX_OUTPUT_TOKENS")]
+    max_output_tokens: Option<u32>,
+
     #[arg(long)]
     db_path: Option<String>,
 }
@@ -81,6 +84,15 @@ where
         .or(loaded_config.config.model.clone())
         .unwrap_or_else(|| "gpt-5.3-codex".to_string());
 
+    let max_output_tokens = cli
+        .max_output_tokens
+        .or_else(|| {
+            std::env::var("GEWU_MAX_OUTPUT_TOKENS")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+        })
+        .or(loaded_config.config.max_output_tokens);
+
     let db_path = cli.db_path.or_else(|| {
         dirs::home_dir().map(|h| {
             h.join(".gewu")
@@ -96,6 +108,7 @@ where
         api_key: Some(api_key),
         endpoint: Some(endpoint),
         model: Some(model),
+        max_output_tokens,
         db_path,
         plugins: loaded_config.config.plugins,
         runtime_plugin_dirs: loaded_config.config.runtime_plugin_dirs,

@@ -88,6 +88,16 @@ fn normalize_assistant_output(input: &str) -> String {
     cleaned.trim().to_string()
 }
 
+fn is_max_output_stop(reason: Option<&str>) -> bool {
+    let Some(reason) = reason else {
+        return false;
+    };
+    matches!(
+        reason.trim().to_ascii_lowercase().as_str(),
+        "max_tokens" | "max_output_tokens" | "length" | "max_tokens_stop" | "max-tokens"
+    )
+}
+
 pub struct Agent {
     llm: Arc<dyn LlmProvider>,
     tools: Arc<Vec<Arc<dyn Tool>>>,
@@ -460,7 +470,16 @@ impl Agent {
                                 tc.function.arguments.push_str(&delta);
                             }
                         }
-                        ProviderEvent::Finish { .. } => {
+                        ProviderEvent::Finish { reason } => {
+                            if is_max_output_stop(reason.as_deref()) {
+                                yield AgentEvent::Error {
+                                    error: format!(
+                                        "Model output was truncated by the provider output-token limit (finish reason: {}). Increase max_output_tokens / GEWU_MAX_OUTPUT_TOKENS and retry.",
+                                        reason.as_deref().unwrap_or("unknown")
+                                    ),
+                                };
+                                return;
+                            }
                         }
                         ProviderEvent::Error { error } => {
                             yield AgentEvent::Error { error };

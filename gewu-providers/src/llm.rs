@@ -22,23 +22,22 @@
 //! - [`ResponseParser`] - Trait for parsing streaming responses
 //! - [`ToolCallAggregator`] - Handles fragmented tool call streaming
 
+use crate::anthropic_types::{
+    AnthropicChunk, AnthropicConfig, AnthropicMessage, AnthropicStream, AnthropicTool,
+    AssistantMessage as AnthropicAssistantMessage, Client as AnthropicClient, ContentBlock,
+    ContentBlockDeltaChunk, ContentBlockStart, ContentBlockStartChunk, ContentDelta,
+    CreateMessageRequest, MessageStartChunk, ToolCall, UserMessage,
+};
 use crate::openai_types::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionMessageToolCalls,
+    AssistantMessage as OpenAIAssistantMessage, ChatCompletionMessageToolCall,
+    ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCalls,
     ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartFile,
     ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
     ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionStream, ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequest,
-    FileData, FunctionCall as OpenAIFunctionCall, FunctionObjectArgs, ImageUrl, OpenAIConfig,
-    AssistantMessage as OpenAIAssistantMessage, Client as OpenAIClient,
-};
-use crate::anthropic_types::{
-    AnthropicChunk, AnthropicConfig, AnthropicMessage, AnthropicStream, AnthropicTool,
-    ContentBlock, ContentBlockDeltaChunk, ContentBlockStart,
-    ContentBlockStartChunk, ContentDelta, CreateMessageRequest,
-    MessageStartChunk, ToolCall, UserMessage,
-    AssistantMessage as AnthropicAssistantMessage, Client as AnthropicClient,
+    ChatCompletionStream, ChatCompletionTool, ChatCompletionTools, Client as OpenAIClient,
+    CreateChatCompletionRequest, FileData, FunctionCall as OpenAIFunctionCall, FunctionObjectArgs,
+    ImageUrl, OpenAIConfig,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -113,6 +112,7 @@ pub struct OpenAIProvider {
     client: OpenAIClient,
     model: String,
     capabilities: Capabilities,
+    max_output_tokens: Option<u32>,
 }
 
 impl OpenAIProvider {
@@ -129,6 +129,7 @@ impl OpenAIProvider {
             client: OpenAIClient::with_config(config),
             model: model.to_string(),
             capabilities,
+            max_output_tokens: None,
         }
     }
 
@@ -149,7 +150,13 @@ impl OpenAIProvider {
             client: OpenAIClient::with_config(config),
             model: model.to_string(),
             capabilities,
+            max_output_tokens: None,
         }
+    }
+
+    pub fn with_max_output_tokens(mut self, max_output_tokens: Option<u32>) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self
     }
 
     /// Determines capabilities based on model name.
@@ -491,7 +498,7 @@ impl RequestBuilder for OpenAIProvider {
                 Some(openai_tools)
             },
             stream: None,
-            max_tokens: None,
+            max_tokens: self.max_output_tokens,
             temperature: None,
         })
     }
@@ -705,6 +712,7 @@ pub struct AnthropicProvider {
     client: AnthropicClient,
     model: String,
     capabilities: Capabilities,
+    max_output_tokens: Option<u32>,
 }
 
 impl AnthropicProvider {
@@ -715,6 +723,7 @@ impl AnthropicProvider {
             client: AnthropicClient::with_config(config),
             model: model.to_string(),
             capabilities,
+            max_output_tokens: Some(8192),
         }
     }
 
@@ -725,7 +734,13 @@ impl AnthropicProvider {
             client: AnthropicClient::with_config(config),
             model: model.to_string(),
             capabilities,
+            max_output_tokens: Some(8192),
         }
+    }
+
+    pub fn with_max_output_tokens(mut self, max_output_tokens: Option<u32>) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self
     }
 
     pub fn with_extended_thinking(mut self) -> Self {
@@ -791,9 +806,7 @@ impl AnthropicProvider {
 
     fn convert_content_part(&self, part: &ContentPart) -> Option<ContentBlock> {
         match part {
-            ContentPart::Text { text } => Some(ContentBlock::Text {
-                text: text.clone(),
-            }),
+            ContentPart::Text { text } => Some(ContentBlock::Text { text: text.clone() }),
             ContentPart::Image { data, mime_type } => Some(ContentBlock::Text {
                 text: format!("[Image: {}](data:{};base64,{})", mime_type, mime_type, data),
             }),
@@ -803,11 +816,9 @@ impl AnthropicProvider {
             ContentPart::Video { data, mime_type } => Some(ContentBlock::Text {
                 text: format!("[Video: {}](data:{};base64,{})", mime_type, mime_type, data),
             }),
-            ContentPart::File { data, mime_type } => {
-                Some(ContentBlock::Text {
-                    text: format!("[File: {}](data:{};base64,{})", mime_type, mime_type, data),
-                })
-            }
+            ContentPart::File { data, mime_type } => Some(ContentBlock::Text {
+                text: format!("[File: {}](data:{};base64,{})", mime_type, mime_type, data),
+            }),
         }
     }
 
@@ -822,7 +833,9 @@ impl AnthropicProvider {
                     .iter()
                     .filter_map(|p| self.convert_content_part(p))
                     .collect();
-                Ok(vec![AnthropicMessage::User(UserMessage { content: blocks })])
+                Ok(vec![AnthropicMessage::User(UserMessage {
+                    content: blocks,
+                })])
             }
             Message::Assistant {
                 content,
@@ -861,14 +874,16 @@ impl AnthropicProvider {
                 if blocks.is_empty() && anthropic_tool_calls.is_none() {
                     Ok(vec![])
                 } else {
-                    Ok(vec![AnthropicMessage::Assistant(AnthropicAssistantMessage {
-                        content: if blocks.is_empty() {
-                            None
-                        } else {
-                            Some(blocks)
+                    Ok(vec![AnthropicMessage::Assistant(
+                        AnthropicAssistantMessage {
+                            content: if blocks.is_empty() {
+                                None
+                            } else {
+                                Some(blocks)
+                            },
+                            tool_calls: anthropic_tool_calls,
                         },
-                        tool_calls: anthropic_tool_calls,
-                    })])
+                    )])
                 }
             }
             Message::Tool {
@@ -886,7 +901,9 @@ impl AnthropicProvider {
                         blocks.push(block);
                     }
                 }
-                Ok(vec![AnthropicMessage::User(UserMessage { content: blocks })])
+                Ok(vec![AnthropicMessage::User(UserMessage {
+                    content: blocks,
+                })])
             }
         }
     }
@@ -945,7 +962,7 @@ impl AnthropicProvider {
                 Some(anthropic_tools)
             },
             stream: true,
-            max_tokens: Some(8192),
+            max_tokens: self.max_output_tokens,
         })
     }
 }
@@ -1010,10 +1027,7 @@ impl AnthropicToolCallAggregator {
                         let delta = state.argument_buffer[state.sent_len..new_len].to_string();
                         state.sent_len = new_len;
                         if !delta.is_empty() {
-                            events.push(ProviderEvent::ToolCallDelta {
-                                id,
-                                delta,
-                            });
+                            events.push(ProviderEvent::ToolCallDelta { id, delta });
                         }
                     }
                 }
@@ -1036,7 +1050,8 @@ impl AnthropicProvider {
     fn parse_stream(
         &self,
         stream: AnthropicStream,
-    ) -> futures::stream::BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>> {
+    ) -> futures::stream::BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>
+    {
         let s = async_stream::try_stream! {
             let mut tool_aggregator = AnthropicToolCallAggregator::default();
             let mut stream = stream;
@@ -1143,6 +1158,29 @@ mod tests {
         let provider = OpenAIProvider::new_with_endpoint(api_key, base_url, model);
 
         assert!(provider.build(&[], &[]).is_ok());
+    }
+
+    #[test]
+    fn openai_provider_uses_configured_max_output_tokens() {
+        let provider =
+            OpenAIProvider::new_with_endpoint("test-key", "http://localhost:8080/v1", "gpt-4")
+                .with_max_output_tokens(Some(16_384));
+
+        let request = provider.build(&[], &[]).expect("build request");
+        assert_eq!(request.max_tokens, Some(16_384));
+    }
+
+    #[test]
+    fn anthropic_provider_uses_configured_max_output_tokens() {
+        let provider = AnthropicProvider::new_with_endpoint(
+            "test-key",
+            "http://localhost:8080",
+            "claude-sonnet",
+        )
+        .with_max_output_tokens(Some(32_000));
+
+        let request = provider.build(&[], &[]).expect("build request");
+        assert_eq!(request.max_tokens, Some(32_000));
     }
 
     #[test]

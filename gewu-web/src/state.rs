@@ -25,6 +25,12 @@ pub struct ServerConfig {
     pub api_key: Option<String>,
     pub endpoint: Option<String>,
     pub model: Option<String>,
+    #[serde(
+        alias = "maxTokens",
+        alias = "max_output_tokens",
+        alias = "maxOutputTokens"
+    )]
+    pub max_output_tokens: Option<u32>,
     pub db_path: Option<String>,
     #[serde(default)]
     pub plugins: HashMap<String, Value>,
@@ -40,6 +46,7 @@ impl Default for ServerConfig {
             api_key: None,
             endpoint: None,
             model: Some("gpt-5.3-codex".to_string()),
+            max_output_tokens: None,
             db_path: None,
             plugins: HashMap::new(),
             runtime_plugin_dirs: Vec::new(),
@@ -106,6 +113,7 @@ impl AppState {
             .model
             .clone()
             .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+        let max_output_tokens = config.max_output_tokens;
         let plugins = config.plugins.clone();
         let runtime_plugin_dirs: Vec<PathBuf> = config
             .runtime_plugin_dirs
@@ -122,9 +130,10 @@ impl AppState {
         let pool_guard = self.db_pool.lock().await;
         let pool = pool_guard.as_ref().context("Database not initialized")?;
 
-        let provider = Arc::new(OpenAIProvider::new_with_endpoint(
-            &api_key, &endpoint, &model,
-        ));
+        let provider = Arc::new(
+            OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model)
+                .with_max_output_tokens(max_output_tokens),
+        );
 
         let plugin_host = self.build_plugin_host(provider.clone(), pool.clone(), plugins)?;
         let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs(
@@ -178,6 +187,7 @@ impl AppState {
             .model
             .clone()
             .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+        let max_output_tokens = config.max_output_tokens;
         let plugins = config.plugins.clone();
         let runtime_plugin_dirs: Vec<PathBuf> = config
             .runtime_plugin_dirs
@@ -195,9 +205,10 @@ impl AppState {
         let pool = pool_guard.as_ref().context("Database not initialized")?;
 
         info!("Creating provider and agent...");
-        let provider = Arc::new(OpenAIProvider::new_with_endpoint(
-            &api_key, &endpoint, &model,
-        ));
+        let provider = Arc::new(
+            OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model)
+                .with_max_output_tokens(max_output_tokens),
+        );
 
         let mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
         let plugin_host = self.build_plugin_host(provider.clone(), pool.clone(), plugins)?;
@@ -312,6 +323,7 @@ impl AppState {
             .model
             .clone()
             .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+        let max_output_tokens = config.max_output_tokens;
         let plugins = config.plugins.clone();
         let runtime_plugin_dirs: Vec<PathBuf> = config
             .runtime_plugin_dirs
@@ -328,9 +340,10 @@ impl AppState {
         let pool_guard = self.db_pool.lock().await;
         let pool = pool_guard.as_ref().context("Database not initialized")?;
 
-        let provider = Arc::new(OpenAIProvider::new_with_endpoint(
-            &api_key, &endpoint, &model,
-        ));
+        let provider = Arc::new(
+            OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model)
+                .with_max_output_tokens(max_output_tokens),
+        );
 
         let mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
         let plugin_host = self.build_plugin_host(provider.clone(), pool.clone(), plugins)?;
