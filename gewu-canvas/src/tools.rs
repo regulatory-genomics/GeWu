@@ -233,12 +233,18 @@ impl Tool for CanvasCloseTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: CanvasIdArgs = serde_json::from_value(args).map_err(box_err)?;
         match self.manager.close(&ctx.session_id, &input.canvas_id).await {
-            Ok(()) => Ok(ToolResult::new(
+            Ok(state) => Ok(ToolResult::new(
                 "canvas.close",
                 json!({
                     "canvas_id": input.canvas_id,
                     "closed": true,
+                    "state": state,
                     "event": "canvas:close",
+                    "event_payload": {
+                        "event": "canvas:close",
+                        "canvas_id": input.canvas_id,
+                        "state": state,
+                    },
                 })
                 .to_string(),
             )),

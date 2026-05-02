@@ -27,6 +27,7 @@
   // kind -> render fn
   const renderers = new Map();
   let activeCanvasId = null;
+  let trayEl = null;
 
   function ensureShell() {
     if (overlay.dataset.shell === 'ready') return;
@@ -53,12 +54,54 @@
     });
   }
 
+  function ensureTray() {
+    if (trayEl) return trayEl;
+    trayEl = document.createElement('div');
+    trayEl.className = 'canvas-tray';
+    trayEl.setAttribute('aria-label', 'Hidden canvases');
+    document.body.appendChild(trayEl);
+    return trayEl;
+  }
+
+  function renderTray() {
+    const tray = ensureTray();
+    const hidden = Array.from(canvases.values())
+      .map((entry) => entry.state)
+      .filter((state) => state.visible === false);
+    tray.innerHTML = '';
+    tray.hidden = hidden.length === 0;
+    if (hidden.length > 0) {
+      const heading = document.createElement('div');
+      heading.className = 'canvas-tray-heading';
+      heading.textContent = 'Canvas hidden — click to reopen';
+      tray.appendChild(heading);
+    }
+    for (const state of hidden) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'canvas-tray-item';
+      button.textContent = `↗ Reopen ${state.kind}: ${state.title || state.canvas_id}`;
+      button.title = `Reopen ${state.canvas_id}`;
+      button.addEventListener('click', () => show(state.canvas_id));
+      tray.appendChild(button);
+    }
+  }
+
   function show(canvasId) {
     ensureShell();
     activeCanvasId = canvasId;
     overlay.hidden = false;
     overlay.classList.add('visible');
     document.body.classList.add('canvas-overlay-open');
+    const entry = canvases.get(canvasId);
+    if (entry) {
+      entry.state.visible = true;
+      entry.state.focused = true;
+    }
+    for (const [id, entry] of canvases.entries()) {
+      if (id !== canvasId) entry.state.focused = false;
+    }
+    renderTray();
     render(canvasId);
   }
 
@@ -66,7 +109,13 @@
     overlay.hidden = true;
     overlay.classList.remove('visible');
     document.body.classList.remove('canvas-overlay-open');
+    if (activeCanvasId && canvases.has(activeCanvasId)) {
+      const entry = canvases.get(activeCanvasId);
+      entry.state.visible = false;
+      entry.state.focused = false;
+    }
     activeCanvasId = null;
+    renderTray();
   }
 
   function render(canvasId) {
@@ -165,6 +214,7 @@
       }
       if (payload.updated_at) entry.state.updated_at = payload.updated_at;
       if (id === activeCanvasId) render(id);
+      renderTray();
       return true;
     }
 
@@ -177,8 +227,12 @@
 
     if (payload.event === 'canvas:close') {
       const id = payload.canvas_id;
-      canvases.delete(id);
+      if (canvases.has(id)) {
+        const state = payload.state || canvases.get(id).state;
+        canvases.set(id, { state: { ...state, visible: false, focused: false } });
+      }
       if (id === activeCanvasId) hide();
+      else renderTray();
       return true;
     }
 

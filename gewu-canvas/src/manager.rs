@@ -49,7 +49,9 @@ impl CanvasManager {
     ///
     /// If `canvas_id` is `Some` and already exists for this session, the
     /// existing state is returned with `focused = true` (and other fields
-    /// updated from the inputs only when explicitly provided).
+    /// updated from the inputs only when explicitly provided). The
+    /// single-focus invariant is enforced in both branches: any other
+    /// canvas in the session is defocused.
     pub async fn open(
         &self,
         session_id: &str,
@@ -63,8 +65,15 @@ impl CanvasManager {
         let session = guard.sessions.entry(session_id.to_string()).or_default();
 
         if let Some(id) = canvas_id.as_deref() {
-            if let Some(existing) = session.get_mut(id) {
-                existing.focused = true;
+            if session.contains_key(id) {
+                // Defocus everything else first so we never end up with
+                // two focused canvases after a re-open.
+                for (other_id, state) in session.iter_mut() {
+                    state.focused = other_id == id;
+                }
+                let existing = session
+                    .get_mut(id)
+                    .expect("contains_key returned true above");
                 existing.visible = true;
                 if let Some(t) = title {
                     existing.title = if t.is_empty() { None } else { Some(t) };
@@ -76,7 +85,7 @@ impl CanvasManager {
             }
         }
 
-        // Defocus other canvases in the session — single-focus model for MVP.
+        // New canvas: defocus existing canvases (single-focus model).
         for state in session.values_mut() {
             state.focused = false;
         }
@@ -94,7 +103,7 @@ impl CanvasManager {
         state
     }
 
-    pub async fn close(&self, session_id: &str, canvas_id: &str) -> Result<(), CanvasError> {
+    pub async fn close(&self, session_id: &str, canvas_id: &str) -> Result<CanvasState, CanvasError> {
         let mut guard = self.inner.write().await;
         let session = guard
             .sessions
@@ -103,13 +112,15 @@ impl CanvasManager {
                 session_id: session_id.into(),
                 canvas_id: canvas_id.into(),
             })?;
-        session
-            .remove(canvas_id)
+        let state = session
+            .get_mut(canvas_id)
             .ok_or_else(|| CanvasError::NotFound {
                 session_id: session_id.into(),
                 canvas_id: canvas_id.into(),
             })?;
-        Ok(())
+        state.visible = false;
+        state.focused = false;
+        Ok(state.clone())
     }
 
     pub async fn focus(&self, session_id: &str, canvas_id: &str) -> Result<CanvasState, CanvasError> {
@@ -279,13 +290,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_removes_canvas() {
+    async fn close_hides_canvas_without_removing_it() {
         let m = CanvasManager::new();
         let opened = m
             .open("s1", None, CanvasKind::Genome, CanvasMode::Overlay, None, None)
             .await;
-        m.close("s1", &opened.canvas_id).await.unwrap();
-        assert!(m.get_state("s1", &opened.canvas_id).await.is_none());
+        let closed = m.close("s1", &opened.canvas_id).await.unwrap();
+        assert!(!closed.visible);
+        assert!(!closed.focused);
+        let stored = m.get_state("s1", &opened.canvas_id).await.unwrap();
+        assert_eq!(stored.canvas_id, opened.canvas_id);
+        assert!(!stored.visible);
     }
 
     #[tokio::test]
@@ -327,5 +342,59 @@ mod tests {
             .await;
         m.drop_session("s1").await;
         assert!(m.list("s1").await.is_empty());
+    }
+
+    /// Regression: re-opening an existing canvas must defocus its siblings.
+    /// Originally the code only set focused=true on the target without
+    /// clearing focus on others, so the single-focus invariant could be
+    /// broken (issue surfaced in code review).
+    #[tokio::test]
+    async fn reopening_existing_canvas_defocuses_siblings() {
+        let m = CanvasManager::new();
+        // Open A (auto-focused), then B (auto-focused — A loses focus).
+        let a = m
+            .open(
+                "s1",
+                Some("a".into()),
+                CanvasKind::Genome,
+                CanvasMode::Overlay,
+                None,
+                None,
+            )
+            .await;
+        let b = m
+            .open(
+                "s1",
+                Some("b".into()),
+                CanvasKind::Genome,
+                CanvasMode::Overlay,
+                None,
+                None,
+            )
+            .await;
+        assert!(!m.get_state("s1", &a.canvas_id).await.unwrap().focused);
+        assert!(m.get_state("s1", &b.canvas_id).await.unwrap().focused);
+
+        // Re-open A. B must lose focus; only A is focused after.
+        let reopened = m
+            .open(
+                "s1",
+                Some("a".into()),
+                CanvasKind::Genome,
+                CanvasMode::Overlay,
+                None,
+                None,
+            )
+            .await;
+        assert!(reopened.focused);
+        assert!(!m.get_state("s1", "b").await.unwrap().focused);
+        let focused: Vec<_> = m
+            .list("s1")
+            .await
+            .into_iter()
+            .filter(|s| s.focused)
+            .collect();
+        assert_eq!(focused.len(), 1, "exactly one canvas may be focused");
+        assert_eq!(focused[0].canvas_id, "a");
     }
 }
