@@ -3,6 +3,7 @@ use gewu_canvas::{canvas_tools, genome_tools, CanvasManager, GenomeToolsConfig};
 use gewu_core::traits::Tool;
 use gewu_providers::OpenAIProvider;
 use gewu_runtime::{BackgroundTaskCoordinator, PluginHost, PluginRegistry, RuntimeFactory};
+use gewu_storage::session_store::{SessionRecord, SessionStore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -21,6 +22,16 @@ pub struct SessionInfo {
     pub id: String,
     pub agent_type: String,
     pub created_at: i64,
+}
+
+impl From<SessionRecord> for SessionInfo {
+    fn from(r: SessionRecord) -> Self {
+        Self {
+            id: r.session_id,
+            agent_type: r.agent_type,
+            created_at: r.created_at,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -99,25 +110,16 @@ pub type PluginRegistrar = Arc<dyn Fn(&mut PluginRegistry) + Send + Sync>;
 #[derive(Clone)]
 pub struct AppState {
     pub auth_token: Arc<RwLock<crate::auth::AuthState>>,
-    pub sessions: Arc<RwLock<HashMap<String, SessionInfo>>>,
     pub agents: Arc<RwLock<HashMap<String, Arc<AgentHandle>>>>,
     pub active_turns: Arc<RwLock<HashMap<String, ActiveTurnInfo>>>,
     pub config: Arc<RwLock<ServerConfig>>,
     pub db_pool: Arc<Mutex<Option<SqlitePool>>>,
+    pub session_store: Arc<SessionStore>,
     pub mcp_tools: Arc<Vec<Arc<dyn Tool>>>,
     pub plugin_registrar: PluginRegistrar,
-    /// Per-session canvas registry. Constructed once and shared via the
-    /// six canvas.* tools, which are merged into mcp_tools at session
-    /// creation time. The same handle is exposed on AppState so the
-    /// browser-side inverse channel (/api/sessions/:id/canvas/...) can
-    /// read/write canvas state without going through the agent.
     pub canvases: CanvasManager,
-    /// Pre-built canvas tools sharing `canvases`. Cloned into every new
-    /// session's agent. We hold them as Arc<Vec<Arc<dyn Tool>>> so the
-    /// existing per-session merge in create_session/switch_agent can
-    /// concatenate them with mcp_tools without re-allocating the manager
-    /// on every request.
     pub canvas_tools: Arc<Vec<Arc<dyn Tool>>>,
+    rebuild_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl AppState {
@@ -202,13 +204,16 @@ impl AppState {
             Some(create_db_pool(&db_path).await?)
         };
 
+        let session_store = {
+            let pool = db_pool.as_ref().context("Database not initialized")?;
+            let store = SessionStore::new(pool.clone()).await?;
+            store.backfill_from_history().await?;
+            Arc::new(store)
+        };
+
         let canvases = CanvasManager::new();
         let mut canvas_tools_vec = canvas_tools(Arc::new(canvases.clone()));
 
-        // Register genome.* tools when tachyon-browser is configured. They
-        // join the canvas.* tools in the per-session tool list, so the agent
-        // can fluidly mix `canvas.get_state` → `genome.inspect_region` →
-        // `canvas.set_state` without crossing crate boundaries.
         let tachyon_url = config
             .tachyon_browser_url
             .clone()
@@ -239,15 +244,16 @@ impl AppState {
 
         Ok(Self {
             auth_token: Arc::new(RwLock::new(auth_token)),
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             agents: Arc::new(RwLock::new(HashMap::new())),
             active_turns: Arc::new(RwLock::new(HashMap::new())),
             config: Arc::new(RwLock::new(config)),
             db_pool: Arc::new(Mutex::new(db_pool)),
+            session_store,
             mcp_tools: Arc::new(mcp_tools),
             plugin_registrar,
             canvases,
             canvas_tools,
+            rebuild_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -319,10 +325,9 @@ impl AppState {
             agent_type: agent_type.clone(),
         });
 
-        self.sessions
-            .write()
-            .await
-            .insert(session_id.clone(), session_info.clone());
+        self.session_store
+            .insert(&session_id, &agent_type, created_at)
+            .await?;
         self.agents.write().await.insert(session_id.clone(), handle);
         info!("Session {} stored in state", session_id);
 
@@ -330,70 +335,36 @@ impl AppState {
     }
 
     pub async fn get_session(&self, session_id: &str) -> Option<SessionInfo> {
-        self.sessions.read().await.get(session_id).cloned()
+        self.session_store
+            .get(session_id)
+            .await
+            .ok()
+            .flatten()
+            .map(SessionInfo::from)
     }
 
     pub async fn resolve_session_id(&self, id: &str) -> Result<String> {
-        let sessions = self.sessions.read().await;
-        if sessions.contains_key(id) {
+        if self.session_store.get(id).await?.is_some() {
             return Ok(id.to_string());
         }
-        let matches = sessions
-            .keys()
-            .filter(|session_id| session_id.starts_with(id))
-            .cloned()
-            .collect::<Vec<_>>();
-        drop(sessions);
-        if matches.len() == 1 {
-            return Ok(matches[0].clone());
+        if let Some(full_id) = self.session_store.resolve_prefix(id).await? {
+            return Ok(full_id);
         }
-
-        let pool_guard = self.db_pool.lock().await;
-        let pool = pool_guard.as_ref().context("Database not initialized")?;
-        let pattern = format!("{id}%");
-        let rows = sqlx::query(
-            r#"
-            SELECT DISTINCT session_id FROM memory_messages WHERE session_id LIKE ?
-            UNION
-            SELECT DISTINCT session_id FROM execution_runs WHERE session_id LIKE ?
-            UNION
-            SELECT DISTINCT parent_session_id FROM tasks WHERE parent_session_id LIKE ?
-            UNION
-            SELECT DISTINCT child_session_id FROM tasks WHERE child_session_id LIKE ?
-            UNION
-            SELECT DISTINCT task_id FROM tasks WHERE task_id LIKE ?
-            "#,
-        )
-        .bind(&pattern)
-        .bind(&pattern)
-        .bind(&pattern)
-        .bind(&pattern)
-        .bind(&pattern)
-        .fetch_all(pool)
-        .await
-        .context("Failed to resolve session id")?;
-
-        let matches = rows
-            .into_iter()
-            .filter_map(|row| {
-                row.try_get::<Option<String>, _>("session_id")
-                    .ok()
-                    .flatten()
-            })
-            .collect::<Vec<_>>();
-        if matches.len() == 1 {
-            Ok(matches[0].clone())
-        } else {
-            Ok(id.to_string())
-        }
+        Ok(id.to_string())
     }
 
     pub async fn list_sessions(&self) -> Vec<SessionInfo> {
-        self.sessions.read().await.values().cloned().collect()
+        self.session_store
+            .list_all()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(SessionInfo::from)
+            .collect()
     }
 
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
-        self.sessions.write().await.remove(session_id);
+        self.session_store.delete(session_id).await?;
         self.agents.write().await.remove(session_id);
         self.active_turns.write().await.remove(session_id);
         self.canvases.drop_session(session_id).await;
@@ -452,52 +423,58 @@ impl AppState {
         self.agents.read().await.get(session_id).cloned()
     }
 
-    pub async fn get_session_messages(
+    pub async fn ensure_agent(
         &self,
         session_id: &str,
-    ) -> Result<Vec<gewu_core::types::Message>> {
+        fallback_agent_type: &str,
+    ) -> Result<(String, Arc<AgentHandle>)> {
         let session_id = self.resolve_session_id(session_id).await?;
-        let pool_guard = self.db_pool.lock().await;
-        let pool = pool_guard.as_ref().context("Database not initialized")?;
 
-        let rows =
-            sqlx::query("SELECT content FROM memory_messages WHERE session_id = ? ORDER BY id ASC")
-                .bind(&session_id)
-                .fetch_all(pool)
-                .await
-                .context("Failed to load messages from DB")?;
-
-        let mut messages = Vec::new();
-        for row in rows {
-            let content: String = row.try_get("content")?;
-            let message: gewu_core::types::Message =
-                serde_json::from_str(&content).context("Failed to deserialize message content")?;
-            messages.push(message);
+        if let Some(handle) = self.get_agent(&session_id).await {
+            return Ok((session_id, handle));
         }
 
-        info!(
-            "Loaded {} messages for session {}",
-            messages.len(),
-            session_id
-        );
-        Ok(messages)
+        let lock = {
+            let mut locks = self.rebuild_locks.lock().await;
+            locks
+                .entry(session_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _guard = lock.lock().await;
+
+        if let Some(handle) = self.get_agent(&session_id).await {
+            return Ok((session_id, handle));
+        }
+
+        let record = self
+            .session_store
+            .get(&session_id)
+            .await?
+            .context("Session not found")?;
+
+        info!("rehydrating agent for persisted session {}", session_id);
+
+        let agent_type = if record.agent_type.is_empty() {
+            fallback_agent_type.to_string()
+        } else {
+            record.agent_type.clone()
+        };
+
+        let handle = self.build_agent(&session_id, &agent_type).await?;
+        self.agents
+            .write()
+            .await
+            .insert(session_id.clone(), handle.clone());
+
+        Ok((session_id, handle))
     }
 
-    pub async fn switch_agent(
+    async fn build_agent(
         &self,
         session_id: &str,
-        new_agent_type: String,
-    ) -> Result<SessionInfo> {
-        info!(
-            "Switching agent for session {} to type: {}",
-            session_id, new_agent_type
-        );
-
-        let old_handle = self.agents.write().await.remove(session_id);
-        if old_handle.is_none() {
-            return Err(anyhow::anyhow!("Session not found"));
-        }
-
+        agent_type: &str,
+    ) -> Result<Arc<AgentHandle>> {
         let config = self.config.read().await;
         let api_key = config.api_key.clone().context("API key not configured")?;
         let endpoint = config.endpoint.clone().context("Endpoint not configured")?;
@@ -540,42 +517,82 @@ impl AppState {
             &[],
         )?;
         let (agent, _registry) = runtime
-            .build_specialist(&new_agent_type, session_id.to_string(), mcp_tools)
+            .build_specialist(agent_type, session_id.to_string(), mcp_tools)
             .await?;
 
-        let handle = Arc::new(AgentHandle {
+        Ok(Arc::new(AgentHandle {
             agent: Arc::new(Mutex::new(agent)),
             session_id: session_id.to_string(),
-            agent_type: new_agent_type.clone(),
-        });
+            agent_type: agent_type.to_string(),
+        }))
+    }
 
-        let created_at = {
-            let sessions = self.sessions.read().await;
-            sessions
-                .get(session_id)
-                .map(|s| s.created_at)
-                .unwrap_or_else(|| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64
-                })
-        };
+    pub async fn get_session_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<gewu_core::types::Message>> {
+        let session_id = self.resolve_session_id(session_id).await?;
+        let pool_guard = self.db_pool.lock().await;
+        let pool = pool_guard.as_ref().context("Database not initialized")?;
 
-        let session_info = SessionInfo {
-            id: session_id.to_string(),
-            agent_type: new_agent_type,
-            created_at,
-        };
+        let rows =
+            sqlx::query("SELECT content FROM memory_messages WHERE session_id = ? ORDER BY id ASC")
+                .bind(&session_id)
+                .fetch_all(pool)
+                .await
+                .context("Failed to load messages from DB")?;
+
+        let mut messages = Vec::new();
+        for row in rows {
+            let content: String = row.try_get("content")?;
+            let message: gewu_core::types::Message =
+                serde_json::from_str(&content).context("Failed to deserialize message content")?;
+            messages.push(message);
+        }
+
+        info!(
+            "Loaded {} messages for session {}",
+            messages.len(),
+            session_id
+        );
+        Ok(messages)
+    }
+
+    pub async fn switch_agent(
+        &self,
+        session_id: &str,
+        new_agent_type: String,
+    ) -> Result<SessionInfo> {
+        info!(
+            "Switching agent for session {} to type: {}",
+            session_id, new_agent_type
+        );
+
+        self.agents.write().await.remove(session_id);
+
+        let record = self
+            .session_store
+            .get(session_id)
+            .await?
+            .context("Session not found")?;
+
+        let handle = self.build_agent(session_id, &new_agent_type).await?;
+
+        self.session_store
+            .update_agent_type(session_id, &new_agent_type)
+            .await?;
 
         self.agents
             .write()
             .await
             .insert(session_id.to_string(), handle);
-        *self.sessions.write().await.get_mut(session_id).unwrap() = session_info.clone();
 
         info!("Agent switched successfully for session {}", session_id);
-        Ok(session_info)
+        Ok(SessionInfo {
+            id: session_id.to_string(),
+            agent_type: new_agent_type,
+            created_at: record.created_at,
+        })
     }
 
     pub async fn update_config(&self, new_config: ServerConfig) -> Result<()> {
