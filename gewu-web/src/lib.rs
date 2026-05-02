@@ -151,6 +151,10 @@ where
             get(routes::sessions::handle_get_messages),
         )
         .route(
+            "/api/sessions/{id}/work-graph",
+            get(routes::work_graph::handle_get_work_graph),
+        )
+        .route(
             "/api/sessions/{id}/switch-agent",
             post(routes::sessions::handle_switch_agent),
         )
