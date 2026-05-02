@@ -667,6 +667,9 @@ function renderMessageHistory(messages) {
     const toolCallHosts = new Map();
     let lastAssistantDiv = null;
     let lastAssistantToolsEl = null;
+    if (window.canvasController) {
+        try { window.canvasController.hide(); } catch (e) { /* non-fatal */ }
+    }
     for (const msg of messages) {
         if (msg.role === 'system') continue;
 
@@ -701,12 +704,15 @@ function renderMessageHistory(messages) {
                 const details = createPersistedToolCall(host.toolName || msg.tool_name || 'tool', host.input, msg.content || '');
                 host.toolsEl.appendChild(details);
                 addTraceRunFromToolOutput(host.messageDiv, msg.content || '');
+                replayCanvasEventFromToolOutput(msg.content || '');
             } else if (lastAssistantToolsEl) {
                 const details = createPersistedToolCall(msg.tool_name || 'tool', '', msg.content || '');
                 lastAssistantToolsEl.appendChild(details);
                 addTraceRunFromToolOutput(lastAssistantDiv, msg.content || '');
+                replayCanvasEventFromToolOutput(msg.content || '');
             } else {
                 renderMessage(msg);
+                replayCanvasEventFromToolOutput(msg.content || '');
             }
         } else {
             renderMessage(msg);
@@ -716,6 +722,16 @@ function renderMessageHistory(messages) {
             }
         }
     }
+}
+
+function replayCanvasEventFromToolOutput(output) {
+    if (!window.canvasController) return;
+    try {
+        const parsed = parseToolOutputJson(output);
+        if (parsed && typeof parsed.event === 'string' && parsed.event.startsWith('canvas:')) {
+            window.canvasController.handle(parsed.event_payload || parsed);
+        }
+    } catch (e) { /* persisted tool output may be non-JSON */ }
 }
 
 function isEmptyAssistantTurn(msg) {
@@ -1489,6 +1505,9 @@ async function sendMessage() {
 // Event Listeners
 sendBtn.addEventListener('click', sendMessage);
 messageInput.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) {
+        return;
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         sendMessage();
