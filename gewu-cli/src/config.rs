@@ -32,6 +32,8 @@ pub struct Config {
     pub runtime_plugin_dirs: Vec<String>,
     #[serde(rename = "skillDirs", default)]
     pub skill_dirs: Vec<String>,
+    #[serde(rename = "tachyonBrowser", default)]
+    pub tachyon_browser: serde_json::Value,
 }
 
 #[derive(Debug)]

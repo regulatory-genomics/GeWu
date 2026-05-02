@@ -14,6 +14,8 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 use uuid::Uuid;
 
+use crate::sidecar::TachyonBrowserConfig;
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct SessionInfo {
     pub id: String,
@@ -46,6 +48,8 @@ pub struct ServerConfig {
     /// viewer but the agent cannot run genome analyses.
     #[serde(default, alias = "tachyonBrowserUrl")]
     pub tachyon_browser_url: Option<String>,
+    #[serde(rename = "tachyonBrowser", default)]
+    pub tachyon_browser: TachyonBrowserConfig,
 }
 
 impl Default for ServerConfig {
@@ -60,6 +64,7 @@ impl Default for ServerConfig {
             runtime_plugin_dirs: Vec::new(),
             skill_dirs: Vec::new(),
             tachyon_browser_url: None,
+            tachyon_browser: TachyonBrowserConfig::default(),
         }
     }
 }

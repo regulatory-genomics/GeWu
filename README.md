@@ -72,6 +72,44 @@ GeWu also supports YAML runtime plugins for HTTP-backed tools and lifecycle hook
 
 A runtime plugin can expose tools such as `memory_search` and hook into lifecycle events such as `specialist.system_prompt.transform`, `agent.event`, and `tool.execute.after`. See `examples/gewu-memory-runtime-plugin.yaml` for a memory daemon configuration.
 
+### Managed Tachyon Browser Sidecar
+
+GeWu web can manage `tachyon-browser` as a local HTTP sidecar for genome canvas
+data and `genome.*` tools. This keeps Tachyon's genomics stack out of GeWu core
+while letting users start a single GeWu web process.
+
+```jsonc
+{
+  "tachyonBrowser": {
+    "enabled": true,
+    "autoStart": true,
+    "url": "http://127.0.0.1:8400",
+    "command": "/home/gilberthan/disk1/projects/tachyon-browser/target/release/tachyon-browser",
+    "args": [
+      "--host", "127.0.0.1",
+      "--port", "8400",
+      "--registry", "/path/to/tachyon-browser-registry.json",
+      "--genes", "/path/to/gene-info.ucf"
+    ],
+    "healthPath": "/api/health",
+    "startupTimeoutMs": 10000
+  }
+}
+```
+
+Startup behavior:
+
+1. If `url` is already healthy, GeWu reuses it.
+2. If not healthy and `autoStart=true`, GeWu spawns `command` with `args`.
+3. GeWu waits for `healthPath`, then registers `genome.*` tools.
+4. The resolved URL is injected into `index.html` as
+   `<meta name="tachyon-browser-url" ...>`, so `tachyon-canvas` can fetch
+   `/api/browser/*` from the sidecar.
+5. If GeWu started the sidecar, GeWu terminates it on shutdown.
+
+`TACHYON_BROWSER_URL` remains supported as an override for using an already
+running external sidecar.
+
 ### Configuring a Plugin
 
 Add a `plugins` block to your `config.json`:
