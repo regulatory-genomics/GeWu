@@ -169,6 +169,35 @@
         .session-item:hover { background: var(--bg-tertiary); }
         .session-item.active { background: var(--border-color); }
 
+        .session-children {
+            margin-left: 20px;
+            padding-left: 10px;
+            border-left: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .session-child {
+            padding: 7px 8px;
+            font-size: 12px;
+            opacity: 0.92;
+        }
+
+        .session-status-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--text-muted);
+            flex-shrink: 0;
+        }
+
+        .session-status-dot.running { background: var(--accent-orange); }
+        .session-status-dot.completed { background: var(--accent-green); }
+        .session-status-dot.failed,
+        .session-status-dot.invalid { background: var(--accent-red); }
+        .session-status-dot.incomplete { background: var(--accent-orange); }
+
         .session-icon {
             font-size: 16px;
             flex-shrink: 0;
@@ -727,6 +756,8 @@
         }
 
         #send-btn:hover { background: #2ea043; }
+        #send-btn.stop { background: var(--accent-red); }
+        #send-btn.stop:hover { background: #da3633; }
         #send-btn:disabled {
             background: var(--bg-tertiary);
             color: var(--text-muted);
@@ -860,8 +891,10 @@
 
         let token = '';
         let isLoading = false;
+        let activeChatAbortController = null;
         let activeToolCallEls = [];
         const activeToolCallsByName = new Map();
+        const activeToolCallsById = new Map();
         let currentMarkdownBuffer = '';
         let currentAssistantToolsEl = null;
 
@@ -1028,6 +1061,13 @@
             statusIndicator.className = loading ? 'loading' : '';
         }
 
+        function setSendButtonMode(mode) {
+            const stopping = mode === 'stop';
+            sendBtn.textContent = stopping ? 'Stop' : 'Send';
+            sendBtn.classList.toggle('stop', stopping);
+            sendBtn.disabled = false;
+        }
+
         function escapeHtml(text) {
             const div = document.createElement('div');
             div.textContent = text;
@@ -1086,7 +1126,42 @@
                     }
                 });
                 sessionList.appendChild(item);
+                for (const child of session.children || []) {
+                    const childItem = document.createElement('div');
+                    childItem.className = 'session-item session-child' + (child.id === state.currentSession?.id ? ' active' : '');
+                    const status = child.execution_status || child.result_status || 'pending';
+                    const label = child.title || child.agent_type || child.id.substring(0, 8);
+                    childItem.innerHTML = `
+                        <span class="session-status-dot ${escapeHtml(status)}"></span>
+                        <span class="session-name" title="${escapeHtml(label)}">${escapeHtml(child.agent_type || 'subagent')} · ${escapeHtml(label.substring(0, 28))}</span>
+                    `;
+                    childItem.addEventListener('click', () => switchSession(child));
+                    sessionList.appendChild(childItem);
+                }
             });
+        }
+
+        async function refreshSessionTree() {
+            try {
+                const resp = await fetch(`/api/sessions/tree?token=${encodeURIComponent(token)}`);
+                if (!resp.ok) return;
+                const data = await resp.json();
+                const tree = data.sessions || [];
+                const byId = new Map(state.sessions.map(session => [session.id, session]));
+                const nextSessions = [];
+                for (const node of tree) {
+                    const session = { ...(byId.get(node.session.id) || {}), ...node.session, children: node.children || [] };
+                    nextSessions.push(session);
+                }
+                for (const session of state.sessions) {
+                    if (!nextSessions.some(item => item.id === session.id)) nextSessions.push(session);
+                }
+                state.sessions = nextSessions;
+                renderSessions();
+                saveState();
+            } catch (e) {
+                console.warn('Failed to refresh session tree', e);
+            }
         }
 
         async function switchSession(session, forceReload = false) {
@@ -1117,6 +1192,7 @@
 
             renderSessions();
             setStatus('Ready');
+            await refreshSessionTree();
         }
 
         function renderMessageHistory(messages) {
@@ -1488,24 +1564,41 @@
         }
 
         // Tool Call Display (inline in chat)
-        function rememberActiveToolCall(toolName, details) {
+        function rememberActiveToolCall(toolCallId, toolName, details) {
             activeToolCallEls.push(details);
+            if (toolCallId) {
+                activeToolCallsById.set(toolCallId, details);
+            }
             const key = toolName || 'tool';
             const queue = activeToolCallsByName.get(key) || [];
             queue.push(details);
             activeToolCallsByName.set(key, queue);
         }
 
-        function takeActiveToolCall(toolName) {
+        function takeActiveToolCall(toolCallId, toolName) {
+            if (toolCallId && activeToolCallsById.has(toolCallId)) {
+                const details = activeToolCallsById.get(toolCallId);
+                activeToolCallsById.delete(toolCallId);
+                activeToolCallEls = activeToolCallEls.filter(el => el !== details);
+                const key = details.dataset.toolName || toolName || 'tool';
+                const queue = activeToolCallsByName.get(key) || [];
+                const idx = queue.indexOf(details);
+                if (idx !== -1) queue.splice(idx, 1);
+                if (queue.length === 0) activeToolCallsByName.delete(key);
+                return details;
+            }
             const key = toolName || 'tool';
             const queue = activeToolCallsByName.get(key);
             if (queue && queue.length > 0) {
                 const details = queue.shift();
                 if (queue.length === 0) activeToolCallsByName.delete(key);
                 activeToolCallEls = activeToolCallEls.filter(el => el !== details);
+                if (details.dataset.toolCallId) activeToolCallsById.delete(details.dataset.toolCallId);
                 return details;
             }
-            return activeToolCallEls.shift() || null;
+            const details = activeToolCallEls.shift() || null;
+            if (details?.dataset.toolCallId) activeToolCallsById.delete(details.dataset.toolCallId);
+            return details;
         }
 
         function resetStreamingTurn() {
@@ -1515,12 +1608,31 @@
             currentMarkdownBuffer = '';
             activeToolCallEls = [];
             activeToolCallsByName.clear();
+            activeToolCallsById.clear();
         }
 
-        function createToolCall(toolName, input) {
+        function markActiveToolCallsCanceled() {
+            for (const details of activeToolCallEls) {
+                const status = details.querySelector('.tool-status');
+                const icon = details.querySelector('.tool-icon');
+                if (status) {
+                    status.className = 'tool-status cancelled';
+                    status.textContent = 'stopped';
+                }
+                if (icon) icon.textContent = '▶';
+                details.open = false;
+            }
+            activeToolCallEls = [];
+            activeToolCallsByName.clear();
+            activeToolCallsById.clear();
+        }
+
+        function createToolCall(toolCallId, toolName, input, metadata = null) {
             ensureAssistantTurn();
             const details = document.createElement('details');
             details.className = 'tool-call';
+            if (toolCallId) details.dataset.toolCallId = toolCallId;
+            details.dataset.toolName = toolName || 'tool';
             details.innerHTML = `
                 <summary>
                     <span class="tool-icon">▼</span>
@@ -1539,10 +1651,70 @@
                 </div>
             `;
             currentAssistantToolsEl.appendChild(details);
+            if (metadata && typeof metadata === 'object') {
+                attachToolStartMetadata(details, metadata);
+            }
             details.open = true;
-            rememberActiveToolCall(toolName, details);
+            rememberActiveToolCall(toolCallId, toolName, details);
             chatContainer.scrollTop = chatContainer.scrollHeight;
             return details;
+        }
+
+        function attachToolStartMetadata(details, metadata) {
+            const childSessionId = metadata.child_session_id || metadata.session_id || metadata.task_id;
+            const rootRunId = metadata.root_run_id || metadata.current_run_id;
+            if (childSessionId) {
+                upsertChildSessionFromMetadata(metadata, childSessionId);
+                const action = document.createElement('div');
+                action.className = 'trace-actions';
+                action.innerHTML = '<button type="button" class="trace-toggle-btn">Open session</button>';
+                action.querySelector('button').addEventListener('click', async (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    await openSyntheticSession(childSessionId, metadata.specialist_id || metadata.description || 'subagent');
+                });
+                details.querySelector('.tool-body').prepend(action);
+                refreshSessionTree();
+            }
+            if (rootRunId) {
+                const messageDiv = details.closest('.message');
+                if (messageDiv) {
+                    const runIds = getTraceRunIds(messageDiv);
+                    if (!runIds.includes(rootRunId)) {
+                        runIds.push(rootRunId);
+                        messageDiv.dataset.traceRunIds = JSON.stringify(runIds);
+                    }
+                    ensureTraceAction(messageDiv);
+                }
+            }
+        }
+
+        function upsertChildSessionFromMetadata(metadata, childSessionId) {
+            const parentId = metadata.parent_session_id || state.currentSession?.id;
+            const child = {
+                id: childSessionId,
+                agent_type: metadata.specialist_id || 'subagent',
+                title: metadata.description || metadata.prompt || childSessionId.substring(0, 8),
+                execution_status: metadata.mode === 'async' ? 'running' : 'running',
+                result_status: 'pending',
+                created_at: Math.floor(Date.now() / 1000)
+            };
+            let parent = state.sessions.find(session => session.id === parentId);
+            if (!parent && state.currentSession?.id === parentId) {
+                parent = state.currentSession;
+                state.sessions.unshift(parent);
+            }
+            if (!parent) return;
+            const children = parent.children || [];
+            const existingIndex = children.findIndex(item => item.id === childSessionId);
+            if (existingIndex === -1) {
+                children.push(child);
+            } else {
+                children[existingIndex] = { ...children[existingIndex], ...child };
+            }
+            parent.children = children;
+            renderSessions();
+            saveState();
         }
 
         function finishToolCall(details, output) {
@@ -1554,6 +1726,7 @@
             details.querySelector('.tool-output').textContent = output;
             details.open = false;
             addTraceRunFromToolOutput(details.closest('.message'), output);
+            refreshSessionTree();
             chatContainer.scrollTop = chatContainer.scrollHeight;
         }
 
@@ -1625,11 +1798,11 @@
                     appendToDiv(currentAssistantDiv, 'assistant', event.data.delta);
                     break;
                 case 'tool_start':
-                    createToolCall(event.data.tool, event.data.input);
+                    createToolCall(event.data.tool_call_id, event.data.tool, event.data.input, event.data.metadata);
                     break;
                 case 'tool_finish':
                     {
-                        const toolCallEl = takeActiveToolCall(event.data.tool);
+                        const toolCallEl = takeActiveToolCall(event.data.tool_call_id, event.data.tool);
                         if (toolCallEl) {
                             finishToolCall(toolCallEl, event.data.output);
                         }
@@ -1649,13 +1822,18 @@
 
         // Send Message
         async function sendMessage() {
-            if (isLoading || !state.currentSession) return;
+            if (isLoading) {
+                activeChatAbortController?.abort();
+                return;
+            }
+            if (!state.currentSession) return;
 
             const message = messageInput.value.trim();
             if (!message) return;
 
             isLoading = true;
-            sendBtn.disabled = true;
+            activeChatAbortController = new AbortController();
+            setSendButtonMode('stop');
             messageInput.value = '';
             setStatus('Thinking...', true);
 
@@ -1667,6 +1845,7 @@
                 const resp = await fetch(`/api/chat?token=${encodeURIComponent(token)}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
+                    signal: activeChatAbortController.signal,
                     body: JSON.stringify({ session_id: state.currentSession.id, message })
                 });
 
@@ -1694,12 +1873,20 @@
                     }
                 }
             } catch (e) {
+                if (e.name === 'AbortError') {
+                    markActiveToolCallsCanceled();
+                    setStatus('Stopped');
+                    return;
+                }
                 console.error('Fetch error:', e);
                 showError('Connection error: ' + e.message);
             } finally {
                 isLoading = false;
-                sendBtn.disabled = false;
-                setStatus('Ready');
+                activeChatAbortController = null;
+                setSendButtonMode('send');
+                if (statusText.textContent !== 'Stopped') {
+                    setStatus('Ready');
+                }
             }
         }
 
@@ -1771,6 +1958,7 @@
                     state.currentSession = restored || state.sessions[0];
                 }
                 renderSessions();
+                refreshSessionTree();
                 if (state.currentSession) {
                     switchSession(state.currentSession, true);
                 } else {
