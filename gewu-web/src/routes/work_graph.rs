@@ -67,11 +67,12 @@ async fn resolve_session(app: &AppState, id: &str) -> (String, Option<SessionInf
         .resolve_session_id(id)
         .await
         .unwrap_or_else(|_| id.to_string());
-    let sessions = app.sessions.read().await;
-    if let Some(session) = sessions.get(&resolved_id).cloned() {
-        return (session.id.clone(), Some(session));
-    }
-    (resolved_id, None)
+    let session = app.get_session(&resolved_id).await;
+    let id_out = session
+        .as_ref()
+        .map(|s| s.id.clone())
+        .unwrap_or(resolved_id);
+    (id_out, session)
 }
 
 fn append_active_turn(graph: &mut WorkGraph, turn: crate::state::ActiveTurnInfo) {

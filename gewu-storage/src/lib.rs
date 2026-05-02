@@ -51,8 +51,10 @@ use sqlx::{Row, sqlite::SqlitePool};
 use tracing::{error, info};
 
 pub mod execution_trace_store;
+pub mod session_store;
 pub mod task_store;
 pub use execution_trace_store::{ExecutionTraceStore, StartExecutionRun};
+pub use session_store::SessionStore;
 pub use task_store::TaskStore;
 
 /// SQLite-backed implementation of [`Memory`] for persistent storage.

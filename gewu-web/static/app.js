@@ -1457,8 +1457,17 @@ async function sendMessage() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             signal: activeChatAbortController.signal,
-            body: JSON.stringify({ session_id: state.currentSession.id, message })
+            body: JSON.stringify({
+                session_id: state.currentSession.id,
+                agent_type: state.currentSession.agent_type || agentSelector.value || 'general',
+                message
+            })
         });
+
+        if (!resp.ok) {
+            const errorText = await resp.text();
+            throw new Error(errorText || `Chat request failed (${resp.status})`);
+        }
 
         const reader = resp.body.getReader();
         const decoder = new TextDecoder();

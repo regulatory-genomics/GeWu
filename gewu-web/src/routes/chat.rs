@@ -13,6 +13,8 @@ use tracing::{debug, error, info, warn};
 pub struct ChatRequest {
     pub message: String,
     pub session_id: String,
+    #[serde(default)]
+    pub agent_type: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -102,14 +104,19 @@ pub async fn handle_chat(
         return Err(AppError::Unauthorized);
     }
 
-    let agent_handle = app.get_agent(&req.session_id).await;
-    let agent_handle = agent_handle.ok_or(AppError::SessionNotFound)?;
+    let fallback_type = req.agent_type.as_deref().unwrap_or("general");
+    let (session_id, agent_handle) = app
+        .ensure_agent(&req.session_id, fallback_type)
+        .await
+        .map_err(|e| {
+            warn!("ensure_agent failed for {}: {}", req.session_id, e);
+            AppError::SessionNotFound
+        })?;
 
-    info!("Agent found for session: {}, starting chat", req.session_id);
+    info!("Agent found for session: {}, starting chat", session_id);
 
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let message = req.message.clone();
-    let session_id = req.session_id.clone();
     app.start_active_turn(&session_id).await;
 
     tokio::spawn(async move {
