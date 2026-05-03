@@ -84,7 +84,7 @@ impl WorkflowCompiler {
 
         for edge in &m.edges {
             if let EdgeSpec::Plain([from, to]) = edge {
-                graph.add_edge(from, to);
+                graph.add_edge(from, to)?;
             }
         }
 
@@ -152,6 +152,7 @@ impl WorkflowCompiler {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_specialist_node(
         &self,
         id: &str,
@@ -371,7 +372,7 @@ impl WorkflowCompiler {
                     Ok(run) => run,
                     Err(e) => return error_partial(&write_path, e.to_string()),
                 };
-                let tool = match runtime.resolve_capabilities(&[cap.clone()]) {
+                let tool = match runtime.resolve_capabilities(std::slice::from_ref(&cap)) {
                     Ok(mut ts) => match ts.pop() {
                         Some(t) => t,
                         None => {

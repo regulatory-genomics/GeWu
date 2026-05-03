@@ -64,25 +64,25 @@ impl CanvasManager {
         let mut guard = self.inner.write().await;
         let session = guard.sessions.entry(session_id.to_string()).or_default();
 
-        if let Some(id) = canvas_id.as_deref() {
-            if session.contains_key(id) {
-                // Defocus everything else first so we never end up with
-                // two focused canvases after a re-open.
-                for (other_id, state) in session.iter_mut() {
-                    state.focused = other_id == id;
-                }
-                let existing = session
-                    .get_mut(id)
-                    .expect("contains_key returned true above");
-                existing.visible = true;
-                if let Some(t) = title {
-                    existing.title = if t.is_empty() { None } else { Some(t) };
-                }
-                if let Some(p) = initial_payload {
-                    existing.payload = p;
-                }
-                return existing.clone();
+        if let Some(id) = canvas_id.as_deref()
+            && session.contains_key(id)
+        {
+            // Defocus everything else first so we never end up with
+            // two focused canvases after a re-open.
+            for (other_id, state) in session.iter_mut() {
+                state.focused = other_id == id;
             }
+            let existing = session
+                .get_mut(id)
+                .expect("contains_key returned true above");
+            existing.visible = true;
+            if let Some(t) = title {
+                existing.title = if t.is_empty() { None } else { Some(t) };
+            }
+            if let Some(p) = initial_payload {
+                existing.payload = p;
+            }
+            return existing.clone();
         }
 
         // New canvas: defocus existing canvases (single-focus model).
@@ -90,7 +90,7 @@ impl CanvasManager {
             state.focused = false;
         }
 
-        let id = canvas_id.unwrap_or_else(|| short_canvas_id());
+        let id = canvas_id.unwrap_or_else(short_canvas_id);
         let mut state = CanvasState::new(id.clone(), kind);
         state.mode = mode;
         if let Some(t) = title {
@@ -103,7 +103,11 @@ impl CanvasManager {
         state
     }
 
-    pub async fn close(&self, session_id: &str, canvas_id: &str) -> Result<CanvasState, CanvasError> {
+    pub async fn close(
+        &self,
+        session_id: &str,
+        canvas_id: &str,
+    ) -> Result<CanvasState, CanvasError> {
         let mut guard = self.inner.write().await;
         let session = guard
             .sessions
@@ -123,7 +127,11 @@ impl CanvasManager {
         Ok(state.clone())
     }
 
-    pub async fn focus(&self, session_id: &str, canvas_id: &str) -> Result<CanvasState, CanvasError> {
+    pub async fn focus(
+        &self,
+        session_id: &str,
+        canvas_id: &str,
+    ) -> Result<CanvasState, CanvasError> {
         let mut guard = self.inner.write().await;
         let session = guard
             .sessions
@@ -158,10 +166,12 @@ impl CanvasManager {
                 session_id: session_id.into(),
                 canvas_id: canvas_id.into(),
             })?;
-        let state = session.get_mut(canvas_id).ok_or_else(|| CanvasError::NotFound {
-            session_id: session_id.into(),
-            canvas_id: canvas_id.into(),
-        })?;
+        let state = session
+            .get_mut(canvas_id)
+            .ok_or_else(|| CanvasError::NotFound {
+                session_id: session_id.into(),
+                canvas_id: canvas_id.into(),
+            })?;
         state.apply_patch(patch);
         Ok(state.clone())
     }
@@ -204,7 +214,14 @@ mod tests {
     async fn open_then_get_returns_same_canvas() {
         let m = CanvasManager::new();
         let opened = m
-            .open("s1", None, CanvasKind::Genome, CanvasMode::Overlay, None, None)
+            .open(
+                "s1",
+                None,
+                CanvasKind::Genome,
+                CanvasMode::Overlay,
+                None,
+                None,
+            )
             .await;
         let fetched = m.get_state("s1", &opened.canvas_id).await.unwrap();
         assert_eq!(fetched.canvas_id, opened.canvas_id);
@@ -293,7 +310,14 @@ mod tests {
     async fn close_hides_canvas_without_removing_it() {
         let m = CanvasManager::new();
         let opened = m
-            .open("s1", None, CanvasKind::Genome, CanvasMode::Overlay, None, None)
+            .open(
+                "s1",
+                None,
+                CanvasKind::Genome,
+                CanvasMode::Overlay,
+                None,
+                None,
+            )
             .await;
         let closed = m.close("s1", &opened.canvas_id).await.unwrap();
         assert!(!closed.visible);
@@ -338,8 +362,15 @@ mod tests {
     #[tokio::test]
     async fn drop_session_removes_all_canvases() {
         let m = CanvasManager::new();
-        m.open("s1", None, CanvasKind::Genome, CanvasMode::Overlay, None, None)
-            .await;
+        m.open(
+            "s1",
+            None,
+            CanvasKind::Genome,
+            CanvasMode::Overlay,
+            None,
+            None,
+        )
+        .await;
         m.drop_session("s1").await;
         assert!(m.list("s1").await.is_empty());
     }

@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use tokio::fs;
 
 pub fn into_tool_error(e: impl Into<anyhow::Error>) -> Box<dyn std::error::Error + Send + Sync> {
-    Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.into()))
+    Box::new(std::io::Error::other(e.into()))
 }
 
 pub fn parse_empty_args(tool_name: &str, required_params: &[(&str, &str)]) -> String {
@@ -114,9 +114,9 @@ pub fn resolve_safe_path(root: impl AsRef<Path>, user_path: impl AsRef<Path>) ->
     // If user_path is absolute, it must start with root.
     // If it is relative, we join it to root.
     let joined = if user_path.is_absolute() {
-        let user_path_ref: &Path = user_path.as_ref();
+        let user_path_ref: &Path = user_path;
         if user_path_ref == Path::new("/") {
-            return Ok(root.join(".").into());
+            return Ok(root.join("."));
         }
         user_path.to_path_buf()
     } else {
@@ -212,13 +212,13 @@ pub async fn is_binary_file(path: impl AsRef<Path>, file_size: u64) -> Result<bo
         .map(|e| e.to_lowercase());
 
     // Binary extensions list (same as legacy)
-    match ext.as_deref() {
-        Some(
-            ".zip" | ".tar" | ".gz" | ".exe" | ".dll" | ".so" | ".class" | ".jar" | ".war" | ".7z"
-            | ".doc" | ".docx" | ".xls" | ".xlsx" | ".ppt" | ".pptx" | ".odt" | ".ods" | ".odp"
-            | ".bin" | ".dat" | ".obj" | ".o" | ".a" | ".lib" | ".wasm" | ".pyc" | ".pyo",
-        ) => return Ok(true),
-        _ => {}
+    if let Some(
+        ".zip" | ".tar" | ".gz" | ".exe" | ".dll" | ".so" | ".class" | ".jar" | ".war" | ".7z"
+        | ".doc" | ".docx" | ".xls" | ".xlsx" | ".ppt" | ".pptx" | ".odt" | ".ods" | ".odp"
+        | ".bin" | ".dat" | ".obj" | ".o" | ".a" | ".lib" | ".wasm" | ".pyc" | ".pyo",
+    ) = ext.as_deref()
+    {
+        return Ok(true);
     }
 
     if file_size == 0 {

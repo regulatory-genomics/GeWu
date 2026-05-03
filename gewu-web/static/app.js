@@ -40,7 +40,6 @@ const projectNameInput = document.getElementById('project-name-input');
 const projectPathInput = document.getElementById('project-path-input');
 const projectDirectoryList = document.getElementById('project-directory-list');
 
-let token = '';
 let isLoading = false;
 let activeChatAbortController = null;
 let activeToolCallEls = [];
@@ -62,10 +61,8 @@ marked.setOptions({
     gfm: true
 });
 
-// URL params
-const urlParams = new URLSearchParams(window.location.search);
-token = urlParams.get('token') || '';
-window.token = token;
+// Cookie-based auth: no URL token, no `window.token`. Cookies are sent
+// automatically by fetch and EventSource for same-origin requests.
 
 // Load persisted state
 function loadState() {
@@ -187,7 +184,7 @@ toggleSidebarBtn.addEventListener('click', () => {
 // API Functions
 async function loadServerInfo() {
     try {
-        const resp = await fetch(`/api/info?token=${encodeURIComponent(token)}`);
+        const resp = await fetch('/api/info');
         const data = await resp.json();
         modelNameEl.textContent = data.model || 'unknown';
         endpointNameEl.textContent = data.endpoint || 'unknown';
@@ -199,7 +196,7 @@ async function loadServerInfo() {
 
 async function loadAgents() {
     try {
-        const resp = await fetch(`/api/agents?token=${encodeURIComponent(token)}`);
+        const resp = await fetch('/api/agents');
         if (!resp.ok) throw new Error('Failed to load agents');
         const data = await resp.json();
         const agents = (data.agents || []).map(agent => agent.name);
@@ -238,9 +235,12 @@ function setSendButtonMode(mode) {
 }
 
 function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 function renderMarkdown(text) {
@@ -267,7 +267,7 @@ async function loadWorkGraph(sessionId = state.currentSession?.id) {
         return;
     }
     try {
-        const resp = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/work-graph?token=${encodeURIComponent(token)}`);
+        const resp = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/work-graph`);
         if (!resp.ok) throw new Error('Failed to load work graph');
         const data = await resp.json();
         state.workGraph = data.graph || null;
@@ -497,7 +497,7 @@ async function openWorkTraceNode(runId, card) {
     const graph = panel.querySelector('.trace-graph');
     graph.innerHTML = '';
     try {
-        const resp = await fetch(`/api/runs/${encodeURIComponent(runId)}?token=${encodeURIComponent(token)}`);
+        const resp = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
         if (resp.ok) {
             const data = await resp.json();
             if (data.run) graph.appendChild(await renderRunNode(data.run));
@@ -713,7 +713,7 @@ function renderSessions() {
 
 async function refreshSessionTree() {
     try {
-        const resp = await fetch(`/api/projects/tree?token=${encodeURIComponent(token)}`);
+        const resp = await fetch('/api/projects/tree');
         if (!resp.ok) return;
         const data = await resp.json();
         const projects = data.projects || [];
@@ -755,7 +755,7 @@ async function switchSession(session, forceReload = false) {
 
     // Load messages for this session
     try {
-        const resp = await fetch(`/api/sessions/${session.id}/messages?token=${encodeURIComponent(token)}`);
+        const resp = await fetch(`/api/sessions/${session.id}/messages`);
         if (resp.ok) {
             const data = await resp.json();
             messages = data.messages || [];
@@ -785,7 +785,7 @@ async function reloadCurrentSessionMessages() {
     if (!state.currentSession) return;
     const shouldFollow = isChatNearBottom();
     try {
-        const resp = await fetch(`/api/sessions/${state.currentSession.id}/messages?token=${encodeURIComponent(token)}`);
+        const resp = await fetch(`/api/sessions/${state.currentSession.id}/messages`);
         if (!resp.ok) return;
         const data = await resp.json();
         const messages = data.messages || [];
@@ -861,9 +861,9 @@ function stopSessionEvents() {
 
 function startSessionEvents() {
     stopSessionEvents();
-    if (!state.currentSession || !token) return;
+    if (!state.currentSession) return;
     const sessionId = state.currentSession.id;
-    sessionEventSource = new EventSource(`/api/events?token=${encodeURIComponent(token)}&session_id=${encodeURIComponent(sessionId)}`);
+    sessionEventSource = new EventSource(`/api/events?session_id=${encodeURIComponent(sessionId)}`);
     sessionEventSource.addEventListener('background_group.completed', async (event) => {
         if (!state.currentSession || state.currentSession.id !== sessionId) return;
         let payload = {};
@@ -1172,7 +1172,7 @@ async function toggleMessageTrace(messageDiv) {
     const runIds = getTraceRunIds(messageDiv);
     for (const runId of runIds) {
         try {
-            const resp = await fetch(`/api/runs/${encodeURIComponent(runId)}?token=${encodeURIComponent(token)}`);
+            const resp = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
             if (resp.ok) {
                 const data = await resp.json();
                 if (data.run) graph.appendChild(await renderRunNode(data.run));
@@ -1260,7 +1260,7 @@ async function renderRunNode(run) {
         });
     }
     try {
-        const childResp = await fetch(`/api/runs/${encodeURIComponent(run.id)}/children?token=${encodeURIComponent(token)}`);
+        const childResp = await fetch(`/api/runs/${encodeURIComponent(run.id)}/children`);
         if (childResp.ok) {
             const data = await childResp.json();
             for (const child of data.children || []) {
@@ -1283,7 +1283,7 @@ async function openRunDetails(run, node) {
     node.open = true;
     let events = [];
     try {
-        const resp = await fetch(`/api/runs/${encodeURIComponent(run.id)}/events?token=${encodeURIComponent(token)}`);
+        const resp = await fetch(`/api/runs/${encodeURIComponent(run.id)}/events`);
         if (resp.ok) {
             const data = await resp.json();
             events = data.events || [];
@@ -1344,7 +1344,7 @@ async function openSyntheticSession(sessionId, agentType) {
 async function deleteSession(sessionId) {
     if (!confirm('Delete this session?')) return;
     try {
-        const resp = await fetch(`/api/sessions/${sessionId}?token=${encodeURIComponent(token)}`, {
+        const resp = await fetch(`/api/sessions/${sessionId}`, {
             method: 'DELETE'
         });
         if (!resp.ok) throw new Error('Failed to delete');
@@ -1368,7 +1368,7 @@ async function deleteSession(sessionId) {
 async function createSession(agentType = 'general') {
     try {
         setStatus('Creating...', true);
-        const resp = await fetch(`/api/sessions?token=${encodeURIComponent(token)}`, {
+        const resp = await fetch('/api/sessions', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ agent_type: agentType, project_id: state.currentProjectId })
@@ -1403,7 +1403,7 @@ async function createProject() {
     const name = projectNameInput?.value?.trim() || defaultName;
     try {
         setStatus('Creating project...', true);
-        const resp = await fetch(`/api/projects?token=${encodeURIComponent(token)}`, {
+        const resp = await fetch('/api/projects', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name, workdir })
@@ -1449,10 +1449,10 @@ function closeProjectPicker() {
 
 async function browseProjectDirectories(path = '') {
     if (!projectDirectoryList) return;
-    const query = path ? `&path=${encodeURIComponent(path)}` : '';
+    const query = path ? `?path=${encodeURIComponent(path)}` : '';
     projectDirectoryList.innerHTML = '<div class="directory-loading">Loading directories…</div>';
     try {
-        const resp = await fetch(`/api/projects/directories?token=${encodeURIComponent(token)}${query}`);
+        const resp = await fetch(`/api/projects/directories${query}`);
         const data = await readJsonResponse(resp);
         if (!resp.ok) throw new Error(data?.error || 'Failed to browse directories');
         renderDirectoryChoices(data.directories || []);
@@ -1508,7 +1508,7 @@ async function switchAgent() {
     }
     try {
         setStatus('Switching agent...', true);
-        const resp = await fetch(`/api/sessions/${state.currentSession.id}/switch-agent?token=${encodeURIComponent(token)}`, {
+        const resp = await fetch(`/api/sessions/${state.currentSession.id}/switch-agent`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ agent_type: newAgentType })
@@ -1820,7 +1820,7 @@ async function sendMessageText(message, options = {}) {
     if (!options.internal) addMessage('user', message, { forceScroll: true });
     resetStreamingTurn();
     try {
-        const resp = await fetch(`/api/chat?token=${encodeURIComponent(token)}`, {
+        const resp = await fetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             signal: activeChatAbortController.signal,
@@ -1917,37 +1917,20 @@ agentSelector.addEventListener('change', switchAgent);
 // Window resize handler
 window.addEventListener('resize', updateHandles);
 
-function showTokenError(message) {
-    chatContainer.innerHTML = `
-        <div style="display: flex; align-items: center; justify-content: center; height: 100%; flex-direction: column; text-align: center; padding: 20px;">
-            <div style="color: var(--accent-red); margin-bottom: 16px;">
-                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <circle cx="12" cy="12" r="10"></circle>
-                    <line x1="12" y1="8" x2="12" y2="12"></line>
-                    <line x1="12" y1="16" x2="12.01" y2="16"></line>
-                </svg>
-            </div>
-            <h2 style="color: var(--accent-red); margin: 0 0 8px 0;">Access Denied</h2>
-            <p style="color: var(--text-secondary); margin: 0 0 16px 0;">${escapeHtml(message)}</p>
-            <p style="font-size: 12px; color: var(--text-muted); margin: 0;">Please provide a valid token to access this page</p>
-        </div>
-    `;
-}
 
-async function validateToken() {
-    if (!token) {
-        showTokenError("No token provided in URL");
-        return false;
-    }
+async function validateSession() {
     try {
-        const resp = await fetch(`/api/validate?token=${encodeURIComponent(token)}`);
+        const modeResp = await fetch('/api/auth/mode');
+        const modeData = await modeResp.json();
+        if (!modeData.password_required) return true;
+        const resp = await fetch('/api/validate');
         if (!resp.ok) {
-            showTokenError("Invalid token");
+            window.location.href = '/login';
             return false;
         }
         return true;
     } catch (e) {
-        showTokenError("Token validation failed");
+        window.location.href = '/login';
         return false;
     }
 }
@@ -1956,7 +1939,7 @@ async function validateToken() {
 loadState();
 applyState();
 
-validateToken().then(valid => {
+validateSession().then(valid => {
     if (!valid) return;
     loadServerInfo();
     loadAgents().then(() => {

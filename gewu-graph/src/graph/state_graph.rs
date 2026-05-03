@@ -295,17 +295,17 @@ impl<S: State + 'static> StateGraph<S> {
     /// executing `end`. Edges are evaluated after the source node
     /// returns, and all outgoing edges are followed.
     ///
-    /// # Panics
-    /// Panics if `start` is `START` or `end` is `END`.
-    pub fn add_edge(&mut self, start: &str, end: &str) -> &mut Self {
+    /// # Errors
+    /// Returns `GraphError::ExecutionError` if `start` is `END` or `end` is `START`.
+    pub fn add_edge(&mut self, start: &str, end: &str) -> Result<&mut Self, GraphError> {
         if start == END {
-            panic!("START cannot be END node");
+            return Err(GraphError::ExecutionError("END cannot be used as edge start".into()));
         }
         if end == START {
-            panic!("END cannot be START node");
+            return Err(GraphError::ExecutionError("START cannot be used as edge end".into()));
         }
         self.edges.insert((start.to_string(), end.to_string()));
-        self
+        Ok(self)
     }
 
     /// Adds a conditional edge that routes execution based on the current state.
@@ -722,8 +722,8 @@ impl<S: State + 'static> CompiledGraph<S> {
     /// can be computed concurrently, with state merges happening between
     /// supersteps.
     ///
-    /// # Panics
-    /// Panics if the graph contains subgraph nodes (subgraphs are not supported).
+    /// # Errors
+    /// Returns `GraphError::ExecutionError` if the graph contains subgraph nodes.
     pub async fn invoke_parallel(&self, input: S) -> Result<S, GraphError> {
         let entry = self.entry_point.clone().ok_or(GraphError::NoEntryPoint)?;
 

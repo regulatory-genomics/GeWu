@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
-use gewu_canvas::{canvas_tools, genome_tools, CanvasManager, GenomeToolsConfig};
+use gewu_canvas::{canvas_tools, CanvasManager};
+use tachyon_browser_client::{tachyon_tools, TachyonClientConfig};
 use gewu_core::traits::Tool;
 use gewu_providers::OpenAIProvider;
 use gewu_runtime::{BackgroundTaskCoordinator, PluginHost, PluginRegistry, RuntimeFactory};
@@ -7,12 +8,12 @@ use gewu_storage::session_store::{SessionRecord, SessionStore};
 use gewu_storage::{ProjectRecord, ProjectStore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+use tokio::task::AbortHandle;
 use tracing::info;
 use uuid::Uuid;
 
@@ -81,6 +82,10 @@ pub struct ServerConfig {
         alias = "maxOutputTokens"
     )]
     pub max_output_tokens: Option<u32>,
+    #[serde(default, alias = "contextLimit")]
+    pub context_limit: Option<usize>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
     pub db_path: Option<String>,
     #[serde(default)]
     pub plugins: HashMap<String, Value>,
@@ -99,13 +104,17 @@ pub struct ServerConfig {
     pub tachyon_browser: TachyonBrowserConfig,
 }
 
+pub const DEFAULT_MODEL: &str = "gpt-5.3-codex";
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             api_key: None,
             endpoint: None,
-            model: Some("gpt-5.3-codex".to_string()),
+            model: Some(DEFAULT_MODEL.to_string()),
             max_output_tokens: None,
+            context_limit: None,
+            temperature: None,
             db_path: None,
             plugins: HashMap::new(),
             runtime_plugin_dirs: Vec::new(),
@@ -145,11 +154,13 @@ pub type PluginRegistrar = Arc<dyn Fn(&mut PluginRegistry) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub auth_token: Arc<RwLock<crate::auth::AuthState>>,
+    pub auth_mode: Arc<RwLock<crate::auth::AuthMode>>,
+    pub cookie_store: crate::auth::CookieStore,
     pub agents: Arc<RwLock<HashMap<String, Arc<AgentHandle>>>>,
     pub active_turns: Arc<RwLock<HashMap<String, ActiveTurnInfo>>>,
+    pub active_aborts: Arc<RwLock<HashMap<String, Vec<AbortHandle>>>>,
     pub config: Arc<RwLock<ServerConfig>>,
-    pub db_pool: Arc<Mutex<Option<SqlitePool>>>,
+    pub db_pool: SqlitePool,
     pub project_store: Arc<ProjectStore>,
     pub session_store: Arc<SessionStore>,
     pub mcp_tools: Arc<Vec<Arc<dyn Tool>>>,
@@ -197,8 +208,9 @@ impl AppState {
         let model = config
             .model
             .clone()
-            .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let max_output_tokens = config.max_output_tokens;
+        let temperature = config.temperature;
         let plugins = config.plugins.clone();
         let runtime_plugin_dirs: Vec<PathBuf> = config
             .runtime_plugin_dirs
@@ -212,12 +224,12 @@ impl AppState {
             .collect();
         drop(config);
 
-        let pool_guard = self.db_pool.lock().await;
-        let pool = pool_guard.as_ref().context("Database not initialized")?;
+        let pool = &self.db_pool;
 
         let provider = Arc::new(
             OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model)
-                .with_max_output_tokens(max_output_tokens),
+                .with_max_output_tokens(max_output_tokens)
+                .with_temperature(temperature),
         );
 
         let plugin_host = self.build_plugin_host(provider.clone(), pool.clone(), plugins)?;
@@ -239,21 +251,20 @@ impl AppState {
 
     pub async fn new(
         config: ServerConfig,
-        auth_token: crate::auth::AuthState,
+        auth_mode: crate::auth::AuthMode,
         mcp_tools: Vec<Arc<dyn Tool>>,
         plugin_registrar: PluginRegistrar,
     ) -> Result<Self> {
         let db_pool = if let Some(ref path) = config.db_path {
-            Some(create_db_pool(path).await?)
+            create_db_pool(path).await?
         } else {
-            let db_path = get_default_db_path()?;
-            Some(create_db_pool(&db_path).await?)
+            let db_path = ensure_default_db_path()?;
+            create_db_pool(&db_path).await?
         };
 
         let (project_store, session_store) = {
-            let pool = db_pool.as_ref().context("Database not initialized")?;
-            let project_store = Arc::new(ProjectStore::new(pool.clone()).await?);
-            let store = SessionStore::new(pool.clone()).await?;
+            let project_store = Arc::new(ProjectStore::new(db_pool.clone()).await?);
+            let store = SessionStore::new(db_pool.clone()).await?;
             let session_store = Arc::new(store);
             let default_project = ensure_default_project(&project_store).await?;
             session_store.backfill_from_history().await?;
@@ -272,7 +283,7 @@ impl AppState {
             .or_else(|| std::env::var("TACHYON_BROWSER_URL").ok())
             .unwrap_or_default();
         if !tachyon_url.trim().is_empty() {
-            let genome = genome_tools(GenomeToolsConfig {
+            let genome = tachyon_tools(TachyonClientConfig {
                 base_url: tachyon_url,
                 timeout: std::time::Duration::from_secs(60),
             });
@@ -281,8 +292,8 @@ impl AppState {
         }
         let canvas_tools = Arc::new(canvas_tools_vec);
 
-        if let Some(pool) = db_pool.as_ref() {
-            let coordinator = BackgroundTaskCoordinator::new(pool.clone());
+        {
+            let coordinator = BackgroundTaskCoordinator::new(db_pool.clone());
             match coordinator.reconcile_uninjected_groups().await {
                 Ok(count) if count > 0 => {
                     info!("reconciled {count} async task completion group(s)");
@@ -292,14 +303,46 @@ impl AppState {
                     tracing::warn!("failed to reconcile async task groups: {err}");
                 }
             }
+
+            let stale_rows = sqlx::query(
+                "SELECT session_id, content FROM active_turn_snapshots",
+            )
+            .fetch_all(&db_pool)
+            .await
+            .unwrap_or_default();
+            for row in &stale_rows {
+                let sid: String = row.get("session_id");
+                let content: String = row.get("content");
+                let summary = if content.len() > 200 {
+                    format!("{}…", &content[..200])
+                } else {
+                    content
+                };
+                let msg = format!("[session.interrupted_by_restart] Last partial response: {summary}");
+                let _ = sqlx::query(
+                    "INSERT INTO memory_messages (session_id, role, content, created_at) VALUES (?, 'system', ?, strftime('%s','now'))",
+                )
+                .bind(&sid)
+                .bind(&msg)
+                .execute(&db_pool)
+                .await;
+                info!("marked session {sid} as interrupted by restart");
+            }
+            if !stale_rows.is_empty() {
+                let _ = sqlx::query("DELETE FROM active_turn_snapshots")
+                    .execute(&db_pool)
+                    .await;
+            }
         }
 
         Ok(Self {
-            auth_token: Arc::new(RwLock::new(auth_token)),
+            auth_mode: Arc::new(RwLock::new(auth_mode)),
+            cookie_store: crate::auth::CookieStore::new(),
             agents: Arc::new(RwLock::new(HashMap::new())),
             active_turns: Arc::new(RwLock::new(HashMap::new())),
+            active_aborts: Arc::new(RwLock::new(HashMap::new())),
             config: Arc::new(RwLock::new(config)),
-            db_pool: Arc::new(Mutex::new(db_pool)),
+            db_pool: db_pool.clone(),
             project_store,
             session_store,
             mcp_tools: Arc::new(mcp_tools),
@@ -333,8 +376,9 @@ impl AppState {
         let model = config
             .model
             .clone()
-            .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let max_output_tokens = config.max_output_tokens;
+        let temperature = config.temperature;
         let plugins = config.plugins.clone();
         let runtime_plugin_dirs: Vec<PathBuf> = config
             .runtime_plugin_dirs
@@ -348,15 +392,15 @@ impl AppState {
             .collect();
         drop(config);
 
-        let pool_guard = self.db_pool.lock().await;
-        let pool = pool_guard.as_ref().context("Database not initialized")?;
+        let pool = &self.db_pool;
         let working_directory = project_workdir(project.as_ref())?;
         let working_directory_string = working_directory.to_string_lossy().to_string();
 
         info!("Creating provider and agent...");
         let provider = Arc::new(
             OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model)
-                .with_max_output_tokens(max_output_tokens),
+                .with_max_output_tokens(max_output_tokens)
+                .with_temperature(temperature),
         );
 
         let mut mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
@@ -464,9 +508,17 @@ impl AppState {
         Ok(infos)
     }
 
-    pub async fn browse_project_directories(&self, requested: Option<String>) -> Result<Vec<DirectoryEntry>> {
+    pub async fn browse_project_directories(
+        &self,
+        requested: Option<String>,
+    ) -> Result<Vec<DirectoryEntry>> {
         let roots = self.directory_picker_roots().await?;
-        if requested.as_deref().map(str::trim).unwrap_or_default().is_empty() {
+        if requested
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
             return Ok(roots
                 .into_iter()
                 .map(|path| directory_entry(path, true))
@@ -475,13 +527,19 @@ impl AppState {
 
         let raw = PathBuf::from(requested.unwrap());
         let canonical = raw.canonicalize().with_context(|| {
-            format!("Directory does not exist or cannot be read: {}", raw.display())
+            format!(
+                "Directory does not exist or cannot be read: {}",
+                raw.display()
+            )
         })?;
         if !canonical.is_dir() {
             bail!("Path is not a directory: {}", canonical.display());
         }
         if !roots.iter().any(|root| canonical.starts_with(root)) {
-            bail!("Directory is outside allowed project roots: {}", canonical.display());
+            bail!(
+                "Directory is outside allowed project roots: {}",
+                canonical.display()
+            );
         }
 
         let mut entries = Vec::new();
@@ -528,11 +586,13 @@ impl AppState {
 
     pub async fn infer_legacy_session_projects(&self) -> Result<usize> {
         let sessions = self.session_store.list_all().await?;
-        let pool_guard = self.db_pool.lock().await;
-        let pool = pool_guard.as_ref().context("Database not initialized")?;
+        let pool = &self.db_pool;
         let mut updated = 0usize;
 
-        for session in sessions.into_iter().filter(|session| session.project_id.is_none()) {
+        for session in sessions
+            .into_iter()
+            .filter(|session| session.project_id.is_none())
+        {
             let Some(workdir) = self.infer_session_workdir(pool, &session).await? else {
                 continue;
             };
@@ -562,8 +622,35 @@ impl AppState {
         self.session_store.delete(session_id).await?;
         self.agents.write().await.remove(session_id);
         self.active_turns.write().await.remove(session_id);
+        self.active_aborts.write().await.remove(session_id);
         self.canvases.drop_session(session_id).await;
         Ok(())
+    }
+
+    pub async fn register_abort_handle(&self, session_id: &str, handle: AbortHandle) {
+        self.active_aborts
+            .write()
+            .await
+            .entry(session_id.to_string())
+            .or_default()
+            .push(handle);
+    }
+
+    pub async fn remove_abort_handles(&self, session_id: &str) {
+        self.active_aborts.write().await.remove(session_id);
+    }
+
+    pub async fn cancel_session(&self, session_id: &str) -> bool {
+        let handles = self.active_aborts.write().await.remove(session_id);
+        if let Some(handles) = handles {
+            for h in &handles {
+                h.abort();
+            }
+            self.finish_active_turn(session_id).await;
+            !handles.is_empty()
+        } else {
+            false
+        }
     }
 
     pub async fn start_active_turn(&self, session_id: &str) {
@@ -579,12 +666,28 @@ impl AppState {
                 content: String::new(),
             },
         );
+        self.upsert_turn_snapshot(session_id, now, now, 0, "", "")
+            .await;
     }
 
     pub async fn touch_active_turn(&self, session_id: &str, event_count: usize) {
-        if let Some(turn) = self.active_turns.write().await.get_mut(session_id) {
+        let mut turns = self.active_turns.write().await;
+        if let Some(turn) = turns.get_mut(session_id) {
             turn.last_event_at = unix_timestamp();
             turn.event_count = event_count;
+            if event_count % 10 == 0 {
+                let t = turn.clone();
+                drop(turns);
+                self.upsert_turn_snapshot(
+                    session_id,
+                    t.started_at,
+                    t.last_event_at,
+                    t.event_count,
+                    &t.reasoning,
+                    &t.content,
+                )
+                .await;
+            }
         }
     }
 
@@ -604,6 +707,44 @@ impl AppState {
 
     pub async fn finish_active_turn(&self, session_id: &str) {
         self.active_turns.write().await.remove(session_id);
+        self.delete_turn_snapshot(session_id).await;
+    }
+
+    async fn upsert_turn_snapshot(
+        &self,
+        session_id: &str,
+        started_at: i64,
+        last_event_at: i64,
+        event_count: usize,
+        reasoning: &str,
+        content: &str,
+    ) {
+        let pool = &self.db_pool;
+        let _ = sqlx::query(
+            "INSERT INTO active_turn_snapshots (session_id, started_at, last_event_at, event_count, reasoning, content) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(session_id) DO UPDATE SET \
+             last_event_at = excluded.last_event_at, \
+             event_count = excluded.event_count, \
+             reasoning = excluded.reasoning, \
+             content = excluded.content",
+        )
+        .bind(session_id)
+        .bind(started_at)
+        .bind(last_event_at)
+        .bind(event_count as i64)
+        .bind(reasoning)
+        .bind(content)
+        .execute(pool)
+        .await;
+    }
+
+    async fn delete_turn_snapshot(&self, session_id: &str) {
+        let pool = &self.db_pool;
+        let _ = sqlx::query("DELETE FROM active_turn_snapshots WHERE session_id = ?")
+            .bind(session_id)
+            .execute(pool)
+            .await;
     }
 
     pub async fn get_active_turn(&self, session_id: &str) -> Option<ActiveTurnInfo> {
@@ -676,8 +817,9 @@ impl AppState {
         let model = config
             .model
             .clone()
-            .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let max_output_tokens = config.max_output_tokens;
+        let temperature = config.temperature;
         let plugins = config.plugins.clone();
         let runtime_plugin_dirs: Vec<PathBuf> = config
             .runtime_plugin_dirs
@@ -691,12 +833,12 @@ impl AppState {
             .collect();
         drop(config);
 
-        let pool_guard = self.db_pool.lock().await;
-        let pool = pool_guard.as_ref().context("Database not initialized")?;
+        let pool = &self.db_pool;
 
         let provider = Arc::new(
             OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model)
-                .with_max_output_tokens(max_output_tokens),
+                .with_max_output_tokens(max_output_tokens)
+                .with_temperature(temperature),
         );
 
         let mut mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
@@ -738,7 +880,11 @@ impl AppState {
         pool: &SqlitePool,
         record: &SessionRecord,
     ) -> Result<Option<String>> {
-        if let Some(workdir) = record.workdir.as_deref().filter(|value| !value.trim().is_empty()) {
+        if let Some(workdir) = record
+            .workdir
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
             return Ok(Some(workdir.to_string()));
         }
 
@@ -752,8 +898,12 @@ impl AppState {
 
         for row in rows {
             let raw: Option<String> = row.try_get("input_json").ok();
-            let Some(raw) = raw else { continue; };
-            let Ok(value) = serde_json::from_str::<Value>(&raw) else { continue; };
+            let Some(raw) = raw else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
             if let Some(workdir) = trace_workdir(&value) {
                 return Ok(Some(workdir.to_string()));
             }
@@ -780,15 +930,15 @@ impl AppState {
         session_id: &str,
     ) -> Result<Vec<gewu_core::types::Message>> {
         let session_id = self.resolve_session_id(session_id).await?;
-        let pool_guard = self.db_pool.lock().await;
-        let pool = pool_guard.as_ref().context("Database not initialized")?;
+        let pool = &self.db_pool;
 
-        let rows =
-            sqlx::query("SELECT content FROM memory_messages WHERE session_id = ? ORDER BY id ASC")
-                .bind(&session_id)
-                .fetch_all(pool)
-                .await
-                .context("Failed to load messages from DB")?;
+        let rows = sqlx::query(
+            "SELECT content FROM memory_messages WHERE session_id = ? ORDER BY created_at, id",
+        )
+        .bind(&session_id)
+        .fetch_all(pool)
+        .await
+        .context("Failed to load messages from DB")?;
 
         let mut messages = Vec::new();
         for row in rows {
@@ -917,7 +1067,9 @@ fn directory_entry(path: PathBuf, is_root: bool) -> DirectoryEntry {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| path.to_str().unwrap_or("/"))
             .to_string(),
-        parent: path.parent().map(|parent| parent.to_string_lossy().to_string()),
+        parent: path
+            .parent()
+            .map(|parent| parent.to_string_lossy().to_string()),
         path: path.to_string_lossy().to_string(),
         is_root,
     }
@@ -936,7 +1088,11 @@ fn trace_workdir(value: &Value) -> Option<&str> {
     value
         .pointer("/metadata/workdir")
         .and_then(Value::as_str)
-        .or_else(|| value.pointer("/metadata/workspace_root").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .pointer("/metadata/workspace_root")
+                .and_then(Value::as_str)
+        })
         .or_else(|| value.pointer("/metadata/directory").and_then(Value::as_str))
 }
 
@@ -949,7 +1105,10 @@ fn project_workdir(project: Option<&ProjectRecord>) -> Result<PathBuf> {
     }
 }
 
-fn session_workdir(record: Option<&SessionRecord>, project: Option<&ProjectRecord>) -> Result<PathBuf> {
+fn session_workdir(
+    record: Option<&SessionRecord>,
+    project: Option<&ProjectRecord>,
+) -> Result<PathBuf> {
     if let Some(workdir) = record.and_then(|record| record.workdir.as_deref()) {
         if !workdir.trim().is_empty() {
             return Ok(PathBuf::from(workdir));
@@ -958,7 +1117,7 @@ fn session_workdir(record: Option<&SessionRecord>, project: Option<&ProjectRecor
     project_workdir(project)
 }
 
-fn session_metadata(project: Option<&ProjectRecord>, working_directory: &PathBuf) -> Value {
+fn session_metadata(project: Option<&ProjectRecord>, working_directory: &Path) -> Value {
     let workdir = working_directory.to_string_lossy().to_string();
     match project {
         Some(project) => serde_json::json!({
@@ -980,7 +1139,7 @@ fn unix_timestamp() -> i64 {
         .as_secs() as i64
 }
 
-fn get_default_db_path() -> Result<String> {
+fn ensure_default_db_path() -> Result<String> {
     let home_dir = dirs::home_dir().context("Failed to determine home directory")?;
     let gewu_dir = home_dir.join(".gewu");
     if !gewu_dir.exists() {
@@ -990,10 +1149,9 @@ fn get_default_db_path() -> Result<String> {
 }
 
 async fn create_db_pool(db_path: &str) -> Result<SqlitePool> {
-    let db_url = format!("sqlite://{}?mode=rwc", db_path);
-    let pool = SqlitePoolOptions::new()
-        .connect(&db_url)
-        .await
-        .context("Failed to connect to SQLite database")?;
+    // Phase 1 (C2 + C5): use the shared, PRAGMA-tuned helper and run
+    // versioned SQL migrations from gewu-storage/migrations/.
+    let pool = gewu_storage::create_pool(Path::new(db_path)).await?;
+    gewu_storage::run_migrations(&pool).await?;
     Ok(pool)
 }

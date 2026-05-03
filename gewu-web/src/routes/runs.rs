@@ -54,10 +54,7 @@ pub async fn handle_get_run_events(
 }
 
 async fn trace_store(app: &AppState) -> anyhow::Result<ExecutionTraceStore> {
-    let pool_guard = app.db_pool.lock().await;
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Database not initialized"))?;
+    let pool = &app.db_pool;
     ExecutionTraceStore::new(pool.clone()).await
 }
 

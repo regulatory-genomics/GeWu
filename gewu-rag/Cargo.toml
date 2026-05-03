@@ -2,6 +2,8 @@
 name = "gewu-rag"
 version = "0.1.0"
 edition = "2024"
+publish = false
+description = "Retrieval-augmented generation pipeline with vector search for GeWu"
 
 [dependencies]
 gewu-core = { path = "../gewu-core" }
@@ -29,3 +31,6 @@ dotenvy = "0.15"
 [dev-dependencies]
 tokio-test = "0.4"
 anyhow = "1.0"
+
+[lints]
+workspace = true

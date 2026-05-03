@@ -20,65 +20,8 @@ pub struct StartExecutionRun {
 
 impl ExecutionTraceStore {
     pub async fn new(pool: SqlitePool) -> Result<Self> {
-        let store = Self { pool };
-        store.migrate().await?;
-        Ok(store)
-    }
-
-    async fn migrate(&self) -> Result<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS execution_runs (
-                id TEXT PRIMARY KEY,
-                parent_id TEXT,
-                session_id TEXT,
-                kind TEXT NOT NULL,
-                name TEXT NOT NULL,
-                status TEXT NOT NULL,
-                input_json TEXT,
-                output_json TEXT,
-                error TEXT,
-                started_at INTEGER NOT NULL,
-                finished_at INTEGER
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .context("Failed to create execution_runs table")?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS execution_events (
-                id TEXT PRIMARY KEY,
-                run_id TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                FOREIGN KEY(run_id) REFERENCES execution_runs(id)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .context("Failed to create execution_events table")?;
-
-        for statement in [
-            "CREATE INDEX IF NOT EXISTS idx_execution_runs_session ON execution_runs(session_id)",
-            "CREATE INDEX IF NOT EXISTS idx_execution_runs_parent ON execution_runs(parent_id)",
-            "CREATE INDEX IF NOT EXISTS idx_execution_runs_status ON execution_runs(status)",
-            "CREATE INDEX IF NOT EXISTS idx_execution_runs_started ON execution_runs(started_at)",
-            "CREATE INDEX IF NOT EXISTS idx_execution_events_run ON execution_events(run_id)",
-            "CREATE INDEX IF NOT EXISTS idx_execution_events_type ON execution_events(event_type)",
-            "CREATE INDEX IF NOT EXISTS idx_execution_events_created ON execution_events(created_at)",
-        ] {
-            sqlx::query(statement)
-                .execute(&self.pool)
-                .await
-                .with_context(|| format!("Failed to execute migration statement: {statement}"))?;
-        }
-
-        Ok(())
+        // Schema in `gewu-storage/migrations/0005_execution_runs.sql` and `0006_execution_events.sql`.
+        Ok(Self { pool })
     }
 
     pub async fn start_run(&self, input: StartExecutionRun) -> Result<ExecutionRun> {
@@ -334,6 +277,7 @@ mod tests {
     #[tokio::test]
     async fn execution_run_tree_lifecycle() -> Result<()> {
         let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        crate::run_migrations(&pool).await?;
         let store = ExecutionTraceStore::new(pool).await?;
 
         let workflow = store

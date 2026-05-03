@@ -30,15 +30,13 @@
 //!
 //! No changes to `gewu_core::types::AgentEvent` are required.
 
-pub mod genome_tools;
 pub mod manager;
 pub mod state;
 pub mod tools;
 
-pub use genome_tools::{genome_tools, GenomeToolsConfig};
 pub use manager::{CanvasError, CanvasManager};
 pub use state::{
-    CanvasEvent, CanvasKind, CanvasMode, CanvasState, CanvasStatePatch, GenomeCanvasState,
-    GenomeSelection, GenomeViewport, SampleSpec, TrackSpec, TrackType, CANVAS_STATE_VERSION,
+    CANVAS_STATE_VERSION, CanvasEvent, CanvasKind, CanvasMode, CanvasState, CanvasStatePatch,
+    GenomeCanvasState, GenomeSelection, GenomeViewport, SampleSpec, TrackSpec, TrackType,
 };
 pub use tools::canvas_tools;

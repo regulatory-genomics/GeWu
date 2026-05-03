@@ -55,25 +55,25 @@ impl GatewayConfig {
                 .config
                 .specialist_dirs
                 .iter()
-                .map(|s| expand_config_path(s))
+                .map(expand_config_path)
                 .collect(),
             workflow_dirs: loaded
                 .config
                 .workflow_dirs
                 .iter()
-                .map(|s| expand_config_path(s))
+                .map(expand_config_path)
                 .collect(),
             runtime_plugin_dirs: loaded
                 .config
                 .runtime_plugin_dirs
                 .iter()
-                .map(|s| expand_config_path(s))
+                .map(expand_config_path)
                 .collect(),
             skill_dirs: loaded
                 .config
                 .skill_dirs
                 .iter()
-                .map(|s| expand_config_path(s))
+                .map(expand_config_path)
                 .collect(),
         })
     }
@@ -81,10 +81,10 @@ impl GatewayConfig {
 
 pub fn expand_config_path(s: impl AsRef<str>) -> PathBuf {
     let s = s.as_ref();
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
     }
     PathBuf::from(s)
 }

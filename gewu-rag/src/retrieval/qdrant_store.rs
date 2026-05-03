@@ -196,19 +196,16 @@ impl QdrantStore {
             let mut named_vectors = NamedVectors::default()
                 .add_vector(&self.config.dense_vector_name, vectors[i].clone());
 
-            if let Some(sparse_vecs) = sparse_vectors {
-                if i < sparse_vecs.len() {
-                    let sparse = &sparse_vecs[i];
-                    if !sparse.indices.is_empty() {
-                        let indices_u32: Vec<u32> =
-                            sparse.indices.iter().map(|&x| x as u32).collect();
-                        let sparse_vector =
-                            SparseVectorBuilder::new(indices_u32, sparse.values.clone()).build();
-                        named_vectors = named_vectors.add_vector(
-                            &self.config.sparse_vector_name,
-                            Vector::from(sparse_vector),
-                        );
-                    }
+            if let Some(sparse_vecs) = sparse_vectors
+                && i < sparse_vecs.len()
+            {
+                let sparse = &sparse_vecs[i];
+                if !sparse.indices.is_empty() {
+                    let indices_u32: Vec<u32> = sparse.indices.iter().map(|&x| x as u32).collect();
+                    let sparse_vector =
+                        SparseVectorBuilder::new(indices_u32, sparse.values.clone()).build();
+                    named_vectors = named_vectors
+                        .add_vector(&self.config.sparse_vector_name, Vector::from(sparse_vector));
                 }
             }
 

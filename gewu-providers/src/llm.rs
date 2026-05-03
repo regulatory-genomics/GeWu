@@ -113,6 +113,7 @@ pub struct OpenAIProvider {
     model: String,
     capabilities: Capabilities,
     max_output_tokens: Option<u32>,
+    temperature: Option<f32>,
 }
 
 impl OpenAIProvider {
@@ -130,6 +131,7 @@ impl OpenAIProvider {
             model: model.to_string(),
             capabilities,
             max_output_tokens: None,
+            temperature: None,
         }
     }
 
@@ -151,6 +153,7 @@ impl OpenAIProvider {
             model: model.to_string(),
             capabilities,
             max_output_tokens: None,
+            temperature: None,
         }
     }
 
@@ -159,10 +162,16 @@ impl OpenAIProvider {
         self
     }
 
+    pub fn with_temperature(mut self, temperature: Option<f32>) -> Self {
+        self.temperature = temperature;
+        self
+    }
+
     /// Determines capabilities based on model name.
     ///
     /// This is a heuristic based on common model naming patterns.
     /// For accurate capability settings, use a custom provider implementation.
+    #[allow(clippy::branches_sharing_code, clippy::if_same_then_else)]
     fn default_capabilities_for_model(model: &str) -> Capabilities {
         let model_lower = model.to_lowercase();
         if model_lower.contains("gpt-4o") || model_lower.contains("gpt-5") {
@@ -256,10 +265,7 @@ impl OpenAIProvider {
                 Some(ChatCompletionRequestUserMessageContentPart::ImageUrl(
                     ChatCompletionRequestMessageContentPartImage {
                         content_type: "image_url".to_string(),
-                        image_url: ImageUrl {
-                            url: url.into(),
-                            detail: None,
-                        },
+                        image_url: ImageUrl { url, detail: None },
                     },
                 ))
             }
@@ -499,7 +505,7 @@ impl RequestBuilder for OpenAIProvider {
             },
             stream: None,
             max_tokens: self.max_output_tokens,
-            temperature: None,
+            temperature: self.temperature,
         })
     }
 }
@@ -551,42 +557,43 @@ impl ToolCallAggregator {
 
         let state = &mut self.states[index];
 
-        if let Some(id) = &chunk.id {
-            if !id.is_empty() {
-                state.id = Some(id.clone());
-            }
+        if let Some(id) = &chunk.id
+            && !id.is_empty()
+        {
+            state.id = Some(id.clone());
         }
 
         if let Some(function) = &chunk.function {
-            if let Some(name) = &function.name {
-                if !name.is_empty() {
-                    state.name = Some(name.clone());
-                }
+            if let Some(name) = &function.name
+                && !name.is_empty()
+            {
+                state.name = Some(name.clone());
             }
 
-            if let Some(args) = &function.arguments {
-                if !args.is_empty() && !state.finalized {
-                    state.argument_buffer.push_str(args);
-                    Self::update_finalized_flag(state);
-                    if state.started {
-                        if let Some(id) = state.id.clone() {
-                            Self::emit_pending_arguments(state, &id, &mut events);
-                        }
-                    }
+            if let Some(args) = &function.arguments
+                && !args.is_empty()
+                && !state.finalized
+            {
+                state.argument_buffer.push_str(args);
+                Self::update_finalized_flag(state);
+                if state.started
+                    && let Some(id) = state.id.clone()
+                {
+                    Self::emit_pending_arguments(state, &id, &mut events);
                 }
             }
         }
 
-        if !state.started {
-            if let (Some(id), Some(name)) = (state.id.clone(), state.name.clone()) {
-                events.push(ProviderEvent::ToolCallStart {
-                    id: id.clone(),
-                    name,
-                });
-                state.started = true;
+        if !state.started
+            && let (Some(id), Some(name)) = (state.id.clone(), state.name.clone())
+        {
+            events.push(ProviderEvent::ToolCallStart {
+                id: id.clone(),
+                name,
+            });
+            state.started = true;
 
-                Self::emit_pending_arguments(state, &id, &mut events);
-            }
+            Self::emit_pending_arguments(state, &id, &mut events);
         }
 
         events
@@ -641,17 +648,15 @@ impl ResponseParser for OpenAIProvider {
                 if let Some(choice) = response.choices.first() {
                     let delta = &choice.delta;
 
-                    if let Some(reasoning) = &delta.reasoning_content {
-                        if !reasoning.is_empty() {
+                    if let Some(reasoning) = &delta.reasoning_content
+                        && !reasoning.is_empty() {
                             yield ProviderEvent::ReasoningDelta { delta: reasoning.clone() };
                         }
-                    }
 
-                    if let Some(content) = &delta.content {
-                        if !content.is_empty() {
+                    if let Some(content) = &delta.content
+                        && !content.is_empty() {
                             yield ProviderEvent::ContentDelta { delta: content.clone() };
                         }
-                    }
 
                     if let Some(tool_calls) = &delta.tool_calls {
                         for tool_call in tool_calls {
@@ -711,6 +716,7 @@ impl LlmProvider for OpenAIProvider {
 pub struct AnthropicProvider {
     client: AnthropicClient,
     model: String,
+    #[allow(dead_code)]
     capabilities: Capabilities,
     max_output_tokens: Option<u32>,
 }
@@ -842,10 +848,10 @@ impl AnthropicProvider {
                 tool_calls,
             } => {
                 let mut blocks: Vec<ContentBlock> = Vec::new();
-                if let Some(text) = content {
-                    if !text.is_empty() {
-                        blocks.push(ContentBlock::Text { text: text.clone() });
-                    }
+                if let Some(text) = content
+                    && !text.is_empty()
+                {
+                    blocks.push(ContentBlock::Text { text: text.clone() });
                 }
                 let anthropic_tool_calls: Option<Vec<ToolCall>> = if let Some(calls) = tool_calls {
                     if !calls.is_empty() {

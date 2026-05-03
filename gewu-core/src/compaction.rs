@@ -164,10 +164,9 @@ pub fn prune(messages: &mut [Message]) -> usize {
         if let Message::Assistant {
             content: Some(c), ..
         } = msg
+            && c.starts_with("Summary:")
         {
-            if c.starts_with("Summary:") {
-                break;
-            }
+            break;
         }
 
         if let Message::Tool { content, media, .. } = msg {
@@ -258,7 +257,7 @@ pub fn build_consolidation_prompt(raw_text: &str, n_results: usize) -> Vec<Messa
 }
 
 pub fn apply_consolidation_to_memory(
-    messages: &mut Vec<Message>,
+    messages: &mut [Message],
     tool_call_ids: &[String],
     summary: &str,
     file_path: &std::path::Path,
@@ -274,20 +273,19 @@ pub fn apply_consolidation_to_memory(
             media,
             ..
         } = msg
+            && id_set.contains(tool_call_id.as_str())
         {
-            if id_set.contains(tool_call_id.as_str()) {
-                if tool_call_id == last_id {
-                    *content = format!(
-                        "[Consolidated summary of {} tool calls]\n\n{}\n\n[Full data: {}]",
-                        tool_call_ids.len(),
-                        summary,
-                        file_path.display()
-                    );
-                } else {
-                    *content = "[See consolidated summary below]".to_string();
-                }
-                media.clear();
+            if tool_call_id == last_id {
+                *content = format!(
+                    "[Consolidated summary of {} tool calls]\n\n{}\n\n[Full data: {}]",
+                    tool_call_ids.len(),
+                    summary,
+                    file_path.display()
+                );
+            } else {
+                *content = "[See consolidated summary below]".to_string();
             }
+            media.clear();
         }
     }
 }

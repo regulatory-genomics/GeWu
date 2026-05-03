@@ -102,10 +102,10 @@ impl Tool for GrepTool {
                 let mut builder = WalkBuilder::new(&search_path);
                 if let Some(inc) = &input.include {
                     let mut glob_builder = ignore::overrides::OverrideBuilder::new(&search_path);
-                    if let Ok(_) = glob_builder.add(inc) {
-                        if let Ok(overrides) = glob_builder.build() {
-                            builder.overrides(overrides);
-                        }
+                    if glob_builder.add(inc).is_ok()
+                        && let Ok(overrides) = glob_builder.build()
+                    {
+                        builder.overrides(overrides);
                     }
                 }
 

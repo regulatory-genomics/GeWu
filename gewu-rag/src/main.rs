@@ -290,7 +290,7 @@ async fn run_interactive(rag_system: &RagSystem) -> Result<()> {
             continue;
         }
 
-        print!("\n");
+        println!();
         match rag_system.query(input).await {
             Ok(response) => {
                 println!("\n=== Answer ===\n{}\n", response);

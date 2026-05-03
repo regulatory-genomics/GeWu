@@ -23,52 +23,23 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub async fn new(pool: SqlitePool) -> Result<Self> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS sessions (
-                session_id  TEXT PRIMARY KEY,
-                agent_type  TEXT NOT NULL,
-                created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
-                updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .context("Failed to create sessions table")?;
-
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at)")
-            .execute(&pool)
-            .await
-            .context("Failed to create sessions updated_at index")?;
-
-        if let Err(err) = sqlx::query("ALTER TABLE sessions ADD COLUMN project_id TEXT")
-            .execute(&pool)
-            .await
-        {
-            let message = err.to_string();
-            if !message.contains("duplicate column name") {
-                return Err(err).context("Failed to migrate sessions.project_id");
+        // Schema lives in `gewu-storage/migrations/0002_sessions.sql`.
+        // The runner is invoked from each binary's startup
+        // (gewu-web/state.rs, gewu-cli/lib.rs, gewu-gateway/lib.rs).
+        // Backwards-compat shim: if the table existed pre-migrations without
+        // project_id/workdir columns, ALTER them in. Errors are tolerated for
+        // duplicate columns.
+        for stmt in [
+            "ALTER TABLE sessions ADD COLUMN project_id TEXT",
+            "ALTER TABLE sessions ADD COLUMN workdir TEXT",
+        ] {
+            if let Err(err) = sqlx::query(stmt).execute(&pool).await {
+                let message = err.to_string();
+                if !message.contains("duplicate column name") {
+                    return Err(err).context("Failed to backfill sessions schema");
+                }
             }
         }
-
-        if let Err(err) = sqlx::query("ALTER TABLE sessions ADD COLUMN workdir TEXT")
-            .execute(&pool)
-            .await
-        {
-            let message = err.to_string();
-            if !message.contains("duplicate column name") {
-                return Err(err).context("Failed to migrate sessions.workdir");
-            }
-        }
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_project_updated ON sessions(project_id, updated_at DESC)",
-        )
-        .execute(&pool)
-        .await
-        .context("Failed to create sessions project_id index")?;
-
         Ok(Self { pool })
     }
 
@@ -80,7 +51,7 @@ impl SessionStore {
             INSERT OR IGNORE INTO sessions (session_id, agent_type, created_at, updated_at)
             SELECT
                 m.session_id,
-                'general',
+                'unknown',
                 MIN(m.created_at),
                 MAX(m.created_at)
             FROM memory_messages m
@@ -163,14 +134,17 @@ impl SessionStore {
         .await
         .context("Failed to get session")?;
 
-        Ok(row.map(|r| SessionRecord {
-            session_id: r.try_get("session_id").unwrap_or_default(),
-            project_id: r.try_get("project_id").unwrap_or(None),
-            workdir: r.try_get("workdir").unwrap_or(None),
-            agent_type: r.try_get("agent_type").unwrap_or_default(),
-            created_at: r.try_get("created_at").unwrap_or(0),
-            updated_at: r.try_get("updated_at").unwrap_or(0),
-        }))
+        Ok(match row {
+            Some(r) => Some(SessionRecord {
+                session_id: r.try_get("session_id").context("deserialize session_id")?,
+                project_id: r.try_get("project_id").context("deserialize project_id")?,
+                workdir: r.try_get("workdir").context("deserialize workdir")?,
+                agent_type: r.try_get("agent_type").context("deserialize agent_type")?,
+                created_at: r.try_get("created_at").context("deserialize created_at")?,
+                updated_at: r.try_get("updated_at").context("deserialize updated_at")?,
+            }),
+            None => None,
+        })
     }
 
     /// Resolve a short prefix to a full session_id. Returns `None` if zero
@@ -198,17 +172,18 @@ impl SessionStore {
         .await
         .context("Failed to list sessions")?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| SessionRecord {
-                session_id: r.try_get("session_id").unwrap_or_default(),
-                project_id: r.try_get("project_id").unwrap_or(None),
-                workdir: r.try_get("workdir").unwrap_or(None),
-                agent_type: r.try_get("agent_type").unwrap_or_default(),
-                created_at: r.try_get("created_at").unwrap_or(0),
-                updated_at: r.try_get("updated_at").unwrap_or(0),
-            })
-            .collect())
+        let mut records = Vec::with_capacity(rows.len());
+        for r in rows {
+            records.push(SessionRecord {
+                session_id: r.try_get("session_id").context("deserialize session_id")?,
+                project_id: r.try_get("project_id").context("deserialize project_id")?,
+                workdir: r.try_get("workdir").context("deserialize workdir")?,
+                agent_type: r.try_get("agent_type").context("deserialize agent_type")?,
+                created_at: r.try_get("created_at").context("deserialize created_at")?,
+                updated_at: r.try_get("updated_at").context("deserialize updated_at")?,
+            });
+        }
+        Ok(records)
     }
 
     pub async fn list_by_project(&self, project_id: &str) -> Result<Vec<SessionRecord>> {
@@ -220,17 +195,18 @@ impl SessionStore {
         .await
         .context("Failed to list sessions by project")?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| SessionRecord {
-                session_id: r.try_get("session_id").unwrap_or_default(),
-                project_id: r.try_get("project_id").unwrap_or(None),
-                workdir: r.try_get("workdir").unwrap_or(None),
-                agent_type: r.try_get("agent_type").unwrap_or_default(),
-                created_at: r.try_get("created_at").unwrap_or(0),
-                updated_at: r.try_get("updated_at").unwrap_or(0),
-            })
-            .collect())
+        let mut records = Vec::with_capacity(rows.len());
+        for r in rows {
+            records.push(SessionRecord {
+                session_id: r.try_get("session_id").context("deserialize session_id")?,
+                project_id: r.try_get("project_id").context("deserialize project_id")?,
+                workdir: r.try_get("workdir").context("deserialize workdir")?,
+                agent_type: r.try_get("agent_type").context("deserialize agent_type")?,
+                created_at: r.try_get("created_at").context("deserialize created_at")?,
+                updated_at: r.try_get("updated_at").context("deserialize updated_at")?,
+            });
+        }
+        Ok(records)
     }
 
     pub async fn update_project_id(
@@ -308,20 +284,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        // Create memory_messages table for backfill tests
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS memory_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at INTEGER DEFAULT (unixepoch())
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        crate::run_migrations(&pool).await.unwrap();
         pool
     }
 
@@ -331,7 +294,13 @@ mod tests {
         let store = SessionStore::new(pool).await?;
 
         let rec = store
-            .insert("s1", Some("project-1"), Some("/tmp/project-1"), "general", 1000)
+            .insert(
+                "s1",
+                Some("project-1"),
+                Some("/tmp/project-1"),
+                "general",
+                1000,
+            )
             .await?;
         assert_eq!(rec.session_id, "s1");
         assert_eq!(rec.project_id.as_deref(), Some("project-1"));
@@ -408,7 +377,7 @@ mod tests {
         let got = store.get("old-session-1").await?.unwrap();
         assert_eq!(got.project_id, None);
         assert_eq!(got.workdir, None);
-        assert_eq!(got.agent_type, "general");
+        assert_eq!(got.agent_type, "unknown");
         assert_eq!(got.created_at, 500);
         assert_eq!(got.updated_at, 600);
 

@@ -152,44 +152,35 @@ async fn execute_tool_with_panic_recovery(
         Ok(Ok(res)) => res,
         Ok(Err(e)) => {
             let panic_msg = extract_panic_message(e);
-            Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "Tool '{}' panicked during execution: {}. This may indicate an issue with \
+            Err(Box::new(std::io::Error::other(format!(
+                "Tool '{}' panicked during execution: {}. This may indicate an issue with \
                     the tool implementation or invalid input. Consider adjusting the tool arguments \
                     or checking the tool's requirements.",
-                    tool_name, panic_msg
-                ),
-            )) as Box<dyn Error + Send + Sync>)
+                tool_name, panic_msg
+            ))) as Box<dyn Error + Send + Sync>)
         }
         Err(join_err) => {
             if join_err.is_panic() {
                 match join_err.try_into_panic() {
                     Ok(panic_payload) => {
                         let panic_msg = extract_panic_message(panic_payload);
-                        Err(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!(
-                                "Tool '{}' panicked during execution: {}. This may indicate an issue with \
+                        Err(Box::new(std::io::Error::other(format!(
+                            "Tool '{}' panicked during execution: {}. This may indicate an issue with \
                                 the tool implementation or invalid input. Consider adjusting the tool \
                                 arguments or checking the tool's requirements.",
-                                tool_name, panic_msg
-                            ),
-                        )) as Box<dyn Error + Send + Sync>)
+                            tool_name, panic_msg
+                        ))) as Box<dyn Error + Send + Sync>)
                     }
-                    Err(_) => Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!(
-                            "Tool '{}' panicked but could not retrieve panic payload",
-                            tool_name
-                        ),
-                    )) as Box<dyn Error + Send + Sync>),
+                    Err(_) => Err(Box::new(std::io::Error::other(format!(
+                        "Tool '{}' panicked but could not retrieve panic payload",
+                        tool_name
+                    ))) as Box<dyn Error + Send + Sync>),
                 }
             } else {
-                Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Tool '{}' task was aborted unexpectedly", tool_name),
-                )) as Box<dyn Error + Send + Sync>)
+                Err(Box::new(std::io::Error::other(format!(
+                    "Tool '{}' task was aborted unexpectedly",
+                    tool_name
+                ))) as Box<dyn Error + Send + Sync>)
             }
         }
     }
@@ -402,15 +393,20 @@ impl Agent {
         AgentBuilder::default()
     }
 
-    pub async fn reset(&mut self) {
-        self.memory.clear().await;
+    pub async fn reset(&mut self) -> Result<()> {
+        self.memory
+            .clear()
+            .await
+            .map_err(|e| anyhow::anyhow!("Memory::clear failed: {}", e))?;
         if !self.system_prompt.is_empty() {
             self.memory
                 .add_message(Message::System {
                     content: self.system_prompt.clone(),
                 })
-                .await;
+                .await
+                .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
         }
+        Ok(())
     }
 
     pub fn ask<'a>(
@@ -419,10 +415,12 @@ impl Agent {
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
         async_stream::try_stream! {
             if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
-                 self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
+                 self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await
+                    .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
             }
 
-            self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await;
+            self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await
+                .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
 
             let mut turn = 0;
             let mut recent_tool_calls: VecDeque<(String, String)> = VecDeque::new();
@@ -433,11 +431,11 @@ impl Agent {
                     info!("History compacted.");
                 }
 
-                if let Some(max) = self.max_turns {
-                    if turn >= max {
-                        yield AgentEvent::Error { error: "Max turns reached without final answer.".to_string() };
-                        break;
-                    }
+                if let Some(max) = self.max_turns
+                    && turn >= max
+                {
+                    yield AgentEvent::Error { error: "Max turns reached without final answer.".to_string() };
+                    break;
                 }
                 turn += 1;
 
@@ -504,7 +502,8 @@ impl Agent {
                     content: if normalized_content.is_empty() { None } else { Some(normalized_content.clone()) },
                     tool_calls: if current_tool_calls.is_empty() { None } else { Some(current_tool_calls.clone()) },
                 };
-                self.memory.add_message(assistant_msg).await;
+                self.memory.add_message(assistant_msg).await
+                    .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
 
                 if current_tool_calls.is_empty() {
                     yield AgentEvent::Finish { response: normalized_content };
@@ -593,7 +592,8 @@ impl Agent {
                                 tool_name: Some(completed.tool_name),
                                 content: completed.output,
                                 media: media_parts,
-                            }).await;
+                            }).await
+                                .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
                         }
 
                         call_index = block_end;
@@ -629,7 +629,8 @@ impl Agent {
                         tool_name: Some(completed.tool_name.clone()),
                         content: completed.output,
                         media: media_parts,
-                    }).await;
+                    }).await
+                        .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
 
                     if turn_tool_tokens > turn_tool_budget && pending_consolidation_ids.len() >= 3 {
                         info!(
@@ -664,7 +665,8 @@ impl Agent {
                                         &summary_text,
                                         &file_path,
                                     );
-                                    self.memory.replace(all_messages).await;
+                                    self.memory.replace(all_messages).await
+                                        .map_err(|e| anyhow::anyhow!("Memory::replace failed: {}", e))?;
                                     info!("Consolidated {} tool outputs into summary ({} chars)", pending_consolidation_ids.len(), summary_text.len());
                                 }
                             }
@@ -752,7 +754,7 @@ When constructing the summary, try to stick to this template:
                 self.memory
                     .messages()
                     .iter()
-                    .map(|m| estimate_message_tokens(m))
+                    .map(estimate_message_tokens)
                     .sum(),
                 self.context_limit,
             ) {
@@ -792,7 +794,10 @@ When constructing the summary, try to stick to this template:
             new_history.push(last_user_msg.clone());
         }
 
-        self.memory.replace(new_history).await;
+        self.memory
+            .replace(new_history)
+            .await
+            .map_err(|e| anyhow::anyhow!("Memory::replace failed: {}", e))?;
         Ok(true)
     }
 }

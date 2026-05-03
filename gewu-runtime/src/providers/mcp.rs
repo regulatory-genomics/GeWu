@@ -68,5 +68,5 @@ impl ToolProvider for McpToolProvider {
 pub fn _discover_mcp_tools(
     _spec: &McpProviderSpec,
 ) -> Result<Vec<Box<dyn Tool>>, Box<dyn std::error::Error + Send + Sync>> {
-    unimplemented!("MCP tool discovery via ToolProvider not yet wired")
+    Err("MCP tool discovery via ToolProvider not yet wired".into())
 }

@@ -1,8 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use gewu_providers::OpenAIProvider;
 use gewu_runtime::{PluginHost, PluginRegistry, RuntimeFactory, WorkflowRegistry};
-use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
-use std::path::PathBuf;
+use sqlx::SqlitePool;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::GatewayConfig;
@@ -70,14 +70,9 @@ impl AppState {
     }
 }
 
-async fn create_db_pool(db_path: &PathBuf) -> Result<SqlitePool> {
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating db parent dir {}", parent.display()))?;
-    }
-    let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
-    SqlitePoolOptions::new()
-        .connect(&db_url)
-        .await
-        .with_context(|| format!("connecting gateway sqlite db at {}", db_path.display()))
+async fn create_db_pool(db_path: &Path) -> Result<SqlitePool> {
+    // Phase 1 (C2 + C5): use shared PRAGMA-tuned helper and run migrations.
+    let pool = gewu_storage::create_pool(db_path).await?;
+    gewu_storage::run_migrations(&pool).await?;
+    Ok(pool)
 }

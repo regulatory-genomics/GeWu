@@ -70,25 +70,21 @@ impl RagSystem {
             ..Default::default()
         };
 
-        let agent_graph = self.build_agent_graph();
-        let main_graph = self.build_main_graph(agent_graph);
+        let agent_graph = self.build_agent_graph()?;
+        let main_graph = self.build_main_graph(agent_graph)?;
 
         let final_state = main_graph.ainvoke(initial_state).await?;
 
-        if let Some(last_msg) = final_state.messages.last() {
-            if let Message::Assistant { content, .. } = last_msg {
-                Ok(content
-                    .clone()
-                    .unwrap_or_else(|| "No response generated.".to_string()))
-            } else {
-                Ok("No response generated.".to_string())
-            }
+        if let Some(Message::Assistant { content, .. }) = final_state.messages.last() {
+            Ok(content
+                .clone()
+                .unwrap_or_else(|| "No response generated.".to_string()))
         } else {
             Ok("No response generated.".to_string())
         }
     }
 
-    fn build_agent_graph(&self) -> CompiledGraph<AgentState> {
+    fn build_agent_graph(&self) -> anyhow::Result<CompiledGraph<AgentState>> {
         let config = self.config.clone();
         let llm = self.llm.clone();
         let tools = self.get_tools();
@@ -180,17 +176,17 @@ impl RagSystem {
             },
         );
 
-        graph.add_edge("tools", "should_compress");
-        graph.add_edge("compress_context", "orchestrator");
-        graph.add_edge("fallback_response", "collect_answer");
+        graph.add_edge("tools", "should_compress")?;
+        graph.add_edge("compress_context", "orchestrator")?;
+        graph.add_edge("fallback_response", "collect_answer")?;
 
-        graph.compile()
+        Ok(graph.compile())
     }
 
     fn build_main_graph(
         &self,
         agent_subgraph: CompiledGraph<AgentState>,
-    ) -> CompiledGraph<MainState> {
+    ) -> anyhow::Result<CompiledGraph<MainState>> {
         let llm = self.llm.clone();
         let agent_subgraph = agent_subgraph.clone();
 
@@ -246,7 +242,7 @@ impl RagSystem {
         });
 
         graph.set_entry_point("summarize_history");
-        graph.add_edge("summarize_history", "rewrite_query");
+        graph.add_edge("summarize_history", "rewrite_query")?;
 
         graph.add_conditional_edges(
             "rewrite_query",
@@ -262,10 +258,10 @@ impl RagSystem {
             },
         );
 
-        graph.add_edge("request_clarification", "rewrite_query");
-        graph.add_edge("run_agents", "aggregate_answers");
+        graph.add_edge("request_clarification", "rewrite_query")?;
+        graph.add_edge("run_agents", "aggregate_answers")?;
         graph.set_finish_point("aggregate_answers");
 
-        graph.compile()
+        Ok(graph.compile())
     }
 }

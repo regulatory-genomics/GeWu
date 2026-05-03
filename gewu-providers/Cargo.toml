@@ -2,6 +2,7 @@
 name = "gewu-providers"
 version = "0.1.0"
 edition = "2024"
+description = "LLM provider implementations (OpenAI-compatible, replay, scripted) for GeWu"
 
 [dependencies]
 gewu-core = { path = "../gewu-core" }
@@ -23,3 +24,6 @@ parking_lot = "0.12"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+
+[lints]
+workspace = true

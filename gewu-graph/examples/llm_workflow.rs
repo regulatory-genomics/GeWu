@@ -315,9 +315,9 @@ fn build_graph() -> CompiledGraph<AgentState> {
     graph.add_node("general_assist", general_assist);
     graph.add_node("synthesizer", synthesizer);
 
-    graph.add_edge("code_assist", "synthesizer");
-    graph.add_edge("qa_assist", "synthesizer");
-    graph.add_edge("general_assist", "synthesizer");
+    graph.add_edge("code_assist", "synthesizer").expect("valid edge");
+    graph.add_edge("qa_assist", "synthesizer").expect("valid edge");
+    graph.add_edge("general_assist", "synthesizer").expect("valid edge");
 
     graph.set_entry_point("classify_intent");
     graph.set_finish_point("synthesizer");
@@ -374,7 +374,7 @@ async fn main() -> Result<()> {
 
     let graph = build_graph();
 
-    let test_inputs = vec![
+    let test_inputs = [
         "How do I implement a binary search tree in Rust?",
         "What is the capital of France?",
         "Can you help me debug this code? I'm getting a segmentation fault.",

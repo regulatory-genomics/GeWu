@@ -22,15 +22,10 @@ pub async fn handle_get_work_graph(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<WorkGraphResponse>, AppError> {
     let (session_id, session) = resolve_session(&app, &id).await;
-    let pool_guard = app.db_pool.lock().await;
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| AppError::InternalError("Database is not initialized".to_string()))?
-        .clone();
-    drop(pool_guard);
+    let pool = &app.db_pool;
 
     let task_store = TaskStore::new(pool.clone()).await?;
-    let trace_store = ExecutionTraceStore::new(pool).await?;
+    let trace_store = ExecutionTraceStore::new(pool.clone()).await?;
     let tasks = task_store.list_child_tasks(&session_id).await?;
     let runs = trace_store.runs_for_session(&session_id).await?;
 

@@ -11,7 +11,7 @@ use gewu_tools::{
     WriteFileTool,
 };
 use sqlx::SqlitePool;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub struct AgentConfig {
@@ -202,7 +202,7 @@ fn metadata_dirs(metadata: &serde_json::Value, key: &str) -> Vec<PathBuf> {
 
 pub fn resolve_tools(
     capabilities: &[String],
-    working_directory: &PathBuf,
+    working_directory: &Path,
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
 ) -> Vec<Box<dyn Tool>> {

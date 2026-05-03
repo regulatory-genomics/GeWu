@@ -6,6 +6,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 #[tokio::test]
 async fn test_blocked_task_resume() -> Result<()> {
     let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+    gewu_storage::run_migrations(&pool).await?;
     let store = TaskStore::new(pool.clone()).await?;
 
     let task_id = "resume-test-1";
@@ -68,6 +69,7 @@ async fn test_blocked_task_resume() -> Result<()> {
 #[tokio::test]
 async fn test_task_status_transitions() -> Result<()> {
     let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+    gewu_storage::run_migrations(&pool).await?;
     let store = TaskStore::new(pool).await?;
 
     store.create_task("t2", "build", "compile project").await?;

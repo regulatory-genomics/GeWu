@@ -87,10 +87,7 @@ pub async fn handle_projects_tree(
     let projects = app.project_store.list_all().await?;
     let sessions = app.list_sessions().await;
 
-    let pool_guard = app.db_pool.lock().await;
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| AppError::InternalError("Database is not initialized".to_string()))?;
+    let pool = &app.db_pool;
 
     let mut nodes = Vec::with_capacity(projects.len());
     for project in projects {

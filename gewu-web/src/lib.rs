@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
     middleware,
     routing::{delete, get, post},
@@ -9,6 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
@@ -19,7 +20,7 @@ pub mod routes;
 pub mod sidecar;
 pub mod state;
 
-use auth::AuthState;
+use auth::AuthMode;
 use gewu_cli::mcp_loader;
 use gewu_runtime::PluginRegistry;
 use state::{AppState, PluginRegistrar};
@@ -52,6 +53,17 @@ struct Cli {
 
     #[arg(long)]
     db_path: Option<String>,
+
+    /// Enable cookie-based password auth. When omitted, the server runs with
+    /// no auth (open mode). Required when binding to a non-loopback host
+    /// unless `--allow-insecure-bind` is also set.
+    #[arg(long, env = "GEWU_PASSWORD")]
+    password: Option<String>,
+
+    /// Permit non-loopback bind without a password (use only on trusted
+    /// networks). Off by default.
+    #[arg(long, default_value_t = false)]
+    allow_insecure_bind: bool,
 }
 
 pub async fn run_with_plugins<F>(register_plugins: F) -> Result<()>
@@ -86,7 +98,7 @@ where
         .model
         .or_else(|| std::env::var("OPENAI_MODEL").ok())
         .or(loaded_config.config.model.clone())
-        .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+        .unwrap_or_else(|| state::DEFAULT_MODEL.to_string());
 
     let max_output_tokens = cli
         .max_output_tokens
@@ -118,6 +130,8 @@ where
         endpoint: Some(endpoint),
         model: Some(model),
         max_output_tokens,
+        context_limit: None,
+        temperature: None,
         db_path,
         plugins: loaded_config.config.plugins,
         runtime_plugin_dirs: loaded_config.config.runtime_plugin_dirs,
@@ -133,16 +147,22 @@ where
             .await?;
     if let Some(sidecar) = managed_tachyon_browser.as_ref() {
         config.tachyon_browser_url = Some(sidecar.url().to_string());
-        // Browser clients may run on a different machine over SSH tunnels, so
-        // never inject the loopback sidecar URL into HTML. Keep the real URL
-        // server-side for genome.* tools and same-origin /api/browser proxying.
-        std::env::set_var("TACHYON_BROWSER_URL", "");
+        // SAFETY: set before any thread spawns and reads env. Single-threaded init.
+        unsafe {
+            std::env::set_var("TACHYON_BROWSER_URL", "");
+        }
     }
 
-    let auth_state = AuthState::new();
+    let auth_mode = AuthMode::from_cli(cli.password.as_deref())?;
+    if !cli.host.is_loopback() && !auth_mode.requires_password() && !cli.allow_insecure_bind {
+        bail!(
+            "non-loopback bind ({}) requires --password or --allow-insecure-bind",
+            cli.host
+        );
+    }
     let plugin_registrar: PluginRegistrar = Arc::new(register_plugins);
     let app_state =
-        Arc::new(AppState::new(config, auth_state.clone(), mcp_tools, plugin_registrar).await?);
+        Arc::new(AppState::new(config, auth_mode.clone(), mcp_tools, plugin_registrar).await?);
 
     // CORS policy:
     //
@@ -156,27 +176,20 @@ where
     // the user's machine reach the local agent. Disallowed.
     let cors = build_cors_layer();
 
-    let token = auth_state.valid_token.clone();
-
     // ── Public routes (NO auth required) ──────────────────────────────────
     //
     // /api/validate intentionally does its own validation in-handler so
-    // unauthenticated callers can probe the token without authenticating
-    // first. Static asset serving is also open.
+    // unauthenticated callers can probe whether a cookie is valid without
+    // authenticating first. The login page and /api/login/logout are also
+    // public so the user can authenticate.
     let public = Router::new()
         .route("/", get(fallback::serve_index))
         .route("/index.html", get(fallback::serve_index))
+        .route("/login", get(routes::login::login_page))
+        .route("/api/login", post(routes::login::handle_login))
+        .route("/api/logout", post(routes::login::handle_logout))
+        .route("/api/auth/mode", get(routes::login::handle_auth_mode))
         .route("/api/validate", get(routes::sessions::handle_validate));
-
-    // /api/token returns the random in-process token. Gated behind an
-    // explicit env var so it's never exposed by default. The CLI prints
-    // the token URL at startup; that's the supported way to discover it.
-    let public = if std::env::var("GEWU_PUBLIC_TOKEN_ENDPOINT").as_deref() == Ok("1") {
-        tracing::warn!("GEWU_PUBLIC_TOKEN_ENDPOINT=1 — /api/token is exposed without auth");
-        public.route("/api/token", get(routes::sessions::handle_get_token))
-    } else {
-        public
-    };
 
     // ── Protected routes (token required) ─────────────────────────────────
     let protected = Router::new()
@@ -233,6 +246,10 @@ where
             post(routes::sessions::handle_switch_agent),
         )
         .route(
+            "/api/sessions/{id}/cancel",
+            post(routes::sessions::handle_cancel_session),
+        )
+        .route(
             "/api/sessions/{id}/canvas",
             get(routes::canvas::handle_list),
         )
@@ -250,7 +267,7 @@ where
         )
         .route_layer(middleware::from_fn_with_state(
             app_state.clone(),
-            auth_middleware::require_token,
+            auth_middleware::require_auth,
         ));
 
     // Static file serving via ServeDir (handles path traversal correctly).
@@ -263,6 +280,26 @@ where
     let app = public
         .merge(protected)
         .fallback_service(static_service)
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static(
+                "default-src 'self'; img-src 'self' data:; \
+                 script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; \
+                 connect-src 'self'; font-src 'self' data:",
+            ),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::X_FRAME_OPTIONS,
+            axum::http::HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::X_CONTENT_TYPE_OPTIONS,
+            axum::http::HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::REFERRER_POLICY,
+            axum::http::HeaderValue::from_static("no-referrer"),
+        ))
         .layer(cors)
         .with_state(app_state);
 
@@ -271,7 +308,13 @@ where
     println!("========================================");
     println!("GeWu Web UI");
     println!("========================================");
-    println!("URL: http://{}:{}/?token={}", cli.host, cli.port, token);
+    if auth_mode.requires_password() {
+        println!("URL:  http://{}:{}/login", cli.host, cli.port);
+        println!("Auth: cookie (password mode)");
+    } else {
+        println!("URL:  http://{}:{}/", cli.host, cli.port);
+        println!("Auth: open (no password)");
+    }
     println!("========================================");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

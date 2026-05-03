@@ -106,22 +106,19 @@ impl Tool for CodeSearchTool {
                 let line = buffer[..idx].to_string();
                 buffer = buffer[idx + 1..].to_string();
 
-                if line.starts_with("data: ") {
-                    let data_str = &line[6..];
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(data_str) {
-                        if let Some(content) = val
-                            .get("result")
-                            .and_then(|r| r.get("content"))
-                            .and_then(|c| c.as_array())
-                        {
-                            for item in content {
-                                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                                    if !results.is_empty() {
-                                        results.push_str("\n\n---\n\n");
-                                    }
-                                    results.push_str(text);
-                                }
+                if let Some(data_str) = line.strip_prefix("data: ")
+                    && let Ok(val) = serde_json::from_str::<serde_json::Value>(data_str)
+                    && let Some(content) = val
+                        .get("result")
+                        .and_then(|r| r.get("content"))
+                        .and_then(|c| c.as_array())
+                {
+                    for item in content {
+                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                            if !results.is_empty() {
+                                results.push_str("\n\n---\n\n");
                             }
+                            results.push_str(text);
                         }
                     }
                 }
@@ -202,22 +199,19 @@ impl Tool for WebSearchTool {
                 let line = buffer[..idx].to_string();
                 buffer = buffer[idx + 1..].to_string();
 
-                if line.starts_with("data: ") {
-                    let data_str = &line[6..];
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(data_str) {
-                        if let Some(content) = val
-                            .get("result")
-                            .and_then(|r| r.get("content"))
-                            .and_then(|c| c.as_array())
-                        {
-                            for item in content {
-                                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                                    if !results.is_empty() {
-                                        results.push_str("\n\n---\n\n");
-                                    }
-                                    results.push_str(text);
-                                }
+                if let Some(data_str) = line.strip_prefix("data: ")
+                    && let Ok(val) = serde_json::from_str::<serde_json::Value>(data_str)
+                    && let Some(content) = val
+                        .get("result")
+                        .and_then(|r| r.get("content"))
+                        .and_then(|c| c.as_array())
+                {
+                    for item in content {
+                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                            if !results.is_empty() {
+                                results.push_str("\n\n---\n\n");
                             }
+                            results.push_str(text);
                         }
                     }
                 }

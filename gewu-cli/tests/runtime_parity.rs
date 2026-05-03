@@ -63,6 +63,7 @@ async fn tool_names_from_wrapper(
         .connect("sqlite::memory:")
         .await
         .unwrap();
+    gewu_storage::run_migrations(&pool).await.unwrap();
     let provider: Arc<dyn LlmProvider> = Arc::new(StubLlm);
     let (_, registry) = create_agent(
         agent_name,
@@ -84,6 +85,7 @@ async fn tool_names_from_runtime(
         .connect("sqlite::memory:")
         .await
         .unwrap();
+    gewu_storage::run_migrations(&pool).await.unwrap();
     let provider: Arc<dyn LlmProvider> = Arc::new(StubLlm);
     let runtime = RuntimeGeWuRuntime::builder()
         .provider(provider)

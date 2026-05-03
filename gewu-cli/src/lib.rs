@@ -16,7 +16,7 @@ use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 use std::collections::HashMap;
 use std::env;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -116,7 +116,7 @@ async fn run_runtime_agent(
     session_id: &str,
     additional_tools: &[Arc<dyn Tool>],
     prompt: &str,
-    workdir: &PathBuf,
+    workdir: &Path,
 ) -> Result<()> {
     let request = SpecialistExecutionRequest {
         task_id: Uuid::new_v4().to_string(),
@@ -172,10 +172,10 @@ async fn run_runtime_agent(
                 }
             },
             SpecialistExecutionEvent::Completed(envelope) => {
-                if envelope.output_json.is_none() {
-                    if let Some(reason) = envelope.block_reason {
-                        println!("{}", reason);
-                    }
+                if envelope.output_json.is_none()
+                    && let Some(reason) = envelope.block_reason
+                {
+                    println!("{}", reason);
                 }
             }
         }
@@ -189,10 +189,10 @@ fn resolve_manifest_dirs(config: &config::Config) -> Vec<PathBuf> {
         .specialist_dirs
         .iter()
         .map(|s| {
-            if s.starts_with("~/") {
-                if let Some(ref h) = home {
-                    return h.join(&s[2..]);
-                }
+            if s.starts_with("~/")
+                && let Some(ref h) = home
+            {
+                return h.join(&s[2..]);
             }
             PathBuf::from(s)
         })
@@ -209,10 +209,10 @@ fn resolve_manifest_dirs(config: &config::Config) -> Vec<PathBuf> {
 fn resolve_workflow_dirs(config: &config::Config, cli_extra: &[String]) -> Vec<PathBuf> {
     let home = dirs::home_dir();
     let expand = |s: &String| -> PathBuf {
-        if s.starts_with("~/") {
-            if let Some(ref h) = home {
-                return h.join(&s[2..]);
-            }
+        if s.starts_with("~/")
+            && let Some(ref h) = home
+        {
+            return h.join(&s[2..]);
         }
         PathBuf::from(s)
     };
@@ -230,10 +230,10 @@ fn resolve_workflow_dirs(config: &config::Config, cli_extra: &[String]) -> Vec<P
 }
 
 fn expand_config_path(s: &str) -> PathBuf {
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
     }
     PathBuf::from(s)
 }
@@ -311,6 +311,7 @@ where
         .connect("sqlite::memory:")
         .await
         .context("Failed to create in-memory SQLite database for agent listing")?;
+    gewu_storage::run_migrations(&pool).await?;
     let working_directory = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let plugin_host = build_plugin_host_with(
         &loaded_config.config.plugins,
@@ -361,6 +362,7 @@ where
         .connect("sqlite::memory:")
         .await
         .context("Failed to create in-memory SQLite database for workflow listing")?;
+    gewu_storage::run_migrations(&pool).await?;
     let working_directory = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let plugin_host = build_plugin_host_with(
         &loaded_config.config.plugins,
@@ -528,12 +530,9 @@ where
     };
 
     info!("Using database: {}", db_path);
-    let db_url = format!("sqlite://{}?mode=rwc", db_path);
 
-    let pool = SqlitePoolOptions::new()
-        .connect(&db_url)
-        .await
-        .context("Failed to connect to SQLite database")?;
+    let pool = gewu_storage::create_pool(Path::new(&db_path)).await?;
+    gewu_storage::run_migrations(&pool).await?;
 
     let session_id = cli.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     println!("Session ID: {}", session_id);

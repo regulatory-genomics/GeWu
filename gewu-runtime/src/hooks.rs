@@ -67,11 +67,11 @@ impl HookRegistry {
                         .pointer("/patch/append_system_prompt")
                         .and_then(Value::as_str)
                 });
-            if let Some(append) = append {
-                if !append.trim().is_empty() {
-                    prompt.push_str("\n\n");
-                    prompt.push_str(append);
-                }
+            if let Some(append) = append
+                && !append.trim().is_empty()
+            {
+                prompt.push_str("\n\n");
+                prompt.push_str(append);
             }
         }
         Ok(prompt)

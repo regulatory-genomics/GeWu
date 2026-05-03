@@ -26,9 +26,7 @@ fn get_message_content(msg: &Message) -> String {
             })
             .collect::<Vec<_>>()
             .join(""),
-        Message::Assistant { content, .. } => {
-            content.as_ref().map(|c| c.clone()).unwrap_or_default()
-        }
+        Message::Assistant { content, .. } => content.clone().unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -308,10 +306,10 @@ pub async fn orchestrator(
                 }
                 ProviderEvent::ToolCallDelta { id, delta } => {
                     tracing::debug!("[TOOL_CALL_DELTA] id={}, delta_len={}", id, delta.len());
-                    if let Some(ref mut calls) = current_tool_calls {
-                        if let Some(call) = calls.iter_mut().find(|c| c.id == id) {
-                            call.function.arguments.push_str(&delta);
-                        }
+                    if let Some(ref mut calls) = current_tool_calls
+                        && let Some(call) = calls.iter_mut().find(|c| c.id == id)
+                    {
+                        call.function.arguments.push_str(&delta);
                     }
                 }
                 ProviderEvent::Finish { reason } => {
@@ -371,12 +369,8 @@ pub async fn orchestrator(
         });
     }
 
-    let tool_calls = if let Some(last) = new_messages.last() {
-        if let Message::Assistant { tool_calls, .. } = last {
-            tool_calls.clone().unwrap_or_default()
-        } else {
-            vec![]
-        }
+    let tool_calls = if let Some(Message::Assistant { tool_calls, .. }) = new_messages.last() {
+        tool_calls.clone().unwrap_or_default()
     } else {
         vec![]
     };
@@ -579,10 +573,10 @@ pub async fn fallback_response(
         msg_types.push(format!("{:?}", m));
         match m {
             Message::Assistant { content, .. } => {
-                if let Some(c) = content {
-                    if !c.is_empty() {
-                        all_content.push(c.clone());
-                    }
+                if let Some(c) = content
+                    && !c.is_empty()
+                {
+                    all_content.push(c.clone());
                 }
             }
             Message::Tool { content, .. } => {

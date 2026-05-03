@@ -129,13 +129,14 @@ pub trait Memory: Send + Sync {
 
     fn messages(&self) -> &[Message];
 
-    async fn add_message(&mut self, message: Message);
+    async fn add_message(&mut self, message: Message) -> Result<(), Box<dyn Error + Send + Sync>>;
 
-    async fn clear(&mut self);
+    async fn clear(&mut self) -> Result<(), Box<dyn Error + Send + Sync>>;
 
     fn messages_mut(&mut self) -> &mut [Message];
 
-    async fn replace(&mut self, messages: Vec<Message>);
+    async fn replace(&mut self, messages: Vec<Message>)
+    -> Result<(), Box<dyn Error + Send + Sync>>;
 }
 
 #[async_trait]
@@ -151,20 +152,26 @@ impl Memory for Vec<Message> {
         self
     }
 
-    async fn add_message(&mut self, message: Message) {
+    async fn add_message(&mut self, message: Message) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.push(message);
+        Ok(())
     }
 
-    async fn clear(&mut self) {
+    async fn clear(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.clear();
+        Ok(())
     }
 
     fn messages_mut(&mut self) -> &mut [Message] {
         self.as_mut_slice()
     }
 
-    async fn replace(&mut self, messages: Vec<Message>) {
+    async fn replace(
+        &mut self,
+        messages: Vec<Message>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         *self = messages;
+        Ok(())
     }
 }
 

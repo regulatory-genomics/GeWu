@@ -259,11 +259,10 @@
    */
   async function pushPatch(canvasId, patch, opts = {}) {
     const sessionId = opts.sessionId || (window.state && window.state.currentSessionId);
-    const token = opts.token || (window.token || '');
     if (!sessionId || !canvasId) return null;
     try {
       const resp = await fetch(
-        `/api/sessions/${encodeURIComponent(sessionId)}/canvas/${encodeURIComponent(canvasId)}/state?token=${encodeURIComponent(token)}`,
+        `/api/sessions/${encodeURIComponent(sessionId)}/canvas/${encodeURIComponent(canvasId)}/state`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

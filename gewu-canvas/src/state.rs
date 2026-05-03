@@ -39,16 +39,12 @@ impl CanvasKind {
 /// How the canvas is laid out in the host UI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum CanvasMode {
+    #[default]
     Overlay,
     Docked,
     Fullscreen,
-}
-
-impl Default for CanvasMode {
-    fn default() -> Self {
-        Self::Overlay
-    }
 }
 
 /// The full state for a single canvas instance.
@@ -243,18 +239,14 @@ impl Default for TrackSpec {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum TrackType {
+    #[default]
     Signal,
     Peak,
     Gene,
     Annotation,
     Qc,
-}
-
-impl Default for TrackType {
-    fn default() -> Self {
-        Self::Signal
-    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

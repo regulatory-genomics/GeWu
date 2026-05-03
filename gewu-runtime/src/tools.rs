@@ -17,7 +17,9 @@ use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 enum TaskMode {
+    #[default]
     Barrier,
     Async,
 }
@@ -28,12 +30,6 @@ impl TaskMode {
             Self::Barrier => "barrier",
             Self::Async => "async",
         }
-    }
-}
-
-impl Default for TaskMode {
-    fn default() -> Self {
-        Self::Barrier
     }
 }
 
@@ -330,18 +326,18 @@ impl Tool for TaskTool {
             .find(|run| run.kind == ExecutionRunKind::Specialist);
 
         let mut output = serde_json::to_value(&envelope)?;
-        if let Some(root_run) = root_run {
-            if let Some(object) = output.as_object_mut() {
-                object.insert(
-                    "_trace".to_string(),
-                    json!({
-                        "root_run_id": root_run.id,
-                        "current_run_id": root_run.id,
-                        "session_id": task_id,
-                        "specialist_id": request.specialist_id,
-                    }),
-                );
-            }
+        if let Some(root_run) = root_run
+            && let Some(object) = output.as_object_mut()
+        {
+            object.insert(
+                "_trace".to_string(),
+                json!({
+                    "root_run_id": root_run.id,
+                    "current_run_id": root_run.id,
+                    "session_id": task_id,
+                    "specialist_id": request.specialist_id,
+                }),
+            );
         }
 
         Ok(ToolResult::new("task", serde_json::to_string(&output)?))

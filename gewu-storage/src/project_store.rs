@@ -19,37 +19,8 @@ pub struct ProjectStore {
 
 impl ProjectStore {
     pub async fn new(pool: SqlitePool) -> Result<Self> {
-        let store = Self { pool };
-        store.migrate().await?;
-        Ok(store)
-    }
-
-    async fn migrate(&self) -> Result<()> {
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS projects (
-                project_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                workdir TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                UNIQUE(workdir)
-            )"#,
-        )
-        .execute(&self.pool)
-        .await
-        .context("Failed to create projects table")?;
-
-        for stmt in [
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_workdir ON projects(workdir)",
-            "CREATE INDEX IF NOT EXISTS idx_projects_updated ON projects(updated_at)",
-        ] {
-            sqlx::query(stmt)
-                .execute(&self.pool)
-                .await
-                .context("Failed to create projects index")?;
-        }
-
-        Ok(())
+        // Schema in `gewu-storage/migrations/0007_projects.sql`.
+        Ok(Self { pool })
     }
 
     pub async fn create(
@@ -177,10 +148,12 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn test_pool() -> SqlitePool {
-        SqlitePoolOptions::new()
+        let pool = SqlitePoolOptions::new()
             .connect("sqlite::memory:")
             .await
-            .unwrap()
+            .unwrap();
+        crate::run_migrations(&pool).await.unwrap();
+        pool
     }
 
     #[tokio::test]

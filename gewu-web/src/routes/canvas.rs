@@ -11,13 +11,13 @@
 //!   - `POST   /api/sessions/:sid/canvas/:cid/state`    -> patch
 //!   - `DELETE /api/sessions/:sid/canvas/:cid`          -> hide/minimize
 //!
-//! All endpoints honor the existing `?token=` auth used elsewhere in
-//! gewu-web.
+//! Auth is enforced by the route group's `auth_middleware::require_auth`
+//! layer (cookie-based since Phase 2). Handlers do not re-validate.
 
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Path, Query, RawQuery, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::Json;
@@ -28,25 +28,6 @@ use serde_json::{json, Value};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
-pub struct TokenQuery {
-    token: Option<String>,
-}
-
-async fn require_token(state: &AppState, query: &TokenQuery) -> Result<(), (StatusCode, String)> {
-    let auth = state.auth_token.read().await;
-    let valid = query
-        .token
-        .as_ref()
-        .map(|t| auth.validate(t))
-        .unwrap_or(false);
-    if valid {
-        Ok(())
-    } else {
-        Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string()))
-    }
-}
-
-#[derive(Deserialize)]
 pub struct PatchBody {
     pub patch: CanvasStatePatch,
 }
@@ -54,9 +35,7 @@ pub struct PatchBody {
 pub async fn handle_list(
     State(app): State<Arc<AppState>>,
     Path(session_id): Path<String>,
-    Query(query): Query<TokenQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_token(&app, &query).await?;
     let canvases = app.canvases.list(&session_id).await;
     Ok(Json(json!({ "canvases": canvases })))
 }
@@ -64,9 +43,7 @@ pub async fn handle_list(
 pub async fn handle_get(
     State(app): State<Arc<AppState>>,
     Path((session_id, canvas_id)): Path<(String, String)>,
-    Query(query): Query<TokenQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_token(&app, &query).await?;
     let state = app.canvases.get_state(&session_id, &canvas_id).await;
     match state {
         Some(s) => Ok(Json(json!({ "state": s }))),
@@ -77,10 +54,8 @@ pub async fn handle_get(
 pub async fn handle_patch(
     State(app): State<Arc<AppState>>,
     Path((session_id, canvas_id)): Path<(String, String)>,
-    Query(query): Query<TokenQuery>,
     Json(body): Json<PatchBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_token(&app, &query).await?;
     match app
         .canvases
         .set_state(&session_id, &canvas_id, body.patch)
@@ -94,9 +69,7 @@ pub async fn handle_patch(
 pub async fn handle_close(
     State(app): State<Arc<AppState>>,
     Path((session_id, canvas_id)): Path<(String, String)>,
-    Query(query): Query<TokenQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_token(&app, &query).await?;
     match app.canvases.close(&session_id, &canvas_id).await {
         Ok(state) => Ok(Json(json!({ "closed": true, "state": state }))),
         Err(e) => Err((StatusCode::NOT_FOUND, e.to_string())),
@@ -131,7 +104,10 @@ async fn browser_target_url(
     }
     let config = app.config.read().await;
     let Some(base) = config.tachyon_browser_url.as_deref() else {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "tachyon-browser is not configured".to_string()));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tachyon-browser is not configured".to_string(),
+        ));
     };
     let mut target = format!("{}/api/browser/{}", base.trim_end_matches('/'), path);
     if let Some(query) = raw_query.filter(|query| !query.is_empty()) {
@@ -150,17 +126,26 @@ async fn proxy_browser_request(
     let request = match method {
         Method::GET => client.get(&target),
         Method::POST => client.post(&target).json(&body.unwrap_or(Value::Null)),
-        _ => return Err((StatusCode::METHOD_NOT_ALLOWED, "unsupported method".to_string())),
+        _ => {
+            return Err((
+                StatusCode::METHOD_NOT_ALLOWED,
+                "unsupported method".to_string(),
+            ))
+        }
     };
-    let upstream = request
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("tachyon-browser fetch failed: {e}")))?;
+    let upstream = request.send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("tachyon-browser fetch failed: {e}"),
+        )
+    })?;
     let status = upstream.status();
-    let bytes = upstream
-        .bytes()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("tachyon-browser response read failed: {e}")))?;
+    let bytes = upstream.bytes().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("tachyon-browser response read failed: {e}"),
+        )
+    })?;
 
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = status;

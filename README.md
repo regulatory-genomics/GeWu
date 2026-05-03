@@ -135,32 +135,19 @@ Each key under `plugins` is a plugin name. The object is passed as `plugin_confi
 
 ### Building with a Plugin
 
-GeWu core does not ship built-in domain plugins. Plugin integration now happens via
+GeWu core does not ship built-in domain plugins. Plugin integration happens via
 composition binaries that depend on `gewu-cli` or `gewu-web` as libraries and register
 plugin constructors at startup.
 
-```bash
-# No plugins
-cargo run --bin gewu-cli -- --agent build
-
-# Genome-enabled distribution (from GeWu-genome)
-cargo run -p gewu-genome-cli -- --agent genome-orchestrator
-
-# Genome-enabled web distribution (from GeWu-genome)
-cargo run -p gewu-genome-web -- --port 8080
-
-# FateWeaver-enabled distribution (from FateWeaver)
-cargo run -p gewu-fateweaver-cli -- --agent fateweaver_orchestrator
-```
+Genome analysis tools are provided by `tachyon-browser-client`, a Rust crate inside
+the [tachyon-browser](../tachyon-browser) repo. Configure `tachyonBrowser` in your
+config to enable them.
 
 ### Listing Available Agents
 
 ```bash
 cargo run --bin gewu-cli -- --list-agents
 ```
-
-Composition binaries list both builtin and plugin-provided specialists through the same
-`--list-agents` command.
 
 ### Writing a Plugin
 
@@ -178,7 +165,6 @@ impl Plugin for MyPlugin {
     fn specialist_descriptors(&self) -> Vec<SpecialistDescriptor> { /* ... */ }
 }
 
-/// Constructor for PluginRegistry
 pub fn build_my_plugin(ctx: &PluginPlatformContext) -> anyhow::Result<Box<dyn Plugin>> {
     let config = serde_json::from_value(ctx.plugin_config.clone())?;
     Ok(Box::new(MyPlugin::new(config, ctx.provider.clone(), ctx.pool.clone())))
@@ -197,16 +183,13 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-### Composition Crates
+## Security Model
 
-- `gewu-genome-cli` / `gewu-genome-web` (in `GeWu-genome`) register the `genome` plugin.
-- `gewu-fateweaver-cli` (in `FateWeaver`) registers the `fateweaver` plugin.
-
-To build your own plugin-enabled distribution:
-
-1. Create a binary crate that depends on `gewu-cli` or `gewu-web` and your plugin crate.
-2. Call `gewu_cli::run_with_plugins(...)` or `gewu_web::run_with_plugins(...)` from `main`.
-3. Register plugin constructors with `PluginRegistry::register("<name>", <constructor>)`.
+- **Loopback default**: `cargo run --bin gewu-web` binds to `127.0.0.1` with no auth required.
+- **Password mode**: `--password <pw>` enables cookie-based auth (argon2 hashed). The login page is served at `/login`.
+- **Non-loopback guard**: binding to `0.0.0.0` or a public IP without `--password` refuses to start unless `--allow-insecure-bind` is passed.
+- **Cookie auth**: `gewu_session` cookie with `HttpOnly; SameSite=Strict; Path=/`. No URL tokens.
+- **Security headers**: CSP, X-Frame-Options: DENY, X-Content-Type-Options: nosniff, Referrer-Policy: no-referrer.
 
 ### Config Precedence
 

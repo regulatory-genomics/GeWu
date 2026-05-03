@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use gewu_core::types::{TaskExecutionStatus, TaskRecord, TaskResultStatus, TaskStatus};
 use sqlx::Row;
 use sqlx::sqlite::SqlitePool;
@@ -23,59 +23,8 @@ pub struct AsyncTaskGroupStore {
 
 impl AsyncTaskGroupStore {
     pub async fn new(pool: SqlitePool) -> Result<Self> {
-        let store = Self { pool };
-        store.migrate().await?;
-        Ok(store)
-    }
-
-    async fn migrate(&self) -> Result<()> {
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS async_task_groups (
-                group_id TEXT PRIMARY KEY,
-                parent_session_id TEXT NOT NULL,
-                parent_message_id TEXT NOT NULL,
-                expected_member_count INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'running',
-                injected_at INTEGER,
-                created_at INTEGER DEFAULT (unixepoch()),
-                updated_at INTEGER DEFAULT (unixepoch()),
-                UNIQUE(parent_session_id, parent_message_id)
-            )"#,
-        )
-        .execute(&self.pool)
-        .await
-        .context("create async_task_groups")?;
-
-        sqlx::query(
-            r#"ALTER TABLE async_task_groups
-               ADD COLUMN expected_member_count INTEGER NOT NULL DEFAULT 0"#,
-        )
-        .execute(&self.pool)
-        .await
-        .ok();
-
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS async_task_group_members (
-                group_id TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                child_session_id TEXT NOT NULL,
-                created_at INTEGER DEFAULT (unixepoch()),
-                PRIMARY KEY(group_id, task_id),
-                FOREIGN KEY(group_id) REFERENCES async_task_groups(group_id)
-            )"#,
-        )
-        .execute(&self.pool)
-        .await
-        .context("create async_task_group_members")?;
-
-        for stmt in [
-            "CREATE INDEX IF NOT EXISTS idx_atg_parent ON async_task_groups(parent_session_id, parent_message_id)",
-            "CREATE INDEX IF NOT EXISTS idx_atgm_task ON async_task_group_members(task_id)",
-            "CREATE INDEX IF NOT EXISTS idx_atgm_group ON async_task_group_members(group_id)",
-        ] {
-            sqlx::query(stmt).execute(&self.pool).await?;
-        }
-        Ok(())
+        // Schema lives in `gewu-storage/migrations/0003_async_task_groups.sql`.
+        Ok(Self { pool })
     }
 
     pub async fn create_or_get_group(
@@ -188,6 +137,25 @@ impl AsyncTaskGroupStore {
         Ok(r.rows_affected() > 0)
     }
 
+    /// Variant of `mark_injected` that runs inside a caller-provided transaction.
+    /// Used by callers that need to atomically pair the UPDATE with another insert
+    /// (e.g. the BackgroundTaskCoordinator pairing this with a memory_messages
+    /// INSERT to avoid the failure path described in C1/M6).
+    pub async fn mark_injected_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        group_id: &str,
+    ) -> Result<bool> {
+        let r = sqlx::query(
+            r#"UPDATE async_task_groups
+               SET status = 'completed', injected_at = unixepoch(), updated_at = unixepoch()
+               WHERE group_id = ? AND injected_at IS NULL"#,
+        )
+        .bind(group_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
     async fn get_group_by_parent(
         &self,
         parent_session_id: &str,
@@ -251,9 +219,15 @@ mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
 
+    async fn make_pool() -> Result<sqlx::sqlite::SqlitePool> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        crate::run_migrations(&pool).await?;
+        Ok(pool)
+    }
+
     #[tokio::test]
     async fn create_or_get_group_reuses_parent_turn() -> Result<()> {
-        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        let pool = make_pool().await?;
         let store = AsyncTaskGroupStore::new(pool).await?;
         let first = store.create_or_get_group("parent", "msg").await?;
         let second = store.create_or_get_group("parent", "msg").await?;
@@ -263,7 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_or_get_group_keeps_largest_expected_count() -> Result<()> {
-        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        let pool = make_pool().await?;
         let store = AsyncTaskGroupStore::new(pool).await?;
         let first = store
             .create_or_get_group_with_expected_count("parent", "msg", 3)
@@ -279,7 +253,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_injected_is_idempotent() -> Result<()> {
-        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        let pool = make_pool().await?;
         let store = AsyncTaskGroupStore::new(pool).await?;
         let group = store.create_or_get_group("parent", "msg").await?;
         assert!(store.mark_injected(&group.group_id).await?);

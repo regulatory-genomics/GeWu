@@ -98,9 +98,7 @@ pub async fn ensure_tachyon_browser(
     }
 
     if !cfg.auto_start {
-        anyhow::bail!(
-            "tachyon-browser at {url} is not healthy and tachyonBrowser.autoStart=false"
-        );
+        anyhow::bail!("tachyon-browser at {url} is not healthy and tachyonBrowser.autoStart=false");
     }
 
     let command = cfg
@@ -139,7 +137,11 @@ async fn wait_until_healthy(url: &str, health_path: &str, timeout_ms: u64) -> Re
         if health_ok(url, health_path).await {
             return Ok(());
         }
-        last_error = format!("{}{} not healthy yet", url.trim_end_matches('/'), health_path);
+        last_error = format!(
+            "{}{} not healthy yet",
+            url.trim_end_matches('/'),
+            health_path
+        );
         sleep(Duration::from_millis(200)).await;
     }
     anyhow::bail!(
@@ -186,7 +188,8 @@ mod tests {
             "command": "tachyon-browser",
             "startupTimeoutMs": 1234,
             "workingDirectory": "/tmp"
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(cfg.enabled);
         assert!(cfg.auto_start);
         assert_eq!(cfg.startup_timeout_ms, 1234);

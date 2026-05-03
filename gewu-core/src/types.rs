@@ -272,6 +272,7 @@ impl ExecutionRunKind {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "chat_message" => Some(Self::ChatMessage),
@@ -305,6 +306,7 @@ impl ExecutionRunStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "running" => Some(Self::Running),
@@ -533,6 +535,7 @@ impl TaskStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "ready" => Some(Self::Ready),
@@ -572,6 +575,7 @@ impl TaskExecutionStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(Self::Pending),
@@ -611,6 +615,7 @@ impl TaskResultStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(Self::Pending),

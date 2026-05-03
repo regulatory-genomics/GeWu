@@ -160,10 +160,10 @@ make_tool!(SynthesisTool, "fw_synthesis", |args: Value| {
         let mut keys: Vec<&String> = m.keys().collect();
         keys.sort(); // deterministic order
         for k in keys {
-            if let Some(v) = m.get(k) {
-                if let Some(cs) = v.get("claims").and_then(|c| c.as_array()) {
-                    all.extend(cs.iter().cloned());
-                }
+            if let Some(v) = m.get(k)
+                && let Some(cs) = v.get("claims").and_then(|c| c.as_array())
+            {
+                all.extend(cs.iter().cloned());
             }
         }
     }
@@ -282,6 +282,7 @@ async fn build_runtime() -> Arc<GeWuRuntime> {
         .connect("sqlite::memory:")
         .await
         .unwrap();
+    gewu_storage::run_migrations(&pool).await.unwrap();
     let provider: Arc<dyn LlmProvider> = Arc::new(StubLlm);
     let rt = GeWuRuntime::builder()
         .provider(provider)

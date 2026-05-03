@@ -13,24 +13,15 @@ use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct EventsQuery {
-    token: Option<String>,
     session_id: Option<String>,
 }
 
 pub async fn handle_events(
-    State(app): State<Arc<AppState>>,
+    State(_app): State<Arc<AppState>>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
-    let auth = app.auth_token.read().await;
-    let valid = query
-        .token
-        .as_ref()
-        .map(|t| auth.validate(t))
-        .unwrap_or(false);
-    drop(auth);
-    if !valid {
-        return Err(AppError::Unauthorized);
-    }
+    // Auth is enforced by middleware; cookies are sent automatically by
+    // EventSource for same-origin requests.
 
     let session_filter = query.session_id.clone();
     let stream = BroadcastStream::new(subscribe_background_events()).filter_map(move |event| {

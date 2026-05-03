@@ -251,9 +251,9 @@ fn build_research_graph(
     graph.add_node("synthesize", synthesize);
     graph.add_node("respond", format_response);
 
-    graph.add_edge("generate_queries", "search");
-    graph.add_edge("search", "synthesize");
-    graph.add_edge("synthesize", "respond");
+    graph.add_edge("generate_queries", "search").expect("valid edge");
+    graph.add_edge("search", "synthesize").expect("valid edge");
+    graph.add_edge("synthesize", "respond").expect("valid edge");
 
     graph.set_entry_point("generate_queries");
     graph.set_finish_point("respond");
@@ -307,7 +307,7 @@ async fn main() -> Result<()> {
     println!("Research tool created: {}\n", research_tool.tool_name());
     println!("Running research queries...\n");
 
-    let test_queries = vec!["What are the benefits of Rust for systems programming?"];
+    let test_queries = ["What are the benefits of Rust for systems programming?"];
 
     for (i, query) in test_queries.iter().enumerate() {
         println!("========================================");

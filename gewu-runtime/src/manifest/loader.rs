@@ -14,6 +14,12 @@ pub struct SpecialistManifestLoader {
     dirs: Vec<PathBuf>,
 }
 
+impl Default for SpecialistManifestLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SpecialistManifestLoader {
     pub fn new() -> Self {
         Self { dirs: Vec::new() }

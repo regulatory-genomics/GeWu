@@ -28,10 +28,10 @@ pub async fn serve_index() -> Response {
             let injected = inject_runtime_meta(&body);
             Html(injected).into_response()
         }
-        Err(_) => Html(
-            "<html><body><h1>GeWu</h1><p>index.html not found.</p></body></html>".to_string(),
-        )
-        .into_response(),
+        Err(_) => {
+            Html("<html><body><h1>GeWu</h1><p>index.html not found.</p></body></html>".to_string())
+                .into_response()
+        }
     }
 }
 

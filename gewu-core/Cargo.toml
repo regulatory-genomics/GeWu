@@ -2,6 +2,7 @@
 name = "gewu-core"
 version = "0.1.0"
 edition = "2024"
+description = "Core traits, types, and agent loop for the GeWu agent framework"
 
 [dependencies]
 anyhow = "1.0"
@@ -21,3 +22,6 @@ sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-native-tls"] }
 [dev-dependencies]
 gewu-providers = { path = "../gewu-providers" }
 gewu-tools = { path = "../gewu-tools" }
+
+[lints]
+workspace = true

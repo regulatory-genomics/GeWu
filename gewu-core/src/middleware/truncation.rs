@@ -91,12 +91,12 @@ impl TruncationService {
         let mut out_lines: Vec<&str> = Vec::new();
         let mut bytes = 0;
 
-        for i in 0..lines.len().min(self.max_lines) {
-            let line_size = lines[i].len() + if i > 0 { 1 } else { 0 };
+        for (i, line) in lines.iter().take(self.max_lines).enumerate() {
+            let line_size = line.len() + if i > 0 { 1 } else { 0 };
             if bytes + line_size > self.max_bytes {
                 break;
             }
-            out_lines.push(lines[i]);
+            out_lines.push(line);
             bytes += line_size;
         }
 
@@ -116,11 +116,7 @@ impl TruncationService {
         let truncated = self.truncate_json_value(&val, self.max_bytes);
         let serialized = serde_json::to_string(&truncated).ok()?;
 
-        if serialized.len() < text.len() {
-            Some(serialized)
-        } else {
-            Some(serialized)
-        }
+        Some(serialized)
     }
 
     fn truncate_json_value(&self, val: &serde_json::Value, budget: usize) -> serde_json::Value {

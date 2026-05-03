@@ -41,19 +41,16 @@ impl LlmProvider for MockLlm {
         let response = responses.remove(0);
 
         let s = async_stream::try_stream! {
-            match response {
-                Message::Assistant { content, tool_calls } => {
-                    if let Some(c) = content {
-                        yield ProviderEvent::ContentDelta { delta: c };
-                    }
-                    if let Some(calls) = tool_calls {
-                        for call in calls {
-                            yield ProviderEvent::ToolCallStart { id: call.id.clone(), name: call.function.name };
-                            yield ProviderEvent::ToolCallDelta { id: call.id, delta: call.function.arguments };
-                        }
+            if let Message::Assistant { content, tool_calls } = response {
+                if let Some(c) = content {
+                    yield ProviderEvent::ContentDelta { delta: c };
+                }
+                if let Some(calls) = tool_calls {
+                    for call in calls {
+                        yield ProviderEvent::ToolCallStart { id: call.id.clone(), name: call.function.name };
+                        yield ProviderEvent::ToolCallDelta { id: call.id, delta: call.function.arguments };
                     }
                 }
-                _ => {}
             }
         };
         Ok(Box::pin(s))

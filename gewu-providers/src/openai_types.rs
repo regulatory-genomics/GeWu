@@ -479,7 +479,7 @@ impl FunctionObjectArgs {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct CreateChatCompletionRequestArgs {
     model: Option<String>,
     messages: Option<Vec<ChatCompletionRequestMessage>>,
@@ -487,19 +487,6 @@ pub struct CreateChatCompletionRequestArgs {
     stream: Option<bool>,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
-}
-
-impl Default for CreateChatCompletionRequestArgs {
-    fn default() -> Self {
-        Self {
-            model: None,
-            messages: None,
-            tools: None,
-            stream: None,
-            max_tokens: None,
-            temperature: None,
-        }
-    }
 }
 
 impl CreateChatCompletionRequestArgs {
@@ -547,15 +534,9 @@ impl CreateChatCompletionRequestArgs {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatCompletionRequestSystemMessageArgs {
     content: Option<String>,
-}
-
-impl Default for ChatCompletionRequestSystemMessageArgs {
-    fn default() -> Self {
-        Self { content: None }
-    }
 }
 
 impl ChatCompletionRequestSystemMessageArgs {
@@ -571,15 +552,9 @@ impl ChatCompletionRequestSystemMessageArgs {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatCompletionRequestUserMessageArgs {
     content: Option<Vec<ChatCompletionRequestUserMessageContentPart>>,
-}
-
-impl Default for ChatCompletionRequestUserMessageArgs {
-    fn default() -> Self {
-        Self { content: None }
-    }
 }
 
 impl ChatCompletionRequestUserMessageArgs {
@@ -595,19 +570,10 @@ impl ChatCompletionRequestUserMessageArgs {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatCompletionRequestAssistantMessageArgs {
     content: Option<String>,
     tool_calls: Option<Vec<ChatCompletionMessageToolCalls>>,
-}
-
-impl Default for ChatCompletionRequestAssistantMessageArgs {
-    fn default() -> Self {
-        Self {
-            content: None,
-            tool_calls: None,
-        }
-    }
 }
 
 impl ChatCompletionRequestAssistantMessageArgs {
@@ -629,19 +595,10 @@ impl ChatCompletionRequestAssistantMessageArgs {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatCompletionRequestToolMessageArgs {
     tool_call_id: Option<String>,
     content: Option<String>,
-}
-
-impl Default for ChatCompletionRequestToolMessageArgs {
-    fn default() -> Self {
-        Self {
-            tool_call_id: None,
-            content: None,
-        }
-    }
 }
 
 impl ChatCompletionRequestToolMessageArgs {

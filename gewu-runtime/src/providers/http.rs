@@ -79,36 +79,6 @@ fn normalize_endpoint(endpoint: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn runtime_plugin_tools_convert_to_http_capabilities() {
-        let manifest: RuntimePluginManifest = serde_yaml::from_str(
-            r#"
-id: gewu-memory
-kind: http
-base_url: http://127.0.0.1:7878
-tools:
-  - name: memory_search
-    description: Search prior memory
-    endpoint: /v1/memory/search
-    method: POST
-"#,
-        )
-        .unwrap();
-
-        let provider = HttpToolProvider::from_runtime_plugin(&manifest)
-            .unwrap()
-            .unwrap();
-        let caps = provider.capabilities();
-        assert_eq!(caps.len(), 1);
-        assert_eq!(caps[0].name, "memory_search");
-        assert_eq!(caps[0].provider_kind, "http");
-    }
-}
-
 impl ToolProvider for HttpProviderSpec {
     fn kind(&self) -> &str {
         "http"
@@ -243,5 +213,35 @@ impl Tool for HttpTool {
             &self.cap.name,
             format!("[{}] {}", status.as_u16(), body),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_plugin_tools_convert_to_http_capabilities() {
+        let manifest: RuntimePluginManifest = serde_yaml::from_str(
+            r#"
+id: gewu-memory
+kind: http
+base_url: http://127.0.0.1:7878
+tools:
+  - name: memory_search
+    description: Search prior memory
+    endpoint: /v1/memory/search
+    method: POST
+"#,
+        )
+        .unwrap();
+
+        let provider = HttpToolProvider::from_runtime_plugin(&manifest)
+            .unwrap()
+            .unwrap();
+        let caps = provider.capabilities();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].name, "memory_search");
+        assert_eq!(caps[0].provider_kind, "http");
     }
 }

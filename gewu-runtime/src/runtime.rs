@@ -15,7 +15,7 @@ use schemars::schema::RootSchema;
 use serde_json::Value;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::capability::{CapabilityRegistry, ToolFactoryProvider};
@@ -298,7 +298,9 @@ impl GeWuRuntime {
             if !resolved {
                 // Fall back to capability registry (handles command tools, etc.)
                 if self.capability_registry.contains(cap) {
-                    let produced = self.capability_registry.resolve(&[cap.clone()], &ctx)?;
+                    let produced = self
+                        .capability_registry
+                        .resolve(std::slice::from_ref(cap), &ctx)?;
                     tools.extend(produced);
                 } else {
                     return Err(anyhow!("No factory can resolve capability: {}", cap));
@@ -319,11 +321,11 @@ impl GeWuRuntime {
     pub fn resolve_capabilities_in_directory(
         &self,
         caps: &[String],
-        working_directory: &PathBuf,
+        working_directory: &Path,
     ) -> Result<Vec<Box<dyn Tool>>> {
         self.resolve_capabilities_with_working_directory(
             caps,
-            working_directory.clone(),
+            working_directory.to_path_buf(),
             Value::Null,
         )
     }
@@ -331,12 +333,12 @@ impl GeWuRuntime {
     pub fn resolve_capabilities_with_metadata(
         &self,
         caps: &[String],
-        working_directory: &PathBuf,
+        working_directory: &Path,
         metadata_json: Value,
     ) -> Result<Vec<Box<dyn Tool>>> {
         self.resolve_capabilities_with_working_directory(
             caps,
-            working_directory.clone(),
+            working_directory.to_path_buf(),
             metadata_json,
         )
     }
@@ -412,10 +414,9 @@ impl GeWuRuntime {
                         if let Ok(report) = serde_json::from_str::<
                             gewu_tools::report_result::ReportResultArgs,
                         >(&output)
+                            && let Some(val) = report.result
                         {
-                            if let Some(val) = report.result {
-                                return Ok(val);
-                            }
+                            return Ok(val);
                         }
                     }
                     AgentEvent::Error { error } => {
@@ -1248,7 +1249,7 @@ fn working_directory_from_metadata(metadata_json: &Value) -> Result<PathBuf> {
         .map_err(Into::into)
 }
 
-fn metadata_with_workspace_root(metadata_json: Value, working_directory: &PathBuf) -> Value {
+fn metadata_with_workspace_root(metadata_json: Value, working_directory: &Path) -> Value {
     let workspace_root = working_directory.to_string_lossy().to_string();
     match metadata_json {
         Value::Object(mut map) => {
@@ -1323,31 +1324,6 @@ fn classify_task_result(
         return TaskResultStatus::Incomplete;
     }
     TaskResultStatus::Accepted
-}
-
-#[cfg(test)]
-mod task_result_tests {
-    use super::*;
-
-    #[test]
-    fn blocked_specialist_is_completed_execution_with_invalid_result() {
-        let final_status = TaskStatus::Blocked;
-        let execution_status = match final_status {
-            TaskStatus::Succeeded | TaskStatus::Blocked => TaskExecutionStatus::Completed,
-            TaskStatus::Failed => TaskExecutionStatus::Failed,
-            TaskStatus::Ready | TaskStatus::Running => TaskExecutionStatus::Interrupted,
-        };
-
-        assert_eq!(execution_status, TaskExecutionStatus::Completed);
-        assert_eq!(
-            classify_task_result(
-                final_status,
-                "API error: invalid params, tool result's tool id not found",
-                &None,
-            ),
-            TaskResultStatus::Invalid
-        );
-    }
 }
 
 struct RuntimeToolRegistry {
@@ -1745,5 +1721,30 @@ impl ToolFactory for ComposerToolFactoryForRegistry {
         // factories vec. This stub exists only so the registry index knows
         // these capability names exist.
         Ok(vec![])
+    }
+}
+
+#[cfg(test)]
+mod task_result_tests {
+    use super::*;
+
+    #[test]
+    fn blocked_specialist_is_completed_execution_with_invalid_result() {
+        let final_status = TaskStatus::Blocked;
+        let execution_status = match final_status {
+            TaskStatus::Succeeded | TaskStatus::Blocked => TaskExecutionStatus::Completed,
+            TaskStatus::Failed => TaskExecutionStatus::Failed,
+            TaskStatus::Ready | TaskStatus::Running => TaskExecutionStatus::Interrupted,
+        };
+
+        assert_eq!(execution_status, TaskExecutionStatus::Completed);
+        assert_eq!(
+            classify_task_result(
+                final_status,
+                "API error: invalid params, tool result's tool id not found",
+                &None,
+            ),
+            TaskResultStatus::Invalid
+        );
     }
 }

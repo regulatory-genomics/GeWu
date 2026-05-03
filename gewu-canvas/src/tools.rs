@@ -25,7 +25,7 @@ use gewu_core::traits::Tool;
 use gewu_core::types::{ToolContext, ToolExecutionPolicy, ToolResult};
 use schemars::schema::RootSchema;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::manager::CanvasManager;
 use crate::state::{CanvasEvent, CanvasKind, CanvasMode, CanvasState, CanvasStatePatch};
@@ -139,7 +139,7 @@ impl Tool for CanvasOpenTool {
             mode: preview.mode,
             initial_state: preview,
         };
-        Ok(serde_json::to_value(event).map_err(box_err)?)
+        serde_json::to_value(event).map_err(box_err)
     }
 
     async fn execute(
@@ -434,7 +434,10 @@ impl Tool for CanvasGetStateTool {
         ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: CanvasIdArgs = serde_json::from_value(args).map_err(box_err)?;
-        let state = self.manager.get_state(&ctx.session_id, &input.canvas_id).await;
+        let state = self
+            .manager
+            .get_state(&ctx.session_id, &input.canvas_id)
+            .await;
         let output = json!({
             "canvas_id": input.canvas_id,
             "state": state,
@@ -519,9 +522,7 @@ mod tests {
     #[tokio::test]
     async fn start_metadata_emits_canvas_open_event() {
         let m = Arc::new(CanvasManager::new());
-        let open = CanvasOpenTool {
-            manager: m.clone(),
-        };
+        let open = CanvasOpenTool { manager: m.clone() };
         let args = serde_json::to_string(&json!({
             "kind": "genome",
             "title": "demo",
@@ -568,10 +569,24 @@ mod tests {
     #[tokio::test]
     async fn list_returns_canvases_for_session_only() {
         let m = Arc::new(CanvasManager::new());
-        m.open("s1", None, CanvasKind::Genome, CanvasMode::Overlay, None, None)
-            .await;
-        m.open("s2", None, CanvasKind::Genome, CanvasMode::Overlay, None, None)
-            .await;
+        m.open(
+            "s1",
+            None,
+            CanvasKind::Genome,
+            CanvasMode::Overlay,
+            None,
+            None,
+        )
+        .await;
+        m.open(
+            "s2",
+            None,
+            CanvasKind::Genome,
+            CanvasMode::Overlay,
+            None,
+            None,
+        )
+        .await;
         let list = CanvasListTool { manager: m };
 
         let r1 = list.execute(json!({}), &ctx("s1")).await.unwrap();

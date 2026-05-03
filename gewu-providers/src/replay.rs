@@ -192,13 +192,13 @@ mod tests {
         assert_eq!(events.len(), 1);
         match events[0].as_ref().unwrap() {
             ProviderEvent::ContentDelta { delta } => assert_eq!(delta, "hi"),
-            _ => panic!(),
+            other => panic!("expected ContentDelta(\"hi\"), got {:?}", other),
         }
         let stream2 = p.stream_response(&[], &[]).await.unwrap();
         let events2: Vec<_> = stream2.collect().await;
         match events2[0].as_ref().unwrap() {
             ProviderEvent::ContentDelta { delta } => assert_eq!(delta, "bye"),
-            _ => panic!(),
+            other => panic!("expected ContentDelta(\"bye\"), got {:?}", other),
         }
     }
 
@@ -238,7 +238,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         match events[0].as_ref().unwrap() {
             ProviderEvent::ContentDelta { delta } => assert_eq!(delta, "recorded"),
-            _ => panic!(),
+            other => panic!("expected ContentDelta(\"recorded\"), got {:?}", other),
         }
     }
 

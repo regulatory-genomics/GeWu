@@ -16,7 +16,9 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
 thiserror = "2.0"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

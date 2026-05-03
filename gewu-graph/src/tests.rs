@@ -132,14 +132,14 @@ mod tests {
         let mut graph = StateGraph::<TestState>::new();
 
         let set_messages =
-            |state: TestState| async move { partial(None, Some(vec!["msg1".to_string()])) };
+            |_state: TestState| async move { partial(None, Some(vec!["msg1".to_string()])) };
 
         let increment = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("set_messages", set_messages);
         graph.add_node("increment", increment);
         graph.set_entry_point("set_messages");
-        graph.add_edge("set_messages", "increment");
+        graph.add_edge("set_messages", "increment").expect("valid edge");
         graph.set_finish_point("increment");
 
         let compiled = graph.compile();
@@ -162,12 +162,12 @@ mod tests {
         let node_a = |state: TestState| async move { partial(Some(state.count + 10), None) };
 
         let node_b =
-            |state: TestState| async move { partial(None, Some(vec!["from_b".to_string()])) };
+            |_state: TestState| async move { partial(None, Some(vec!["from_b".to_string()])) };
 
         graph.add_node("a", node_a);
         graph.add_node("b", node_b);
         graph.set_entry_point("a");
-        graph.add_edge("a", "b");
+        graph.add_edge("a", "b").expect("valid edge");
         graph.set_finish_point("a");
         graph.set_finish_point("b");
 
@@ -199,8 +199,8 @@ mod tests {
         };
 
         graph.add_node("start", node);
-        graph.add_node("high", node.clone());
-        graph.add_node("low", node.clone());
+        graph.add_node("high", node);
+        graph.add_node("low", node);
         graph.set_entry_point("start");
         graph.add_conditional_edges(
             "start",
@@ -262,10 +262,10 @@ mod tests {
             [("positive".to_string(), "positive".to_string())].into(),
         );
 
-        graph.add_edge("high", END);
-        graph.add_edge("low", END);
-        graph.add_edge("positive", END);
-        graph.add_edge("negative", END);
+        graph.add_edge("high", END).expect("valid edge");
+        graph.add_edge("low", END).expect("valid edge");
+        graph.add_edge("positive", END).expect("valid edge");
+        graph.add_edge("negative", END).expect("valid edge");
 
         let compiled = graph.compile();
 
@@ -347,7 +347,7 @@ mod tests {
         graph.add_node("via_send", via_send);
         graph.add_node("via_edge", via_edge);
         graph.set_entry_point("spawn");
-        graph.add_edge("spawn", "via_edge");
+        graph.add_edge("spawn", "via_edge").expect("valid edge");
         graph.set_finish_point("via_send");
         graph.set_finish_point("via_edge");
 
@@ -380,7 +380,7 @@ mod tests {
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
+        graph.add_edge("step1", "step2").expect("valid edge");
         graph.set_finish_point("step2");
 
         let compiled = graph.compile();
@@ -422,7 +422,7 @@ mod tests {
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
+        graph.add_edge("step1", "step2").expect("valid edge");
         graph.set_finish_point("step2");
 
         let compiled = graph.compile();
@@ -437,9 +437,8 @@ mod tests {
         let mut customs = Vec::new();
 
         while let Some(result) = stream.next().await {
-            match result.unwrap() {
-                StreamOutput::Custom { node, data } => customs.push((node, data)),
-                _ => {}
+            if let StreamOutput::Custom { node, data } = result.unwrap() {
+                customs.push((node, data))
             }
         }
 
@@ -459,7 +458,7 @@ mod tests {
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
+        graph.add_edge("step1", "step2").expect("valid edge");
         graph.set_finish_point("step2");
 
         let compiled = graph.compile();
@@ -499,7 +498,7 @@ mod tests {
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
+        graph.add_edge("step1", "step2").expect("valid edge");
         graph.set_finish_point("step2");
 
         let compiled = graph.compile();
@@ -510,7 +509,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let values = vec![stream.clone()];
+        let values = [stream.clone()];
 
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].count, 11);
@@ -527,7 +526,7 @@ mod tests {
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
+        graph.add_edge("step1", "step2").expect("valid edge");
         graph.set_finish_point("step2");
 
         let compiled = graph.compile();
@@ -564,7 +563,7 @@ mod tests {
 
         graph.add_node("a", node_a);
         graph.set_entry_point("a");
-        graph.add_edge("a", END);
+        graph.add_edge("a", END).expect("valid edge");
 
         let compiled = graph.compile();
         let result = compiled
@@ -611,8 +610,8 @@ mod tests {
         graph.add_node("worker_a", worker_a);
         graph.add_node("worker_b", worker_b);
         graph.set_entry_point("spawn");
-        graph.add_edge("worker_a", END);
-        graph.add_edge("worker_b", END);
+        graph.add_edge("worker_a", END).expect("valid edge");
+        graph.add_edge("worker_b", END).expect("valid edge");
 
         let compiled = graph.compile();
         let result = compiled
@@ -705,7 +704,7 @@ mod tests {
         graph.add_subgraph_node("nested", subgraph_compiled);
         graph.add_node("after", after);
         graph.set_entry_point("spawn");
-        graph.add_edge("spawn", "after");
+        graph.add_edge("spawn", "after").expect("valid edge");
         graph.set_finish_point("after");
 
         let compiled = graph.compile();
@@ -725,19 +724,25 @@ mod tests {
     // ========================================
 
     #[test]
-    #[should_panic(expected = "START cannot be END node")]
     fn test_builder_rejects_start_equals_end() {
         let mut graph = StateGraph::<TestState>::new();
         graph.add_node("node", |_: TestState| async { partial(None, None) });
-        graph.add_edge(END, END);
+        let err = graph.add_edge(END, END).unwrap_err();
+        assert!(
+            err.to_string().contains("END cannot be used as edge start"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "END cannot be START node")]
     fn test_builder_rejects_end_equals_start() {
         let mut graph = StateGraph::<TestState>::new();
         graph.add_node("node", |_: TestState| async { partial(None, None) });
-        graph.add_edge("node", START);
+        let err = graph.add_edge("node", START).unwrap_err();
+        assert!(
+            err.to_string().contains("START cannot be used as edge end"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -783,7 +788,7 @@ mod tests {
         graph.add_node("increment", increment);
         graph.add_node("add_message", add_message);
         graph.set_entry_point("increment");
-        graph.add_edge("increment", "add_message");
+        graph.add_edge("increment", "add_message").expect("valid edge");
         graph.set_finish_point("add_message");
 
         let compiled = graph.compile();
@@ -862,7 +867,7 @@ mod tests {
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
+        graph.add_edge("step1", "step2").expect("valid edge");
         graph.set_finish_point("step2");
 
         let compiled = graph.compile();
@@ -874,9 +879,8 @@ mod tests {
         let mut states = Vec::new();
 
         while let Some(result) = stream.next().await {
-            match result.unwrap() {
-                StreamOutput::Value(s) => states.push(s),
-                _ => {}
+            if let StreamOutput::Value(s) = result.unwrap() {
+                states.push(s)
             }
         }
 
@@ -902,8 +906,8 @@ mod tests {
         graph.add_node("add_b", add_b);
         graph.add_node("record_c", record_c);
         graph.set_entry_point("add_a");
-        graph.add_edge("add_a", "add_b");
-        graph.add_edge("add_a", "record_c");
+        graph.add_edge("add_a", "add_b").expect("valid edge");
+        graph.add_edge("add_a", "record_c").expect("valid edge");
         graph.set_finish_point("add_b");
         graph.set_finish_point("record_c");
 
@@ -935,7 +939,7 @@ mod tests {
         subgraph.add_node("double", double);
         subgraph.add_node("add_hello", add_hello);
         subgraph.set_entry_point("double");
-        subgraph.add_edge("double", "add_hello");
+        subgraph.add_edge("double", "add_hello").expect("valid edge");
         subgraph.set_finish_point("add_hello");
 
         let subgraph_compiled = subgraph.compile();
@@ -950,8 +954,8 @@ mod tests {
         main_graph.add_subgraph_node("nested", subgraph_compiled);
         main_graph.add_node("subtract", subtract);
         main_graph.set_entry_point("increment");
-        main_graph.add_edge("increment", "nested");
-        main_graph.add_edge("nested", "subtract");
+        main_graph.add_edge("increment", "nested").expect("valid edge");
+        main_graph.add_edge("nested", "subtract").expect("valid edge");
         main_graph.set_finish_point("subtract");
 
         let compiled = main_graph.compile();
@@ -988,7 +992,7 @@ mod tests {
         graph.add_node("spawn", spawn);
         graph.add_node("worker", worker);
         graph.set_entry_point("spawn");
-        graph.add_edge("spawn", "worker");
+        graph.add_edge("spawn", "worker").expect("valid edge");
         graph.set_finish_point("worker");
 
         let compiled = graph.compile();
@@ -1016,7 +1020,7 @@ mod tests {
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
+        graph.add_edge("step1", "step2").expect("valid edge");
         graph.set_finish_point("step2");
 
         let compiled = graph.compile();
@@ -1084,7 +1088,7 @@ mod tests {
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
+        graph.add_edge("step1", "step2").expect("valid edge");
         graph.set_finish_point("step2");
 
         let compiled = graph.compile();
@@ -1120,7 +1124,7 @@ mod tests {
         graph.add_node("custom_only", custom_only);
         graph.add_node("after", after);
         graph.set_entry_point("custom_only");
-        graph.add_edge("custom_only", "after");
+        graph.add_edge("custom_only", "after").expect("valid edge");
         graph.set_finish_point("after");
 
         let compiled = graph.compile();
@@ -1212,8 +1216,8 @@ mod tests {
         graph.add_node("b", b);
         graph.add_node("c", c);
         graph.set_entry_point("a");
-        graph.add_edge("a", "b");
-        graph.add_edge("b", "c");
+        graph.add_edge("a", "b").expect("valid edge");
+        graph.add_edge("b", "c").expect("valid edge");
         graph.set_finish_point("c");
 
         let compiled = graph.compile();
@@ -1303,9 +1307,8 @@ mod tests {
         let mut customs = Vec::new();
 
         while let Some(result) = stream.next().await {
-            match result.unwrap() {
-                StreamOutput::Custom { node, data } => customs.push((node, data)),
-                _ => {}
+            if let StreamOutput::Custom { node, data } = result.unwrap() {
+                customs.push((node, data))
             }
         }
 
@@ -1323,7 +1326,7 @@ mod tests {
 
         let step1 = |state: TestState| async move { partial(Some(state.count + 10), None) };
 
-        let step2 = |state: TestState| async move { custom(serde_json::json!({"step2": "done"})) };
+        let step2 = |_state: TestState| async move { custom(serde_json::json!({"step2": "done"})) };
 
         let step3 = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
@@ -1331,8 +1334,8 @@ mod tests {
         graph.add_node("step2", step2);
         graph.add_node("step3", step3);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
-        graph.add_edge("step2", "step3");
+        graph.add_edge("step1", "step2").expect("valid edge");
+        graph.add_edge("step2", "step3").expect("valid edge");
         graph.set_finish_point("step3");
 
         let compiled = graph.compile();
@@ -1524,8 +1527,8 @@ mod tests {
         graph.add_node("msg2", add_msg2);
         graph.add_node("msg3", add_msg3);
         graph.set_entry_point("msg1");
-        graph.add_edge("msg1", "msg2");
-        graph.add_edge("msg2", "msg3");
+        graph.add_edge("msg1", "msg2").expect("valid edge");
+        graph.add_edge("msg2", "msg3").expect("valid edge");
         graph.set_finish_point("msg3");
 
         let compiled = graph.compile();

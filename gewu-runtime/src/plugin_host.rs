@@ -74,11 +74,11 @@ impl PluginHost {
 
         for (name, config) in plugin_configs {
             // Skip disabled plugins
-            if let Some(enabled) = config.get("enabled") {
-                if enabled == &Value::Bool(false) {
-                    tracing::info!("Plugin '{}' is disabled, skipping", name);
-                    continue;
-                }
+            if let Some(enabled) = config.get("enabled")
+                && enabled == &Value::Bool(false)
+            {
+                tracing::info!("Plugin '{}' is disabled, skipping", name);
+                continue;
             }
 
             if let Some(constructor) = registry.constructor(name) {

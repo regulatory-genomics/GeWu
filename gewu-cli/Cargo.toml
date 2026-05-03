@@ -2,6 +2,7 @@
 name = "gewu-cli"
 version = "0.1.0"
 edition = "2024"
+description = "Command-line interface and session orchestration for the GeWu agent framework"
 
 [dependencies]
 gewu-core = { path = "../gewu-core" }
@@ -28,3 +29,6 @@ schemars = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true

@@ -87,11 +87,7 @@ impl Tool for CliTool {
     }
 
     fn schema(&self) -> RootSchema {
-        if let Ok(schema) = serde_json::from_value(self.cap.input_schema.clone()) {
-            schema
-        } else {
-            RootSchema::default()
-        }
+        serde_json::from_value(self.cap.input_schema.clone()).unwrap_or_default()
     }
 
     async fn execute(

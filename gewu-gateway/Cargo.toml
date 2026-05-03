@@ -30,3 +30,6 @@ gewu-storage = { path = "../gewu-storage" }
 [[bin]]
 name = "gewu-gateway"
 path = "src/main.rs"
+
+[lints]
+workspace = true

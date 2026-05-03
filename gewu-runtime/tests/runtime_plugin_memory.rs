@@ -64,10 +64,10 @@ fn spawn_capture_hook(expected_requests: usize) -> (String, Arc<Mutex<Vec<serde_
             let mut request = [0_u8; 8192];
             let size = stream.read(&mut request).unwrap();
             let request_text = String::from_utf8_lossy(&request[..size]);
-            if let Some((_, body)) = request_text.split_once("\r\n\r\n") {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(body.trim()) {
-                    captures_for_thread.lock().unwrap().push(value);
-                }
+            if let Some((_, body)) = request_text.split_once("\r\n\r\n")
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(body.trim())
+            {
+                captures_for_thread.lock().unwrap().push(value);
             }
             let body = serde_json::json!({
                 "event_id": "evt_test",
@@ -116,6 +116,7 @@ hooks:
         .connect("sqlite::memory:")
         .await
         .unwrap();
+    gewu_storage::run_migrations(&pool).await.unwrap();
     let provider: Arc<dyn LlmProvider> = Arc::new(FinishLlm);
     let runtime = GeWuRuntime::builder()
         .provider(provider)
@@ -180,6 +181,7 @@ hooks:
         .connect("sqlite::memory:")
         .await
         .unwrap();
+    gewu_storage::run_migrations(&pool).await.unwrap();
     let provider: Arc<dyn LlmProvider> = Arc::new(FinishLlm);
     let runtime = GeWuRuntime::builder()
         .provider(provider)

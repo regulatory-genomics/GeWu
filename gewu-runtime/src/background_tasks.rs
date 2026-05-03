@@ -1,7 +1,6 @@
 use anyhow::Result;
-use gewu_core::traits::Memory;
 use gewu_core::types::{Message, TaskExecutionStatus, TaskRecord};
-use gewu_storage::{AsyncTaskGroup, AsyncTaskGroupStore, SqliteMemory};
+use gewu_storage::{AsyncTaskGroup, AsyncTaskGroupStore};
 use serde_json::Value;
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
@@ -95,14 +94,28 @@ impl BackgroundTaskCoordinator {
         if members.iter().any(|t| !is_settled(&t.execution_status)) {
             return Ok(false);
         }
-        if !store.mark_injected(&group.group_id).await? {
-            return Ok(false);
-        }
 
         let message = build_completion_message(&group, &members);
-        let mut memory =
-            SqliteMemory::new(self.pool.clone(), group.parent_session_id.clone()).await?;
-        memory.add_message(message).await;
+        let content = serde_json::to_string(&message)
+            .map_err(|e| anyhow::anyhow!("serialize completion message: {}", e))?;
+
+        // Atomically: mark group injected AND insert the parent's notification
+        // message. If either step fails the transaction rolls back, leaving
+        // injected_at = NULL so a future `on_task_settled` or startup
+        // `reconcile_uninjected_groups` will retry.
+        let mut tx = self.pool.begin().await?;
+        let was_marked = AsyncTaskGroupStore::mark_injected_tx(&mut tx, &group.group_id).await?;
+        if !was_marked {
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+        sqlx::query("INSERT INTO memory_messages (session_id, content) VALUES (?, ?)")
+            .bind(&group.parent_session_id)
+            .bind(content)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| anyhow::anyhow!("persist completion message: {}", e))?;
+        tx.commit().await?;
 
         let summary = build_summary_line(&members);
         let _ = bg_sender().send(BackgroundGroupCompletedEvent {
@@ -159,10 +172,10 @@ pub fn build_completion_message(group: &AsyncTaskGroup, tasks: &[TaskRecord]) ->
                 task.result_status.as_str()
             );
             let mut parts = vec![status_line];
-            if let Some(err) = task.error.as_deref().or(task.block_reason.as_deref()) {
-                if !err.trim().is_empty() {
-                    parts.push(format!("   Error: {}", truncate(err.trim(), 240)));
-                }
+            if let Some(err) = task.error.as_deref().or(task.block_reason.as_deref())
+                && !err.trim().is_empty()
+            {
+                parts.push(format!("   Error: {}", truncate(err.trim(), 240)));
             }
             if let Some(excerpt) = task_result_excerpt(task) {
                 parts.push(indent(&excerpt));
@@ -311,5 +324,58 @@ mod tests {
             started_at: Some(1),
             finished_at: Some(2),
         }
+    }
+
+    #[tokio::test]
+    async fn maybe_inject_rolls_back_when_message_insert_fails() -> anyhow::Result<()> {
+        use gewu_storage::TaskStore;
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        gewu_storage::run_migrations(&pool).await?;
+
+        let groups = AsyncTaskGroupStore::new(pool.clone()).await?;
+        let tasks = TaskStore::new(pool.clone()).await?;
+
+        let group = groups
+            .create_or_get_group_with_expected_count("parent", "msg", 1)
+            .await?;
+        let _record = tasks.create_task("t1", "explore", "p").await?;
+        groups.add_member(&group.group_id, "t1", "child").await?;
+        tasks
+            .mark_finished(
+                "t1",
+                &TaskExecutionStatus::Completed,
+                &TaskResultStatus::Accepted,
+                Some("stop"),
+                None,
+                None,
+            )
+            .await?;
+
+        // Drop the memory_messages table to force the INSERT to fail.
+        sqlx::query("DROP TABLE memory_messages")
+            .execute(&pool)
+            .await?;
+
+        let coord = BackgroundTaskCoordinator::new(pool.clone());
+        let result = coord
+            .on_task_settled(TaskSettledEvent {
+                task_id: "t1".into(),
+            })
+            .await;
+        assert!(result.is_err(), "expected insert failure to surface");
+
+        // Critical assertion: injected_at must still be NULL because the
+        // transaction rolled back.
+        let again = groups
+            .get_group_for_task("t1")
+            .await?
+            .expect("group still present");
+        assert!(
+            again.injected_at.is_none(),
+            "injected_at should be NULL after rollback"
+        );
+        Ok(())
     }
 }

@@ -115,6 +115,7 @@ async fn test_runtime() -> Arc<GeWuRuntime> {
         .connect("sqlite::memory:")
         .await
         .unwrap();
+    gewu_storage::run_migrations(&pool).await.unwrap();
     let provider: Arc<dyn LlmProvider> = Arc::new(StubLlm);
 
     let rt = GeWuRuntime::builder()
@@ -133,6 +134,7 @@ async fn test_runtime() -> Arc<GeWuRuntime> {
         .connect("sqlite::memory:")
         .await
         .unwrap();
+    gewu_storage::run_migrations(&pool2).await.unwrap();
     let provider2: Arc<dyn LlmProvider> = Arc::new(StubLlm);
     let mut reg = gewu_runtime::CapabilityRegistry::new();
     reg.register(Arc::new(ToolFactoryProvider::new(

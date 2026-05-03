@@ -1,6 +1,6 @@
 use crate::state::AppState;
 use axum::{
-    extract::{Query, State},
+    extract::State,
     response::sse::{Event, KeepAlive, Sse},
     Json,
 };
@@ -15,11 +15,6 @@ pub struct ChatRequest {
     pub session_id: String,
     #[serde(default)]
     pub agent_type: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct TokenQuery {
-    pub token: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -86,23 +81,12 @@ impl SseEvent {
 
 pub async fn handle_chat(
     State(app): State<Arc<AppState>>,
-    Query(query): Query<TokenQuery>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, AppError> {
     info!("handle_chat called for session: {}", req.session_id);
 
-    let auth = app.auth_token.read().await;
-    let valid = query
-        .token
-        .as_ref()
-        .map(|t| auth.validate(t))
-        .unwrap_or(false);
-    drop(auth);
-
-    if !valid {
-        warn!("Unauthorized chat attempt");
-        return Err(AppError::Unauthorized);
-    }
+    // Auth is enforced by `auth_middleware::require_auth` on the protected
+    // route group. The handler trusts the cookie validation done there.
 
     let fallback_type = req.agent_type.as_deref().unwrap_or("general");
     let (session_id, agent_handle) = app
@@ -119,7 +103,9 @@ pub async fn handle_chat(
     let message = req.message.clone();
     app.start_active_turn(&session_id).await;
 
-    tokio::spawn(async move {
+    let session_id_for_cleanup = session_id.clone();
+    let app_for_cleanup = app.clone();
+    let join_handle = tokio::spawn(async move {
         let mut agent = agent_handle.agent.lock().await;
         info!("Agent locked, calling ask() with message: {}", message);
         let stream = agent.ask(&message);
@@ -182,8 +168,13 @@ pub async fn handle_chat(
             }
         }
         app.finish_active_turn(&session_id).await;
+        app.remove_abort_handles(&session_id).await;
         info!("Stream finished for session ({} events sent)", event_count);
     });
+
+    app_for_cleanup
+        .register_abort_handle(&session_id_for_cleanup, join_handle.abort_handle())
+        .await;
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
 

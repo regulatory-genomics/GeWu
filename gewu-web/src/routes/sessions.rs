@@ -1,6 +1,6 @@
 use crate::state::{AppState, SessionInfo};
 use axum::{
-    extract::{Query, State},
+    extract::State,
     Json,
 };
 use serde_json::{json, Value};
@@ -18,11 +18,6 @@ pub struct CreateSessionRequest {
 #[derive(Debug, serde::Deserialize)]
 pub struct SwitchAgentRequest {
     pub agent_type: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct TokenQuery {
-    pub token: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -138,10 +133,7 @@ async fn attach_missing_workflow_trace_messages(
         return Ok(messages);
     }
 
-    let pool_guard = app.db_pool.lock().await;
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| AppError::InternalError("Database is not initialized".to_string()))?;
+    let pool = &app.db_pool;
 
     let rows = sqlx::query(
         r#"
@@ -407,23 +399,29 @@ mod tests {
     }
 }
 
+/// Probe whether the caller is authenticated. The middleware enforces auth
+/// for protected routes; this endpoint is registered on the public group so
+/// the frontend can detect open vs password mode and decide whether to show
+/// the login UI. In open mode (`AuthMode::None`) it always returns valid;
+/// in password mode it inspects the cookie.
 pub async fn handle_validate(
     State(app): State<Arc<AppState>>,
-    Query(query): Query<TokenQuery>,
-) -> Result<Json<ValidateResponse>, AppError> {
-    let token = query.token.as_ref().ok_or(AppError::Unauthorized)?;
-    let auth = app.auth_token.read().await;
-    if !auth.validate(token) {
-        return Err(AppError::Unauthorized);
+    headers: axum::http::HeaderMap,
+) -> Json<ValidateResponse> {
+    let mode = app.auth_mode.read().await.clone();
+    if matches!(mode, crate::auth::AuthMode::None) {
+        return Json(ValidateResponse { valid: true });
     }
-    Ok(Json(ValidateResponse { valid: true }))
-}
-
-/// Returns the auth token without requiring authentication.
-/// Safe for local dev servers; allows cross-origin frontends to auto-connect.
-pub async fn handle_get_token(State(app): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let auth = app.auth_token.read().await;
-    Json(serde_json::json!({ "token": auth.valid_token }))
+    let cookie = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|h| h.to_str().ok())
+        .and_then(crate::auth::extract_session_cookie)
+        .map(str::to_string);
+    let valid = match cookie {
+        Some(c) => app.cookie_store.validate(&c).await,
+        None => false,
+    };
+    Json(ValidateResponse { valid })
 }
 
 pub async fn handle_server_info(
@@ -459,10 +457,7 @@ pub async fn handle_sessions_tree(
     State(app): State<Arc<AppState>>,
 ) -> Result<Json<SessionsTreeResponse>, AppError> {
     let sessions = app.list_sessions().await;
-    let pool_guard = app.db_pool.lock().await;
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| AppError::InternalError("Database is not initialized".to_string()))?;
+    let pool = &app.db_pool;
 
     let mut nodes = Vec::new();
     for session in sessions {
@@ -531,6 +526,22 @@ pub async fn handle_switch_agent(
     Ok(Json(SessionResponse { session }))
 }
 
+pub async fn handle_cancel_session(
+    State(app): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<MessageResponse>, AppError> {
+    let cancelled = app.cancel_session(&id).await;
+    if cancelled {
+        Ok(Json(MessageResponse {
+            message: "Session cancelled".to_string(),
+        }))
+    } else {
+        Ok(Json(MessageResponse {
+            message: "No active turn to cancel".to_string(),
+        }))
+    }
+}
+
 #[derive(Debug)]
 pub enum AppError {
     Unauthorized,
@@ -551,24 +562,21 @@ impl axum::response::IntoResponse for AppError {
             AppError::Unauthorized => {
                 (axum::http::StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
             }
-            AppError::SessionNotFound => {
-                (
-                    axum::http::StatusCode::NOT_FOUND,
-                    Json(json!({ "error": "Session not found" })),
-                )
-                    .into_response()
-            }
-            AppError::BadRequest(msg) => {
-                (axum::http::StatusCode::BAD_REQUEST, Json(json!({ "error": msg })))
-                    .into_response()
-            }
-            AppError::InternalError(msg) => {
-                (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": msg })),
-                )
-                    .into_response()
-            }
+            AppError::SessionNotFound => (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Session not found" })),
+            )
+                .into_response(),
+            AppError::BadRequest(msg) => (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({ "error": msg })),
+            )
+                .into_response(),
+            AppError::InternalError(msg) => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": msg })),
+            )
+                .into_response(),
         }
     }
 }
