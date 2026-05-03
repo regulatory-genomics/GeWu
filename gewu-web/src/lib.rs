@@ -284,7 +284,7 @@ where
             axum::http::header::CONTENT_SECURITY_POLICY,
             axum::http::HeaderValue::from_static(
                 "default-src 'self'; img-src 'self' data:; \
-                 script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; \
+                 script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; \
                  connect-src 'self'; font-src 'self' data:",
             ),
         ))
