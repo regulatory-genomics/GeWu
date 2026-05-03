@@ -449,14 +449,34 @@ impl GeWuRuntime {
         additional_tools: Vec<Arc<dyn Tool>>,
         metadata_json: Value,
     ) -> Result<(Agent, Arc<dyn ToolRegistry>)> {
+        let working_directory = working_directory_from_metadata(&metadata_json)?;
+        self.build_specialist_with_metadata_in_directory(
+            name,
+            session_id,
+            additional_tools,
+            metadata_json,
+            working_directory,
+        )
+        .await
+    }
+
+    pub async fn build_specialist_with_metadata_in_directory(
+        &self,
+        name: &str,
+        session_id: String,
+        additional_tools: Vec<Arc<dyn Tool>>,
+        metadata_json: Value,
+        working_directory: PathBuf,
+    ) -> Result<(Agent, Arc<dyn ToolRegistry>)> {
         let descriptor = self
             .find_specialist(name)
             .ok_or_else(|| anyhow!("Unknown specialist: {}", name))?;
 
         let descriptor = self.descriptor_with_skills(descriptor);
+        let metadata_json = metadata_with_workspace_root(metadata_json, &working_directory);
         let tools = self.resolve_capabilities_with_metadata(
             &descriptor.capabilities,
-            &std::env::current_dir()?,
+            &working_directory,
             metadata_json.clone(),
         )?;
         let memory = SqliteMemory::new(self.pool.clone(), session_id.clone()).await?;
@@ -524,7 +544,20 @@ impl GeWuRuntime {
         request: SpecialistExecutionRequest,
         additional_tools: Vec<Arc<dyn Tool>>,
     ) -> BoxStream<'_, Result<SpecialistExecutionEvent>> {
+        let working_directory = request_working_directory(&request);
+        self.execute_request_stream_in_directory(request, additional_tools, working_directory)
+    }
+
+    pub fn execute_request_stream_in_directory(
+        &self,
+        request: SpecialistExecutionRequest,
+        additional_tools: Vec<Arc<dyn Tool>>,
+        working_directory: Result<PathBuf>,
+    ) -> BoxStream<'_, Result<SpecialistExecutionEvent>> {
         Box::pin(async_stream::try_stream! {
+        let mut request = request;
+        let working_directory = working_directory?;
+        request.metadata_json = metadata_with_workspace_root(request.metadata_json.clone(), &working_directory);
         let store = TaskStore::new(self.pool.clone()).await?;
         let existing = store.get_task(&request.task_id).await?;
         if existing.is_none() {
@@ -539,7 +572,7 @@ impl GeWuRuntime {
         let descriptor = self.descriptor_with_skills(descriptor);
         let tools = self.resolve_capabilities_with_metadata(
             &descriptor.capabilities,
-            &std::env::current_dir()?,
+            &working_directory,
             request.metadata_json.clone(),
         )?;
         let memory = SqliteMemory::new(self.pool.clone(), request.session_id.clone()).await?;
@@ -888,7 +921,7 @@ impl GeWuRuntime {
             "agent_id": descriptor.id.clone(),
             "specialist_id": descriptor.id.clone(),
             "session_id": session_id,
-            "workspace_root": std::env::current_dir().ok().map(|p| p.display().to_string()),
+            "workspace_root": workspace_root_from_metadata(metadata_json),
             "prompt": user_prompt.unwrap_or_default(),
             "system_prompt": system_prompt.clone(),
             "metadata": {
@@ -954,7 +987,7 @@ impl GeWuRuntime {
             "event_kind": event_kind,
             "user_id": request.metadata_json.get("user_id").and_then(Value::as_str).unwrap_or("default"),
             "project_id": request.metadata_json.get("project_id").and_then(Value::as_str),
-            "workspace_root": std::env::current_dir().ok().map(|p| p.display().to_string()),
+            "workspace_root": workspace_root_from_metadata(&request.metadata_json),
             "agent_id": descriptor.id.clone(),
             "specialist_id": descriptor.id.clone(),
             "session_id": request.session_id.clone(),
@@ -995,7 +1028,7 @@ impl GeWuRuntime {
             "event_kind": "user_message",
             "user_id": request.metadata_json.get("user_id").and_then(Value::as_str).unwrap_or("default"),
             "project_id": request.metadata_json.get("project_id").and_then(Value::as_str),
-            "workspace_root": std::env::current_dir().ok().map(|p| p.display().to_string()),
+            "workspace_root": workspace_root_from_metadata(&request.metadata_json),
             "agent_id": descriptor.id.clone(),
             "specialist_id": descriptor.id.clone(),
             "session_id": request.session_id.clone(),
@@ -1174,7 +1207,7 @@ impl HookedTool {
             "event_kind": event_kind,
             "user_id": self.metadata_json.get("user_id").and_then(Value::as_str).unwrap_or("default"),
             "project_id": self.metadata_json.get("project_id").and_then(Value::as_str),
-            "workspace_root": std::env::current_dir().ok().map(|p| p.display().to_string()),
+            "workspace_root": workspace_root_from_metadata(&self.metadata_json),
             "agent_id": self.specialist_id.clone(),
             "specialist_id": self.specialist_id.clone(),
             "session_id": self.session_id.clone(),
@@ -1194,6 +1227,55 @@ impl HookedTool {
             },
         })
     }
+}
+
+fn request_working_directory(request: &SpecialistExecutionRequest) -> Result<PathBuf> {
+    if let Some(workdir) = request.workdir.as_deref().filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(workdir));
+    }
+    working_directory_from_metadata(&request.metadata_json)
+}
+
+fn working_directory_from_metadata(metadata_json: &Value) -> Result<PathBuf> {
+    metadata_json
+        .get("workdir")
+        .or_else(|| metadata_json.get("workspace_root"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(std::env::current_dir)
+        .map_err(Into::into)
+}
+
+fn metadata_with_workspace_root(metadata_json: Value, working_directory: &PathBuf) -> Value {
+    let workspace_root = working_directory.to_string_lossy().to_string();
+    match metadata_json {
+        Value::Object(mut map) => {
+            map.entry("workdir".to_string())
+                .or_insert_with(|| Value::String(workspace_root.clone()));
+            map.insert("workspace_root".to_string(), Value::String(workspace_root));
+            Value::Object(map)
+        }
+        other => serde_json::json!({
+            "workdir": workspace_root,
+            "workspace_root": workspace_root,
+            "metadata": other,
+        }),
+    }
+}
+
+fn workspace_root_from_metadata(metadata_json: &Value) -> Option<String> {
+    metadata_json
+        .get("workspace_root")
+        .or_else(|| metadata_json.get("workdir"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string())
+        })
 }
 
 fn append_runtime_context(system_prompt: String) -> String {

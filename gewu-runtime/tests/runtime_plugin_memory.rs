@@ -133,6 +133,7 @@ hooks:
                 specialist_id: "general".to_string(),
                 session_id: "memory-profile-session".to_string(),
                 prompt: "What do you remember about me?".to_string(),
+                workdir: None,
                 metadata_json: serde_json::json!({
                     "project_id": "GeWu",
                     "user_id": "default"
@@ -196,6 +197,7 @@ hooks:
                 specialist_id: "general".to_string(),
                 session_id: "memory-raw-session".to_string(),
                 prompt: "Persist this raw GeWu prompt.".to_string(),
+                workdir: None,
                 metadata_json: serde_json::json!({
                     "project_id": "GeWu",
                     "user_id": "default"

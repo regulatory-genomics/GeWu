@@ -298,6 +298,11 @@ impl WorkflowCompiler {
                     specialist_id: specialist_id.clone(),
                     session_id: format!("{}:{}", session_id, node_id),
                     prompt: prompt_text,
+                    workdir: metadata
+                        .get("workdir")
+                        .or_else(|| metadata.get("workspace_root"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
                     metadata_json: metadata,
                 };
                 let result = runtime

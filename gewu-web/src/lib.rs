@@ -184,6 +184,19 @@ where
         .route("/api/agents", get(routes::sessions::handle_list_agents))
         .route("/api/chat", post(routes::chat::handle_chat))
         .route("/api/events", get(routes::events::handle_events))
+        .route("/api/projects", get(routes::projects::handle_list_projects))
+        .route(
+            "/api/projects",
+            post(routes::projects::handle_create_project),
+        )
+        .route(
+            "/api/projects/tree",
+            get(routes::projects::handle_projects_tree),
+        )
+        .route(
+            "/api/projects/directories",
+            get(routes::projects::handle_browse_directories),
+        )
         .route("/api/runs", get(routes::runs::handle_list_runs))
         .route("/api/runs/{id}", get(routes::runs::handle_get_run))
         .route(

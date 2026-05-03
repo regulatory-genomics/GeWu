@@ -159,7 +159,7 @@ impl Tool for ComposeWorkflowTool {
     async fn execute(
         &self,
         args: Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: ComposeArgs = serde_json::from_value(args)?;
 
@@ -174,7 +174,18 @@ impl Tool for ComposeWorkflowTool {
             specialist_id: "composer".to_string(),
             session_id: task_id.clone(),
             prompt,
-            metadata_json: json!({ "source": "compose_workflow_tool" }),
+            workdir: ctx
+                .metadata
+                .get("workdir")
+                .or_else(|| ctx.metadata.get("workspace_root"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            metadata_json: json!({
+                "source": "compose_workflow_tool",
+                "project_id": ctx.metadata.get("project_id").and_then(Value::as_str),
+                "workdir": ctx.metadata.get("workdir").or_else(|| ctx.metadata.get("workspace_root")).and_then(Value::as_str),
+                "workspace_root": ctx.metadata.get("workspace_root").or_else(|| ctx.metadata.get("workdir")).and_then(Value::as_str),
+            }),
         };
 
         info!(

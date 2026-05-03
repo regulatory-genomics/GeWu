@@ -83,6 +83,10 @@ pub struct Cli {
     #[arg(long)]
     pub db_path: Option<String>,
 
+    /// Working directory for tools and runtime plugins. Defaults to the process cwd.
+    #[arg(long)]
+    pub workdir: Option<String>,
+
     /// Path to LLM configuration file
     #[arg(long)]
     pub llm_config: Option<String>,
@@ -112,14 +116,18 @@ async fn run_runtime_agent(
     session_id: &str,
     additional_tools: &[Arc<dyn Tool>],
     prompt: &str,
+    workdir: &PathBuf,
 ) -> Result<()> {
     let request = SpecialistExecutionRequest {
         task_id: Uuid::new_v4().to_string(),
         specialist_id: agent_id.to_string(),
         session_id: session_id.to_string(),
         prompt: prompt.to_string(),
+        workdir: Some(workdir.to_string_lossy().to_string()),
         metadata_json: serde_json::json!({
             "user_id": "default",
+            "workdir": workdir.to_string_lossy().to_string(),
+            "workspace_root": workdir.to_string_lossy().to_string(),
         }),
     };
     let mut stream = runtime.execute_request_stream(request, additional_tools.to_vec());
@@ -228,6 +236,21 @@ fn expand_config_path(s: &str) -> PathBuf {
         }
     }
     PathBuf::from(s)
+}
+
+fn resolve_cli_workdir(workdir: Option<&str>) -> Result<PathBuf> {
+    let path = match workdir {
+        Some(value) => PathBuf::from(value),
+        None => env::current_dir()?,
+    };
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        env::current_dir()?.join(path)
+    };
+    absolute
+        .canonicalize()
+        .with_context(|| format!("resolving --workdir {}", absolute.display()))
 }
 
 fn resolve_runtime_plugin_dirs(config: &config::Config) -> Vec<PathBuf> {
@@ -515,6 +538,8 @@ where
     let session_id = cli.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     println!("Session ID: {}", session_id);
 
+    let working_directory = resolve_cli_workdir(cli.workdir.as_deref())?;
+
     let manifest_dirs = resolve_manifest_dirs(&file_config);
     let runtime_plugin_dirs = resolve_runtime_plugin_dirs(&file_config);
     let skill_dirs = resolve_skill_dirs(&file_config);
@@ -524,7 +549,7 @@ where
         &file_config.plugins,
         provider.clone(),
         pool.clone(),
-        env::current_dir()?,
+        working_directory.clone(),
         extra_register,
     )?;
     let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs(
@@ -549,8 +574,15 @@ where
         let prompt = prompt_parts.join(" ");
         if !prompt.is_empty() {
             println!("> {}", prompt);
-            if let Err(e) =
-                run_runtime_agent(&runtime, &cli.agent, &session_id, &mcp_tools, &prompt).await
+            if let Err(e) = run_runtime_agent(
+                &runtime,
+                &cli.agent,
+                &session_id,
+                &mcp_tools,
+                &prompt,
+                &working_directory,
+            )
+            .await
             {
                 error!("Error: {}", e);
             }
@@ -577,8 +609,15 @@ where
             break;
         }
 
-        if let Err(e) =
-            run_runtime_agent(&runtime, &cli.agent, &session_id, &mcp_tools, input).await
+        if let Err(e) = run_runtime_agent(
+            &runtime,
+            &cli.agent,
+            &session_id,
+            &mcp_tools,
+            input,
+            &working_directory,
+        )
+        .await
         {
             error!("Error processing message: {}", e);
         }

@@ -11,6 +11,8 @@ use std::sync::Arc;
 #[derive(Debug, serde::Deserialize)]
 pub struct CreateSessionRequest {
     pub agent_type: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -506,7 +508,7 @@ pub async fn handle_create_session(
     State(app): State<Arc<AppState>>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<Json<SessionResponse>, AppError> {
-    let session = app.create_session(req.agent_type).await?;
+    let session = app.create_session(req.agent_type, req.project_id).await?;
     Ok(Json(SessionResponse { session }))
 }
 
@@ -533,6 +535,7 @@ pub async fn handle_switch_agent(
 pub enum AppError {
     Unauthorized,
     SessionNotFound,
+    BadRequest(String),
     InternalError(String),
 }
 
@@ -549,10 +552,22 @@ impl axum::response::IntoResponse for AppError {
                 (axum::http::StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
             }
             AppError::SessionNotFound => {
-                (axum::http::StatusCode::NOT_FOUND, "Session not found").into_response()
+                (
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "Session not found" })),
+                )
+                    .into_response()
+            }
+            AppError::BadRequest(msg) => {
+                (axum::http::StatusCode::BAD_REQUEST, Json(json!({ "error": msg })))
+                    .into_response()
             }
             AppError::InternalError(msg) => {
-                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": msg })),
+                )
+                    .into_response()
             }
         }
     }

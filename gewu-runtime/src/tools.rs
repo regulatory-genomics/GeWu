@@ -217,12 +217,22 @@ impl Tool for TaskTool {
                 Value::String(current_run_id.to_string()),
             );
         }
+        for key in ["project_id", "workdir", "workspace_root"] {
+            if let Some(value) = ctx.metadata.get(key).and_then(Value::as_str) {
+                metadata.insert(key.to_string(), Value::String(value.to_string()));
+            }
+        }
 
         let request = SpecialistExecutionRequest {
             task_id: task_id.clone(),
             specialist_id: input.subagent_type.clone(),
             session_id: task_id.clone(),
             prompt: input.prompt.clone(),
+            workdir: metadata
+                .get("workdir")
+                .or_else(|| metadata.get("workspace_root"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
             metadata_json: Value::Object(metadata),
         };
 

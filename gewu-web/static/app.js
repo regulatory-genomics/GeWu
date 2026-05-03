@@ -1,6 +1,9 @@
 // State
 const state = {
     sidebar: { width: 220, collapsed: false },
+    projects: [],
+    currentProjectId: null,
+    expandedProjects: {},
     sessions: [],
     currentSession: null,
     currentSessionId: null,
@@ -23,10 +26,19 @@ const statusIndicator = document.getElementById('status-indicator');
 const statusText = document.getElementById('status-text');
 const toggleSidebarBtn = document.getElementById('toggle-sidebar');
 const newSessionBtn = document.getElementById('new-session-btn');
+const addProjectBtn = document.getElementById('add-project-btn');
 const sidebarHandle = document.getElementById('sidebar-handle');
 const agentSelector = document.getElementById('agent-selector');
 const traceContainer = document.getElementById('trace-container');
 const workTabs = Array.from(document.querySelectorAll('.work-tab'));
+const projectPickerModal = document.getElementById('project-picker-modal');
+const projectPickerClose = document.getElementById('project-picker-close');
+const projectPickerCancel = document.getElementById('project-picker-cancel');
+const projectPickerCreate = document.getElementById('project-picker-create');
+const projectPickerCurrent = document.getElementById('project-picker-current');
+const projectNameInput = document.getElementById('project-name-input');
+const projectPathInput = document.getElementById('project-path-input');
+const projectDirectoryList = document.getElementById('project-directory-list');
 
 let token = '';
 let isLoading = false;
@@ -42,6 +54,7 @@ const autoResumedGroups = new Set();
 const pendingBackgroundCompletions = new Map();
 const seenBackgroundCompletionGroups = new Set();
 let suppressChatAutoScroll = false;
+let selectedProjectDirectory = '';
 
 // Configure marked
 marked.setOptions({
@@ -61,6 +74,9 @@ function loadState() {
         if (saved) {
             const parsed = JSON.parse(saved);
             if (parsed.sidebar) state.sidebar = parsed.sidebar;
+            if (Array.isArray(parsed.projects)) state.projects = parsed.projects;
+            if (parsed.currentProjectId) state.currentProjectId = parsed.currentProjectId;
+            if (parsed.expandedProjects) state.expandedProjects = parsed.expandedProjects;
             if (parsed.sessions) state.sessions = parsed.sessions;
             if (parsed.currentSessionId) state.currentSessionId = parsed.currentSessionId;
         }
@@ -74,6 +90,9 @@ function saveState() {
     try {
         localStorage.setItem('gewu_state', JSON.stringify({
             sidebar: state.sidebar,
+            projects: state.projects,
+            currentProjectId: state.currentProjectId,
+            expandedProjects: state.expandedProjects,
             sessions: state.sessions,
             currentSessionId: state.currentSession?.id || state.currentSessionId || null
         }));
@@ -555,9 +574,106 @@ function addMessage(role, content, options = {}) {
 }
 
 // Session Management
+function flattenProjectSessions(projects = state.projects) {
+    return projects.flatMap(project => project.sessions || []);
+}
+
+function syncFlatSessionsFromProjects() {
+    state.sessions = flattenProjectSessions();
+}
+
+function findProjectForSession(sessionId) {
+    if (!sessionId) return null;
+    for (const project of state.projects) {
+        for (const session of project.sessions || []) {
+            if (session.id === sessionId) return project;
+            if ((session.children || []).some(child => child.id === sessionId)) return project;
+        }
+    }
+    return null;
+}
+
+function findRootSession(sessionId) {
+    for (const session of state.sessions) {
+        if (session.id === sessionId) return session;
+    }
+    return null;
+}
+
+function selectProject(projectId) {
+    if (!projectId) return;
+    state.currentProjectId = projectId;
+    state.expandedProjects[projectId] = true;
+    saveState();
+}
+
+function projectLabel(project) {
+    return project.name || project.project_id || 'Project';
+}
+
+function shortWorkdir(workdir = '') {
+    if (!workdir) return '';
+    const parts = workdir.split('/').filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : workdir;
+}
+
+function projectNameFromPath(path = '') {
+    return path.split('/').filter(Boolean).pop() || 'Project';
+}
+
+function upsertSessionInProject(session) {
+    const projectId = session.project_id || state.currentProjectId || state.projects[0]?.project_id;
+    if (!projectId) {
+        if (!state.sessions.some(item => item.id === session.id)) state.sessions.unshift(session);
+        return;
+    }
+    let project = state.projects.find(item => item.project_id === projectId);
+    if (!project) {
+        project = { project_id: projectId, name: 'Project', workdir: '', sessions: [] };
+        state.projects.unshift(project);
+    }
+    const sessions = project.sessions || [];
+    const index = sessions.findIndex(item => item.id === session.id);
+    if (index === -1) sessions.unshift(session);
+    else sessions[index] = { ...sessions[index], ...session };
+    project.sessions = sessions;
+    syncFlatSessionsFromProjects();
+}
+
+function removeSessionFromState(sessionId) {
+    state.sessions = state.sessions.filter(session => session.id !== sessionId);
+    for (const project of state.projects) {
+        project.sessions = (project.sessions || []).filter(session => session.id !== sessionId);
+    }
+}
+
 function renderSessions() {
     sessionList.innerHTML = '';
-    state.sessions.forEach(session => {
+    state.projects.forEach(project => {
+        const isCurrentProject = project.project_id === state.currentProjectId;
+        const expanded = state.expandedProjects[project.project_id] !== false;
+        const section = document.createElement('div');
+        section.className = 'project-section' + (isCurrentProject ? ' active' : '');
+        const header = document.createElement('button');
+        header.type = 'button';
+        header.className = 'project-header';
+        header.innerHTML = `
+            <span class="project-caret">${expanded ? '▾' : '▸'}</span>
+            <span class="project-title" title="${escapeHtml(project.workdir || '')}">${escapeHtml(projectLabel(project))}</span>
+            <span class="project-workdir">${escapeHtml(shortWorkdir(project.workdir))}</span>
+        `;
+        header.addEventListener('click', () => {
+            selectProject(project.project_id);
+            state.expandedProjects[project.project_id] = !expanded;
+            renderSessions();
+            saveState();
+        });
+        section.appendChild(header);
+
+        const body = document.createElement('div');
+        body.className = 'project-body';
+        body.hidden = !expanded;
+        (project.sessions || []).forEach(session => {
         const item = document.createElement('div');
         item.className = 'session-item' + (session.id === state.currentSession?.id ? ' active' : '');
         item.innerHTML = `
@@ -573,7 +689,9 @@ function renderSessions() {
                 switchSession(session);
             }
         });
-        sessionList.appendChild(item);
+        body.appendChild(item);
+        const childrenEl = document.createElement('div');
+        childrenEl.className = 'session-children';
         for (const child of session.children || []) {
             const childItem = document.createElement('div');
             childItem.className = 'session-item session-child' + (child.id === state.currentSession?.id ? ' active' : '');
@@ -584,27 +702,38 @@ function renderSessions() {
                 <span class="session-name" title="${escapeHtml(label)}">${escapeHtml(child.agent_type || 'subagent')} · ${escapeHtml(label.substring(0, 28))}</span>
             `;
             childItem.addEventListener('click', () => switchSession(child));
-            sessionList.appendChild(childItem);
+            childrenEl.appendChild(childItem);
         }
+        if (childrenEl.childElementCount > 0) body.appendChild(childrenEl);
+        });
+        section.appendChild(body);
+        sessionList.appendChild(section);
     });
 }
 
 async function refreshSessionTree() {
     try {
-        const resp = await fetch(`/api/sessions/tree?token=${encodeURIComponent(token)}`);
+        const resp = await fetch(`/api/projects/tree?token=${encodeURIComponent(token)}`);
         if (!resp.ok) return;
         const data = await resp.json();
-        const tree = data.sessions || [];
+        const projects = data.projects || [];
         const byId = new Map(state.sessions.map(session => [session.id, session]));
-        const nextSessions = [];
-        for (const node of tree) {
-            const session = { ...(byId.get(node.session.id) || {}), ...node.session, children: node.children || [] };
-            nextSessions.push(session);
+        const nextProjects = projects.map(project => ({
+            ...project,
+            sessions: (project.sessions || []).map(node => ({
+                ...(byId.get(node.session.id) || {}),
+                ...node.session,
+                children: node.children || []
+            }))
+        }));
+        state.projects = nextProjects;
+        syncFlatSessionsFromProjects();
+        if (!state.currentProjectId && state.projects.length > 0) {
+            state.currentProjectId = state.projects[0].project_id;
         }
-        for (const session of state.sessions) {
-            if (!nextSessions.some(item => item.id === session.id)) nextSessions.push(session);
+        if (state.currentSessionId && !state.currentSession) {
+            state.currentSession = state.sessions.find(s => s.id === state.currentSessionId) || null;
         }
-        state.sessions = nextSessions;
         renderSessions();
         saveState();
     } catch (e) {
@@ -616,6 +745,8 @@ async function switchSession(session, forceReload = false) {
     if (!forceReload && state.currentSession?.id === session.id) return;
     state.currentSession = session;
     state.currentSessionId = session.id;
+    const project = session.project_id ? state.projects.find(p => p.project_id === session.project_id) : findProjectForSession(session.id);
+    if (project) selectProject(project.project_id);
     agentSelector.value = session.agent_type;
     clearChat();
     renderSessions();
@@ -1202,12 +1333,11 @@ function formatRunDuration(run) {
 async function openSyntheticSession(sessionId, agentType) {
     const session = {
         id: sessionId,
+        project_id: state.currentProjectId,
         agent_type: agentType || 'specialist',
         created_at: Math.floor(Date.now() / 1000)
     };
-    if (!state.sessions.some(s => s.id === sessionId)) {
-        state.sessions.unshift(session);
-    }
+    upsertSessionInProject(session);
     await switchSession(session, true);
 }
 
@@ -1221,14 +1351,12 @@ async function deleteSession(sessionId) {
         if (state.currentSession?.id === sessionId) {
             state.currentSession = null;
             clearChat();
-            const idx = state.sessions.findIndex(s => s.id === sessionId);
-            if (idx !== -1) state.sessions.splice(idx, 1);
+            removeSessionFromState(sessionId);
             if (state.sessions.length > 0) {
                 switchSession(state.sessions[0]);
             }
         } else {
-            const idx = state.sessions.findIndex(s => s.id === sessionId);
-            if (idx !== -1) state.sessions.splice(idx, 1);
+            removeSessionFromState(sessionId);
         }
         renderSessions();
         saveState();
@@ -1243,17 +1371,18 @@ async function createSession(agentType = 'general') {
         const resp = await fetch(`/api/sessions?token=${encodeURIComponent(token)}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ agent_type: agentType })
+            body: JSON.stringify({ agent_type: agentType, project_id: state.currentProjectId })
         });
         const data = await resp.json();
         const session = data.session;
         state.currentSession = session;
         state.currentSessionId = session.id;
+        state.currentProjectId = session.project_id || state.currentProjectId;
         agentSelector.value = session.agent_type;
-        state.sessions.unshift(session);
-        if (state.sessions.length > 10) state.sessions.pop();
+        upsertSessionInProject(session);
         clearChat();
         renderSessions();
+        await refreshSessionTree();
         setStatus('Ready');
         saveState();
         return true;
@@ -1262,6 +1391,110 @@ async function createSession(agentType = 'general') {
         setStatus('Error');
         return false;
     }
+}
+
+async function createProject() {
+    if (!selectedProjectDirectory) {
+        await openProjectPicker();
+        return false;
+    }
+    const workdir = selectedProjectDirectory;
+    const defaultName = projectNameFromPath(workdir);
+    const name = projectNameInput?.value?.trim() || defaultName;
+    try {
+        setStatus('Creating project...', true);
+        const resp = await fetch(`/api/projects?token=${encodeURIComponent(token)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, workdir })
+        });
+        const data = await readJsonResponse(resp);
+        if (!resp.ok) throw new Error(data?.error || 'Failed to create project');
+        const project = data.project;
+        state.currentProjectId = project.project_id;
+        state.expandedProjects[project.project_id] = true;
+        closeProjectPicker();
+        await refreshSessionTree();
+        setStatus('Ready');
+        return true;
+    } catch (e) {
+        showError('Failed to create project: ' + e.message);
+        setStatus('Error');
+        return false;
+    }
+}
+
+async function readJsonResponse(resp) {
+    const text = await resp.text();
+    if (!text) return {};
+    try {
+        return JSON.parse(text);
+    } catch (_err) {
+        return { error: text };
+    }
+}
+
+async function openProjectPicker(path = '') {
+    selectedProjectDirectory = '';
+    if (projectNameInput) projectNameInput.value = '';
+    if (projectPathInput) projectPathInput.value = '';
+    if (projectPickerModal) projectPickerModal.hidden = false;
+    await browseProjectDirectories(path);
+}
+
+function closeProjectPicker() {
+    selectedProjectDirectory = '';
+    if (projectPickerModal) projectPickerModal.hidden = true;
+}
+
+async function browseProjectDirectories(path = '') {
+    if (!projectDirectoryList) return;
+    const query = path ? `&path=${encodeURIComponent(path)}` : '';
+    projectDirectoryList.innerHTML = '<div class="directory-loading">Loading directories…</div>';
+    try {
+        const resp = await fetch(`/api/projects/directories?token=${encodeURIComponent(token)}${query}`);
+        const data = await readJsonResponse(resp);
+        if (!resp.ok) throw new Error(data?.error || 'Failed to browse directories');
+        renderDirectoryChoices(data.directories || []);
+    } catch (e) {
+        projectDirectoryList.innerHTML = `<div class="directory-error">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function renderDirectoryChoices(directories) {
+    if (!projectDirectoryList) return;
+    projectDirectoryList.innerHTML = '';
+    if (directories.length === 0) {
+        projectDirectoryList.innerHTML = '<div class="directory-empty">No directories found.</div>';
+        return;
+    }
+    for (const directory of directories) {
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'directory-choice' + (directory.is_root ? ' root' : '');
+        row.innerHTML = `
+            <span class="directory-icon">${directory.name === '..' ? '↩' : '📁'}</span>
+            <span class="directory-main">
+                <span class="directory-name">${escapeHtml(directory.name)}</span>
+                <span class="directory-path">${escapeHtml(directory.path)}</span>
+            </span>
+            <span class="directory-open">Open</span>
+        `;
+        row.addEventListener('click', () => {
+            selectedProjectDirectory = directory.path;
+            if (projectPathInput) projectPathInput.value = directory.path;
+            if (projectNameInput && !projectNameInput.value.trim() && directory.name !== '..') {
+                projectNameInput.value = projectNameFromPath(directory.path);
+            }
+            if (projectPickerCurrent) projectPickerCurrent.textContent = directory.path;
+            browseProjectDirectories(directory.path);
+        });
+        projectDirectoryList.appendChild(row);
+    }
+}
+
+function firstAvailableSession() {
+    return state.sessions.find(s => s.id === state.currentSessionId) || state.sessions[0] || null;
 }
 
 async function switchAgent() {
@@ -1286,10 +1519,7 @@ async function switchAgent() {
         const data = await resp.json();
         state.currentSession = data.session;
         state.currentSessionId = data.session.id;
-        const idx = state.sessions.findIndex(s => s.id === state.currentSession.id);
-        if (idx !== -1) {
-            state.sessions[idx] = data.session;
-        }
+        upsertSessionInProject(data.session);
         renderSessions();
         saveState();
         addMessage('assistant', `Agent switched to ${newAgentType}. Memory preserved from previous agent.`);
@@ -1440,16 +1670,17 @@ function upsertChildSessionFromMetadata(metadata, childSessionId) {
     const parentId = metadata.parent_session_id || state.currentSession?.id;
     const child = {
         id: childSessionId,
+        project_id: state.currentProjectId,
         agent_type: metadata.specialist_id || 'subagent',
         title: metadata.description || metadata.prompt || childSessionId.substring(0, 8),
         execution_status: metadata.mode === 'async' ? 'running' : 'running',
         result_status: 'pending',
         created_at: Math.floor(Date.now() / 1000)
     };
-    let parent = state.sessions.find(session => session.id === parentId);
+    let parent = findRootSession(parentId);
     if (!parent && state.currentSession?.id === parentId) {
         parent = state.currentSession;
-        state.sessions.unshift(parent);
+        upsertSessionInProject(parent);
     }
     if (!parent) return;
     const children = parent.children || [];
@@ -1673,6 +1904,14 @@ newSessionBtn.addEventListener('click', async () => {
     }
 });
 
+addProjectBtn?.addEventListener('click', () => openProjectPicker());
+projectPickerClose?.addEventListener('click', closeProjectPicker);
+projectPickerCancel?.addEventListener('click', closeProjectPicker);
+projectPickerCreate?.addEventListener('click', createProject);
+projectPickerModal?.addEventListener('click', (event) => {
+    if (event.target === projectPickerModal) closeProjectPicker();
+});
+
 agentSelector.addEventListener('change', switchAgent);
 
 // Window resize handler
@@ -1721,16 +1960,16 @@ validateToken().then(valid => {
     if (!valid) return;
     loadServerInfo();
     loadAgents().then(() => {
-        if (!state.currentSession && state.sessions.length > 0) {
-            const restored = state.sessions.find(s => s.id === state.currentSessionId);
-            state.currentSession = restored || state.sessions[0];
-        }
         renderSessions();
-        refreshSessionTree();
-        if (state.currentSession) {
-            switchSession(state.currentSession, true);
-        } else {
-            addMessage('assistant', 'Select a session or create a new one to start.');
-        }
+        refreshSessionTree().then(() => {
+            if (!state.currentSession && state.sessions.length > 0) {
+                state.currentSession = firstAvailableSession();
+            }
+            if (state.currentSession) {
+                switchSession(state.currentSession, true);
+            } else {
+                addMessage('assistant', 'Select a session or create a new one to start.');
+            }
+        });
     });
 });

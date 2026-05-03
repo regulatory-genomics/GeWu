@@ -100,6 +100,7 @@ fn minimal_cli(workflow_dir: &str) -> Cli {
         list_models: false,
         session_id: Some("t".into()),
         db_path: Some(unique_db_path("cli")),
+        workdir: None,
         llm_config: None,
         workflow: None,
         workflow_input: None,

@@ -11,16 +11,19 @@ pub async fn execute_job_now(state: Arc<AppState>, job: ScheduledJob) -> Result<
         anyhow::bail!("job '{}' already has a running execution", job.id);
     }
     let run = state.jobs.create_run(&job.id, &job.prompt).await?;
+    let effective_workdir = job.workdir.clone();
     let request = SpecialistExecutionRequest {
         task_id: format!("gateway-job:{}:{}", job.id, run.id),
         specialist_id: job.specialist_id.clone(),
         session_id: format!("gateway-session:{}", run.id),
         prompt: job.prompt.clone(),
+        workdir: effective_workdir.clone(),
         metadata_json: serde_json::json!({
             "source": "gewu-gateway",
             "job_id": job.id,
             "run_id": run.id,
-            "workdir": job.workdir,
+            "workdir": effective_workdir,
+            "workspace_root": effective_workdir,
             "timezone": job.timezone,
         }),
     };

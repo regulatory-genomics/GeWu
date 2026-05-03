@@ -37,6 +37,10 @@
                 <div class="session-list" id="session-list"></div>
             </div>
             <div class="sidebar-footer">
+                <button id="add-project-btn" type="button">
+                    <span>＋</span>
+                    <span>Add Project</span>
+                </button>
                 <button id="new-session-btn" type="button">
                     <span>+</span>
                     <span>New Session</span>
@@ -77,6 +81,31 @@
          Mounted lazily by canvas.js when a canvas:open event arrives.
          Sits above the regular chat layout but is hidden by default. -->
     <div id="canvas-overlay" class="canvas-overlay" hidden></div>
+
+    <div id="project-picker-modal" class="modal-backdrop" hidden>
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="project-picker-title">
+            <div class="modal-header">
+                <div>
+                    <div id="project-picker-title" class="modal-title">Add Project</div>
+                    <div id="project-picker-current" class="modal-subtitle">Choose a directory from this machine.</div>
+                </div>
+                <button id="project-picker-close" class="modal-close" type="button" aria-label="Close">×</button>
+            </div>
+            <label class="modal-field">
+                <span>Project name</span>
+                <input id="project-name-input" type="text" placeholder="Project name" />
+            </label>
+            <label class="modal-field">
+                <span>Selected directory</span>
+                <input id="project-path-input" type="text" readonly placeholder="Select a directory below" />
+            </label>
+            <div id="project-directory-list" class="directory-list"></div>
+            <div class="modal-actions">
+                <button id="project-picker-cancel" type="button" class="modal-secondary">Cancel</button>
+                <button id="project-picker-create" type="button" class="modal-primary">Create Project</button>
+            </div>
+        </div>
+    </div>
 
     <script src="/canvas.js"></script>
     <!-- tachyon-canvas IIFE bundle: registers a "genome" renderer with

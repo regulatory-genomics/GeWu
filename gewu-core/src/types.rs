@@ -459,6 +459,8 @@ pub struct SpecialistExecutionRequest {
     pub specialist_id: String,
     pub session_id: String,
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
     #[serde(default)]
     pub metadata_json: serde_json::Value,
 }
