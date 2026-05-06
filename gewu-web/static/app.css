@@ -2,6 +2,9 @@
     --sidebar-width: 248px;
     --sidebar-min: 200px;
     --sidebar-max: 380px;
+    --work-panel-width: 420px;
+    --work-panel-min: 320px;
+    --work-panel-max: 900px;
     --header-height: 64px;
     --input-height: 104px;
 
@@ -65,7 +68,7 @@ button {
 
 #app {
     display: grid;
-    grid-template-columns: var(--sidebar-width) minmax(0, 1fr) minmax(320px, 380px);
+    grid-template-columns: var(--sidebar-width) minmax(0, 1fr) var(--work-panel-width);
     grid-template-rows: var(--header-height) minmax(0, 1fr) var(--input-height);
     grid-template-areas:
         "header header header"
@@ -610,6 +613,35 @@ button {
     background: rgba(29, 78, 216, 0.16);
 }
 
+#work-panel-handle {
+    position: fixed;
+    top: var(--header-height);
+    bottom: var(--input-height);
+    right: var(--work-panel-width);
+    width: 10px;
+    cursor: col-resize;
+    z-index: 120;
+    background: transparent;
+}
+
+#work-panel-handle::after {
+    content: '';
+    position: absolute;
+    top: 16px;
+    bottom: 16px;
+    left: 4px;
+    width: 2px;
+    border-radius: 999px;
+    background: transparent;
+    transition: background var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+#work-panel-handle:hover::after,
+#work-panel-handle.dragging::after {
+    background: rgba(29, 78, 216, 0.35);
+    box-shadow: 0 0 0 3px rgba(29, 78, 216, 0.10);
+}
+
 #chat-panel {
     grid-area: chat;
     display: flex;
@@ -951,7 +983,7 @@ button {
 
 .work-tabs {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 6px;
     padding: 10px 12px;
     border-bottom: 1px solid var(--border-color);
@@ -991,6 +1023,99 @@ button {
     background: rgba(248, 250, 252, 0.82);
     border: 1px dashed var(--border-strong);
     border-radius: var(--radius-lg);
+}
+
+.canvas-dock[hidden] { display: none; }
+.canvas-dock {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: rgba(255, 255, 255, 0.78);
+}
+
+.canvas-dock-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border-color);
+    background: rgba(248, 250, 252, 0.92);
+    font-size: 12px;
+}
+
+.canvas-dock-kind {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 10px;
+    font-weight: 800;
+    color: var(--accent-blue);
+    border: 1px solid rgba(29, 78, 216, 0.24);
+    background: var(--accent-blue-soft);
+    border-radius: 999px;
+    padding: 3px 7px;
+}
+
+.canvas-dock-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+    font-weight: 780;
+}
+
+.canvas-dock-id {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 10px;
+}
+
+.canvas-dock-flex { flex: 1; }
+
+.canvas-dock-popup {
+    border: 1px solid var(--border-color);
+    background: var(--surface);
+    color: var(--text-secondary);
+    border-radius: 999px;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 760;
+    padding: 6px 9px;
+}
+
+.canvas-dock-popup:hover {
+    border-color: rgba(29, 78, 216, 0.36);
+    color: var(--accent-blue);
+}
+
+.canvas-dock-body {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 12px;
+    background: var(--bg-primary);
+}
+
+.canvas-dock-footer {
+    padding: 6px 12px;
+    border-top: 1px solid var(--border-color);
+    color: var(--text-muted);
+    background: rgba(248, 250, 252, 0.92);
+    font-size: 11px;
+}
+
+.canvas-dock-empty {
+    border: 1px dashed var(--border-strong);
+    border-radius: var(--radius-lg);
+    color: var(--text-secondary);
+    line-height: 1.5;
+    padding: 14px;
+    background: rgba(248, 250, 252, 0.82);
 }
 
 .work-overview {
@@ -1376,7 +1501,7 @@ button {
 
 @media (max-width: 1180px) {
     #app {
-        grid-template-columns: var(--sidebar-width) minmax(0, 1fr) 320px;
+        grid-template-columns: var(--sidebar-width) minmax(0, 1fr) minmax(var(--work-panel-min), var(--work-panel-width));
     }
     #header-info .header-info-item:first-child { display: none; }
 }
@@ -1396,7 +1521,8 @@ button {
             "input";
     }
     #sidebar,
-    #sidebar-handle { display: none; }
+    #sidebar-handle,
+    #work-panel-handle { display: none; }
     #trace-panel {
         margin: 0 14px 14px;
         min-height: 280px;

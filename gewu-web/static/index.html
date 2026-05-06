@@ -56,6 +56,9 @@
             <div id="error-container"></div>
         </main>
 
+        <!-- Work Panel Resize Handle -->
+        <div id="work-panel-handle" aria-label="Resize Work Panel"></div>
+
         <aside id="trace-panel">
             <div id="trace-header">Work Panel</div>
             <div class="work-tabs">
@@ -63,9 +66,25 @@
                 <button type="button" class="work-tab" data-work-tab="todo">Todo</button>
                 <button type="button" class="work-tab" data-work-tab="tasks">Tasks</button>
                 <button type="button" class="work-tab" data-work-tab="trace">Trace</button>
+                <button type="button" class="work-tab" data-work-tab="canvas">Canvas</button>
             </div>
             <div id="trace-container">
                 <div class="trace-empty">Select a session to inspect its work timeline.</div>
+            </div>
+            <div id="canvas-dock" class="canvas-dock" hidden>
+                <header class="canvas-dock-header">
+                    <span class="canvas-dock-kind"></span>
+                    <span class="canvas-dock-title">Canvas</span>
+                    <span class="canvas-dock-id"></span>
+                    <span class="canvas-dock-flex"></span>
+                    <button type="button" class="canvas-dock-popup" data-action="open-popup" title="Open popup">Popup</button>
+                </header>
+                <div class="canvas-dock-body">
+                    <div class="canvas-dock-empty">No canvas open yet.</div>
+                </div>
+                <footer class="canvas-dock-footer">
+                    <span class="canvas-dock-status">Docked in Work Panel</span>
+                </footer>
             </div>
         </aside>
 

@@ -1,6 +1,7 @@
 // State
 const state = {
     sidebar: { width: 220, collapsed: false },
+    workPanel: { width: 420 },
     projects: [],
     currentProjectId: null,
     expandedProjects: {},
@@ -28,6 +29,7 @@ const toggleSidebarBtn = document.getElementById('toggle-sidebar');
 const newSessionBtn = document.getElementById('new-session-btn');
 const addProjectBtn = document.getElementById('add-project-btn');
 const sidebarHandle = document.getElementById('sidebar-handle');
+const workPanelHandle = document.getElementById('work-panel-handle');
 const agentSelector = document.getElementById('agent-selector');
 const traceContainer = document.getElementById('trace-container');
 const workTabs = Array.from(document.querySelectorAll('.work-tab'));
@@ -71,6 +73,9 @@ function loadState() {
         if (saved) {
             const parsed = JSON.parse(saved);
             if (parsed.sidebar) state.sidebar = parsed.sidebar;
+            if (parsed.workPanel && Number.isFinite(parsed.workPanel.width)) {
+                state.workPanel.width = Math.min(Math.max(parsed.workPanel.width, 320), 900);
+            }
             if (Array.isArray(parsed.projects)) state.projects = parsed.projects;
             if (parsed.currentProjectId) state.currentProjectId = parsed.currentProjectId;
             if (parsed.expandedProjects) state.expandedProjects = parsed.expandedProjects;
@@ -87,6 +92,7 @@ function saveState() {
     try {
         localStorage.setItem('gewu_state', JSON.stringify({
             sidebar: state.sidebar,
+            workPanel: state.workPanel,
             projects: state.projects,
             currentProjectId: state.currentProjectId,
             expandedProjects: state.expandedProjects,
@@ -101,6 +107,7 @@ function saveState() {
 // Apply state to UI
 function applyState() {
     document.documentElement.style.setProperty('--sidebar-width', state.sidebar.width + 'px');
+    document.documentElement.style.setProperty('--work-panel-width', state.workPanel.width + 'px');
     if (state.sidebar.collapsed) {
         sidebar.classList.add('collapsed');
     }
@@ -112,6 +119,9 @@ function updateHandles() {
     const sidebarWidth = state.sidebar.collapsed ? 48 : state.sidebar.width;
     sidebarHandle.style.left = sidebarWidth + 'px';
     sidebarHandle.style.display = state.sidebar.collapsed ? 'none' : 'block';
+    if (workPanelHandle) {
+        workPanelHandle.style.right = state.workPanel.width + 'px';
+    }
 }
 
 // Resize Handle Logic
@@ -166,6 +176,51 @@ function stopResize() {
 
 // Event Listeners for Resize Handle
 sidebarHandle.addEventListener('mousedown', startResize);
+
+let isResizingWorkPanel = false;
+let workPanelStartX = 0;
+let workPanelStartWidth = 0;
+
+function startWorkPanelResize(e) {
+    e.preventDefault();
+    isResizingWorkPanel = true;
+    workPanelStartX = e.clientX;
+    workPanelStartWidth = state.workPanel.width;
+    document.body.style.userSelect = 'none';
+    document.body.style.overflow = 'hidden';
+    workPanelHandle.classList.add('dragging');
+    document.addEventListener('mousemove', onWorkPanelResize);
+    document.addEventListener('mouseup', stopWorkPanelResize);
+}
+
+function onWorkPanelResize(e) {
+    if (!isResizingWorkPanel) return;
+    const delta = workPanelStartX - e.clientX;
+    const newWidth = Math.min(Math.max(workPanelStartWidth + delta, 320), 900);
+    state.workPanel.width = newWidth;
+    document.documentElement.style.setProperty('--work-panel-width', newWidth + 'px');
+    updateHandles();
+    if (window.canvasController && typeof window.canvasController.refresh === 'function') {
+        window.canvasController.refresh();
+    }
+}
+
+function stopWorkPanelResize() {
+    isResizingWorkPanel = false;
+    document.body.style.userSelect = '';
+    document.body.style.overflow = '';
+    workPanelHandle.classList.remove('dragging');
+    document.removeEventListener('mousemove', onWorkPanelResize);
+    document.removeEventListener('mouseup', stopWorkPanelResize);
+    saveState();
+    if (window.canvasController && typeof window.canvasController.refresh === 'function') {
+        window.canvasController.refresh();
+    }
+}
+
+if (workPanelHandle) {
+    workPanelHandle.addEventListener('mousedown', startWorkPanelResize);
+}
 
 // Toggle Sidebar
 toggleSidebarBtn.addEventListener('click', () => {
@@ -280,7 +335,17 @@ async function loadWorkGraph(sessionId = state.currentSession?.id) {
 
 function renderWorkPanel() {
     if (!traceContainer) return;
+    const canvasDock = document.getElementById('canvas-dock');
+    const isCanvasTab = state.workTab === 'canvas';
+    traceContainer.hidden = isCanvasTab;
+    if (canvasDock) canvasDock.hidden = !isCanvasTab;
     traceContainer.innerHTML = '';
+    if (isCanvasTab) {
+        if (window.canvasController && typeof window.canvasController.mountDock === 'function') {
+            window.canvasController.mountDock();
+        }
+        return;
+    }
     const graph = state.workGraph;
     if (!graph) {
         traceContainer.innerHTML = '<div class="trace-empty">No work graph is available for this session yet.</div>';
