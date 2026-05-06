@@ -294,7 +294,7 @@ impl Tool for ReadFileTool {
             }
 
             let truncated_line = if text.len() > MAX_LINE_LENGTH {
-                let boundary = text.floor_char_boundary(MAX_LINE_LENGTH);
+                let boundary = floor_char_boundary(&text, MAX_LINE_LENGTH);
                 format!("{}{}", &text[..boundary], MAX_LINE_SUFFIX)
             } else {
                 text.clone()
@@ -357,6 +357,17 @@ impl Tool for ReadFileTool {
 
         Ok(ToolResult::new("read_file", output))
     }
+}
+
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    let mut boundary = index;
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
 }
 
 #[async_trait]
@@ -512,6 +523,33 @@ mod tests {
         assert!(result.output.contains("<path>"));
         assert!(result.output.contains("<type>file</type>"));
         assert!(result.output.contains("1: Hello from file"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_tool_truncates_long_utf8_lines_on_char_boundary() -> Result<()> {
+        let dir = tempdir()?;
+        let working_dir = dir.path().to_path_buf();
+        let file_path = dir.path().join("long_utf8.txt");
+        let long_line = format!("{}中", "a".repeat(MAX_LINE_LENGTH - 1));
+        fs::write(&file_path, long_line).await?;
+
+        let tool = ReadFileTool {
+            working_directory: working_dir,
+        };
+        let args = serde_json::json!({
+            "file_path": file_path.to_str().unwrap()
+        });
+        let ctx = ToolContext::new("test", "msg");
+
+        let result = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+        assert!(result.output.contains(MAX_LINE_SUFFIX));
+        assert!(result.output.contains(&"a".repeat(MAX_LINE_LENGTH - 1)));
+        assert!(!result.output.contains('中'));
         Ok(())
     }
 
