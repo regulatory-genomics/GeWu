@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use axum::{
-    extract::{Path, Query, State},
     Json,
+    extract::{Path, Query, State},
 };
 use gewu_storage::ExecutionTraceStore;
 use serde::Deserialize;

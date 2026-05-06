@@ -1,5 +1,5 @@
 use crate::state::{AppState, SessionInfo};
-use axum::{extract::State, Json};
+use axum::{Json, extract::State};
 use gewu_core::types::{
     ExecutionEvent, ExecutionRun, ExecutionRunKind, ExecutionRunStatus, TaskExecutionStatus,
     TaskRecord, TaskResultStatus,
@@ -9,7 +9,7 @@ use gewu_core::{
 };
 use gewu_storage::{ExecutionTraceStore, TaskStore};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[derive(Debug, Serialize)]

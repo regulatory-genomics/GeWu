@@ -1,6 +1,5 @@
-use anyhow::{bail, Context, Result};
-use gewu_canvas::{canvas_tools, CanvasManager};
-use tachyon_browser_client::{tachyon_tools, TachyonClientConfig};
+use anyhow::{Context, Result, bail};
+use gewu_canvas::{CanvasManager, canvas_tools};
 use gewu_core::traits::Tool;
 use gewu_providers::OpenAIProvider;
 use gewu_runtime::{BackgroundTaskCoordinator, PluginHost, PluginRegistry, RuntimeFactory};
@@ -12,6 +11,7 @@ use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tachyon_browser_client::{TachyonClientConfig, tachyon_tools};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::AbortHandle;
 use tracing::info;
@@ -304,12 +304,10 @@ impl AppState {
                 }
             }
 
-            let stale_rows = sqlx::query(
-                "SELECT session_id, content FROM active_turn_snapshots",
-            )
-            .fetch_all(&db_pool)
-            .await
-            .unwrap_or_default();
+            let stale_rows = sqlx::query("SELECT session_id, content FROM active_turn_snapshots")
+                .fetch_all(&db_pool)
+                .await
+                .unwrap_or_default();
             for row in &stale_rows {
                 let sid: String = row.get("session_id");
                 let content: String = row.get("content");
@@ -318,7 +316,8 @@ impl AppState {
                 } else {
                     content
                 };
-                let msg = format!("[session.interrupted_by_restart] Last partial response: {summary}");
+                let msg =
+                    format!("[session.interrupted_by_restart] Last partial response: {summary}");
                 let _ = sqlx::query(
                     "INSERT INTO memory_messages (session_id, role, content, created_at) VALUES (?, 'system', ?, strftime('%s','now'))",
                 )
