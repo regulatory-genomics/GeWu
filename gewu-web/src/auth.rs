@@ -15,11 +15,11 @@
 //! cookies fix that without exposing secrets in URLs/logs).
 
 use anyhow::Result;
-use argon2::password_hash::rand_core::OsRng as PwOsRng;
 use argon2::password_hash::SaltString;
+use argon2::password_hash::rand_core::OsRng as PwOsRng;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use rand::rngs::OsRng;
 use rand::RngCore;
+use rand::rngs::OsRng;
 use std::collections::HashSet;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;

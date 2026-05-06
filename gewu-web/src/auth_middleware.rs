@@ -18,7 +18,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
 };
 
-use crate::auth::{extract_session_cookie, AuthMode};
+use crate::auth::{AuthMode, extract_session_cookie};
 use crate::state::AppState;
 
 pub async fn require_auth(

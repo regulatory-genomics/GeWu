@@ -9,10 +9,10 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{Html, IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::auth::extract_session_cookie;
@@ -52,10 +52,7 @@ pub async fn handle_login(
     (StatusCode::NO_CONTENT, headers).into_response()
 }
 
-pub async fn handle_logout(
-    State(app): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn handle_logout(State(app): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Some(cookie_header) = headers.get(header::COOKIE)
         && let Ok(s) = cookie_header.to_str()
         && let Some(token) = extract_session_cookie(s)
