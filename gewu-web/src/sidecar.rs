@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
@@ -22,6 +22,73 @@ pub struct TachyonBrowserConfig {
     pub startup_timeout_ms: u64,
     #[serde(rename = "workingDirectory", alias = "working_directory")]
     pub working_directory: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TachyonPluginSuiteConfig {
+    pub enabled: bool,
+    pub id: String,
+    pub renderer: TachyonRendererConfig,
+    pub sidecar: TachyonBrowserConfig,
+}
+
+impl Default for TachyonPluginSuiteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            id: "tachyon".to_string(),
+            renderer: TachyonRendererConfig::default(),
+            sidecar: TachyonBrowserConfig::default(),
+        }
+    }
+}
+
+impl TachyonPluginSuiteConfig {
+    pub fn effective_sidecar_config(&self, legacy: &TachyonBrowserConfig) -> TachyonBrowserConfig {
+        if !self.enabled {
+            return legacy.clone();
+        }
+
+        let mut sidecar = self.sidecar.clone();
+        sidecar.enabled = true;
+        sidecar
+    }
+
+    pub fn runtime_assets(
+        &self,
+        browser_url: Option<&str>,
+    ) -> crate::fallback::RuntimeFrontendAssets {
+        crate::fallback::RuntimeFrontendAssets {
+            tachyon_browser_url: if self.enabled {
+                browser_url
+                    .map(ToOwned::to_owned)
+                    .or_else(|| self.sidecar.url.clone())
+            } else {
+                None
+            },
+            renderer_style: self.renderer.style.clone(),
+            renderer_script: self.renderer.script.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TachyonRendererConfig {
+    pub kind: String,
+    pub script: Option<String>,
+    pub style: Option<String>,
+}
+
+impl Default for TachyonRendererConfig {
+    fn default() -> Self {
+        Self {
+            kind: "genome".to_string(),
+            script: None,
+            style: None,
+        }
+    }
 }
 
 impl Default for TachyonBrowserConfig {
@@ -194,5 +261,119 @@ mod tests {
         assert!(cfg.auto_start);
         assert_eq!(cfg.startup_timeout_ms, 1234);
         assert_eq!(cfg.working_directory.as_deref(), Some("/tmp"));
+    }
+
+    #[test]
+    fn parses_tachyon_plugin_suite_config() {
+        let cfg: TachyonPluginSuiteConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "id": "tachyon",
+            "renderer": {
+                "kind": "genome",
+                "script": "/plugins/tachyon/tachyon-canvas.iife.js",
+                "style": "/plugins/tachyon/tachyon-canvas.css"
+            },
+            "sidecar": {
+                "enabled": true,
+                "autoStart": true,
+                "url": "http://127.0.0.1:8400",
+                "command": "tachyon-browser"
+            }
+        }))
+        .unwrap();
+
+        assert!(cfg.enabled);
+        assert_eq!(cfg.id, "tachyon");
+        assert_eq!(cfg.renderer.kind, "genome");
+        assert_eq!(
+            cfg.renderer.script.as_deref(),
+            Some("/plugins/tachyon/tachyon-canvas.iife.js")
+        );
+        assert_eq!(
+            cfg.renderer.style.as_deref(),
+            Some("/plugins/tachyon/tachyon-canvas.css")
+        );
+        assert!(cfg.sidecar.enabled);
+        assert!(cfg.sidecar.auto_start);
+    }
+
+    #[test]
+    fn enabled_plugin_suite_forces_sidecar_enabled() {
+        let suite: TachyonPluginSuiteConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "sidecar": {
+                "url": "http://127.0.0.1:8400"
+            }
+        }))
+        .unwrap();
+        let legacy = TachyonBrowserConfig::default();
+
+        let effective = suite.effective_sidecar_config(&legacy);
+
+        assert!(effective.enabled);
+        assert_eq!(effective.url.as_deref(), Some("http://127.0.0.1:8400"));
+    }
+
+    #[test]
+    fn disabled_plugin_suite_keeps_legacy_sidecar_config() {
+        let suite = TachyonPluginSuiteConfig::default();
+        let legacy: TachyonBrowserConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "url": "http://127.0.0.1:8500"
+        }))
+        .unwrap();
+
+        let effective = suite.effective_sidecar_config(&legacy);
+
+        assert!(effective.enabled);
+        assert_eq!(effective.url.as_deref(), Some("http://127.0.0.1:8500"));
+    }
+
+    #[test]
+    fn runtime_assets_follow_enabled_plugin_suite() {
+        let suite: TachyonPluginSuiteConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "renderer": {
+                "script": "/plugins/tachyon/tachyon-canvas.iife.js",
+                "style": "/plugins/tachyon/tachyon-canvas.css"
+            },
+            "sidecar": {
+                "url": "http://127.0.0.1:8400"
+            }
+        }))
+        .unwrap();
+
+        let assets = suite.runtime_assets(Some("http://127.0.0.1:8400"));
+
+        assert_eq!(
+            assets.tachyon_browser_url.as_deref(),
+            Some("http://127.0.0.1:8400")
+        );
+        assert_eq!(
+            assets.renderer_script.as_deref(),
+            Some("/plugins/tachyon/tachyon-canvas.iife.js")
+        );
+        assert_eq!(
+            assets.renderer_style.as_deref(),
+            Some("/plugins/tachyon/tachyon-canvas.css")
+        );
+    }
+
+    #[test]
+    fn runtime_assets_prefer_resolved_browser_url() {
+        let suite: TachyonPluginSuiteConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "sidecar": {
+                "url": "http://127.0.0.1:8400"
+            }
+        }))
+        .unwrap();
+
+        let assets = suite.runtime_assets(Some("http://127.0.0.1:8500"));
+
+        assert_eq!(
+            assets.tachyon_browser_url.as_deref(),
+            Some("http://127.0.0.1:8500")
+        );
     }
 }
