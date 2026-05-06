@@ -92,6 +92,10 @@ pub struct RuntimePluginManifest {
     pub tools: Vec<RuntimeToolSpec>,
     #[serde(default)]
     pub hooks: Vec<RuntimeHookSpec>,
+    #[serde(default)]
+    pub sidecars: Vec<RuntimeSidecarSpec>,
+    #[serde(default)]
+    pub frontend: Option<RuntimeFrontendSpec>,
     #[serde(flatten)]
     pub spec: Value,
 }
@@ -129,6 +133,40 @@ pub struct RuntimeHookSpec {
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub on_error: HookErrorPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeSidecarSpec {
+    pub id: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(rename = "healthPath", alias = "health_path", default)]
+    pub health_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimeFrontendSpec {
+    #[serde(default)]
+    pub assets: Vec<RuntimeFrontendAssetSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeFrontendAssetSpec {
+    pub kind: RuntimeFrontendAssetKind,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeFrontendAssetKind {
+    Style,
+    Script,
 }
 
 fn default_post() -> String {
@@ -240,5 +278,32 @@ hooks:
             RuntimeHookEvent::SpecialistSystemPromptTransform
         );
         assert_eq!(m.hooks[0].method, "POST");
+    }
+
+    #[test]
+    fn parse_runtime_plugin_manifest_with_sidecar_and_frontend() {
+        let yaml = r#"
+id: tachyon
+kind: http
+base_url: http://127.0.0.1:8400
+sidecars:
+  - id: browser
+    url: http://127.0.0.1:8400
+    healthPath: /api/health
+frontend:
+  assets:
+    - kind: style
+      url: http://127.0.0.1:8400/assets/tachyon-canvas.css
+    - kind: script
+      url: http://127.0.0.1:8400/assets/tachyon-canvas.iife.js
+tools: []
+"#;
+        let m: RuntimePluginManifest = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(m.sidecars[0].id, "browser");
+        assert_eq!(m.sidecars[0].health_path.as_deref(), Some("/api/health"));
+        let frontend = m.frontend.unwrap();
+        assert_eq!(frontend.assets[0].kind, RuntimeFrontendAssetKind::Style);
+        assert_eq!(frontend.assets[1].kind, RuntimeFrontendAssetKind::Script);
     }
 }

@@ -22,6 +22,8 @@ pub struct Config {
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
     #[serde(default)]
     pub plugins: std::collections::HashMap<String, serde_json::Value>,
+    #[serde(rename = "pluginSuites", default)]
+    pub plugin_suites: Vec<serde_json::Value>,
     #[serde(rename = "specialistDirs", default)]
     pub specialist_dirs: Vec<String>,
     #[serde(rename = "workflowDirs", default)]
@@ -137,5 +139,50 @@ mod tests {
             cfg.tachyon_plugin_suite["renderer"]["script"],
             "/plugins/tachyon/tachyon-canvas.iife.js"
         );
+    }
+
+    #[test]
+    fn parses_plugin_suites_config() {
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "pluginSuites": [
+                    {
+                        "id": "tachyon",
+                        "enabled": true,
+                        "manifest": "/data/litian/project/tachyon-browser/plugin.yaml",
+                        "config": {
+                            "registry": "/tmp/atac-registry.json",
+                            "genes": "/data/litian/ucf_db/gene_info/result/gene_info.ucf",
+                            "browser": {
+                                "url": "http://127.0.0.1:8400",
+                                "autoStart": false
+                            }
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.plugin_suites.len(), 1);
+        assert_eq!(cfg.plugin_suites[0]["id"], "tachyon");
+        assert_eq!(
+            cfg.plugin_suites[0]["config"]["browser"]["url"],
+            "http://127.0.0.1:8400"
+        );
+    }
+
+    #[test]
+    fn keeps_legacy_tachyon_fields_for_migration() {
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "tachyonBrowser": { "enabled": true, "url": "http://127.0.0.1:8400" },
+                "tachyonPluginSuite": { "enabled": true }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(cfg.tachyon_browser.is_object());
+        assert!(cfg.tachyon_plugin_suite.is_object());
     }
 }
