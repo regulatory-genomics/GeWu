@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use axum::{
+    http::HeaderValue,
     Router, middleware,
     routing::{delete, get, post},
 };
@@ -174,6 +175,7 @@ where
             cli.host
         );
     }
+    let content_security_policy = build_content_security_policy(config.tachyon_browser_url.as_deref());
     let plugin_registrar: PluginRegistrar = Arc::new(register_plugins);
     let app_state =
         Arc::new(AppState::new(config, auth_mode.clone(), mcp_tools, plugin_registrar).await?);
@@ -296,11 +298,7 @@ where
         .fallback_service(static_service)
         .layer(SetResponseHeaderLayer::if_not_present(
             axum::http::header::CONTENT_SECURITY_POLICY,
-            axum::http::HeaderValue::from_static(
-                "default-src 'self'; img-src 'self' data:; \
-                 script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; \
-                 connect-src 'self'; font-src 'self' data:",
-            ),
+            content_security_policy,
         ))
         .layer(SetResponseHeaderLayer::if_not_present(
             axum::http::header::X_FRAME_OPTIONS,
@@ -364,6 +362,39 @@ async fn shutdown_signal() {
     }
 }
 
+fn build_content_security_policy(tachyon_browser_url: Option<&str>) -> HeaderValue {
+    let mut connect_src = "connect-src 'self'".to_string();
+    if let Some(origin) = tachyon_browser_csp_origin(tachyon_browser_url) {
+        connect_src.push(' ');
+        connect_src.push_str(&origin);
+    }
+    let csp = format!(
+        "default-src 'self'; img-src 'self' data:; \
+         script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; \
+         {connect_src}; font-src 'self' data:"
+    );
+    HeaderValue::from_str(&csp).unwrap_or_else(|_| HeaderValue::from_static("default-src 'self'"))
+}
+
+fn tachyon_browser_csp_origin(tachyon_browser_url: Option<&str>) -> Option<String> {
+    let raw = tachyon_browser_url?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(raw).ok()?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return None,
+    }
+    let host = parsed.host_str()?;
+    let mut origin = format!("{}://{}", parsed.scheme(), host);
+    if let Some(port) = parsed.port() {
+        origin.push(':');
+        origin.push_str(&port.to_string());
+    }
+    Some(origin)
+}
+
 /// Build the CORS layer. By default disallows cross-origin requests so the
 /// local-dev server is not silently reachable by other web pages on the
 /// user's machine. Honors `GEWU_CORS_ALLOW_ORIGIN` (comma-separated origins)
@@ -400,4 +431,17 @@ fn build_cors_layer() -> CorsLayer {
         return base;
     }
     base.allow_origin(AllowOrigin::list(origins))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_security_policy_allows_configured_tachyon_browser_url() {
+        let csp = build_content_security_policy(Some("http://127.0.0.1:8400"));
+        let csp = csp.to_str().unwrap();
+
+        assert!(csp.contains("connect-src 'self' http://127.0.0.1:8400"));
+    }
 }
