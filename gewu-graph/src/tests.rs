@@ -139,7 +139,9 @@ mod tests {
         graph.add_node("set_messages", set_messages);
         graph.add_node("increment", increment);
         graph.set_entry_point("set_messages");
-        graph.add_edge("set_messages", "increment").expect("valid edge");
+        graph
+            .add_edge("set_messages", "increment")
+            .expect("valid edge");
         graph.set_finish_point("increment");
 
         let compiled = graph.compile();
@@ -788,7 +790,9 @@ mod tests {
         graph.add_node("increment", increment);
         graph.add_node("add_message", add_message);
         graph.set_entry_point("increment");
-        graph.add_edge("increment", "add_message").expect("valid edge");
+        graph
+            .add_edge("increment", "add_message")
+            .expect("valid edge");
         graph.set_finish_point("add_message");
 
         let compiled = graph.compile();
@@ -939,7 +943,9 @@ mod tests {
         subgraph.add_node("double", double);
         subgraph.add_node("add_hello", add_hello);
         subgraph.set_entry_point("double");
-        subgraph.add_edge("double", "add_hello").expect("valid edge");
+        subgraph
+            .add_edge("double", "add_hello")
+            .expect("valid edge");
         subgraph.set_finish_point("add_hello");
 
         let subgraph_compiled = subgraph.compile();
@@ -954,8 +960,12 @@ mod tests {
         main_graph.add_subgraph_node("nested", subgraph_compiled);
         main_graph.add_node("subtract", subtract);
         main_graph.set_entry_point("increment");
-        main_graph.add_edge("increment", "nested").expect("valid edge");
-        main_graph.add_edge("nested", "subtract").expect("valid edge");
+        main_graph
+            .add_edge("increment", "nested")
+            .expect("valid edge");
+        main_graph
+            .add_edge("nested", "subtract")
+            .expect("valid edge");
         main_graph.set_finish_point("subtract");
 
         let compiled = main_graph.compile();

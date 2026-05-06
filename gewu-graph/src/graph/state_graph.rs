@@ -299,10 +299,14 @@ impl<S: State + 'static> StateGraph<S> {
     /// Returns `GraphError::ExecutionError` if `start` is `END` or `end` is `START`.
     pub fn add_edge(&mut self, start: &str, end: &str) -> Result<&mut Self, GraphError> {
         if start == END {
-            return Err(GraphError::ExecutionError("END cannot be used as edge start".into()));
+            return Err(GraphError::ExecutionError(
+                "END cannot be used as edge start".into(),
+            ));
         }
         if end == START {
-            return Err(GraphError::ExecutionError("START cannot be used as edge end".into()));
+            return Err(GraphError::ExecutionError(
+                "START cannot be used as edge end".into(),
+            ));
         }
         self.edges.insert((start.to_string(), end.to_string()));
         Ok(self)
