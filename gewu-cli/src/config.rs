@@ -34,6 +34,8 @@ pub struct Config {
     pub skill_dirs: Vec<String>,
     #[serde(rename = "tachyonBrowser", default)]
     pub tachyon_browser: serde_json::Value,
+    #[serde(rename = "tachyonPluginSuite", default)]
+    pub tachyon_plugin_suite: serde_json::Value,
 }
 
 #[derive(Debug)]
@@ -110,4 +112,30 @@ fn resolve_config_path(config_path: Option<&str>) -> Result<PathBuf> {
     }
 
     Ok(home_json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_tachyon_plugin_suite_raw_config() {
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "tachyonPluginSuite": {
+                    "enabled": true,
+                    "renderer": {
+                        "script": "/plugins/tachyon/tachyon-canvas.iife.js"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(cfg.tachyon_plugin_suite.is_object());
+        assert_eq!(
+            cfg.tachyon_plugin_suite["renderer"]["script"],
+            "/plugins/tachyon/tachyon-canvas.iife.js"
+        );
+    }
 }
