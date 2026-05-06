@@ -166,43 +166,59 @@ GeWu also supports YAML runtime plugins for HTTP-backed tools and lifecycle hook
 
 A runtime plugin can expose tools such as `memory_search` and hook into lifecycle events such as `specialist.system_prompt.transform`, `agent.event`, and `tool.execute.after`. See `examples/gewu-memory-runtime-plugin.yaml` for a memory daemon configuration.
 
-### Managed Tachyon Browser Sidecar
+### Plugin Suites
 
-GeWu web can manage `tachyon-browser` as a local HTTP sidecar for genome canvas
-data and `genome.*` tools. This keeps Tachyon's genomics stack out of GeWu core
-while letting users start a single GeWu web process.
+GeWu web can load domain integrations as `pluginSuites`. A suite declares its
+manifest, sidecars, frontend renderer assets, and runtime tools from one config
+entry. This keeps domain stacks such as Tachyon out of `gewu-web` while still
+letting users start a single GeWu web process.
 
 ```jsonc
 {
-  "tachyonBrowser": {
-    "enabled": true,
-    "autoStart": true,
-    "url": "http://127.0.0.1:8400",
-    "command": "/home/gilberthan/disk1/projects/tachyon-browser/target/release/tachyon-browser",
-    "args": [
-      "--host", "127.0.0.1",
-      "--port", "8400",
-      "--registry", "/path/to/tachyon-browser-registry.json",
-      "--genes", "/path/to/gene-info.ucf"
-    ],
-    "healthPath": "/api/health",
-    "startupTimeoutMs": 10000
-  }
+  "pluginSuites": [
+    {
+      "id": "tachyon",
+      "enabled": true,
+      "manifest": "/path/to/tachyon-browser/plugin.yaml",
+      "config": {
+        "browser": {
+          "url": "http://127.0.0.1:8400",
+          "autoStart": true,
+          "command": "/path/to/tachyon-browser/target/release/tachyon-browser",
+          "args": [
+            "--host", "127.0.0.1",
+            "--port", "8400",
+            "--registry", "/path/to/tachyon-browser-registry.json",
+            "--genes", "/path/to/gene-info.ucf"
+          ],
+          "healthPath": "/api/health",
+          "startupTimeoutMs": 10000
+        },
+        "renderer": {
+          "kind": "genome",
+          "style": "http://127.0.0.1:8400/assets/tachyon-canvas.css",
+          "script": "http://127.0.0.1:8400/assets/tachyon-canvas.iife.js"
+        }
+      }
+    }
+  ]
 }
 ```
 
 Startup behavior:
 
-1. If `url` is already healthy, GeWu reuses it.
+1. If the suite sidecar `url` is already healthy, GeWu reuses it.
 2. If not healthy and `autoStart=true`, GeWu spawns `command` with `args`.
-3. GeWu waits for `healthPath`, then registers `genome.*` tools.
-4. The resolved URL is injected into `index.html` as
-   `<meta name="tachyon-browser-url" ...>`, so `tachyon-canvas` can fetch
-   `/api/browser/*` from the sidecar.
-5. If GeWu started the sidecar, GeWu terminates it on shutdown.
+3. GeWu adds the manifest's directory to runtime plugin loading, registering
+   tools such as `genome.*` through the manifest rather than direct Rust deps.
+4. GeWu injects `window.__GEWU_PLUGINS__` plus the declared frontend assets
+   into `index.html`.
+5. The browser can reach sidecars through `/api/plugins/{plugin}/{sidecar}/*`.
+   `/api/browser/*` remains as a compatibility proxy for Tachyon.
+6. If GeWu started a sidecar, GeWu terminates it on shutdown.
 
-`TACHYON_BROWSER_URL` remains supported as an override for using an already
-running external sidecar.
+Deprecated `tachyonBrowser` and `tachyonPluginSuite` config blocks are still
+accepted and normalized to the Tachyon plugin suite for migration.
 
 ### Configuring a Plugin
 
@@ -233,9 +249,9 @@ GeWu core does not ship built-in domain plugins. Plugin integration happens via
 composition binaries that depend on `gewu-cli` or `gewu-web` as libraries and register
 plugin constructors at startup.
 
-Genome analysis tools are provided by `tachyon-browser-client`, a Rust crate inside
-the [tachyon-browser](../tachyon-browser) repo. Configure `tachyonBrowser` in your
-config to enable them.
+Genome analysis tools are provided by the Tachyon plugin manifest in the
+[tachyon-browser](../tachyon-browser) repo. Configure a `pluginSuites` entry with
+`id: "tachyon"` to enable them.
 
 ### Listing Available Agents
 
