@@ -1015,6 +1015,7 @@ dependencies = [
  "hex",
  "parking_lot",
  "reqwest",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",

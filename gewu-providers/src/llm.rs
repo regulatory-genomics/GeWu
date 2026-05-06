@@ -45,6 +45,7 @@ use futures::stream::BoxStream;
 use gewu_core::traits::{LlmProvider, Tool};
 use gewu_core::types::{Capabilities, ContentPart, Message, ProviderEvent};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
 
@@ -165,6 +166,59 @@ impl OpenAIProvider {
     pub fn with_temperature(mut self, temperature: Option<f32>) -> Self {
         self.temperature = temperature;
         self
+    }
+
+    fn openai_safe_tool_name(name: &str) -> String {
+        let mut safe = String::new();
+        for ch in name.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                safe.push(ch);
+            } else {
+                safe.push_str("_x");
+                safe.push_str(&format!("{:x}", ch as u32));
+                safe.push('_');
+            }
+        }
+        if safe.is_empty() {
+            "tool".to_string()
+        } else {
+            safe
+        }
+    }
+
+    fn tool_name_aliases(
+        tools: &[Arc<dyn Tool>],
+    ) -> (HashMap<String, String>, HashMap<String, String>) {
+        let mut original_to_safe = HashMap::new();
+        let mut safe_to_original = HashMap::new();
+        let mut used = HashSet::new();
+
+        for (index, tool) in tools.iter().enumerate() {
+            let original = tool.name().to_string();
+            let base = Self::openai_safe_tool_name(&original);
+            let mut safe = base.clone();
+            if used.contains(&safe) {
+                safe = format!("{}_{}", base, index);
+            }
+            used.insert(safe.clone());
+            original_to_safe.insert(original.clone(), safe.clone());
+            safe_to_original.insert(safe, original);
+        }
+
+        (original_to_safe, safe_to_original)
+    }
+
+    fn restore_tool_event_name(
+        event: ProviderEvent,
+        safe_to_original: &HashMap<String, String>,
+    ) -> ProviderEvent {
+        match event {
+            ProviderEvent::ToolCallStart { id, name } => ProviderEvent::ToolCallStart {
+                id,
+                name: safe_to_original.get(&name).cloned().unwrap_or(name),
+            },
+            other => other,
+        }
     }
 
     /// Determines capabilities based on model name.
@@ -334,9 +388,10 @@ impl OpenAIProvider {
     ///
     /// Tool messages may produce multiple API messages: one for the tool result
     /// and optionally an additional user message for media attachments.
-    fn convert_message(
+    fn convert_message_with_aliases(
         &self,
         msg: &Message,
+        original_to_safe: &HashMap<String, String>,
     ) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn Error + Send + Sync>> {
         match msg {
             Message::System { content } => {
@@ -370,7 +425,10 @@ impl OpenAIProvider {
                                     id: tc.id.clone(),
                                     tool_type: "function".to_string(),
                                     function: OpenAIFunctionCall {
-                                        name: tc.function.name.clone(),
+                                        name: original_to_safe
+                                            .get(&tc.function.name)
+                                            .cloned()
+                                            .unwrap_or_else(|| tc.function.name.clone()),
                                         arguments: tc.function.arguments.clone(),
                                     },
                                 },
@@ -444,6 +502,7 @@ impl OpenAIProvider {
     fn convert_tools(
         &self,
         tools: &[Arc<dyn Tool>],
+        original_to_safe: &HashMap<String, String>,
     ) -> Result<Vec<ChatCompletionTools>, Box<dyn Error + Send + Sync>> {
         let mut openai_tools: Vec<ChatCompletionTools> = Vec::new();
         for tool in tools {
@@ -465,7 +524,12 @@ impl OpenAIProvider {
                 }
             }
             let function = FunctionObjectArgs::default()
-                .name(tool.name())
+                .name(
+                    original_to_safe
+                        .get(tool.name())
+                        .map(String::as_str)
+                        .unwrap_or_else(|| tool.name()),
+                )
                 .description(tool.description())
                 .parameters(parameters)
                 .build()
@@ -487,13 +551,14 @@ impl RequestBuilder for OpenAIProvider {
         messages: &[Message],
         tools: &[Arc<dyn Tool>],
     ) -> Result<CreateChatCompletionRequest, Box<dyn Error + Send + Sync>> {
+        let (original_to_safe, _) = Self::tool_name_aliases(tools);
         let mut openai_messages: Vec<ChatCompletionRequestMessage> = Vec::new();
         for msg in messages {
-            let mut converted = self.convert_message(msg)?;
+            let mut converted = self.convert_message_with_aliases(msg, &original_to_safe)?;
             openai_messages.append(&mut converted);
         }
 
-        let openai_tools = self.convert_tools(tools)?;
+        let openai_tools = self.convert_tools(tools, &original_to_safe)?;
 
         Ok(CreateChatCompletionRequest {
             model: self.model.clone(),
@@ -639,6 +704,16 @@ impl ResponseParser for OpenAIProvider {
         &self,
         stream: ChatCompletionStream,
     ) -> BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>> {
+        self.parse_stream_with_tool_aliases(stream, HashMap::new())
+    }
+}
+
+impl OpenAIProvider {
+    fn parse_stream_with_tool_aliases(
+        &self,
+        stream: ChatCompletionStream,
+        safe_to_original: HashMap<String, String>,
+    ) -> BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>> {
         let s = async_stream::try_stream! {
             let mut tool_aggregator = ToolCallAggregator::default();
 
@@ -661,7 +736,7 @@ impl ResponseParser for OpenAIProvider {
                     if let Some(tool_calls) = &delta.tool_calls {
                         for tool_call in tool_calls {
                             for event in tool_aggregator.process_chunk(tool_call) {
-                                yield event;
+                                yield Self::restore_tool_event_name(event, &safe_to_original);
                             }
                         }
                     }
@@ -689,6 +764,7 @@ impl LlmProvider for OpenAIProvider {
         BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
         Box<dyn Error + Send + Sync>,
     > {
+        let (_, safe_to_original) = Self::tool_name_aliases(tools);
         let request = self.build(messages, tools)?;
 
         let stream = self
@@ -698,7 +774,7 @@ impl LlmProvider for OpenAIProvider {
             .await
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
-        let parsed_stream = self.parse_stream(stream);
+        let parsed_stream = self.parse_stream_with_tool_aliases(stream, safe_to_original);
 
         Ok(parsed_stream)
     }
@@ -1146,6 +1222,32 @@ impl LlmProvider for AnthropicProvider {
 mod tests {
     use super::*;
     use crate::openai_types::FunctionCallStream;
+    use gewu_core::types::{ToolContext, ToolResult};
+
+    struct NamedTool(&'static str);
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "test tool"
+        }
+
+        fn schema(&self) -> schemars::schema::RootSchema {
+            schemars::schema_for!(serde_json::Value)
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+            Ok(ToolResult::new(self.0, "ok"))
+        }
+    }
 
     #[test]
     fn test_new_provider() {
@@ -1174,6 +1276,64 @@ mod tests {
 
         let request = provider.build(&[], &[]).expect("build request");
         assert_eq!(request.max_tokens, Some(16_384));
+    }
+
+    #[test]
+    fn openai_tool_definitions_use_api_safe_names() {
+        let provider = OpenAIProvider::new("test-key", "gpt-4");
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(NamedTool("canvas.open"))];
+
+        let request = provider.build(&[], &tools).expect("build request");
+        let tools = request.tools.expect("tools included");
+        let ChatCompletionTools::Function(tool) = &tools[0];
+
+        assert_eq!(tool.function.name, "canvas_x2e_open");
+    }
+
+    #[test]
+    fn openai_assistant_history_uses_api_safe_tool_names() {
+        let provider = OpenAIProvider::new("test-key", "gpt-4");
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(NamedTool("genome.inspect_region"))];
+        let messages = vec![Message::Assistant {
+            content: None,
+            tool_calls: Some(vec![gewu_core::types::ToolCall {
+                id: "call_1".to_string(),
+                r#type: "function".to_string(),
+                function: gewu_core::types::FunctionCall {
+                    name: "genome.inspect_region".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+        }];
+
+        let request = provider.build(&messages, &tools).expect("build request");
+        let ChatCompletionRequestMessage::Assistant(message) = &request.messages[0] else {
+            panic!("expected assistant message")
+        };
+        let calls = message.tool_calls.as_ref().expect("tool calls");
+        let ChatCompletionMessageToolCalls::Function(call) = &calls[0];
+
+        assert_eq!(call.function.name, "genome_x2e_inspect_region");
+    }
+
+    #[test]
+    fn openai_tool_call_events_restore_original_tool_name() {
+        let safe_to_original = HashMap::from([(
+            "canvas_x2e_open".to_string(),
+            "canvas.open".to_string(),
+        )]);
+        let event = OpenAIProvider::restore_tool_event_name(
+            ProviderEvent::ToolCallStart {
+                id: "call_1".to_string(),
+                name: "canvas_x2e_open".to_string(),
+            },
+            &safe_to_original,
+        );
+
+        match event {
+            ProviderEvent::ToolCallStart { name, .. } => assert_eq!(name, "canvas.open"),
+            _ => panic!("expected tool call start"),
+        }
     }
 
     #[test]
@@ -1207,7 +1367,9 @@ mod tests {
             ],
         };
 
-        let converted = provider.convert_message(&msg).expect("convert success");
+        let converted = provider
+            .convert_message_with_aliases(&msg, &HashMap::new())
+            .expect("convert success");
         assert_eq!(converted.len(), 2);
         match &converted[0] {
             ChatCompletionRequestMessage::Tool(tool_msg) => {
