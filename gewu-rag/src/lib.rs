@@ -4,8 +4,8 @@ pub mod document;
 pub mod retrieval;
 pub mod tools;
 
-pub use agent::state::{AgentState, MainState, RagQueryResult};
 pub use agent::graph::RagSystem;
+pub use agent::state::{AgentState, MainState, RagQueryResult};
 pub use config::Config;
 pub use document::chunker::{ChildChunk, DocumentChunker, ParentChunk};
 pub use document::indexer::DocumentIndexer;

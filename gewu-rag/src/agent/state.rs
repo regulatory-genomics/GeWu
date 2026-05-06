@@ -12,7 +12,7 @@ pub struct RagQueryResult {
     pub sources: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentState {
     pub tool_call_count: i32,
     pub iteration_count: i32,
@@ -24,23 +24,6 @@ pub struct AgentState {
     pub agent_answers: Vec<RagQueryResult>,
     pub retrieved_data: Vec<String>,
     pub messages: Vec<Message>,
-}
-
-impl Default for AgentState {
-    fn default() -> Self {
-        Self {
-            tool_call_count: 0,
-            iteration_count: 0,
-            question: String::new(),
-            question_index: 0,
-            context_summary: String::new(),
-            retrieval_keys: Vec::new(),
-            final_answer: String::new(),
-            agent_answers: Vec::new(),
-            retrieved_data: Vec::new(),
-            messages: Vec::new(),
-        }
-    }
 }
 
 impl State for AgentState {
@@ -115,7 +98,7 @@ impl AgentState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PartialAgentState {
     pub tool_call_count: Option<i32>,
     pub iteration_count: Option<i32>,
@@ -129,24 +112,7 @@ pub struct PartialAgentState {
     pub messages: Option<Vec<Message>>,
 }
 
-impl Default for PartialAgentState {
-    fn default() -> Self {
-        Self {
-            tool_call_count: None,
-            iteration_count: None,
-            question: None,
-            question_index: None,
-            context_summary: None,
-            retrieval_keys: None,
-            final_answer: None,
-            agent_answers: None,
-            retrieved_data: None,
-            messages: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MainState {
     pub question_is_clear: bool,
     pub conversation_summary: String,
@@ -155,20 +121,6 @@ pub struct MainState {
     pub agent_answers: Vec<RagQueryResult>,
     pub messages: Vec<Message>,
     pub clarification_needed: Option<String>,
-}
-
-impl Default for MainState {
-    fn default() -> Self {
-        Self {
-            question_is_clear: false,
-            conversation_summary: String::new(),
-            original_query: String::new(),
-            rewritten_questions: Vec::new(),
-            agent_answers: Vec::new(),
-            messages: Vec::new(),
-            clarification_needed: None,
-        }
-    }
 }
 
 impl State for MainState {
@@ -195,7 +147,7 @@ impl State for MainState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PartialMainState {
     pub question_is_clear: Option<bool>,
     pub conversation_summary: Option<String>,
@@ -204,20 +156,6 @@ pub struct PartialMainState {
     pub agent_answers: Option<Vec<RagQueryResult>>,
     pub clarification_needed: Option<String>,
     pub messages: Option<Vec<Message>>,
-}
-
-impl Default for PartialMainState {
-    fn default() -> Self {
-        Self {
-            question_is_clear: None,
-            conversation_summary: None,
-            original_query: None,
-            rewritten_questions: None,
-            agent_answers: None,
-            clarification_needed: None,
-            messages: None,
-        }
-    }
 }
 
 #[cfg(test)]

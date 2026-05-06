@@ -88,7 +88,7 @@ pub use graph::{
     CompiledGraph, GraphError, GraphSend, GraphTool, NodeResult, StateGraph, StreamMode,
     StreamOutput, StreamWriter,
 };
-pub use state::{Append, LastValue, Reducer, State, Sum};
+pub use state::{Append, Blackboard, LastValue, Reducer, State, Sum};
 
 /// The reserved name for the graph's entry point.
 ///

@@ -27,9 +27,12 @@
 
 use crate::types::{ContentPart, Message};
 
-const PRUNE_PROTECT_THRESHOLD: usize = 40_000;
-const PRUNE_MINIMUM_SAVINGS: usize = 20_000;
-const COMPACTION_BUFFER: usize = 20_000;
+pub const MAX_LINES: usize = 2000;
+pub const MAX_BYTES: usize = 50 * 1024;
+pub const PRUNE_PROTECT_THRESHOLD: usize = 40_000;
+pub const PRUNE_MINIMUM_SAVINGS: usize = 20_000;
+pub const COMPACTION_BUFFER: usize = 20_000;
+pub const CONSOLIDATION_DIR: &str = ".gewu/tool-consolidation";
 
 /// Estimates the number of tokens in a text string.
 ///
@@ -161,10 +164,9 @@ pub fn prune(messages: &mut [Message]) -> usize {
         if let Message::Assistant {
             content: Some(c), ..
         } = msg
+            && c.starts_with("Summary:")
         {
-            if c.starts_with("Summary:") {
-                break;
-            }
+            break;
         }
 
         if let Message::Tool { content, media, .. } = msg {
@@ -189,4 +191,101 @@ pub fn prune(messages: &mut [Message]) -> usize {
     }
 
     0
+}
+
+pub struct ConsolidationInput {
+    pub tool_call_ids: Vec<String>,
+    pub tool_names: Vec<String>,
+    pub tool_contents: Vec<String>,
+}
+
+pub struct ConsolidationResult {
+    pub summary_text: String,
+    pub file_path: std::path::PathBuf,
+    pub n_consolidated: usize,
+}
+
+pub fn build_consolidation_text(input: &ConsolidationInput) -> String {
+    let mut text = String::new();
+    for i in 0..input.tool_call_ids.len() {
+        let name = input
+            .tool_names
+            .get(i)
+            .map(|s| s.as_str())
+            .unwrap_or("unknown");
+        let content = &input.tool_contents[i];
+        text.push_str(&format!("--- {}[{}] ---\n{}\n\n", name, i + 1, content));
+    }
+    text
+}
+
+pub fn save_consolidation_file(raw_text: &str) -> std::path::PathBuf {
+    let dir = dirs::home_dir()
+        .map(|h| h.join(".gewu").join("tool-consolidation"))
+        .unwrap_or_else(|| std::path::PathBuf::from(CONSOLIDATION_DIR));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("Failed to create consolidation dir: {}", e);
+    }
+    let file_name = format!("consol_{}.txt", uuid::Uuid::new_v4());
+    let file_path = dir.join(&file_name);
+    if let Err(e) = std::fs::write(&file_path, raw_text) {
+        tracing::warn!("Failed to write consolidation file: {}", e);
+    }
+    file_path
+}
+
+pub fn build_consolidation_prompt(raw_text: &str, n_results: usize) -> Vec<Message> {
+    vec![
+        Message::System {
+            content: format!(
+                "You are a data consolidation assistant. You received {} tool call results that need to be summarized into a single concise report. \
+                Preserve ALL key data points: numbers, rankings, names, scores, p-values, fold enrichments, tissue/stage names. \
+                Structure the summary clearly. Do NOT omit any tool's findings — every result must be represented. \
+                Be thorough but eliminate redundant raw data.",
+                n_results
+            ),
+        },
+        Message::User {
+            content: vec![ContentPart::Text {
+                text: format!(
+                    "Summarize these {} tool results:\n\n{}",
+                    n_results, raw_text
+                ),
+            }],
+        },
+    ]
+}
+
+pub fn apply_consolidation_to_memory(
+    messages: &mut [Message],
+    tool_call_ids: &[String],
+    summary: &str,
+    file_path: &std::path::Path,
+) {
+    let id_set: std::collections::HashSet<&str> =
+        tool_call_ids.iter().map(|s| s.as_str()).collect();
+    let last_id = tool_call_ids.last().map(|s| s.as_str()).unwrap_or("");
+
+    for msg in messages.iter_mut() {
+        if let Message::Tool {
+            tool_call_id,
+            content,
+            media,
+            ..
+        } = msg
+            && id_set.contains(tool_call_id.as_str())
+        {
+            if tool_call_id == last_id {
+                *content = format!(
+                    "[Consolidated summary of {} tool calls]\n\n{}\n\n[Full data: {}]",
+                    tool_call_ids.len(),
+                    summary,
+                    file_path.display()
+                );
+            } else {
+                *content = "[See consolidated summary below]".to_string();
+            }
+            media.clear();
+        }
+    }
 }

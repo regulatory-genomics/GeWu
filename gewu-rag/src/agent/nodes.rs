@@ -1,14 +1,14 @@
 use crate::agent::prompts;
-use crate::agent::state::{AgentState, MainState, PartialAgentState, PartialMainState};
 use crate::agent::state::RagQueryResult;
+use crate::agent::state::{AgentState, MainState, PartialAgentState, PartialMainState};
 use crate::config::Config;
 use anyhow::Result;
 use futures::StreamExt;
 use gewu_core::types::{ContentPart, ProviderEvent, ToolCall, ToolContext};
 use gewu_core::{Message, Tool};
 use gewu_graph::CompiledGraph;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NODE_INVOCATION_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -26,7 +26,7 @@ fn get_message_content(msg: &Message) -> String {
             })
             .collect::<Vec<_>>()
             .join(""),
-        Message::Assistant { content, .. } => content.as_ref().map(|c| c.clone()).unwrap_or_default(),
+        Message::Assistant { content, .. } => content.clone().unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -46,22 +46,32 @@ pub async fn summarize_history(
     }
 
     let compression_prompt = prompts::get_aggregation_prompt();
-    let full_prompt = format!("{}\n\nOriginal conversation:\n{}", compression_prompt, content);
+    let full_prompt = format!(
+        "{}\n\nOriginal conversation:\n{}",
+        compression_prompt, content
+    );
 
     let messages = vec![
-        Message::System { content: full_prompt },
+        Message::System {
+            content: full_prompt,
+        },
         Message::User {
-            content: vec![ContentPart::Text { text: "Summarize the conversation history".to_string() }],
+            content: vec![ContentPart::Text {
+                text: "Summarize the conversation history".to_string(),
+            }],
         },
     ];
 
-    let mut stream = llm.stream_response(&messages, &[]).await.unwrap_or_else(|_| {
-        Box::pin(futures::stream::once(async {
-            Ok(ProviderEvent::Error {
-                error: "LLM error".to_string(),
-            })
-        }))
-    });
+    let mut stream = llm
+        .stream_response(&messages, &[])
+        .await
+        .unwrap_or_else(|_| {
+            Box::pin(futures::stream::once(async {
+                Ok(ProviderEvent::Error {
+                    error: "LLM error".to_string(),
+                })
+            }))
+        });
 
     let mut summary = String::new();
     while let Some(event) = stream.next().await {
@@ -98,20 +108,32 @@ pub async fn rewrite_query(
     };
 
     let rewrite_prompt = prompts::get_rewrite_query_prompt();
-    let full_prompt = format!("{}\n\n{}\n\nUser Query:\n{}", conversation_section, rewrite_prompt, content);
+    let full_prompt = format!(
+        "{}\n\n{}\n\nUser Query:\n{}",
+        conversation_section, rewrite_prompt, content
+    );
 
     let messages = vec![
-        Message::System { content: full_prompt },
-        Message::User { content: vec![ContentPart::Text { text: content.clone() }] },
+        Message::System {
+            content: full_prompt,
+        },
+        Message::User {
+            content: vec![ContentPart::Text {
+                text: content.clone(),
+            }],
+        },
     ];
 
-    let mut stream = llm.stream_response(&messages, &[]).await.unwrap_or_else(|_| {
-        Box::pin(futures::stream::once(async {
-            Ok(ProviderEvent::Error {
-                error: "LLM error".to_string(),
-            })
-        }))
-    });
+    let mut stream = llm
+        .stream_response(&messages, &[])
+        .await
+        .unwrap_or_else(|_| {
+            Box::pin(futures::stream::once(async {
+                Ok(ProviderEvent::Error {
+                    error: "LLM error".to_string(),
+                })
+            }))
+        });
 
     let mut rewritten_query = String::new();
     while let Some(event) = stream.next().await {
@@ -192,7 +214,8 @@ pub async fn rewrite_query(
     PartialMainState {
         question_is_clear: Some(false),
         clarification_needed: Some(
-            "I need more information to understand your question. Could you please clarify?".to_string(),
+            "I need more information to understand your question. Could you please clarify?"
+                .to_string(),
         ),
         ..Default::default()
     }
@@ -205,8 +228,15 @@ pub async fn orchestrator(
     _config: &Config,
 ) -> PartialAgentState {
     let invocation_id = next_invocation_id();
-    tracing::info!("[NODE #{}] orchestrator starting: question={}, msgs={}, tool_count={}, iteration={}, retrieval_keys={}",
-        invocation_id, state.question, state.messages.len(), state.tool_call_count, state.iteration_count, state.retrieval_keys.len());
+    tracing::info!(
+        "[NODE #{}] orchestrator starting: question={}, msgs={}, tool_count={}, iteration={}, retrieval_keys={}",
+        invocation_id,
+        state.question,
+        state.messages.len(),
+        state.tool_call_count,
+        state.iteration_count,
+        state.retrieval_keys.len()
+    );
 
     let sys_msg = Message::System {
         content: prompts::get_orchestrator_prompt(),
@@ -217,7 +247,10 @@ pub async fn orchestrator(
     if !state.context_summary.is_empty() {
         all_messages.push(Message::User {
             content: vec![ContentPart::Text {
-                text: format!("[COMPRESSED CONTEXT FROM PRIOR RESEARCH]\n\n{}", state.context_summary),
+                text: format!(
+                    "[COMPRESSED CONTEXT FROM PRIOR RESEARCH]\n\n{}",
+                    state.context_summary
+                ),
             }],
         });
     }
@@ -230,7 +263,9 @@ pub async fn orchestrator(
         });
         all_messages.push(Message::User {
             content: vec![ContentPart::Text {
-                text: "YOU MUST CALL 'search_child_chunks' AS THE FIRST STEP TO ANSWER THIS QUESTION.".to_string(),
+                text:
+                    "YOU MUST CALL 'search_child_chunks' AS THE FIRST STEP TO ANSWER THIS QUESTION."
+                        .to_string(),
             }],
         });
     } else {
@@ -239,7 +274,11 @@ pub async fn orchestrator(
 
     let stream = llm.stream_response(&all_messages, &tools).await;
     if let Err(e) = stream {
-        tracing::error!("[NODE #{}] orchestrator: stream_response error: {:?}", invocation_id, e);
+        tracing::error!(
+            "[NODE #{}] orchestrator: stream_response error: {:?}",
+            invocation_id,
+            e
+        );
         return PartialAgentState::default();
     }
     let mut stream = stream.unwrap();
@@ -267,29 +306,42 @@ pub async fn orchestrator(
                 }
                 ProviderEvent::ToolCallDelta { id, delta } => {
                     tracing::debug!("[TOOL_CALL_DELTA] id={}, delta_len={}", id, delta.len());
-                    if let Some(ref mut calls) = current_tool_calls {
-                        if let Some(call) = calls.iter_mut().find(|c| c.id == id) {
-                            call.function.arguments.push_str(&delta);
-                        }
+                    if let Some(ref mut calls) = current_tool_calls
+                        && let Some(call) = calls.iter_mut().find(|c| c.id == id)
+                    {
+                        call.function.arguments.push_str(&delta);
                     }
                 }
                 ProviderEvent::Finish { reason } => {
                     tracing::info!("[LLM_FINISH] reason={:?}", reason);
-                    tracing::debug!("[LLM_FINISH] content_len={}, tool_calls={:?}", 
+                    tracing::debug!(
+                        "[LLM_FINISH] content_len={}, tool_calls={:?}",
                         current_content.len(),
-                        current_tool_calls.as_ref().map(|c| c.len()).unwrap_or(0));
+                        current_tool_calls.as_ref().map(|c| c.len()).unwrap_or(0)
+                    );
                     if !current_content.is_empty() || current_tool_calls.is_some() {
                         if !current_content.is_empty() {
-                            tracing::info!("[LLM_CONTENT_PREVIEW] {}", &current_content[..current_content.len().min(200)]);
+                            tracing::info!(
+                                "[LLM_CONTENT_PREVIEW] {}",
+                                &current_content[..current_content.len().min(200)]
+                            );
                         }
                         if let Some(ref tcs) = current_tool_calls {
                             for tc in tcs {
-                                tracing::info!("[LLM_TOOL_CALL] name={}, id={}, args={}", 
-                                    tc.function.name, tc.id, tc.function.arguments);
+                                tracing::info!(
+                                    "[LLM_TOOL_CALL] name={}, id={}, args={}",
+                                    tc.function.name,
+                                    tc.id,
+                                    tc.function.arguments
+                                );
                             }
                         }
                         new_messages.push(Message::Assistant {
-                            content: if current_content.is_empty() { None } else { Some(current_content.clone()) },
+                            content: if current_content.is_empty() {
+                                None
+                            } else {
+                                Some(current_content.clone())
+                            },
                             tool_calls: current_tool_calls.clone(),
                         });
                         current_content.clear();
@@ -308,17 +360,17 @@ pub async fn orchestrator(
 
     if !current_content.is_empty() || current_tool_calls.is_some() {
         new_messages.push(Message::Assistant {
-            content: if current_content.is_empty() { None } else { Some(current_content.clone()) },
+            content: if current_content.is_empty() {
+                None
+            } else {
+                Some(current_content.clone())
+            },
             tool_calls: current_tool_calls,
         });
     }
 
-    let tool_calls = if let Some(last) = new_messages.last() {
-        if let Message::Assistant { tool_calls, .. } = last {
-            tool_calls.clone().unwrap_or_default()
-        } else {
-            vec![]
-        }
+    let tool_calls = if let Some(Message::Assistant { tool_calls, .. }) = new_messages.last() {
+        tool_calls.clone().unwrap_or_default()
     } else {
         vec![]
     };
@@ -333,13 +385,15 @@ pub async fn orchestrator(
     }
 }
 
-pub async fn execute_tools(
-    state: AgentState,
-    tools: Vec<Arc<dyn Tool>>,
-) -> PartialAgentState {
+pub async fn execute_tools(state: AgentState, tools: Vec<Arc<dyn Tool>>) -> PartialAgentState {
     let invocation_id = next_invocation_id();
-    tracing::info!("[NODE #{}] execute_tools starting: tool_count={}, iteration={}, msgs={}",
-        invocation_id, state.tool_call_count, state.iteration_count, state.messages.len());
+    tracing::info!(
+        "[NODE #{}] execute_tools starting: tool_count={}, iteration={}, msgs={}",
+        invocation_id,
+        state.tool_call_count,
+        state.iteration_count,
+        state.messages.len()
+    );
 
     let last_message = state.messages.last();
 
@@ -362,8 +416,14 @@ pub async fn execute_tools(
 
     for tc in &tool_calls {
         let tool_name = &tc.function.name;
-        tracing::info!("[TOOL_EXECUTE] name={}, id={}, args={}", tool_name, tc.id, tc.function.arguments);
-        let args_result: Result<serde_json::Value, _> = serde_json::from_str(&tc.function.arguments);
+        tracing::info!(
+            "[TOOL_EXECUTE] name={}, id={}, args={}",
+            tool_name,
+            tc.id,
+            tc.function.arguments
+        );
+        let args_result: Result<serde_json::Value, _> =
+            serde_json::from_str(&tc.function.arguments);
 
         if let Ok(args) = args_result {
             let tool = tools.iter().find(|t| t.name() == tool_name);
@@ -371,8 +431,16 @@ pub async fn execute_tools(
             if let Some(tool) = tool {
                 match tool.execute(args, &ctx).await {
                     Ok(result) => {
-                        tracing::info!("[TOOL_RESULT] name={}, id={}, output_len={}", tool_name, tc.id, result.output.len());
-                        tracing::debug!("[TOOL_RESULT_PREVIEW] {}", &result.output[..result.output.len().min(300)]);
+                        tracing::info!(
+                            "[TOOL_RESULT] name={}, id={}, output_len={}",
+                            tool_name,
+                            tc.id,
+                            result.output.len()
+                        );
+                        tracing::debug!(
+                            "[TOOL_RESULT_PREVIEW] {}",
+                            &result.output[..result.output.len().min(300)]
+                        );
                         new_messages.push(Message::Tool {
                             tool_call_id: tc.id.clone(),
                             tool_name: Some(tool_name.clone()),
@@ -407,8 +475,13 @@ pub async fn execute_tools(
         }
     }
 
-    tracing::info!("[NODE #{}] execute_tools done: returning tool_call_count={} (tools_executed={}), iteration=1, new_msgs={}",
-        invocation_id, tool_calls.len(), tool_calls.len(), new_messages.len() - state.messages.len());
+    tracing::info!(
+        "[NODE #{}] execute_tools done: returning tool_call_count={} (tools_executed={}), iteration=1, new_msgs={}",
+        invocation_id,
+        tool_calls.len(),
+        tool_calls.len(),
+        new_messages.len() - state.messages.len()
+    );
 
     PartialAgentState {
         messages: Some(new_messages),
@@ -422,41 +495,54 @@ pub async fn compress_context(
     state: AgentState,
     llm: Arc<dyn gewu_core::LlmProvider>,
 ) -> PartialAgentState {
-    tracing::info!("[NODE] compress_context starting: msgs={}, summary_len={}",
-        state.messages.len(), state.context_summary.len());
+    tracing::info!(
+        "[NODE] compress_context starting: msgs={}, summary_len={}",
+        state.messages.len(),
+        state.context_summary.len()
+    );
 
     let content = state
         .messages
         .iter()
-        .filter_map(|m| {
-            match m {
-                Message::Assistant { content, .. } => content.as_ref().filter(|c| !c.is_empty()).cloned(),
-                Message::Tool { content, .. } => Some(content.clone()),
-                _ => None,
+        .filter_map(|m| match m {
+            Message::Assistant { content, .. } => {
+                content.as_ref().filter(|c| !c.is_empty()).cloned()
             }
+            Message::Tool { content, .. } => Some(content.clone()),
+            _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    tracing::debug!("[NODE] compress_context content to compress: len={}", content.len());
+    tracing::debug!(
+        "[NODE] compress_context content to compress: len={}",
+        content.len()
+    );
 
     let compression_prompt = prompts::get_context_compression_prompt();
     let full_prompt = format!("{}\n\nOriginal context:\n{}", compression_prompt, content);
 
     let messages = vec![
-        Message::System { content: full_prompt },
+        Message::System {
+            content: full_prompt,
+        },
         Message::User {
-            content: vec![ContentPart::Text { text: "Compress this context".to_string() }],
+            content: vec![ContentPart::Text {
+                text: "Compress this context".to_string(),
+            }],
         },
     ];
 
-    let mut stream = llm.stream_response(&messages, &[]).await.unwrap_or_else(|_| {
-        Box::pin(futures::stream::once(async {
-            Ok(ProviderEvent::Error {
-                error: "LLM error".to_string(),
-            })
-        }))
-    });
+    let mut stream = llm
+        .stream_response(&messages, &[])
+        .await
+        .unwrap_or_else(|_| {
+            Box::pin(futures::stream::once(async {
+                Ok(ProviderEvent::Error {
+                    error: "LLM error".to_string(),
+                })
+            }))
+        });
 
     let mut compressed = String::new();
     while let Some(event) = stream.next().await {
@@ -465,7 +551,10 @@ pub async fn compress_context(
         }
     }
 
-    tracing::info!("[NODE] compress_context done: compressed_len={}", compressed.len());
+    tracing::info!(
+        "[NODE] compress_context done: compressed_len={}",
+        compressed.len()
+    );
     PartialAgentState {
         context_summary: Some(compressed),
         ..Default::default()
@@ -479,15 +568,15 @@ pub async fn fallback_response(
     let mut all_content = Vec::new();
     let mut tool_count = 0;
     let mut msg_types = Vec::new();
-    
+
     for m in state.messages.iter().rev() {
         msg_types.push(format!("{:?}", m));
         match m {
             Message::Assistant { content, .. } => {
-                if let Some(c) = content {
-                    if !c.is_empty() {
-                        all_content.push(c.clone());
-                    }
+                if let Some(c) = content
+                    && !c.is_empty()
+                {
+                    all_content.push(c.clone());
                 }
             }
             Message::Tool { content, .. } => {
@@ -499,9 +588,14 @@ pub async fn fallback_response(
             _ => {}
         }
     }
-    
-    tracing::debug!("fallback_response: tool_count={}, content_len={}, msg_types={}", tool_count, all_content.len(), msg_types.len());
-    
+
+    tracing::debug!(
+        "fallback_response: tool_count={}, content_len={}, msg_types={}",
+        tool_count,
+        all_content.len(),
+        msg_types.len()
+    );
+
     let answer = if all_content.is_empty() {
         "I couldn't find relevant information to answer your question.".to_string()
     } else {
@@ -524,14 +618,23 @@ pub async fn fallback_response(
     }
 }
 
-pub async fn collect_answer(
-    state: AgentState,
-) -> PartialAgentState {
-    tracing::info!("[NODE] collect_answer starting: messages={}", state.messages.len());
+pub async fn collect_answer(state: AgentState) -> PartialAgentState {
+    tracing::info!(
+        "[NODE] collect_answer starting: messages={}",
+        state.messages.len()
+    );
     for (i, m) in state.messages.iter().enumerate() {
         match m {
-            Message::Assistant { content, tool_calls } => {
-                tracing::debug!("  msg[{}]: Assistant content_len={} tool_calls={}", i, content.as_ref().map(|c| c.len()).unwrap_or(0), tool_calls.as_ref().map(|t| t.len()).unwrap_or(0));
+            Message::Assistant {
+                content,
+                tool_calls,
+            } => {
+                tracing::debug!(
+                    "  msg[{}]: Assistant content_len={} tool_calls={}",
+                    i,
+                    content.as_ref().map(|c| c.len()).unwrap_or(0),
+                    tool_calls.as_ref().map(|t| t.len()).unwrap_or(0)
+                );
             }
             Message::Tool { content, .. } => {
                 tracing::debug!("  msg[{}]: Tool content_len={}", i, content.len());
@@ -541,14 +644,25 @@ pub async fn collect_answer(
             }
         }
     }
-    
+
     let last_assistant_with_content = state.messages.iter().rev().find_map(|m| {
-        if let Message::Assistant { content, tool_calls } = m {
-            tracing::info!("[NODE] collect_answer checking Assistant: content_len={}, tool_calls={}", 
-                content.as_ref().map(|c| c.len()).unwrap_or(0), 
-                tool_calls.as_ref().map(|t| t.len()).unwrap_or(0));
-            if content.as_ref().map(|c| !c.is_empty()).unwrap_or(false) && tool_calls.as_ref().map(|t| t.is_empty()).unwrap_or(true) {
-                tracing::info!("[NODE] collect_answer found assistant content with no tool_calls, len={}", content.as_ref().map(|c| c.len()).unwrap_or(0));
+        if let Message::Assistant {
+            content,
+            tool_calls,
+        } = m
+        {
+            tracing::info!(
+                "[NODE] collect_answer checking Assistant: content_len={}, tool_calls={}",
+                content.as_ref().map(|c| c.len()).unwrap_or(0),
+                tool_calls.as_ref().map(|t| t.len()).unwrap_or(0)
+            );
+            if content.as_ref().map(|c| !c.is_empty()).unwrap_or(false)
+                && tool_calls.as_ref().map(|t| t.is_empty()).unwrap_or(true)
+            {
+                tracing::info!(
+                    "[NODE] collect_answer found assistant content with no tool_calls, len={}",
+                    content.as_ref().map(|c| c.len()).unwrap_or(0)
+                );
                 Some(content.clone().unwrap_or_default())
             } else {
                 None
@@ -561,17 +675,24 @@ pub async fn collect_answer(
     let answer = if let Some(content) = last_assistant_with_content {
         content
     } else {
-        state.messages.iter().rev().find_map(|m| {
-            if let Message::Tool { content, .. } = m {
-                if !content.is_empty() {
-                    Some(content.clone())
+        state
+            .messages
+            .iter()
+            .rev()
+            .find_map(|m| {
+                if let Message::Tool { content, .. } = m {
+                    if !content.is_empty() {
+                        Some(content.clone())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
-            } else {
-                None
-            }
-        }).unwrap_or_else(|| "I couldn't find relevant information to answer your question.".to_string())
+            })
+            .unwrap_or_else(|| {
+                "I couldn't find relevant information to answer your question.".to_string()
+            })
     };
 
     let sources = extract_sources(&answer);
@@ -615,9 +736,7 @@ pub async fn run_parallel_agents(
         .map(|(i, q)| {
             let agent_state = AgentState::new(q.clone(), i);
             let graph = agent_graph.clone();
-            async move {
-                graph.ainvoke(agent_state).await
-            }
+            async move { graph.ainvoke(agent_state).await }
         })
         .collect();
 
@@ -626,8 +745,10 @@ pub async fn run_parallel_agents(
     for result in results {
         match result {
             Ok(agent_result) => {
-                tracing::info!("[NODE] run_parallel_agents: got agent_result with agent_answers={}", 
-                    agent_result.agent_answers.len());
+                tracing::info!(
+                    "[NODE] run_parallel_agents: got agent_result with agent_answers={}",
+                    agent_result.agent_answers.len()
+                );
                 all_answers.extend(agent_result.agent_answers);
             }
             Err(e) => {
@@ -636,7 +757,10 @@ pub async fn run_parallel_agents(
         }
     }
 
-    tracing::info!("[NODE] run_parallel_agents: returning {} total answers", all_answers.len());
+    tracing::info!(
+        "[NODE] run_parallel_agents: returning {} total answers",
+        all_answers.len()
+    );
 
     PartialMainState {
         agent_answers: Some(all_answers),
@@ -648,9 +772,11 @@ pub async fn aggregate_answers(
     state: MainState,
     llm: Arc<dyn gewu_core::LlmProvider>,
 ) -> PartialMainState {
-    tracing::info!("[NODE] aggregate_answers starting: agent_answers={}", 
-        state.agent_answers.len());
-    
+    tracing::info!(
+        "[NODE] aggregate_answers starting: agent_answers={}",
+        state.agent_answers.len()
+    );
+
     if state.agent_answers.is_empty() {
         tracing::info!("[NODE] aggregate_answers: no agent answers, returning default");
         return PartialMainState {
@@ -666,10 +792,18 @@ pub async fn aggregate_answers(
     sorted_answers.sort_by_key(|a| a.index);
 
     for (i, ans) in sorted_answers.iter().enumerate() {
-        tracing::info!("[NODE] aggregate_answers: answer[{}] index={}, answer_len={}", 
-            i, ans.index, ans.answer.len());
+        tracing::info!(
+            "[NODE] aggregate_answers: answer[{}] index={}, answer_len={}",
+            i,
+            ans.index,
+            ans.answer.len()
+        );
         if ans.answer.len() < 200 {
-            tracing::info!("[NODE] aggregate_answers: answer[{}] content: {}", i, ans.answer);
+            tracing::info!(
+                "[NODE] aggregate_answers: answer[{}] content: {}",
+                i,
+                ans.answer
+            );
         }
     }
 
@@ -684,22 +818,30 @@ pub async fn aggregate_answers(
         state.original_query, formatted_answers
     );
 
-    tracing::info!("[NODE] aggregate_answers: user_message len={}", user_message.len());
+    tracing::info!(
+        "[NODE] aggregate_answers: user_message len={}",
+        user_message.len()
+    );
 
     let messages = vec![
-        Message::System { content: prompts::get_aggregation_prompt() },
+        Message::System {
+            content: prompts::get_aggregation_prompt(),
+        },
         Message::User {
             content: vec![ContentPart::Text { text: user_message }],
         },
     ];
 
-    let mut stream = llm.stream_response(&messages, &[]).await.unwrap_or_else(|_| {
-        Box::pin(futures::stream::once(async {
-            Ok(ProviderEvent::Error {
-                error: "LLM error".to_string(),
-            })
-        }))
-    });
+    let mut stream = llm
+        .stream_response(&messages, &[])
+        .await
+        .unwrap_or_else(|_| {
+            Box::pin(futures::stream::once(async {
+                Ok(ProviderEvent::Error {
+                    error: "LLM error".to_string(),
+                })
+            }))
+        });
 
     let mut response = String::new();
     while let Some(event) = stream.next().await {
@@ -710,7 +852,10 @@ pub async fn aggregate_answers(
         }
     }
 
-    tracing::info!("[NODE] aggregate_answers: LLM response len={}", response.len());
+    tracing::info!(
+        "[NODE] aggregate_answers: LLM response len={}",
+        response.len()
+    );
     if response.is_empty() {
         tracing::warn!("[NODE] aggregate_answers: LLM returned empty response!");
     } else if response.len() < 200 {

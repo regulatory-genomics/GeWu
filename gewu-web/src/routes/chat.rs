@@ -1,6 +1,6 @@
 use crate::state::AppState;
 use axum::{
-    extract::{Query, State},
+    extract::State,
     response::sse::{Event, KeepAlive, Sse},
     Json,
 };
@@ -13,11 +13,8 @@ use tracing::{debug, error, info, warn};
 pub struct ChatRequest {
     pub message: String,
     pub session_id: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct TokenQuery {
-    pub token: Option<String>,
+    #[serde(default)]
+    pub agent_type: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -42,17 +39,22 @@ impl SseEvent {
         }
     }
 
-    pub fn tool_start(tool: String, input: String) -> Self {
+    pub fn tool_start(
+        tool_call_id: String,
+        tool: String,
+        input: String,
+        metadata: serde_json::Value,
+    ) -> Self {
         Self {
             event_type: "tool_start".to_string(),
-            data: serde_json::json!({ "tool": tool, "input": input }),
+            data: serde_json::json!({ "tool_call_id": tool_call_id, "tool": tool, "input": input, "metadata": metadata }),
         }
     }
 
-    pub fn tool_finish(tool: String, output: String) -> Self {
+    pub fn tool_finish(tool_call_id: String, tool: String, output: String) -> Self {
         Self {
             event_type: "tool_finish".to_string(),
-            data: serde_json::json!({ "tool": tool, "output": output }),
+            data: serde_json::json!({ "tool_call_id": tool_call_id, "tool": tool, "output": output }),
         }
     }
 
@@ -79,53 +81,67 @@ impl SseEvent {
 
 pub async fn handle_chat(
     State(app): State<Arc<AppState>>,
-    Query(query): Query<TokenQuery>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, AppError> {
     info!("handle_chat called for session: {}", req.session_id);
-    
-    let auth = app.auth_token.read().await;
-    let valid = query.token.as_ref().map(|t| auth.validate(t)).unwrap_or(false);
-    drop(auth);
-    
-    if !valid {
-        warn!("Unauthorized chat attempt");
-        return Err(AppError::Unauthorized);
-    }
 
-    let agent_handle = app.get_agent(&req.session_id).await;
-    let agent_handle = agent_handle.ok_or(AppError::SessionNotFound)?;
-    
-    info!("Agent found for session: {}, starting chat", req.session_id);
+    // Auth is enforced by `auth_middleware::require_auth` on the protected
+    // route group. The handler trusts the cookie validation done there.
+
+    let fallback_type = req.agent_type.as_deref().unwrap_or("general");
+    let (session_id, agent_handle) = app
+        .ensure_agent(&req.session_id, fallback_type)
+        .await
+        .map_err(|e| {
+            warn!("ensure_agent failed for {}: {}", req.session_id, e);
+            AppError::SessionNotFound
+        })?;
+
+    info!("Agent found for session: {}, starting chat", session_id);
 
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let message = req.message.clone();
-    
-    tokio::spawn(async move {
+    app.start_active_turn(&session_id).await;
+
+    let session_id_for_cleanup = session_id.clone();
+    let app_for_cleanup = app.clone();
+    let join_handle = tokio::spawn(async move {
         let mut agent = agent_handle.agent.lock().await;
         info!("Agent locked, calling ask() with message: {}", message);
         let stream = agent.ask(&message);
         futures::pin_mut!(stream);
-        
         let mut event_count = 0usize;
+        let mut client_connected = true;
         while let Some(result) = stream.next().await {
             event_count += 1;
+            app.touch_active_turn(&session_id, event_count).await;
             debug!("Stream received event #{}: {:?}", event_count, result);
             let sse_event = match result {
                 Ok(event) => match event {
                     gewu_core::types::AgentEvent::ReasoningDelta { delta } => {
+                        app.append_active_turn_reasoning(&session_id, &delta).await;
                         SseEvent::reasoning_delta(delta).to_sse_event()
                     }
                     gewu_core::types::AgentEvent::ContentDelta { delta } => {
+                        app.append_active_turn_content(&session_id, &delta).await;
                         SseEvent::content_delta(delta).to_sse_event()
                     }
-                    gewu_core::types::AgentEvent::ToolStart { tool, input } => {
+                    gewu_core::types::AgentEvent::ToolStart {
+                        tool_call_id,
+                        tool,
+                        input,
+                        metadata,
+                    } => {
                         info!("tool_start: {} - {}", tool, input);
-                        SseEvent::tool_start(tool, input).to_sse_event()
+                        SseEvent::tool_start(tool_call_id, tool, input, metadata).to_sse_event()
                     }
-                    gewu_core::types::AgentEvent::ToolFinish { tool, output } => {
+                    gewu_core::types::AgentEvent::ToolFinish {
+                        tool_call_id,
+                        tool,
+                        output,
+                    } => {
                         info!("tool_finish: {} - {}", tool, output);
-                        SseEvent::tool_finish(tool, output).to_sse_event()
+                        SseEvent::tool_finish(tool_call_id, tool, output).to_sse_event()
                     }
                     gewu_core::types::AgentEvent::Finish { response } => {
                         info!("finish: {}", response);
@@ -141,13 +157,24 @@ pub async fn handle_chat(
                     SseEvent::error(e.to_string()).to_sse_event()
                 }
             };
-            if tx.send(Ok::<Event, std::convert::Infallible>(sse_event)).await.is_err() {
-                warn!("SSE channel closed, stopping stream");
-                break;
+            if client_connected
+                && tx
+                    .send(Ok::<Event, std::convert::Infallible>(sse_event))
+                    .await
+                    .is_err()
+            {
+                warn!("SSE channel closed; continuing agent execution without client stream");
+                client_connected = false;
             }
         }
+        app.finish_active_turn(&session_id).await;
+        app.remove_abort_handles(&session_id).await;
         info!("Stream finished for session ({} events sent)", event_count);
     });
+
+    app_for_cleanup
+        .register_abort_handle(&session_id_for_cleanup, join_handle.abort_handle())
+        .await;
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
 

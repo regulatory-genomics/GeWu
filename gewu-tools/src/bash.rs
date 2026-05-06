@@ -75,27 +75,34 @@ impl Tool for BashTool {
             ];
 
             if !allowed.contains(&first_word) {
-                return Ok(ToolResult::new("bash", format!(
-                    "Command '{}' is not allowed in safe mode. Allowed commands: {:?}",
-                    first_word, allowed
-                )));
+                return Ok(ToolResult::new(
+                    "bash",
+                    format!(
+                        "Command '{}' is not allowed in safe mode. Allowed commands: {:?}",
+                        first_word, allowed
+                    ),
+                ));
             }
 
             if trimmed.contains(';') || trimmed.contains("&&") || trimmed.contains("||") {
-                return Ok(ToolResult::new("bash",
+                return Ok(ToolResult::new(
+                    "bash",
                     "Complex command chaining (;, &&, ||) is not allowed in safe mode.".to_string(),
                 ));
             }
 
             if trimmed.contains(" >") || trimmed.contains(">>") || trimmed.contains(" <<") {
-                return Ok(ToolResult::new("bash",
+                return Ok(ToolResult::new(
+                    "bash",
                     "Output redirection (>, >>, <<) is not allowed in safe mode.".to_string(),
                 ));
             }
 
             if trimmed.contains("$(") || trimmed.contains("`") {
-                return Ok(ToolResult::new("bash",
-                    "Command substitution ($(...), backticks) is not allowed in safe mode.".to_string(),
+                return Ok(ToolResult::new(
+                    "bash",
+                    "Command substitution ($(...), backticks) is not allowed in safe mode."
+                        .to_string(),
                 ));
             }
         }
@@ -163,9 +170,10 @@ impl Tool for BashTool {
 
                 Ok(ToolResult::new("bash", result))
             }
-            Err(_) => {
-                Ok(ToolResult::new("bash", format!("Command timed out after {} ms.", input.timeout)))
-            }
+            Err(_) => Ok(ToolResult::new(
+                "bash",
+                format!("Command timed out after {} ms.", input.timeout),
+            )),
         }
     }
 }
@@ -190,7 +198,10 @@ mod tests {
         });
 
         let ctx = ToolContext::new("test-session", "test-msg");
-        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert_eq!(result.output.trim(), "Hello world");
         Ok(())
     }
@@ -209,7 +220,10 @@ mod tests {
         });
 
         let ctx = ToolContext::new("test-session", "test-msg");
-        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains("Command timed out"));
         Ok(())
     }
@@ -228,7 +242,10 @@ mod tests {
         });
 
         let ctx = ToolContext::new("test-session", "test-msg");
-        let _ = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let _ = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let content = fs::read_to_string(working_dir.join("test_bash.txt")).await?;
         assert_eq!(content.trim(), "Bash content");
         Ok(())
@@ -247,49 +264,70 @@ mod tests {
             "command": "echo hello"
         });
         let ctx = ToolContext::new("test-session", "test-msg");
-        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert_eq!(result.output.trim(), "hello");
 
         let args = serde_json::json!({
             "command": "rm -rf /"
         });
         let ctx = ToolContext::new("test-session", "test-msg");
-        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains("not allowed in safe mode"));
 
         let args = serde_json::json!({
             "command": "echo hello > /tmp/out.txt"
         });
         let ctx = ToolContext::new("test-session", "test-msg");
-        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains("Output redirection"));
 
         let args = serde_json::json!({
             "command": "echo hello >> /tmp/out.txt"
         });
         let ctx = ToolContext::new("test-session", "test-msg");
-        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains("Output redirection"));
 
         let args = serde_json::json!({
             "command": "cat <<EOF\nhello\nEOF"
         });
         let ctx = ToolContext::new("test-session", "test-msg");
-        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains("Output redirection"));
 
         let args = serde_json::json!({
             "command": "echo $(whoami)"
         });
         let ctx = ToolContext::new("test-session", "test-msg");
-        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains("Command substitution"));
 
         let args = serde_json::json!({
             "command": "echo `whoami`"
         });
         let ctx = ToolContext::new("test-session", "test-msg");
-        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains("Command substitution"));
 
         Ok(())

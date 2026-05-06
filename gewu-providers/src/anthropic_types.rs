@@ -161,8 +161,14 @@ pub struct MessageResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseContentBlock {
-    Text { text: String },
-    ToolUse { id: String, name: String, input: Value },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
 }
 
 impl<'a> Messages<'a> {
@@ -276,45 +282,45 @@ where
                                     if let Ok(chunk) =
                                         serde_json::from_str::<MessageStartChunk>(data)
                                     {
-                                        return Poll::Ready(Some(Ok(AnthropicChunk::MessageStart(
-                                            chunk,
-                                        ))));
+                                        return Poll::Ready(Some(Ok(
+                                            AnthropicChunk::MessageStart(chunk),
+                                        )));
                                     }
                                 }
                                 "content_block_start" => {
                                     if let Ok(chunk) =
                                         serde_json::from_str::<ContentBlockStartChunk>(data)
                                     {
-                                        return Poll::Ready(Some(Ok(AnthropicChunk::ContentBlockStart(
-                                            chunk,
-                                        ))));
+                                        return Poll::Ready(Some(Ok(
+                                            AnthropicChunk::ContentBlockStart(chunk),
+                                        )));
                                     }
                                 }
                                 "content_block_delta" => {
                                     if let Ok(chunk) =
                                         serde_json::from_str::<ContentBlockDeltaChunk>(data)
                                     {
-                                        return Poll::Ready(Some(Ok(AnthropicChunk::ContentBlockDelta(
-                                            chunk,
-                                        ))));
+                                        return Poll::Ready(Some(Ok(
+                                            AnthropicChunk::ContentBlockDelta(chunk),
+                                        )));
                                     }
                                 }
                                 "content_block_stop" => {
                                     if let Ok(chunk) =
                                         serde_json::from_str::<ContentBlockStopChunk>(data)
                                     {
-                                        return Poll::Ready(Some(Ok(AnthropicChunk::ContentBlockStop(
-                                            chunk,
-                                        ))));
+                                        return Poll::Ready(Some(Ok(
+                                            AnthropicChunk::ContentBlockStop(chunk),
+                                        )));
                                     }
                                 }
                                 "message_delta" => {
                                     if let Ok(chunk) =
                                         serde_json::from_str::<MessageDeltaChunk>(data)
                                     {
-                                        return Poll::Ready(Some(Ok(AnthropicChunk::MessageDelta(
-                                            chunk,
-                                        ))));
+                                        return Poll::Ready(Some(Ok(
+                                            AnthropicChunk::MessageDelta(chunk),
+                                        )));
                                     }
                                 }
                                 "message_stop" => {
@@ -405,10 +411,16 @@ pub struct ContentBlockDeltaChunk {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentDelta {
-    TextDelta { text: String },
-    InputJsonDelta { partial_json: String },
+    TextDelta {
+        text: String,
+    },
+    InputJsonDelta {
+        partial_json: String,
+    },
     #[serde(rename = "thinking_delta")]
-    ThinkingDelta { thinking: String },
+    ThinkingDelta {
+        thinking: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]

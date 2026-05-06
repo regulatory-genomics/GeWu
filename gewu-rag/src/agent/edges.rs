@@ -49,23 +49,23 @@ pub fn route_after_orchestrator(state: &AgentState, config: &Config) -> String {
         tool_calls,
     }) = last_message
     {
-        if let Some(tcs) = tool_calls {
-            if !tcs.is_empty() {
-                if tool_count >= 2 {
-                    tracing::info!("[ROUTE] -> collect_answer (tool_count >= 2)");
-                    return "collect_answer".to_string();
-                }
-                let has_substantive_content = content.as_ref().map(|c| c.len()).unwrap_or(0) > 100;
-                if has_substantive_content {
-                    tracing::info!(
-                        "[ROUTE] -> collect_answer (has substantive content len={})",
-                        content.as_ref().map(|c| c.len()).unwrap_or(0)
-                    );
-                    return "collect_answer".to_string();
-                }
-                tracing::info!("[ROUTE] -> tools");
-                return "tools".to_string();
+        if let Some(tcs) = tool_calls
+            && !tcs.is_empty()
+        {
+            if tool_count >= 2 {
+                tracing::info!("[ROUTE] -> collect_answer (tool_count >= 2)");
+                return "collect_answer".to_string();
             }
+            let has_substantive_content = content.as_ref().map(|c| c.len()).unwrap_or(0) > 100;
+            if has_substantive_content {
+                tracing::info!(
+                    "[ROUTE] -> collect_answer (has substantive content len={})",
+                    content.as_ref().map(|c| c.len()).unwrap_or(0)
+                );
+                return "collect_answer".to_string();
+            }
+            tracing::info!("[ROUTE] -> tools");
+            return "tools".to_string();
         }
         if content.as_ref().map(|c| !c.is_empty()).unwrap_or(false) {
             tracing::info!("[ROUTE] -> collect_answer (has content)");

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::graph::{GraphSend, NodeResult, StateGraph, StreamMode, StreamOutput, END, START};
+    use crate::graph::{END, GraphSend, NodeResult, START, StateGraph, StreamMode, StreamOutput};
     use crate::state::State;
     use futures::StreamExt;
     use serde::{Deserialize, Serialize};
@@ -44,24 +44,35 @@ mod tests {
     async fn test_node_not_found_error() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let node = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let node = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("exists", node);
         graph.set_entry_point("exists");
         graph.set_finish_point("exists");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await;
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await;
         assert!(result.is_ok());
 
         let mut graph2 = StateGraph::<TestState>::new();
         graph2.add_node("node", |_: TestState| async { partial(None, None) });
         graph2.set_entry_point("nonexistent");
         let compiled2 = graph2.compile();
-        let result2 = compiled2.ainvoke(TestState { count: 0, messages: vec![] }).await;
-        assert!(matches!(result2, Err(crate::graph::GraphError::NodeNotFound(_))));
+        let result2 = compiled2
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await;
+        assert!(matches!(
+            result2,
+            Err(crate::graph::GraphError::NodeNotFound(_))
+        ));
     }
 
     #[tokio::test]
@@ -69,8 +80,16 @@ mod tests {
         let mut graph = StateGraph::<TestState>::new();
         graph.add_node("node", |_: TestState| async { partial(None, None) });
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await;
-        assert!(matches!(result, Err(crate::graph::GraphError::NoEntryPoint)));
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(crate::graph::GraphError::NoEntryPoint)
+        ));
     }
 
     #[tokio::test]
@@ -78,10 +97,13 @@ mod tests {
         let mut graph = StateGraph::<TestState>::new();
 
         let spawn = |_state: TestState| async move {
-            NodeResult::Send(vec![GraphSend("nonexistent".to_string(), TestState {
-                count: 100,
-                messages: vec![],
-            })])
+            NodeResult::Send(vec![GraphSend(
+                "nonexistent".to_string(),
+                TestState {
+                    count: 100,
+                    messages: vec![],
+                },
+            )])
         };
 
         graph.add_node("spawn", spawn);
@@ -89,8 +111,16 @@ mod tests {
         graph.set_finish_point("spawn");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await;
-        assert!(matches!(result, Err(crate::graph::GraphError::NodeNotFound(_))));
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(crate::graph::GraphError::NodeNotFound(_))
+        ));
     }
 
     // ========================================
@@ -101,22 +131,25 @@ mod tests {
     async fn test_partial_state_with_none() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let set_messages = |state: TestState| async move {
-            partial(None, Some(vec!["msg1".to_string()]))
-        };
+        let set_messages =
+            |_state: TestState| async move { partial(None, Some(vec!["msg1".to_string()])) };
 
-        let increment = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let increment = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("set_messages", set_messages);
         graph.add_node("increment", increment);
         graph.set_entry_point("set_messages");
-        graph.add_edge("set_messages", "increment");
+        graph.add_edge("set_messages", "increment").expect("valid edge");
         graph.set_finish_point("increment");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 5, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 5,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 6);
         assert_eq!(result.messages, vec!["msg1"]);
@@ -126,23 +159,26 @@ mod tests {
     async fn test_multiple_finish_points() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let node_a = |state: TestState| async move {
-            partial(Some(state.count + 10), None)
-        };
+        let node_a = |state: TestState| async move { partial(Some(state.count + 10), None) };
 
-        let node_b = |state: TestState| async move {
-            partial(None, Some(vec!["from_b".to_string()]))
-        };
+        let node_b =
+            |_state: TestState| async move { partial(None, Some(vec!["from_b".to_string()])) };
 
         graph.add_node("a", node_a);
         graph.add_node("b", node_b);
         graph.set_entry_point("a");
-        graph.add_edge("a", "b");
+        graph.add_edge("a", "b").expect("valid edge");
         graph.set_finish_point("a");
         graph.set_finish_point("b");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 10);
         assert_eq!(result.messages, vec!["from_b"]);
@@ -152,17 +188,19 @@ mod tests {
     async fn test_conditional_edge_fallback_to_path_result() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let node = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let node = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         let check = |state: &TestState| -> String {
-            if state.count >= 5 { "high".to_string() } else { "low".to_string() }
+            if state.count >= 5 {
+                "high".to_string()
+            } else {
+                "low".to_string()
+            }
         };
 
         graph.add_node("start", node);
-        graph.add_node("high", node.clone());
-        graph.add_node("low", node.clone());
+        graph.add_node("high", node);
+        graph.add_node("low", node);
         graph.set_entry_point("start");
         graph.add_conditional_edges(
             "start",
@@ -172,7 +210,13 @@ mod tests {
         graph.set_finish_point("low");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 10, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 10,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
         assert_eq!(result.count, 12);
     }
 
@@ -180,36 +224,58 @@ mod tests {
     async fn test_multiple_conditional_edges_from_same_source() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let increment = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let increment = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         let check_high = |state: &TestState| -> String {
-            if state.count >= 10 { "high".to_string() } else { "low".to_string() }
+            if state.count >= 10 {
+                "high".to_string()
+            } else {
+                "low".to_string()
+            }
         };
 
         let check_positive = |state: &TestState| -> String {
-            if state.count >= 0 { "positive".to_string() } else { "negative".to_string() }
+            if state.count >= 0 {
+                "positive".to_string()
+            } else {
+                "negative".to_string()
+            }
         };
 
         graph.add_node("increment", increment);
         graph.add_node("high", |_: TestState| async { partial(Some(100), None) });
         graph.add_node("low", |_: TestState| async { partial(Some(-100), None) });
         graph.add_node("positive", |_: TestState| async { partial(Some(50), None) });
-        graph.add_node("negative", |_: TestState| async { partial(Some(-50), None) });
+        graph.add_node("negative", |_: TestState| async {
+            partial(Some(-50), None)
+        });
 
         graph.set_entry_point("increment");
-        graph.add_conditional_edges("increment", check_high, [("high".to_string(), "high".to_string())].into());
-        graph.add_conditional_edges("increment", check_positive, [("positive".to_string(), "positive".to_string())].into());
+        graph.add_conditional_edges(
+            "increment",
+            check_high,
+            [("high".to_string(), "high".to_string())].into(),
+        );
+        graph.add_conditional_edges(
+            "increment",
+            check_positive,
+            [("positive".to_string(), "positive".to_string())].into(),
+        );
 
-        graph.add_edge("high", END);
-        graph.add_edge("low", END);
-        graph.add_edge("positive", END);
-        graph.add_edge("negative", END);
+        graph.add_edge("high", END).expect("valid edge");
+        graph.add_edge("low", END).expect("valid edge");
+        graph.add_edge("positive", END).expect("valid edge");
+        graph.add_edge("negative", END).expect("valid edge");
 
         let compiled = graph.compile();
 
-        let result = compiled.ainvoke(TestState { count: 5, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 5,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
         assert!(result.count == -100 || result.count == 50);
     }
 
@@ -219,14 +285,24 @@ mod tests {
 
         let spawn = |_state: TestState| async move {
             NodeResult::Send(vec![
-                GraphSend("worker".to_string(), TestState { count: 10, messages: vec![] }),
-                GraphSend("worker".to_string(), TestState { count: 20, messages: vec![] }),
+                GraphSend(
+                    "worker".to_string(),
+                    TestState {
+                        count: 10,
+                        messages: vec![],
+                    },
+                ),
+                GraphSend(
+                    "worker".to_string(),
+                    TestState {
+                        count: 20,
+                        messages: vec![],
+                    },
+                ),
             ])
         };
 
-        let worker = |state: TestState| async move {
-            partial(Some(state.count), None)
-        };
+        let worker = |state: TestState| async move { partial(Some(state.count), None) };
 
         graph.add_node("spawn", spawn);
         graph.add_node("worker", worker);
@@ -234,7 +310,13 @@ mod tests {
         graph.set_finish_point("spawn");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 20);
     }
@@ -244,7 +326,13 @@ mod tests {
         let mut graph = StateGraph::<TestState>::new();
 
         let spawn = |_state: TestState| async move {
-            NodeResult::Send(vec![GraphSend("via_send".to_string(), TestState { count: 100, messages: vec![] })])
+            NodeResult::Send(vec![GraphSend(
+                "via_send".to_string(),
+                TestState {
+                    count: 100,
+                    messages: vec![],
+                },
+            )])
         };
 
         let via_send = |state: TestState| async move {
@@ -259,12 +347,18 @@ mod tests {
         graph.add_node("via_send", via_send);
         graph.add_node("via_edge", via_edge);
         graph.set_entry_point("spawn");
-        graph.add_edge("spawn", "via_edge");
+        graph.add_edge("spawn", "via_edge").expect("valid edge");
         graph.set_finish_point("via_send");
         graph.set_finish_point("via_edge");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 101);
         assert!(result.messages.contains(&"from_send".to_string()));
@@ -279,22 +373,24 @@ mod tests {
     async fn test_stream_updates_only() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let step1 = |state: TestState| async move {
-            partial(Some(state.count + 10), None)
-        };
+        let step1 = |state: TestState| async move { partial(Some(state.count + 10), None) };
 
-        let step2 = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let step2 = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
+        graph.add_edge("step1", "step2").expect("valid edge");
         graph.set_finish_point("step2");
 
         let compiled = graph.compile();
-        let stream = compiled.stream_with_modes(TestState { count: 0, messages: vec![] }, vec![StreamMode::Updates]);
+        let stream = compiled.stream_with_modes(
+            TestState {
+                count: 0,
+                messages: vec![],
+            },
+            vec![StreamMode::Updates],
+        );
         let mut stream = Box::pin(stream);
         let mut values = Vec::new();
         let mut updates = Vec::new();
@@ -326,18 +422,23 @@ mod tests {
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
+        graph.add_edge("step1", "step2").expect("valid edge");
         graph.set_finish_point("step2");
 
         let compiled = graph.compile();
-        let stream = compiled.stream_with_modes(TestState { count: 0, messages: vec![] }, vec![StreamMode::Custom]);
+        let stream = compiled.stream_with_modes(
+            TestState {
+                count: 0,
+                messages: vec![],
+            },
+            vec![StreamMode::Custom],
+        );
         let mut stream = Box::pin(stream);
         let mut customs = Vec::new();
 
         while let Some(result) = stream.next().await {
-            match result.unwrap() {
-                StreamOutput::Custom { node, data } => customs.push((node, data)),
-                _ => {}
+            if let StreamOutput::Custom { node, data } = result.unwrap() {
+                customs.push((node, data))
             }
         }
 
@@ -350,22 +451,24 @@ mod tests {
     async fn test_stream_tasks_mode() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let step1 = |state: TestState| async move {
-            partial(Some(state.count + 10), None)
-        };
+        let step1 = |state: TestState| async move { partial(Some(state.count + 10), None) };
 
-        let step2 = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let step2 = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
+        graph.add_edge("step1", "step2").expect("valid edge");
         graph.set_finish_point("step2");
 
         let compiled = graph.compile();
-        let stream = compiled.stream_with_modes(TestState { count: 0, messages: vec![] }, vec![StreamMode::Tasks]);
+        let stream = compiled.stream_with_modes(
+            TestState {
+                count: 0,
+                messages: vec![],
+            },
+            vec![StreamMode::Tasks],
+        );
         let mut stream = Box::pin(stream);
         let mut task_starts = Vec::new();
         let mut task_ends = Vec::new();
@@ -388,24 +491,26 @@ mod tests {
     async fn test_astream() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let step1 = |state: TestState| async move {
-            partial(Some(state.count + 10), None)
-        };
+        let step1 = |state: TestState| async move { partial(Some(state.count + 10), None) };
 
-        let step2 = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let step2 = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
+        graph.add_edge("step1", "step2").expect("valid edge");
         graph.set_finish_point("step2");
 
         let compiled = graph.compile();
-        let stream = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
-        let values = vec![stream.clone()];
-        
+        let stream = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
+        let values = [stream.clone()];
+
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].count, 11);
     }
@@ -414,25 +519,28 @@ mod tests {
     async fn test_astream_values() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let step1 = |state: TestState| async move {
-            partial(Some(state.count + 10), None)
-        };
+        let step1 = |state: TestState| async move { partial(Some(state.count + 10), None) };
 
-        let step2 = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let step2 = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
+        graph.add_edge("step1", "step2").expect("valid edge");
         graph.set_finish_point("step2");
 
         let compiled = graph.compile();
-        
+
         let mut values = Vec::new();
-        let mut stream = Box::pin(compiled.astream(TestState { count: 0, messages: vec![] }).await);
-        
+        let mut stream = Box::pin(
+            compiled
+                .astream(TestState {
+                    count: 0,
+                    messages: vec![],
+                })
+                .await,
+        );
+
         while let Some(result) = futures::StreamExt::next(&mut stream).await {
             values.push(result.unwrap());
         }
@@ -451,16 +559,20 @@ mod tests {
     async fn test_invoke_parallel_no_edges() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let node_a = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let node_a = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("a", node_a);
         graph.set_entry_point("a");
-        graph.add_edge("a", END);
+        graph.add_edge("a", END).expect("valid edge");
 
         let compiled = graph.compile();
-        let result = compiled.invoke_parallel(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .invoke_parallel(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 1);
     }
@@ -471,14 +583,24 @@ mod tests {
 
         let spawn = |_state: TestState| async move {
             NodeResult::Send(vec![
-                GraphSend("worker_a".to_string(), TestState { count: 100, messages: vec![] }),
-                GraphSend("worker_b".to_string(), TestState { count: 200, messages: vec![] }),
+                GraphSend(
+                    "worker_a".to_string(),
+                    TestState {
+                        count: 100,
+                        messages: vec![],
+                    },
+                ),
+                GraphSend(
+                    "worker_b".to_string(),
+                    TestState {
+                        count: 200,
+                        messages: vec![],
+                    },
+                ),
             ])
         };
 
-        let worker_a = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let worker_a = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         let worker_b = |state: TestState| async move {
             partial(None, Some(vec![format!("b{}", state.count)]))
@@ -488,11 +610,17 @@ mod tests {
         graph.add_node("worker_a", worker_a);
         graph.add_node("worker_b", worker_b);
         graph.set_entry_point("spawn");
-        graph.add_edge("worker_a", END);
-        graph.add_edge("worker_b", END);
+        graph.add_edge("worker_a", END).expect("valid edge");
+        graph.add_edge("worker_b", END).expect("valid edge");
 
         let compiled = graph.compile();
-        let result = compiled.invoke_parallel(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .invoke_parallel(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 1);
         assert!(result.messages.contains(&"b0".to_string()));
@@ -507,16 +635,26 @@ mod tests {
         let mut graph = StateGraph::<TestState>::new();
 
         let spawn = |_state: TestState| async move {
-            NodeResult::Send(vec![GraphSend("level1".to_string(), TestState { count: 10, messages: vec![] })])
+            NodeResult::Send(vec![GraphSend(
+                "level1".to_string(),
+                TestState {
+                    count: 10,
+                    messages: vec![],
+                },
+            )])
         };
 
         let level1 = |state: TestState| async move {
-            NodeResult::Send(vec![GraphSend("level2".to_string(), TestState { count: state.count * 2, messages: vec![] })])
+            NodeResult::Send(vec![GraphSend(
+                "level2".to_string(),
+                TestState {
+                    count: state.count * 2,
+                    messages: vec![],
+                },
+            )])
         };
 
-        let level2 = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let level2 = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("spawn", spawn);
         graph.add_node("level1", level1);
@@ -525,7 +663,13 @@ mod tests {
         graph.set_finish_point("spawn");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 21);
     }
@@ -534,9 +678,7 @@ mod tests {
     async fn test_send_with_subgraph() {
         let mut subgraph = StateGraph::<TestState>::new();
 
-        let double = |state: TestState| async move {
-            partial(Some(state.count * 2), None)
-        };
+        let double = |state: TestState| async move { partial(Some(state.count * 2), None) };
 
         subgraph.add_node("double", double);
         subgraph.set_entry_point("double");
@@ -547,22 +689,32 @@ mod tests {
         let mut graph = StateGraph::<TestState>::new();
 
         let spawn = |_state: TestState| async move {
-            NodeResult::Send(vec![GraphSend("nested".to_string(), TestState { count: 5, messages: vec![] })])
+            NodeResult::Send(vec![GraphSend(
+                "nested".to_string(),
+                TestState {
+                    count: 5,
+                    messages: vec![],
+                },
+            )])
         };
 
-        let after = |state: TestState| async move {
-            partial(Some(state.count + 100), None)
-        };
+        let after = |state: TestState| async move { partial(Some(state.count + 100), None) };
 
         graph.add_node("spawn", spawn);
         graph.add_subgraph_node("nested", subgraph_compiled);
         graph.add_node("after", after);
         graph.set_entry_point("spawn");
-        graph.add_edge("spawn", "after");
+        graph.add_edge("spawn", "after").expect("valid edge");
         graph.set_finish_point("after");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 10);
     }
@@ -572,19 +724,25 @@ mod tests {
     // ========================================
 
     #[test]
-    #[should_panic(expected = "START cannot be END node")]
     fn test_builder_rejects_start_equals_end() {
         let mut graph = StateGraph::<TestState>::new();
         graph.add_node("node", |_: TestState| async { partial(None, None) });
-        graph.add_edge(END, END);
+        let err = graph.add_edge(END, END).unwrap_err();
+        assert!(
+            err.to_string().contains("END cannot be used as edge start"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "END cannot be START node")]
     fn test_builder_rejects_end_equals_start() {
         let mut graph = StateGraph::<TestState>::new();
         graph.add_node("node", |_: TestState| async { partial(None, None) });
-        graph.add_edge("node", START);
+        let err = graph.add_edge("node", START).unwrap_err();
+        assert!(
+            err.to_string().contains("START cannot be used as edge end"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -600,7 +758,13 @@ mod tests {
         graph.set_finish_point("node");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 10);
     }
@@ -613,9 +777,7 @@ mod tests {
     async fn test_simple_graph() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let increment = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let increment = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         let add_message = |state: TestState| async move {
             let mut msgs = state.messages.clone();
@@ -626,11 +788,17 @@ mod tests {
         graph.add_node("increment", increment);
         graph.add_node("add_message", add_message);
         graph.set_entry_point("increment");
-        graph.add_edge("increment", "add_message");
+        graph.add_edge("increment", "add_message").expect("valid edge");
         graph.set_finish_point("add_message");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 1);
         assert_eq!(result.messages.len(), 1);
@@ -641,13 +809,9 @@ mod tests {
     async fn test_conditional_edges() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let increment = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let increment = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
-        let decrement = |state: TestState| async move {
-            partial(Some(state.count - 1), None)
-        };
+        let decrement = |state: TestState| async move { partial(Some(state.count - 1), None) };
 
         let check = |state: &TestState| -> String {
             if state.count >= 5 {
@@ -696,29 +860,27 @@ mod tests {
     async fn test_stream() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let step1 = |state: TestState| async move {
-            partial(Some(state.count + 10), None)
-        };
+        let step1 = |state: TestState| async move { partial(Some(state.count + 10), None) };
 
-        let step2 = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let step2 = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
+        graph.add_edge("step1", "step2").expect("valid edge");
         graph.set_finish_point("step2");
 
         let compiled = graph.compile();
-        let stream = compiled.stream(TestState { count: 0, messages: vec![] });
+        let stream = compiled.stream(TestState {
+            count: 0,
+            messages: vec![],
+        });
         let mut stream = Box::pin(stream);
         let mut states = Vec::new();
 
         while let Some(result) = stream.next().await {
-            match result.unwrap() {
-                StreamOutput::Value(s) => states.push(s),
-                _ => {}
+            if let StreamOutput::Value(s) = result.unwrap() {
+                states.push(s)
             }
         }
 
@@ -732,13 +894,9 @@ mod tests {
     async fn test_invoke_parallel() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let add_a = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let add_a = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
-        let add_b = |state: TestState| async move {
-            partial(Some(state.count + 10), None)
-        };
+        let add_b = |state: TestState| async move { partial(Some(state.count + 10), None) };
 
         let record_c = |state: TestState| async move {
             partial(None, Some(vec![format!("c{}", state.count)]))
@@ -748,13 +906,19 @@ mod tests {
         graph.add_node("add_b", add_b);
         graph.add_node("record_c", record_c);
         graph.set_entry_point("add_a");
-        graph.add_edge("add_a", "add_b");
-        graph.add_edge("add_a", "record_c");
+        graph.add_edge("add_a", "add_b").expect("valid edge");
+        graph.add_edge("add_a", "record_c").expect("valid edge");
         graph.set_finish_point("add_b");
         graph.set_finish_point("record_c");
 
         let compiled = graph.compile();
-        let result = compiled.invoke_parallel(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .invoke_parallel(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 11);
         assert_eq!(result.messages.len(), 1);
@@ -764,9 +928,7 @@ mod tests {
     async fn test_subgraph() {
         let mut subgraph = StateGraph::<TestState>::new();
 
-        let double = |state: TestState| async move {
-            partial(Some(state.count * 2), None)
-        };
+        let double = |state: TestState| async move { partial(Some(state.count * 2), None) };
 
         let add_hello = |state: TestState| async move {
             let mut msgs = state.messages.clone();
@@ -777,31 +939,33 @@ mod tests {
         subgraph.add_node("double", double);
         subgraph.add_node("add_hello", add_hello);
         subgraph.set_entry_point("double");
-        subgraph.add_edge("double", "add_hello");
+        subgraph.add_edge("double", "add_hello").expect("valid edge");
         subgraph.set_finish_point("add_hello");
 
         let subgraph_compiled = subgraph.compile();
 
         let mut main_graph = StateGraph::<TestState>::new();
 
-        let increment = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let increment = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
-        let subtract = |state: TestState| async move {
-            partial(Some(state.count - 1), None)
-        };
+        let subtract = |state: TestState| async move { partial(Some(state.count - 1), None) };
 
         main_graph.add_node("increment", increment);
         main_graph.add_subgraph_node("nested", subgraph_compiled);
         main_graph.add_node("subtract", subtract);
         main_graph.set_entry_point("increment");
-        main_graph.add_edge("increment", "nested");
-        main_graph.add_edge("nested", "subtract");
+        main_graph.add_edge("increment", "nested").expect("valid edge");
+        main_graph.add_edge("nested", "subtract").expect("valid edge");
         main_graph.set_finish_point("subtract");
 
         let compiled = main_graph.compile();
-        let result = compiled.ainvoke(TestState { count: 5, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 5,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 11);
         assert_eq!(result.messages.len(), 1);
@@ -813,24 +977,32 @@ mod tests {
         let mut graph = StateGraph::<TestState>::new();
 
         let spawn = |_state: TestState| async move {
-            NodeResult::Send(vec![GraphSend("worker".to_string(), TestState {
-                count: 100,
-                messages: vec!["from_send1".to_string()],
-            })])
+            NodeResult::Send(vec![GraphSend(
+                "worker".to_string(),
+                TestState {
+                    count: 100,
+                    messages: vec!["from_send1".to_string()],
+                },
+            )])
         };
 
-        let worker = |state: TestState| async move {
-            partial(Some(state.count + 1), Some(state.messages))
-        };
+        let worker =
+            |state: TestState| async move { partial(Some(state.count + 1), Some(state.messages)) };
 
         graph.add_node("spawn", spawn);
         graph.add_node("worker", worker);
         graph.set_entry_point("spawn");
-        graph.add_edge("spawn", "worker");
+        graph.add_edge("spawn", "worker").expect("valid edge");
         graph.set_finish_point("worker");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 101);
         assert_eq!(result.messages.len(), 1);
@@ -841,22 +1013,24 @@ mod tests {
     async fn test_stream_modes() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let step1 = |state: TestState| async move {
-            partial(Some(state.count + 10), None)
-        };
+        let step1 = |state: TestState| async move { partial(Some(state.count + 10), None) };
 
-        let step2 = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let step2 = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
+        graph.add_edge("step1", "step2").expect("valid edge");
         graph.set_finish_point("step2");
 
         let compiled = graph.compile();
-        let stream = compiled.stream_with_modes(TestState { count: 0, messages: vec![] }, vec![StreamMode::Values, StreamMode::Updates]);
+        let stream = compiled.stream_with_modes(
+            TestState {
+                count: 0,
+                messages: vec![],
+            },
+            vec![StreamMode::Values, StreamMode::Updates],
+        );
         let mut stream = Box::pin(stream);
         let mut values = Vec::new();
         let mut updates = Vec::new();
@@ -885,16 +1059,20 @@ mod tests {
     async fn test_ainvoke_equivalence() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let increment = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let increment = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("increment", increment);
         graph.set_entry_point("increment");
         graph.set_finish_point("increment");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 1);
     }
@@ -903,24 +1081,32 @@ mod tests {
     async fn test_invoke_sync_equivalence() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let step1 = |state: TestState| async move {
-            partial(Some(state.count + 10), None)
-        };
+        let step1 = |state: TestState| async move { partial(Some(state.count + 10), None) };
 
-        let step2 = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let step2 = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
+        graph.add_edge("step1", "step2").expect("valid edge");
         graph.set_finish_point("step2");
 
         let compiled = graph.compile();
 
-        let async_result1 = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
-        let async_result2 = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let async_result1 = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
+        let async_result2 = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(async_result1.count, async_result2.count);
     }
@@ -933,18 +1119,22 @@ mod tests {
             custom(serde_json::json!({"type": "custom_event", "value": 42}))
         };
 
-        let after = |state: TestState| async move {
-            partial(Some(state.count + 100), None)
-        };
+        let after = |state: TestState| async move { partial(Some(state.count + 100), None) };
 
         graph.add_node("custom_only", custom_only);
         graph.add_node("after", after);
         graph.set_entry_point("custom_only");
-        graph.add_edge("custom_only", "after");
+        graph.add_edge("custom_only", "after").expect("valid edge");
         graph.set_finish_point("after");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 5, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 5,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 105);
     }
@@ -953,13 +1143,9 @@ mod tests {
     async fn test_conditional_edge_unmapped_path() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let node = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let node = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
-        let check = |_state: &TestState| -> String {
-            "unmapped_path".to_string()
-        };
+        let check = |_state: &TestState| -> String { "unmapped_path".to_string() };
 
         graph.add_node("start", node);
         graph.set_entry_point("start");
@@ -970,9 +1156,17 @@ mod tests {
         );
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await;
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await;
 
-        assert!(matches!(result, Err(crate::graph::GraphError::NodeNotFound(_))));
+        assert!(matches!(
+            result,
+            Err(crate::graph::GraphError::NodeNotFound(_))
+        ));
     }
 
     #[tokio::test]
@@ -980,12 +1174,16 @@ mod tests {
         let mut graph = StateGraph::<TestState>::new();
 
         let spawn = |_state: TestState| async move {
-            NodeResult::Send(vec![GraphSend("worker".to_string(), TestState { count: 50, messages: vec![] })])
+            NodeResult::Send(vec![GraphSend(
+                "worker".to_string(),
+                TestState {
+                    count: 50,
+                    messages: vec![],
+                },
+            )])
         };
 
-        let worker = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let worker = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("spawn", spawn);
         graph.add_node("worker", worker);
@@ -993,7 +1191,13 @@ mod tests {
         graph.set_finish_point("worker");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 51);
     }
@@ -1002,28 +1206,28 @@ mod tests {
     async fn test_invoke_parallel_chain_execution() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let a = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let a = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
-        let b = |state: TestState| async move {
-            partial(Some(state.count + 10), None)
-        };
+        let b = |state: TestState| async move { partial(Some(state.count + 10), None) };
 
-        let c = |state: TestState| async move {
-            partial(Some(state.count + 100), None)
-        };
+        let c = |state: TestState| async move { partial(Some(state.count + 100), None) };
 
         graph.add_node("a", a);
         graph.add_node("b", b);
         graph.add_node("c", c);
         graph.set_entry_point("a");
-        graph.add_edge("a", "b");
-        graph.add_edge("b", "c");
+        graph.add_edge("a", "b").expect("valid edge");
+        graph.add_edge("b", "c").expect("valid edge");
         graph.set_finish_point("c");
 
         let compiled = graph.compile();
-        let result = compiled.invoke_parallel(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .invoke_parallel(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 111);
     }
@@ -1032,9 +1236,7 @@ mod tests {
     #[should_panic(expected = "Subgraphs are not supported in invoke_parallel")]
     async fn test_invoke_parallel_with_subgraph_panics() {
         let mut subgraph = StateGraph::<TestState>::new();
-        let double = |state: TestState| async move {
-            partial(Some(state.count * 2), None)
-        };
+        let double = |state: TestState| async move { partial(Some(state.count * 2), None) };
         subgraph.add_node("double", double);
         subgraph.set_entry_point("double");
         subgraph.set_finish_point("double");
@@ -1046,7 +1248,13 @@ mod tests {
         graph.set_finish_point("nested");
 
         let compiled = graph.compile();
-        compiled.invoke_parallel(TestState { count: 5, messages: vec![] }).await.unwrap();
+        compiled
+            .invoke_parallel(TestState {
+                count: 5,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1065,7 +1273,12 @@ mod tests {
         graph.set_finish_point("nested");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await;
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await;
 
         assert!(result.is_ok());
     }
@@ -1083,50 +1296,60 @@ mod tests {
         graph.set_finish_point("custom_node");
 
         let compiled = graph.compile();
-        let stream = compiled.stream_with_modes(TestState { count: 0, messages: vec![] }, vec![StreamMode::Custom]);
+        let stream = compiled.stream_with_modes(
+            TestState {
+                count: 0,
+                messages: vec![],
+            },
+            vec![StreamMode::Custom],
+        );
         let mut stream = Box::pin(stream);
         let mut customs = Vec::new();
 
         while let Some(result) = stream.next().await {
-            match result.unwrap() {
-                StreamOutput::Custom { node, data } => customs.push((node, data)),
-                _ => {}
+            if let StreamOutput::Custom { node, data } = result.unwrap() {
+                customs.push((node, data))
             }
         }
 
         assert_eq!(customs.len(), 1);
         assert_eq!(customs[0].0, "custom_node");
-        assert_eq!(customs[0].1.get("event").unwrap(), &serde_json::json!("test"));
+        assert_eq!(
+            customs[0].1.get("event").unwrap(),
+            &serde_json::json!("test")
+        );
     }
 
     #[tokio::test]
     async fn test_all_stream_modes_combined() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let step1 = |state: TestState| async move {
-            partial(Some(state.count + 10), None)
-        };
+        let step1 = |state: TestState| async move { partial(Some(state.count + 10), None) };
 
-        let step2 = |state: TestState| async move {
-            custom(serde_json::json!({"step2": "done"}))
-        };
+        let step2 = |_state: TestState| async move { custom(serde_json::json!({"step2": "done"})) };
 
-        let step3 = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let step3 = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("step1", step1);
         graph.add_node("step2", step2);
         graph.add_node("step3", step3);
         graph.set_entry_point("step1");
-        graph.add_edge("step1", "step2");
-        graph.add_edge("step2", "step3");
+        graph.add_edge("step1", "step2").expect("valid edge");
+        graph.add_edge("step2", "step3").expect("valid edge");
         graph.set_finish_point("step3");
 
         let compiled = graph.compile();
         let stream = compiled.stream_with_modes(
-            TestState { count: 0, messages: vec![] },
-            vec![StreamMode::Values, StreamMode::Updates, StreamMode::Custom, StreamMode::Tasks],
+            TestState {
+                count: 0,
+                messages: vec![],
+            },
+            vec![
+                StreamMode::Values,
+                StreamMode::Updates,
+                StreamMode::Custom,
+                StreamMode::Tasks,
+            ],
         );
         let mut stream = Box::pin(stream);
 
@@ -1157,16 +1380,20 @@ mod tests {
     async fn test_finish_point_without_explicit_edge() {
         let mut graph = StateGraph::<TestState>::new();
 
-        let node = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let node = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("start", node);
         graph.set_entry_point("start");
         graph.set_finish_point("start");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 5, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 5,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 6);
     }
@@ -1177,9 +1404,27 @@ mod tests {
 
         let splitter = |_state: TestState| async move {
             NodeResult::Send(vec![
-                GraphSend("node_a".to_string(), TestState { count: 10, messages: vec![] }),
-                GraphSend("node_b".to_string(), TestState { count: 20, messages: vec![] }),
-                GraphSend("node_c".to_string(), TestState { count: 30, messages: vec![] }),
+                GraphSend(
+                    "node_a".to_string(),
+                    TestState {
+                        count: 10,
+                        messages: vec![],
+                    },
+                ),
+                GraphSend(
+                    "node_b".to_string(),
+                    TestState {
+                        count: 20,
+                        messages: vec![],
+                    },
+                ),
+                GraphSend(
+                    "node_c".to_string(),
+                    TestState {
+                        count: 30,
+                        messages: vec![],
+                    },
+                ),
             ])
         };
 
@@ -1195,7 +1440,13 @@ mod tests {
         graph.set_finish_point("splitter");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 30);
     }
@@ -1205,16 +1456,26 @@ mod tests {
         let mut graph = StateGraph::<TestState>::new();
 
         let level0 = |_state: TestState| async move {
-            NodeResult::Send(vec![GraphSend("level1".to_string(), TestState { count: 1, messages: vec![] })])
+            NodeResult::Send(vec![GraphSend(
+                "level1".to_string(),
+                TestState {
+                    count: 1,
+                    messages: vec![],
+                },
+            )])
         };
 
         let level1 = |state: TestState| async move {
-            NodeResult::Send(vec![GraphSend("level2".to_string(), TestState { count: state.count * 2, messages: vec![] })])
+            NodeResult::Send(vec![GraphSend(
+                "level2".to_string(),
+                TestState {
+                    count: state.count * 2,
+                    messages: vec![],
+                },
+            )])
         };
 
-        let level2 = |state: TestState| async move {
-            partial(Some(state.count + 1), None)
-        };
+        let level2 = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
         graph.add_node("level0", level0);
         graph.add_node("level1", level1);
@@ -1223,7 +1484,13 @@ mod tests {
         graph.set_finish_point("level0");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.count, 3);
     }
@@ -1260,12 +1527,18 @@ mod tests {
         graph.add_node("msg2", add_msg2);
         graph.add_node("msg3", add_msg3);
         graph.set_entry_point("msg1");
-        graph.add_edge("msg1", "msg2");
-        graph.add_edge("msg2", "msg3");
+        graph.add_edge("msg1", "msg2").expect("valid edge");
+        graph.add_edge("msg2", "msg3").expect("valid edge");
         graph.set_finish_point("msg3");
 
         let compiled = graph.compile();
-        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let result = compiled
+            .ainvoke(TestState {
+                count: 0,
+                messages: vec![],
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.messages, vec!["first", "second", "third"]);
     }

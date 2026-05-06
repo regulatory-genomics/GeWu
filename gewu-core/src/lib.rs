@@ -50,7 +50,19 @@ pub mod compaction;
 pub mod middleware;
 pub mod traits;
 pub mod types;
+pub mod work_graph;
 
 pub use agent::Agent;
-pub use traits::{LlmProvider, Memory, Tool, ToolRegistry};
-pub use types::{FileAttachment, Message, ToolContext, ToolResult, TruncationResult};
+pub use traits::{
+    AssemblyContext, LlmProvider, Memory, Plugin, PluginPlatformContext, Tool, ToolFactory,
+    ToolProvider, ToolRegistry,
+};
+pub use types::{
+    CapabilityDescriptor, FileAttachment, Message, SpecialistDescriptor,
+    SpecialistExecutionEnvelope, SpecialistExecutionRequest, ToolContext, ToolExecutionRecord,
+    ToolResult, TruncationResult,
+};
+pub use work_graph::{
+    WorkArtifact, WorkEdge, WorkEdgeKind, WorkEvent, WorkEventKind, WorkGraph, WorkNode,
+    WorkNodeKind, WorkStatus,
+};

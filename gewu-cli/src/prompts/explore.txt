@@ -16,3 +16,8 @@ Guidelines:
 - Do not create any files, or run bash commands that modify the user's system state in any way
 
 Complete the user's search request efficiently and report your findings clearly.
+
+# Task Reporting
+When you have finished your task, you MUST call the `report_result` tool exactly once:
+- If you completed the task successfully: `report_result(status="succeeded", result="<your findings>")`
+- If you could not complete the task due to a missing precondition: `report_result(status="blocked", block_reason="<what is missing>")`

@@ -47,8 +47,69 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use gewu_core::traits::Memory;
 use gewu_core::types::Message;
-use sqlx::{Row, sqlite::SqlitePool};
-use tracing::{error, info};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::{ConnectOptions, Row, sqlite::SqlitePool};
+use std::error::Error;
+use std::path::Path;
+use std::str::FromStr;
+use std::time::Duration;
+use tracing::info;
+
+pub mod async_task_group_store;
+pub mod execution_trace_store;
+pub mod project_store;
+pub mod session_store;
+pub mod task_store;
+pub use async_task_group_store::{AsyncTaskGroup, AsyncTaskGroupStore};
+pub use execution_trace_store::{ExecutionTraceStore, StartExecutionRun};
+pub use project_store::{ProjectRecord, ProjectStore};
+pub use session_store::{SessionRecord, SessionStore};
+pub use task_store::TaskStore;
+
+/// Versioned SQL migrations (Phase 1, C2). Replaces the inline
+/// `CREATE TABLE IF NOT EXISTS` calls scattered across each store.
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// Run all SQL migrations against the given pool. Idempotent.
+pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
+    MIGRATOR
+        .run(pool)
+        .await
+        .context("Failed to run SQL migrations")?;
+    Ok(())
+}
+
+/// Build a SQLite connection pool tuned for GeWu's workload (Phase 1, C5).
+///
+/// Sets WAL journal mode, busy_timeout=5s, foreign_keys=ON,
+/// synchronous=NORMAL, temp_store=memory, and grows max_connections to 20.
+pub async fn create_pool(db_path: &Path) -> Result<SqlitePool> {
+    if let Some(parent) = db_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create db parent dir {}", parent.display()))?;
+    }
+
+    let url = format!("sqlite://{}", db_path.display());
+    let opts = SqliteConnectOptions::from_str(&url)
+        .context("parse sqlite url")?
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(Duration::from_secs(5))
+        .foreign_keys(true)
+        .pragma("temp_store", "memory")
+        .disable_statement_logging();
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(20)
+        .connect_with(opts)
+        .await
+        .context("connect SQLite pool")?;
+
+    Ok(pool)
+}
 
 /// SQLite-backed implementation of [`Memory`] for persistent storage.
 ///
@@ -90,33 +151,13 @@ impl SqliteMemory {
     /// Returns an error if database operations fail (table creation,
     /// index creation, or loading messages).
     pub async fn new(pool: SqlitePool, session_id: String) -> Result<Self> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS memory_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at INTEGER DEFAULT (unixepoch())
-            )
-            "#,
+        let rows = sqlx::query(
+            "SELECT content FROM memory_messages WHERE session_id = ? ORDER BY created_at, id",
         )
-        .execute(&pool)
+        .bind(&session_id)
+        .fetch_all(&pool)
         .await
-        .context("Failed to create memory_messages table")?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_memory_messages_session_id ON memory_messages(session_id)"
-        )
-        .execute(&pool)
-        .await
-        .context("Failed to create index on session_id")?;
-
-        let rows =
-            sqlx::query("SELECT content FROM memory_messages WHERE session_id = ? ORDER BY id ASC")
-                .bind(&session_id)
-                .fetch_all(&pool)
-                .await
-                .context("Failed to load messages from DB")?;
+        .context("Failed to load messages from DB")?;
 
         let mut messages = Vec::new();
         for row in rows {
@@ -152,113 +193,79 @@ impl Memory for SqliteMemory {
 
     /// Adds a message to both the in-memory cache and the database.
     ///
-    /// The message is:
-    /// 1. Added to the in-memory vector immediately
-    /// 2. Asynchronously persisted to SQLite
-    ///
-    /// If serialization fails, the in-memory cache is updated but
-    /// the database write fails silently (logged as error).
-    async fn add_message(&mut self, message: Message) {
+    /// The message is persisted to SQLite first; on success it is appended
+    /// to the in-memory vector. On failure the error is propagated to the
+    /// caller and the in-memory cache is unchanged.
+    async fn add_message(
+        &mut self,
+        message: Message,
+    ) -> std::result::Result<(), Box<dyn Error + Send + Sync>> {
         let session_id = self.session_id.clone();
         let pool = self.pool.clone();
 
-        let content = match serde_json::to_string(&message) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to serialize message for persistence: {}", e);
-                return;
-            }
-        };
+        let content = serde_json::to_string(&message)
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
-        if let Err(e) =
-            sqlx::query("INSERT INTO memory_messages (session_id, content) VALUES (?, ?)")
-                .bind(session_id)
-                .bind(content)
-                .execute(&pool)
-                .await
-        {
-            error!("Failed to persist message to DB: {}", e);
-            return;
-        }
+        sqlx::query("INSERT INTO memory_messages (session_id, content) VALUES (?, ?)")
+            .bind(session_id)
+            .bind(content)
+            .execute(&pool)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         self.messages.push(message);
+        Ok(())
     }
 
     /// Clears all messages for this session from memory and database.
-    async fn clear(&mut self) {
-        if let Err(e) = sqlx::query("DELETE FROM memory_messages WHERE session_id = ?")
+    async fn clear(&mut self) -> std::result::Result<(), Box<dyn Error + Send + Sync>> {
+        sqlx::query("DELETE FROM memory_messages WHERE session_id = ?")
             .bind(&self.session_id)
             .execute(&self.pool)
             .await
-        {
-            error!("Failed to clear messages from DB: {}", e);
-            return;
-        }
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
         self.messages.clear();
+        Ok(())
     }
 
     /// Replaces all messages with a new set.
     ///
-    /// This is used by the agent's compaction logic to replace the
-    /// full conversation history with a summarized version. The operation
-    /// is transactional:
-    ///
-    /// 1. Deletes all existing messages for this session
-    /// 2. Inserts all messages from the new vector
-    ///
-    /// If an error occurs mid-transaction, changes are rolled back
-    /// and an error is logged.
-    async fn replace(&mut self, messages: Vec<Message>) {
-        let mut tx = match self.pool.begin().await {
-            Ok(tx) => tx,
-            Err(e) => {
-                error!("Failed to begin transaction for replace: {}", e);
-                return;
-            }
-        };
+    /// Runs in a single transaction. If any insert fails the transaction
+    /// is rolled back and the in-memory cache is unchanged.
+    async fn replace(
+        &mut self,
+        messages: Vec<Message>,
+    ) -> std::result::Result<(), Box<dyn Error + Send + Sync>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
-        if let Err(e) = sqlx::query("DELETE FROM memory_messages WHERE session_id = ?")
+        sqlx::query("DELETE FROM memory_messages WHERE session_id = ?")
             .bind(&self.session_id)
             .execute(&mut *tx)
             .await
-        {
-            error!("Failed to delete old messages in replace: {}", e);
-            return;
-        }
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
-        let mut insert_failed = false;
         for msg in &messages {
-            let content = match serde_json::to_string(&msg) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Failed to serialize message in replace: {}", e);
-                    insert_failed = true;
-                    continue;
-                }
-            };
+            let content = serde_json::to_string(msg)
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
-            if let Err(e) =
-                sqlx::query("INSERT INTO memory_messages (session_id, content) VALUES (?, ?)")
-                    .bind(&self.session_id)
-                    .bind(content)
-                    .execute(&mut *tx)
-                    .await
-            {
-                error!("Failed to insert message in replace: {}", e);
-                insert_failed = true;
-            }
+            sqlx::query("INSERT INTO memory_messages (session_id, content) VALUES (?, ?)")
+                .bind(&self.session_id)
+                .bind(content)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
         }
 
-        if insert_failed {
-            return;
-        }
+        tx.commit()
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
-        if let Err(e) = tx.commit().await {
-            error!("Failed to commit replace transaction: {}", e);
-            return;
-        }
-
-        self.messages = messages.clone();
+        self.messages = messages;
+        Ok(())
     }
 }
 
@@ -268,9 +275,15 @@ mod tests {
     use gewu_core::types::{ContentPart, Message};
     use sqlx::sqlite::SqlitePoolOptions;
 
+    async fn make_pool() -> Result<SqlitePool> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        run_migrations(&pool).await?;
+        Ok(pool)
+    }
+
     #[tokio::test]
     async fn test_persistence() -> Result<()> {
-        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        let pool = make_pool().await?;
 
         let session_id = "test_1".to_string();
 
@@ -280,25 +293,49 @@ mod tests {
                 text: "Hello".to_string(),
             }],
         };
-        mem1.add_message(msg).await;
+        mem1.add_message(msg)
+            .await
+            .map_err(|e| anyhow::anyhow!("add_message: {}", e))?;
         assert_eq!(mem1.messages().len(), 1);
 
         let mem2 = SqliteMemory::new(pool.clone(), session_id.clone()).await?;
         assert_eq!(mem2.messages().len(), 1);
-        match &mem2.messages()[0] {
-            Message::User { content } => {
-                let text = content
-                    .iter()
-                    .find_map(|p| match p {
-                        ContentPart::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .unwrap_or("");
-                assert_eq!(text, "Hello");
-            }
-            _ => panic!("Wrong type"),
-        }
+        assert!(matches!(
+            &mem2.messages()[0],
+            Message::User { content } if content.iter().any(|p| matches!(p, ContentPart::Text { text } if text == "Hello"))
+        ));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_message_propagates_db_errors() -> Result<()> {
+        let pool = make_pool().await?;
+        let mut mem = SqliteMemory::new(pool.clone(), "s".into()).await?;
+
+        // Close the pool out from under the memory; subsequent inserts must error.
+        pool.close().await;
+
+        let result = mem
+            .add_message(Message::User {
+                content: vec![ContentPart::Text { text: "x".into() }],
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "expected error on closed pool, got Ok with messages={}",
+            mem.messages().len()
+        );
+        // Cache must not advance on failure.
+        assert_eq!(mem.messages().len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migrations_runner_is_idempotent() -> Result<()> {
+        let pool = make_pool().await?;
+        run_migrations(&pool).await?;
+        run_migrations(&pool).await?;
         Ok(())
     }
 }

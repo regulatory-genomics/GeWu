@@ -3,9 +3,23 @@ members = ["gewu-cli",
     "gewu-core",
     "gewu-providers", "gewu-storage",
     "gewu-tools",
+    "gewu-runtime",
     "gewu-web",
+    "gewu-gateway",
     "gewu-graph",
-    "gewu-rag",
+    "gewu-canvas",
 ]
-exclude = ["opencode"]
+exclude = ["opencode", "gewu-rag"]
 resolver = "2"
+
+# Workspace-wide lints. We keep `-D warnings` in CI but allow a few stylistic
+# lints that fire on legacy code and would balloon Phase 0 into a refactor pass.
+# Each item here is tech debt to revisit; do not add new code that needs them.
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+manual_strip = "allow"
+type_complexity = "allow"
+module_inception = "allow"
+branches_sharing_code = "allow"
+should_implement_trait = "allow"
+

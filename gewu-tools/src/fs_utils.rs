@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use tokio::fs;
 
 pub fn into_tool_error(e: impl Into<anyhow::Error>) -> Box<dyn std::error::Error + Send + Sync> {
-    Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.into()))
+    Box::new(std::io::Error::other(e.into()))
 }
 
 pub fn parse_empty_args(tool_name: &str, required_params: &[(&str, &str)]) -> String {
@@ -57,6 +57,54 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     ret
 }
 
+/// Resolves a user-provided path for write access.
+/// Allows writing to the project root OR ~/.gewu/ (GeWu's config directory).
+pub fn resolve_write_path(root: impl AsRef<Path>, user_path: impl AsRef<Path>) -> Result<PathBuf> {
+    let user_path = user_path.as_ref();
+
+    if user_path.is_absolute() {
+        let normalized = normalize_path(user_path);
+        let gewu_dir = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/"))
+            .join(".gewu");
+        if normalized.starts_with(root.as_ref()) || normalized.starts_with(&gewu_dir) {
+            Ok(normalized)
+        } else {
+            Err(anyhow::anyhow!(
+                "Path traversal detected: {:?} is outside of root {:?}",
+                normalized,
+                root.as_ref()
+            ))
+        }
+    } else {
+        resolve_safe_path(root, user_path)
+    }
+}
+
+/// Resolves a user-provided path for read-only access.
+/// Allows reading from anywhere under the user's home directory or the project root.
+/// This is less restrictive than resolve_safe_path since reads are non-destructive.
+pub fn resolve_read_path(root: impl AsRef<Path>, user_path: impl AsRef<Path>) -> Result<PathBuf> {
+    let user_path = user_path.as_ref();
+
+    if user_path.is_absolute() {
+        let normalized = normalize_path(user_path);
+        // Allow any absolute path under home dir or project root
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        if normalized.starts_with(&home) || normalized.starts_with(root.as_ref()) {
+            Ok(normalized)
+        } else {
+            Err(anyhow::anyhow!(
+                "Read access denied: {:?} is outside of home directory",
+                normalized
+            ))
+        }
+    } else {
+        // Relative paths resolve against root (same as before)
+        resolve_safe_path(root, user_path)
+    }
+}
+
 /// Resolves a user-provided path against a root directory, ensuring it stays within the root.
 /// Returns the absolute path if safe, or an error if it attempts to traverse outside.
 pub fn resolve_safe_path(root: impl AsRef<Path>, user_path: impl AsRef<Path>) -> Result<PathBuf> {
@@ -66,9 +114,9 @@ pub fn resolve_safe_path(root: impl AsRef<Path>, user_path: impl AsRef<Path>) ->
     // If user_path is absolute, it must start with root.
     // If it is relative, we join it to root.
     let joined = if user_path.is_absolute() {
-        let user_path_ref: &Path = user_path.as_ref();
+        let user_path_ref: &Path = user_path;
         if user_path_ref == Path::new("/") {
-            return Ok(root.join(".").into());
+            return Ok(root.join("."));
         }
         user_path.to_path_buf()
     } else {
@@ -164,13 +212,13 @@ pub async fn is_binary_file(path: impl AsRef<Path>, file_size: u64) -> Result<bo
         .map(|e| e.to_lowercase());
 
     // Binary extensions list (same as legacy)
-    match ext.as_deref() {
-        Some(
-            ".zip" | ".tar" | ".gz" | ".exe" | ".dll" | ".so" | ".class" | ".jar" | ".war" | ".7z"
-            | ".doc" | ".docx" | ".xls" | ".xlsx" | ".ppt" | ".pptx" | ".odt" | ".ods" | ".odp"
-            | ".bin" | ".dat" | ".obj" | ".o" | ".a" | ".lib" | ".wasm" | ".pyc" | ".pyo",
-        ) => return Ok(true),
-        _ => {}
+    if let Some(
+        ".zip" | ".tar" | ".gz" | ".exe" | ".dll" | ".so" | ".class" | ".jar" | ".war" | ".7z"
+        | ".doc" | ".docx" | ".xls" | ".xlsx" | ".ppt" | ".pptx" | ".odt" | ".ods" | ".odp"
+        | ".bin" | ".dat" | ".obj" | ".o" | ".a" | ".lib" | ".wasm" | ".pyc" | ".pyo",
+    ) = ext.as_deref()
+    {
+        return Ok(true);
     }
 
     if file_size == 0 {

@@ -1,0 +1,70 @@
+id: daily_opencode_rollup
+description: Summarize one local-day OpenCode activity into memory_summaries.
+entry: build_query
+finish: [write_summary]
+metadata:
+  sop:
+    name: Daily OpenCode Rollup
+    description: Summarize OpenCode records for one local date/timezone/workspace and persist a provenance-backed memory summary.
+    visible_to:
+      - general
+      - build
+      - memory-orchestrator
+    triggers:
+      - summarize opencode day
+      - daily memory rollup
+      - summarize what I did that day
+      - 总结某天的 OpenCode 记录
+      - 回顾某天做了什么
+    input_schema:
+      type: object
+      required: [date, timezone, workspace_root]
+      properties:
+        date: { type: string }
+        timezone: { type: string }
+        workspace_root: { type: string }
+        source: { type: string, default: opencode }
+        limit: { type: integer, default: 200 }
+        idempotency_key: { type: string }
+nodes:
+  build_query:
+    kind: tool
+    tool: memory_day_query
+    input: $
+    write: query
+
+  fetch_events:
+    kind: tool
+    tool: memory_sql_query
+    input: $.query
+    write: events
+
+  summarize_day:
+    kind: specialist
+    specialist:
+      id: daily-memory-rollup-agent
+      description: Summarizes raw memory events into daily rollups.
+      capabilities:
+        - report_result
+      skills:
+        - daily-memory-rollup
+      system_prompt: |
+        Use the loaded daily-memory-rollup skill. Call report_result with status "succeeded" and put only the memory_summary_write JSON object in the result field.
+        Preserve the caller's date, timezone, workspace_root, source, and idempotency_key from the input.
+        Do not derive the local date from UTC created_at values; the date in the input is authoritative.
+        The output must include summary_kind, title, content, derived_from, metadata, idempotency_key, and mode.
+        Do not call memory_summary_write yourself. Use report_result with the JSON object; the workflow write_summary node will persist it.
+        Keep the returned JSON focused on the persistable summary object. Do not include raw event dumps or trace/debug blobs in the summary content.
+        If no events were found, call report_result with a valid summary object whose content says no events were found and whose derived_from is empty.
+    input: $
+    write: summary
+
+  write_summary:
+    kind: tool
+    tool: memory_summary_write
+    input: $.summary
+    write: write_result
+edges:
+  - [build_query, fetch_events]
+  - [fetch_events, summarize_day]
+  - [summarize_day, write_summary]

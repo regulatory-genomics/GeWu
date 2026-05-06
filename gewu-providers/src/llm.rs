@@ -22,24 +22,22 @@
 //! - [`ResponseParser`] - Trait for parsing streaming responses
 //! - [`ToolCallAggregator`] - Handles fragmented tool call streaming
 
-use crate::openai_types::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionMessageToolCalls,
-    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionTools, ChatCompletionStream, ChatCompletionTool,
-    CreateChatCompletionRequest, FunctionCall as OpenAIFunctionCall,
-    FunctionObjectArgs, ImageUrl, OpenAIConfig, AssistantMessage as OpenAIAssistantMessage,
-    ChatCompletionRequestMessageContentPartText, FileData,
-    ChatCompletionRequestMessageContentPartFile, Client as OpenAIClient,
-};
 use crate::anthropic_types::{
     AnthropicChunk, AnthropicConfig, AnthropicMessage, AnthropicStream, AnthropicTool,
-    ContentBlock, ContentBlockDeltaChunk, ContentBlockStart,
-    ContentBlockStartChunk, ContentDelta, CreateMessageRequest,
-    MessageStartChunk, ToolCall, UserMessage,
-    AssistantMessage as AnthropicAssistantMessage, Client as AnthropicClient,
+    AssistantMessage as AnthropicAssistantMessage, Client as AnthropicClient, ContentBlock,
+    ContentBlockDeltaChunk, ContentBlockStart, ContentBlockStartChunk, ContentDelta,
+    CreateMessageRequest, MessageStartChunk, ToolCall, UserMessage,
+};
+use crate::openai_types::{
+    AssistantMessage as OpenAIAssistantMessage, ChatCompletionMessageToolCall,
+    ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCalls,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartFile,
+    ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
+    ChatCompletionStream, ChatCompletionTool, ChatCompletionTools, Client as OpenAIClient,
+    CreateChatCompletionRequest, FileData, FunctionCall as OpenAIFunctionCall, FunctionObjectArgs,
+    ImageUrl, OpenAIConfig,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -114,6 +112,8 @@ pub struct OpenAIProvider {
     client: OpenAIClient,
     model: String,
     capabilities: Capabilities,
+    max_output_tokens: Option<u32>,
+    temperature: Option<f32>,
 }
 
 impl OpenAIProvider {
@@ -130,6 +130,8 @@ impl OpenAIProvider {
             client: OpenAIClient::with_config(config),
             model: model.to_string(),
             capabilities,
+            max_output_tokens: None,
+            temperature: None,
         }
     }
 
@@ -150,13 +152,26 @@ impl OpenAIProvider {
             client: OpenAIClient::with_config(config),
             model: model.to_string(),
             capabilities,
+            max_output_tokens: None,
+            temperature: None,
         }
+    }
+
+    pub fn with_max_output_tokens(mut self, max_output_tokens: Option<u32>) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self
+    }
+
+    pub fn with_temperature(mut self, temperature: Option<f32>) -> Self {
+        self.temperature = temperature;
+        self
     }
 
     /// Determines capabilities based on model name.
     ///
     /// This is a heuristic based on common model naming patterns.
     /// For accurate capability settings, use a custom provider implementation.
+    #[allow(clippy::branches_sharing_code, clippy::if_same_then_else)]
     fn default_capabilities_for_model(model: &str) -> Capabilities {
         let model_lower = model.to_lowercase();
         if model_lower.contains("gpt-4o") || model_lower.contains("gpt-5") {
@@ -250,10 +265,7 @@ impl OpenAIProvider {
                 Some(ChatCompletionRequestUserMessageContentPart::ImageUrl(
                     ChatCompletionRequestMessageContentPartImage {
                         content_type: "image_url".to_string(),
-                        image_url: ImageUrl {
-                            url: url.into(),
-                            detail: None,
-                        },
+                        image_url: ImageUrl { url, detail: None },
                     },
                 ))
             }
@@ -353,13 +365,16 @@ impl OpenAIProvider {
                     calls
                         .iter()
                         .map(|tc| {
-                            ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
-                                id: tc.id.clone(),
-                                function: OpenAIFunctionCall {
-                                    name: tc.function.name.clone(),
-                                    arguments: tc.function.arguments.clone(),
+                            ChatCompletionMessageToolCalls::Function(
+                                ChatCompletionMessageToolCall {
+                                    id: tc.id.clone(),
+                                    tool_type: "function".to_string(),
+                                    function: OpenAIFunctionCall {
+                                        name: tc.function.name.clone(),
+                                        arguments: tc.function.arguments.clone(),
+                                    },
                                 },
-                            })
+                            )
                         })
                         .collect()
                 });
@@ -433,8 +448,22 @@ impl OpenAIProvider {
         let mut openai_tools: Vec<ChatCompletionTools> = Vec::new();
         for tool in tools {
             let schema = tool.schema();
-            let parameters = serde_json::to_value(&schema)
+            let mut parameters = serde_json::to_value(&schema)
                 .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+            if let Some(obj) = parameters.as_object_mut() {
+                let is_object = obj
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|t| t == "object");
+                if is_object {
+                    if !obj.contains_key("properties") {
+                        obj.insert("properties".into(), serde_json::json!({}));
+                    }
+                    if !obj.contains_key("required") {
+                        obj.insert("required".into(), serde_json::json!([]));
+                    }
+                }
+            }
             let function = FunctionObjectArgs::default()
                 .name(tool.name())
                 .description(tool.description())
@@ -469,10 +498,14 @@ impl RequestBuilder for OpenAIProvider {
         Ok(CreateChatCompletionRequest {
             model: self.model.clone(),
             messages: openai_messages,
-            tools: if openai_tools.is_empty() { None } else { Some(openai_tools) },
+            tools: if openai_tools.is_empty() {
+                None
+            } else {
+                Some(openai_tools)
+            },
             stream: None,
-            max_tokens: None,
-            temperature: None,
+            max_tokens: self.max_output_tokens,
+            temperature: self.temperature,
         })
     }
 }
@@ -524,42 +557,43 @@ impl ToolCallAggregator {
 
         let state = &mut self.states[index];
 
-        if let Some(id) = &chunk.id {
-            if !id.is_empty() {
-                state.id = Some(id.clone());
-            }
+        if let Some(id) = &chunk.id
+            && !id.is_empty()
+        {
+            state.id = Some(id.clone());
         }
 
         if let Some(function) = &chunk.function {
-            if let Some(name) = &function.name {
-                if !name.is_empty() {
-                    state.name = Some(name.clone());
-                }
+            if let Some(name) = &function.name
+                && !name.is_empty()
+            {
+                state.name = Some(name.clone());
             }
 
-            if let Some(args) = &function.arguments {
-                if !args.is_empty() && !state.finalized {
-                    state.argument_buffer.push_str(args);
-                    Self::update_finalized_flag(state);
-                    if state.started {
-                        if let Some(id) = state.id.clone() {
-                            Self::emit_pending_arguments(state, &id, &mut events);
-                        }
-                    }
+            if let Some(args) = &function.arguments
+                && !args.is_empty()
+                && !state.finalized
+            {
+                state.argument_buffer.push_str(args);
+                Self::update_finalized_flag(state);
+                if state.started
+                    && let Some(id) = state.id.clone()
+                {
+                    Self::emit_pending_arguments(state, &id, &mut events);
                 }
             }
         }
 
-        if !state.started {
-            if let (Some(id), Some(name)) = (state.id.clone(), state.name.clone()) {
-                events.push(ProviderEvent::ToolCallStart {
-                    id: id.clone(),
-                    name,
-                });
-                state.started = true;
+        if !state.started
+            && let (Some(id), Some(name)) = (state.id.clone(), state.name.clone())
+        {
+            events.push(ProviderEvent::ToolCallStart {
+                id: id.clone(),
+                name,
+            });
+            state.started = true;
 
-                Self::emit_pending_arguments(state, &id, &mut events);
-            }
+            Self::emit_pending_arguments(state, &id, &mut events);
         }
 
         events
@@ -614,17 +648,15 @@ impl ResponseParser for OpenAIProvider {
                 if let Some(choice) = response.choices.first() {
                     let delta = &choice.delta;
 
-                    if let Some(reasoning) = &delta.reasoning_content {
-                        if !reasoning.is_empty() {
+                    if let Some(reasoning) = &delta.reasoning_content
+                        && !reasoning.is_empty() {
                             yield ProviderEvent::ReasoningDelta { delta: reasoning.clone() };
                         }
-                    }
 
-                    if let Some(content) = &delta.content {
-                        if !content.is_empty() {
+                    if let Some(content) = &delta.content
+                        && !content.is_empty() {
                             yield ProviderEvent::ContentDelta { delta: content.clone() };
                         }
-                    }
 
                     if let Some(tool_calls) = &delta.tool_calls {
                         for tool_call in tool_calls {
@@ -657,7 +689,7 @@ impl LlmProvider for OpenAIProvider {
         BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
         Box<dyn Error + Send + Sync>,
     > {
-let request = self.build(messages, tools)?;
+        let request = self.build(messages, tools)?;
 
         let stream = self
             .client
@@ -684,7 +716,9 @@ let request = self.build(messages, tools)?;
 pub struct AnthropicProvider {
     client: AnthropicClient,
     model: String,
+    #[allow(dead_code)]
     capabilities: Capabilities,
+    max_output_tokens: Option<u32>,
 }
 
 impl AnthropicProvider {
@@ -695,6 +729,7 @@ impl AnthropicProvider {
             client: AnthropicClient::with_config(config),
             model: model.to_string(),
             capabilities,
+            max_output_tokens: Some(8192),
         }
     }
 
@@ -705,7 +740,13 @@ impl AnthropicProvider {
             client: AnthropicClient::with_config(config),
             model: model.to_string(),
             capabilities,
+            max_output_tokens: Some(8192),
         }
+    }
+
+    pub fn with_max_output_tokens(mut self, max_output_tokens: Option<u32>) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self
     }
 
     pub fn with_extended_thinking(mut self) -> Self {
@@ -771,9 +812,7 @@ impl AnthropicProvider {
 
     fn convert_content_part(&self, part: &ContentPart) -> Option<ContentBlock> {
         match part {
-            ContentPart::Text { text } => Some(ContentBlock::Text {
-                text: text.clone(),
-            }),
+            ContentPart::Text { text } => Some(ContentBlock::Text { text: text.clone() }),
             ContentPart::Image { data, mime_type } => Some(ContentBlock::Text {
                 text: format!("[Image: {}](data:{};base64,{})", mime_type, mime_type, data),
             }),
@@ -783,11 +822,9 @@ impl AnthropicProvider {
             ContentPart::Video { data, mime_type } => Some(ContentBlock::Text {
                 text: format!("[Video: {}](data:{};base64,{})", mime_type, mime_type, data),
             }),
-            ContentPart::File { data, mime_type } => {
-                Some(ContentBlock::Text {
-                    text: format!("[File: {}](data:{};base64,{})", mime_type, mime_type, data),
-                })
-            }
+            ContentPart::File { data, mime_type } => Some(ContentBlock::Text {
+                text: format!("[File: {}](data:{};base64,{})", mime_type, mime_type, data),
+            }),
         }
     }
 
@@ -802,17 +839,19 @@ impl AnthropicProvider {
                     .iter()
                     .filter_map(|p| self.convert_content_part(p))
                     .collect();
-                Ok(vec![AnthropicMessage::User(UserMessage { content: blocks })])
+                Ok(vec![AnthropicMessage::User(UserMessage {
+                    content: blocks,
+                })])
             }
             Message::Assistant {
                 content,
                 tool_calls,
             } => {
                 let mut blocks: Vec<ContentBlock> = Vec::new();
-                if let Some(text) = content {
-                    if !text.is_empty() {
-                        blocks.push(ContentBlock::Text { text: text.clone() });
-                    }
+                if let Some(text) = content
+                    && !text.is_empty()
+                {
+                    blocks.push(ContentBlock::Text { text: text.clone() });
                 }
                 let anthropic_tool_calls: Option<Vec<ToolCall>> = if let Some(calls) = tool_calls {
                     if !calls.is_empty() {
@@ -841,14 +880,16 @@ impl AnthropicProvider {
                 if blocks.is_empty() && anthropic_tool_calls.is_none() {
                     Ok(vec![])
                 } else {
-                    Ok(vec![AnthropicMessage::Assistant(AnthropicAssistantMessage {
-                        content: if blocks.is_empty() {
-                            None
-                        } else {
-                            Some(blocks)
+                    Ok(vec![AnthropicMessage::Assistant(
+                        AnthropicAssistantMessage {
+                            content: if blocks.is_empty() {
+                                None
+                            } else {
+                                Some(blocks)
+                            },
+                            tool_calls: anthropic_tool_calls,
                         },
-                        tool_calls: anthropic_tool_calls,
-                    })])
+                    )])
                 }
             }
             Message::Tool {
@@ -866,7 +907,9 @@ impl AnthropicProvider {
                         blocks.push(block);
                     }
                 }
-                Ok(vec![AnthropicMessage::User(UserMessage { content: blocks })])
+                Ok(vec![AnthropicMessage::User(UserMessage {
+                    content: blocks,
+                })])
             }
         }
     }
@@ -925,7 +968,7 @@ impl AnthropicProvider {
                 Some(anthropic_tools)
             },
             stream: true,
-            max_tokens: Some(8192),
+            max_tokens: self.max_output_tokens,
         })
     }
 }
@@ -990,10 +1033,7 @@ impl AnthropicToolCallAggregator {
                         let delta = state.argument_buffer[state.sent_len..new_len].to_string();
                         state.sent_len = new_len;
                         if !delta.is_empty() {
-                            events.push(ProviderEvent::ToolCallDelta {
-                                id,
-                                delta,
-                            });
+                            events.push(ProviderEvent::ToolCallDelta { id, delta });
                         }
                     }
                 }
@@ -1016,7 +1056,8 @@ impl AnthropicProvider {
     fn parse_stream(
         &self,
         stream: AnthropicStream,
-    ) -> futures::stream::BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>> {
+    ) -> futures::stream::BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>
+    {
         let s = async_stream::try_stream! {
             let mut tool_aggregator = AnthropicToolCallAggregator::default();
             let mut stream = stream;
@@ -1123,6 +1164,29 @@ mod tests {
         let provider = OpenAIProvider::new_with_endpoint(api_key, base_url, model);
 
         assert!(provider.build(&[], &[]).is_ok());
+    }
+
+    #[test]
+    fn openai_provider_uses_configured_max_output_tokens() {
+        let provider =
+            OpenAIProvider::new_with_endpoint("test-key", "http://localhost:8080/v1", "gpt-4")
+                .with_max_output_tokens(Some(16_384));
+
+        let request = provider.build(&[], &[]).expect("build request");
+        assert_eq!(request.max_tokens, Some(16_384));
+    }
+
+    #[test]
+    fn anthropic_provider_uses_configured_max_output_tokens() {
+        let provider = AnthropicProvider::new_with_endpoint(
+            "test-key",
+            "http://localhost:8080",
+            "claude-sonnet",
+        )
+        .with_max_output_tokens(Some(32_000));
+
+        let request = provider.build(&[], &[]).expect("build request");
+        assert_eq!(request.max_tokens, Some(32_000));
     }
 
     #[test]

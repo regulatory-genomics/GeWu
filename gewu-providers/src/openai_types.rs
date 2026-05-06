@@ -19,6 +19,8 @@ pub enum OpenAIError {
     Json(#[from] serde_json::Error),
     #[error("Build error: {0}")]
     Build(String),
+    #[error("SSE stream done")]
+    Done,
 }
 
 #[derive(Debug, Clone)]
@@ -51,9 +53,7 @@ impl Client {
     }
 
     pub fn chat(&self) -> ChatCompletions<'_> {
-        ChatCompletions {
-            client: self,
-        }
+        ChatCompletions { client: self }
     }
 
     pub fn models(&self) -> Models<'_> {
@@ -72,10 +72,15 @@ impl<'a> ChatCompletions<'a> {
     ) -> Result<ChatCompletionStream, OpenAIError> {
         request.stream = Some(true);
         let url = format!("{}/chat/completions", self.client.config.base_url);
-        
-        let response = self.client.http_client
+
+        let response = self
+            .client
+            .http_client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.client.config.api_key))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.client.config.api_key),
+            )
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .json(&request)
@@ -97,10 +102,15 @@ impl<'a> ChatCompletions<'a> {
         request: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, OpenAIError> {
         let url = format!("{}/chat/completions", self.client.config.base_url);
-        
-        let response = self.client.http_client
+
+        let response = self
+            .client
+            .http_client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.client.config.api_key))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.client.config.api_key),
+            )
             .header("Content-Type", "application/json")
             .json(&request)
             .send()
@@ -156,6 +166,39 @@ where
             buffer: String::new(),
         }
     }
+
+    fn try_parse_event(event_block: &str) -> Option<Result<ChatCompletionChunk, OpenAIError>> {
+        let mut data_parts = Vec::new();
+        for line in event_block.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+            if let Some(data) = line.strip_prefix("data: ") {
+                data_parts.push(data);
+            } else if let Some(data) = line.strip_prefix("data:") {
+                data_parts.push(data.trim_start());
+            }
+        }
+        if data_parts.is_empty() {
+            return None;
+        }
+        let data = data_parts.join("");
+        if data == "[DONE]" {
+            return Some(Err(OpenAIError::Done));
+        }
+        match serde_json::from_str::<ChatCompletionChunk>(&data) {
+            Ok(chunk) => Some(Ok(chunk)),
+            Err(e) => {
+                tracing::warn!(
+                    "SSE: skipping malformed event (len={}, err={})",
+                    data.len(),
+                    e
+                );
+                None
+            }
+        }
+    }
 }
 
 impl<S> Stream for SseStream<S>
@@ -166,26 +209,17 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            if let Some(pos) = self.buffer.find('\n') {
-                let line = self.buffer[..pos].to_string();
-                self.buffer = self.buffer[pos + 1..].to_string();
-                
-                let line = line.trim();
-                if line.is_empty() || line.starts_with(':') {
-                    continue;
-                }
-                
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data == "[DONE]" {
-                        return Poll::Ready(None);
-                    }
-                    match serde_json::from_str::<ChatCompletionChunk>(data) {
-                        Ok(chunk) => return Poll::Ready(Some(Ok(chunk))),
-                        Err(e) => return Poll::Ready(Some(Err(OpenAIError::SseParse(e.to_string())))),
-                    }
+            if let Some(pos) = self.buffer.find("\n\n") {
+                let event_block = self.buffer[..pos].to_string();
+                self.buffer = self.buffer[pos + 2..].to_string();
+
+                match Self::try_parse_event(&event_block) {
+                    Some(Err(OpenAIError::Done)) => return Poll::Ready(None),
+                    Some(result) => return Poll::Ready(Some(result)),
+                    None => continue,
                 }
             }
-            
+
             match self.stream.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
                     if let Ok(s) = std::str::from_utf8(&bytes) {
@@ -196,11 +230,14 @@ where
                     return Poll::Ready(Some(Err(OpenAIError::Http(e))));
                 }
                 Poll::Ready(None) => {
-                    if self.buffer.is_empty() {
+                    let remaining = std::mem::take(&mut self.buffer);
+                    if remaining.trim().is_empty() {
                         return Poll::Ready(None);
                     }
-                    self.buffer.clear();
-                    return Poll::Ready(None);
+                    match Self::try_parse_event(&remaining) {
+                        Some(Err(OpenAIError::Done)) | None => return Poll::Ready(None),
+                        Some(result) => return Poll::Ready(Some(result)),
+                    }
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -215,10 +252,15 @@ pub struct Models<'a> {
 impl<'a> Models<'a> {
     pub async fn list(&self) -> Result<ModelsResponse, OpenAIError> {
         let url = format!("{}/models", self.client.config.base_url);
-        
-        let response = self.client.http_client
+
+        let response = self
+            .client
+            .http_client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.client.config.api_key))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.client.config.api_key),
+            )
             .send()
             .await?;
 
@@ -383,6 +425,8 @@ pub enum ChatCompletionMessageToolCalls {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionMessageToolCall {
     pub id: String,
+    #[serde(rename = "type")]
+    pub tool_type: String,
     pub function: FunctionCall,
 }
 
@@ -407,22 +451,22 @@ impl FunctionObjectArgs {
             parameters: Value::Object(serde_json::Map::new()),
         }
     }
-    
+
     pub fn name(mut self, name: &str) -> Self {
         self.name = name.to_string();
         self
     }
-    
+
     pub fn description(mut self, description: &str) -> Self {
         self.description = Some(description.to_string());
         self
     }
-    
+
     pub fn parameters(mut self, parameters: Value) -> Self {
         self.parameters = parameters;
         self
     }
-    
+
     pub fn build(self) -> Result<FunctionObject, OpenAIError> {
         if self.name.is_empty() {
             return Err(OpenAIError::Build("name is required".to_string()));
@@ -435,7 +479,7 @@ impl FunctionObjectArgs {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct CreateChatCompletionRequestArgs {
     model: Option<String>,
     messages: Option<Vec<ChatCompletionRequestMessage>>,
@@ -445,53 +489,42 @@ pub struct CreateChatCompletionRequestArgs {
     temperature: Option<f32>,
 }
 
-impl Default for CreateChatCompletionRequestArgs {
-    fn default() -> Self {
-        Self {
-            model: None,
-            messages: None,
-            tools: None,
-            stream: None,
-            max_tokens: None,
-            temperature: None,
-        }
-    }
-}
-
 impl CreateChatCompletionRequestArgs {
     pub fn model(mut self, model: &str) -> Self {
         self.model = Some(model.to_string());
         self
     }
-    
+
     pub fn messages(mut self, messages: Vec<ChatCompletionRequestMessage>) -> Self {
         self.messages = Some(messages);
         self
     }
-    
+
     pub fn tools(mut self, tools: Vec<ChatCompletionTools>) -> Self {
         self.tools = Some(tools);
         self
     }
-    
+
     pub fn stream(mut self, stream: bool) -> Self {
         self.stream = Some(stream);
         self
     }
-    
+
     pub fn max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
         self
     }
-    
+
     pub fn temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
         self
     }
-    
+
     pub fn build(self) -> Result<CreateChatCompletionRequest, OpenAIError> {
         Ok(CreateChatCompletionRequest {
-            model: self.model.ok_or_else(|| OpenAIError::Build("model is required".to_string()))?,
+            model: self
+                .model
+                .ok_or_else(|| OpenAIError::Build("model is required".to_string()))?,
             messages: self.messages.unwrap_or_default(),
             tools: self.tools,
             stream: self.stream,
@@ -501,15 +534,9 @@ impl CreateChatCompletionRequestArgs {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatCompletionRequestSystemMessageArgs {
     content: Option<String>,
-}
-
-impl Default for ChatCompletionRequestSystemMessageArgs {
-    fn default() -> Self {
-        Self { content: None }
-    }
 }
 
 impl ChatCompletionRequestSystemMessageArgs {
@@ -517,7 +544,7 @@ impl ChatCompletionRequestSystemMessageArgs {
         self.content = Some(content);
         self
     }
-    
+
     pub fn build(self) -> Result<SystemMessage, OpenAIError> {
         Ok(SystemMessage {
             content: self.content.unwrap_or_default(),
@@ -525,15 +552,9 @@ impl ChatCompletionRequestSystemMessageArgs {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatCompletionRequestUserMessageArgs {
     content: Option<Vec<ChatCompletionRequestUserMessageContentPart>>,
-}
-
-impl Default for ChatCompletionRequestUserMessageArgs {
-    fn default() -> Self {
-        Self { content: None }
-    }
 }
 
 impl ChatCompletionRequestUserMessageArgs {
@@ -541,7 +562,7 @@ impl ChatCompletionRequestUserMessageArgs {
         self.content = Some(content);
         self
     }
-    
+
     pub fn build(self) -> Result<UserMessage, OpenAIError> {
         Ok(UserMessage {
             content: self.content.unwrap_or_default(),
@@ -549,19 +570,10 @@ impl ChatCompletionRequestUserMessageArgs {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatCompletionRequestAssistantMessageArgs {
     content: Option<String>,
     tool_calls: Option<Vec<ChatCompletionMessageToolCalls>>,
-}
-
-impl Default for ChatCompletionRequestAssistantMessageArgs {
-    fn default() -> Self {
-        Self {
-            content: None,
-            tool_calls: None,
-        }
-    }
 }
 
 impl ChatCompletionRequestAssistantMessageArgs {
@@ -569,12 +581,12 @@ impl ChatCompletionRequestAssistantMessageArgs {
         self.content = Some(content);
         self
     }
-    
+
     pub fn tool_calls(mut self, tool_calls: Vec<ChatCompletionMessageToolCalls>) -> Self {
         self.tool_calls = Some(tool_calls);
         self
     }
-    
+
     pub fn build(self) -> Result<AssistantMessage, OpenAIError> {
         Ok(AssistantMessage {
             content: self.content,
@@ -583,19 +595,10 @@ impl ChatCompletionRequestAssistantMessageArgs {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatCompletionRequestToolMessageArgs {
     tool_call_id: Option<String>,
     content: Option<String>,
-}
-
-impl Default for ChatCompletionRequestToolMessageArgs {
-    fn default() -> Self {
-        Self {
-            tool_call_id: None,
-            content: None,
-        }
-    }
 }
 
 impl ChatCompletionRequestToolMessageArgs {
@@ -603,15 +606,17 @@ impl ChatCompletionRequestToolMessageArgs {
         self.tool_call_id = Some(tool_call_id);
         self
     }
-    
+
     pub fn content(mut self, content: String) -> Self {
         self.content = Some(content);
         self
     }
-    
+
     pub fn build(self) -> Result<ToolMessage, OpenAIError> {
         Ok(ToolMessage {
-            tool_call_id: self.tool_call_id.ok_or_else(|| OpenAIError::Build("tool_call_id is required".to_string()))?,
+            tool_call_id: self
+                .tool_call_id
+                .ok_or_else(|| OpenAIError::Build("tool_call_id is required".to_string()))?,
             content: self.content.unwrap_or_default(),
         })
     }
@@ -691,4 +696,142 @@ pub struct ChatCompletionResponseChoice {
 pub struct ChatCompletionResponseMessage {
     pub role: String,
     pub content: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    fn make_chunk_json(content: &str) -> String {
+        format!(
+            r#"{{"id":"c1","choices":[{{"index":0,"delta":{{"content":"{}"}}}}]}}"#,
+            content
+        )
+    }
+
+    fn bytes_stream(chunks: Vec<&str>) -> impl Stream<Item = Result<Bytes, reqwest::Error>> {
+        futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|s| Ok(Bytes::from(s.to_string())))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[tokio::test]
+    async fn single_line_events() {
+        let raw = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            make_chunk_json("hello"),
+            make_chunk_json("world"),
+        );
+        let stream = SseStream::new(bytes_stream(vec![&raw]));
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_ok());
+        assert!(items[1].is_ok());
+        let c0 = items[0].as_ref().unwrap();
+        assert_eq!(c0.choices[0].delta.content.as_deref(), Some("hello"));
+        let c1 = items[1].as_ref().unwrap();
+        assert_eq!(c1.choices[0].delta.content.as_deref(), Some("world"));
+    }
+
+    #[tokio::test]
+    async fn multi_line_data_event() {
+        let json = make_chunk_json("joined");
+        let (first, second) = json.split_at(json.len() / 2);
+        let raw = format!("data: {}\ndata: {}\n\ndata: [DONE]\n\n", first, second);
+        let stream = SseStream::new(bytes_stream(vec![&raw]));
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].as_ref().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
+            Some("joined")
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_event_skipped() {
+        let raw = format!(
+            "data: {{bad json}}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            make_chunk_json("ok"),
+        );
+        let stream = SseStream::new(bytes_stream(vec![&raw]));
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].as_ref().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
+            Some("ok")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_end_without_trailing_newlines() {
+        let raw = format!("data: {}", make_chunk_json("last"));
+        let stream = SseStream::new(bytes_stream(vec![&raw]));
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].as_ref().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
+            Some("last")
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_tcp_delivery() {
+        let json = make_chunk_json("split");
+        let full = format!("data: {}\n\ndata: [DONE]\n\n", json);
+        let mid = full.len() / 2;
+        let (a, b) = full.split_at(mid);
+        let stream = SseStream::new(bytes_stream(vec![a, b]));
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].as_ref().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
+            Some("split")
+        );
+    }
+
+    #[tokio::test]
+    async fn done_terminates_stream() {
+        let raw = format!(
+            "data: {}\n\ndata: [DONE]\n\ndata: {}\n\n",
+            make_chunk_json("before"),
+            make_chunk_json("after"),
+        );
+        let stream = SseStream::new(bytes_stream(vec![&raw]));
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].as_ref().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
+            Some("before")
+        );
+    }
+
+    #[tokio::test]
+    async fn comment_lines_ignored() {
+        let raw = format!(
+            ": keep-alive\n\ndata: {}\n\ndata: [DONE]\n\n",
+            make_chunk_json("hi"),
+        );
+        let stream = SseStream::new(bytes_stream(vec![&raw]));
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 1);
+    }
 }

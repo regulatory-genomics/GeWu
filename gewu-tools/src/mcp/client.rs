@@ -176,11 +176,11 @@ impl McpClient {
                                     if let Some(tx) = tx_opt.take() {
                                         let _ = tx.send(Ok(data.trim().to_string()));
                                     }
-                                } else if event_type == "message" {
-                                    if let Ok(msg) = serde_json::from_str::<Value>(&data) {
-                                        Self::handle_incoming_message(msg, &pending_requests_clone)
-                                            .await;
-                                    }
+                                } else if event_type == "message"
+                                    && let Ok(msg) = serde_json::from_str::<Value>(&data)
+                                {
+                                    Self::handle_incoming_message(msg, &pending_requests_clone)
+                                        .await;
                                 }
                             }
                         }
@@ -247,52 +247,53 @@ impl McpClient {
             Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Result<Value>>>>,
         >,
     ) {
-        if let Ok(response) = serde_json::from_value::<JsonRpcResponse>(msg.clone()) {
-            if let Some(id) = response.id {
-                let mut pending = pending_requests.lock().await;
-                if let Some(sender) = pending.remove(&id) {
-                    if let Some(error) = response.error {
-                        if sender.send(Err(anyhow::anyhow!(
+        if let Ok(response) = serde_json::from_value::<JsonRpcResponse>(msg.clone())
+            && let Some(id) = response.id
+        {
+            let mut pending = pending_requests.lock().await;
+            if let Some(sender) = pending.remove(&id) {
+                if let Some(error) = response.error {
+                    if sender
+                        .send(Err(anyhow::anyhow!(
                             "RPC Error {}: {}",
                             error.code,
                             error.message
-                        ))).is_err() {
-                            tracing::warn!("MCP: failed to send RPC error response to channel");
-                        }
-                    } else if let Some(result) = response.result {
-                        if sender.send(Ok(result)).is_err() {
-                            tracing::warn!("MCP: failed to send RPC result to channel");
-                        }
-                    } else {
-                        if sender.send(Ok(Value::Null)).is_err() {
-                            tracing::warn!("MCP: failed to send RPC null result to channel");
-                        }
+                        )))
+                        .is_err()
+                    {
+                        tracing::warn!("MCP: failed to send RPC error response to channel");
                     }
+                } else if let Some(result) = response.result {
+                    if sender.send(Ok(result)).is_err() {
+                        tracing::warn!("MCP: failed to send RPC result to channel");
+                    }
+                } else if sender.send(Ok(Value::Null)).is_err() {
+                    tracing::warn!("MCP: failed to send RPC null result to channel");
                 }
-                return;
             }
+            return;
         }
 
         if let Ok(notification) = serde_json::from_value::<JsonRpcNotification>(msg) {
             if notification.method == "notifications/message" {
-                if let Some(params) = notification.params {
-                    if let Ok(log_params) = serde_json::from_value::<LogMessageParams>(params) {
-                        let logger = log_params.logger.unwrap_or_else(|| "server".to_string());
-                        match log_params.level.as_str() {
-                            "error" | "critical" => {
-                                tracing::error!(target: "mcp", "[{}] {}", logger, log_params.data)
-                            }
-                            "warning" | "warn" => {
-                                tracing::warn!(target: "mcp", "[{}] {}", logger, log_params.data)
-                            }
-                            "info" => {
-                                tracing::info!(target: "mcp", "[{}] {}", logger, log_params.data)
-                            }
-                            "debug" => {
-                                tracing::debug!(target: "mcp", "[{}] {}", logger, log_params.data)
-                            }
-                            _ => tracing::info!(target: "mcp", "[{}] {}", logger, log_params.data),
+                if let Some(params) = notification.params
+                    && let Ok(log_params) = serde_json::from_value::<LogMessageParams>(params)
+                {
+                    let logger = log_params.logger.unwrap_or_else(|| "server".to_string());
+                    match log_params.level.as_str() {
+                        "error" | "critical" => {
+                            tracing::error!(target: "mcp", "[{}] {}", logger, log_params.data)
                         }
+                        "warning" | "warn" => {
+                            tracing::warn!(target: "mcp", "[{}] {}", logger, log_params.data)
+                        }
+                        "info" => {
+                            tracing::info!(target: "mcp", "[{}] {}", logger, log_params.data)
+                        }
+                        "debug" => {
+                            tracing::debug!(target: "mcp", "[{}] {}", logger, log_params.data)
+                        }
+                        _ => tracing::info!(target: "mcp", "[{}] {}", logger, log_params.data),
                     }
                 }
             } else {
@@ -433,66 +434,65 @@ impl McpClient {
                     let body_text = response.text().await?;
 
                     // Simple SSE parser for "event: message\ndata: {JSON}"
-                    let mut lines = body_text.lines();
+                    let lines = body_text.lines();
                     let mut current_event = String::new();
                     let mut current_data = String::new();
 
-                    while let Some(line) = lines.next() {
+                    for line in lines {
                         if line.starts_with("event: ") {
                             current_event = line[7..].trim().to_string();
                         } else if line.starts_with("data: ") {
                             current_data.push_str(&line[6..]);
                         } else if line.is_empty() {
                             // End of event block
-                            if current_event == "message" && !current_data.is_empty() {
-                                if let Ok(msg) = serde_json::from_str::<Value>(&current_data) {
-                                    // We need to handle this message to resolve the pending request
-                                    // Since we are inside the write_result block which holds the transport lock,
-                                    // we must NOT call self.handle_incoming_message directly if it tries to lock transport again (it doesn't seem to).
-                                    // However, handle_incoming_message needs pending_requests which we don't hold lock on here (we released it before write_result).
-                                    // But we passed pending_requests to handle_incoming_message, so it will lock it internally.
-                                    // Wait, handle_incoming_message is static/async but needs pending_requests.
+                            if current_event == "message"
+                                && !current_data.is_empty()
+                                && let Ok(msg) = serde_json::from_str::<Value>(&current_data)
+                            {
+                                // We need to handle this message to resolve the pending request
+                                // Since we are inside the write_result block which holds the transport lock,
+                                // we must NOT call self.handle_incoming_message directly if it tries to lock transport again (it doesn't seem to).
+                                // However, handle_incoming_message needs pending_requests which we don't hold lock on here (we released it before write_result).
+                                // But we passed pending_requests to handle_incoming_message, so it will lock it internally.
+                                // Wait, handle_incoming_message is static/async but needs pending_requests.
 
-                                    // We can't call handle_incoming_message easily because it's an instance method or static?
-                                    // It's static: async fn handle_incoming_message(msg, pending_requests)
+                                // We can't call handle_incoming_message easily because it's an instance method or static?
+                                // It's static: async fn handle_incoming_message(msg, pending_requests)
 
-                                    // We need access to pending_requests.
-                                    // But we are inside an async block that captures `self`? No, `self` is outside.
-                                    // The async block captures `transport` lock guard? No, it captures `transport` via `self.transport.lock().await`.
+                                // We need access to pending_requests.
+                                // But we are inside an async block that captures `self`? No, `self` is outside.
+                                // The async block captures `transport` lock guard? No, it captures `transport` via `self.transport.lock().await`.
 
-                                    // Actually, we can just return the value here?
-                                    // No, the architecture is designed around `pending_requests` map and channel.
-                                    // So we must use the channel to send the result back.
+                                // Actually, we can just return the value here?
+                                // No, the architecture is designed around `pending_requests` map and channel.
+                                // So we must use the channel to send the result back.
 
-                                    // We need a reference to pending_requests.
-                                    // We can clone the arc before the async block.
-                                    // But wait, `write_result` is executed immediately in the same scope.
+                                // We need a reference to pending_requests.
+                                // We can clone the arc before the async block.
+                                // But wait, `write_result` is executed immediately in the same scope.
 
-                                    // The issue is `handle_incoming_message` is not available inside this block easily without passing dependencies.
-                                    // Let's copy the logic or extract it.
+                                // The issue is `handle_incoming_message` is not available inside this block easily without passing dependencies.
+                                // Let's copy the logic or extract it.
 
-                                    if let Ok(response) =
-                                        serde_json::from_value::<JsonRpcResponse>(msg.clone())
-                                    {
-                                        if let Some(resp_id) = response.id {
-                                            if resp_id == id {
-                                                // Found our response!
-                                                // We can return it directly?
-                                                // The `request` function waits on `rx`.
-                                                // If we resolve it here, `rx` will receive it.
+                                if let Ok(response) =
+                                    serde_json::from_value::<JsonRpcResponse>(msg.clone())
+                                    && let Some(resp_id) = response.id
+                                    && resp_id == id
+                                {
+                                    // Found our response!
+                                    // We can return it directly?
+                                    // The `request` function waits on `rx`.
+                                    // If we resolve it here, `rx` will receive it.
 
-                                                // We need to remove from pending_requests?
-                                                // `handle_incoming_message` does that.
+                                    // We need to remove from pending_requests?
+                                    // `handle_incoming_message` does that.
 
-                                                // We can't easily access pending_requests inside this match arm because `transport` is locked.
-                                                // We can return the message from this block and handle it after releasing transport lock?
-                                                return Ok(Some(msg));
-                                            }
-                                        }
-                                    }
-                                    // Handle other messages (notifications, logs) if necessary?
-                                    // For HttpPost request-response, usually we only get the result.
+                                    // We can't easily access pending_requests inside this match arm because `transport` is locked.
+                                    // We can return the message from this block and handle it after releasing transport lock?
+                                    return Ok(Some(msg));
                                 }
+                                // Handle other messages (notifications, logs) if necessary?
+                                // For HttpPost request-response, usually we only get the result.
                             }
                             current_event.clear();
                             current_data.clear();
@@ -508,25 +508,26 @@ impl McpClient {
         match write_result {
             Ok(Some(msg)) => {
                 let mut pending = self.pending_requests.lock().await;
-                if let Some(sender) = pending.remove(&id) {
-                    if let Ok(response) = serde_json::from_value::<JsonRpcResponse>(msg) {
-                        if let Some(error) = response.error {
-                            if sender.send(Err(anyhow::anyhow!(
+                if let Some(sender) = pending.remove(&id)
+                    && let Ok(response) = serde_json::from_value::<JsonRpcResponse>(msg)
+                {
+                    if let Some(error) = response.error {
+                        if sender
+                            .send(Err(anyhow::anyhow!(
                                 "RPC Error {}: {}",
                                 error.code,
                                 error.message
-                            ))).is_err() {
-                                tracing::warn!("MCP: failed to send RPC error response to channel");
-                            }
-                        } else if let Some(result) = response.result {
-                            if sender.send(Ok(result)).is_err() {
-                                tracing::warn!("MCP: failed to send RPC result to channel");
-                            }
-                        } else {
-                            if sender.send(Ok(Value::Null)).is_err() {
-                                tracing::warn!("MCP: failed to send RPC null result to channel");
-                            }
+                            )))
+                            .is_err()
+                        {
+                            tracing::warn!("MCP: failed to send RPC error response to channel");
                         }
+                    } else if let Some(result) = response.result {
+                        if sender.send(Ok(result)).is_err() {
+                            tracing::warn!("MCP: failed to send RPC result to channel");
+                        }
+                    } else if sender.send(Ok(Value::Null)).is_err() {
+                        tracing::warn!("MCP: failed to send RPC null result to channel");
                     }
                 }
             }

@@ -5,3 +5,14 @@ target/
 .vscode/
 .opencode/
 gewu-cli/target/
+docs/
+.gewu/
+.omc/
+.mempalace_opencode_convos/
+__pycache__/
+findings.md
+progress.md
+task_plan.md
+entities.json
+mempalace.yaml
+.playwright-mcp/

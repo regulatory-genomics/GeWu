@@ -38,11 +38,15 @@
 //! ```
 
 use crate::compaction::{self, estimate_message_tokens, is_overflow};
+use crate::compaction::{
+    ConsolidationInput, apply_consolidation_to_memory, build_consolidation_prompt,
+    build_consolidation_text, save_consolidation_file,
+};
 use crate::middleware::TruncationService;
 use crate::traits::{LlmProvider, Memory, Tool, ToolRegistry};
 use crate::types::{
     AgentEvent, ContentPart, FunctionCall, Message, ProviderEvent, ToolCall, ToolContext,
-    ToolResult,
+    ToolExecutionPolicy, ToolResult,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -51,11 +55,48 @@ use serde::Deserialize;
 use std::any::Any;
 use std::collections::VecDeque;
 use std::error::Error;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+fn strip_tag_blocks(input: &str, tag: &str) -> String {
+    let start_tag = format!("<{}>", tag);
+    let end_tag = format!("</{}>", tag);
+    let mut output = input.to_string();
+
+    loop {
+        let lower = output.to_lowercase();
+        let Some(start) = lower.find(&start_tag) else {
+            break;
+        };
+        let Some(end_rel) = lower[start..].find(&end_tag) else {
+            break;
+        };
+        let end = start + end_rel + end_tag.len();
+        output.replace_range(start..end, "");
+    }
+
+    output
+}
+
+fn normalize_assistant_output(input: &str) -> String {
+    let cleaned = ["think", "analysis", "reasoning"]
+        .into_iter()
+        .fold(input.to_string(), |acc, tag| strip_tag_blocks(&acc, tag));
+    cleaned.trim().to_string()
+}
+
+fn is_max_output_stop(reason: Option<&str>) -> bool {
+    let Some(reason) = reason else {
+        return false;
+    };
+    matches!(
+        reason.trim().to_ascii_lowercase().as_str(),
+        "max_tokens" | "max_output_tokens" | "length" | "max_tokens_stop" | "max-tokens"
+    )
+}
 
 pub struct Agent {
     llm: Arc<dyn LlmProvider>,
@@ -66,6 +107,7 @@ pub struct Agent {
     pub context_limit: usize,
     truncation: TruncationService,
     session_id: String,
+    tool_context_metadata: serde_json::Map<String, serde_json::Value>,
 }
 
 pub struct AgentBuilder {
@@ -75,6 +117,8 @@ pub struct AgentBuilder {
     max_turns: Option<usize>,
     memory: Option<Box<dyn Memory>>,
     context_limit: usize,
+    session_id: Option<String>,
+    tool_context_metadata: serde_json::Map<String, serde_json::Value>,
 }
 
 fn extract_panic_message(panic_payload: Box<dyn Any + Send>) -> String {
@@ -101,51 +145,231 @@ async fn execute_tool_with_panic_recovery(
             let rt = tokio::runtime::Handle::current();
             rt.block_on(tool.execute(args, &ctx))
         }))
-    }).await;
+    })
+    .await;
 
     match result {
         Ok(Ok(res)) => res,
         Ok(Err(e)) => {
             let panic_msg = extract_panic_message(e);
-            Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "Tool '{}' panicked during execution: {}. This may indicate an issue with \
+            Err(Box::new(std::io::Error::other(format!(
+                "Tool '{}' panicked during execution: {}. This may indicate an issue with \
                     the tool implementation or invalid input. Consider adjusting the tool arguments \
                     or checking the tool's requirements.",
-                    tool_name, panic_msg
-                ),
-            )) as Box<dyn Error + Send + Sync>)
+                tool_name, panic_msg
+            ))) as Box<dyn Error + Send + Sync>)
         }
         Err(join_err) => {
             if join_err.is_panic() {
                 match join_err.try_into_panic() {
                     Ok(panic_payload) => {
                         let panic_msg = extract_panic_message(panic_payload);
-                        Err(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!(
-                                "Tool '{}' panicked during execution: {}. This may indicate an issue with \
+                        Err(Box::new(std::io::Error::other(format!(
+                            "Tool '{}' panicked during execution: {}. This may indicate an issue with \
                                 the tool implementation or invalid input. Consider adjusting the tool \
                                 arguments or checking the tool's requirements.",
-                                tool_name, panic_msg
-                            ),
-                        )) as Box<dyn Error + Send + Sync>)
+                            tool_name, panic_msg
+                        ))) as Box<dyn Error + Send + Sync>)
                     }
-                    Err(_) => {
-                        Err(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Tool '{}' panicked but could not retrieve panic payload", tool_name),
-                        )) as Box<dyn Error + Send + Sync>)
-                    }
+                    Err(_) => Err(Box::new(std::io::Error::other(format!(
+                        "Tool '{}' panicked but could not retrieve panic payload",
+                        tool_name
+                    ))) as Box<dyn Error + Send + Sync>),
                 }
             } else {
-                Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Tool '{}' task was aborted unexpectedly", tool_name),
-                )) as Box<dyn Error + Send + Sync>)
+                Err(Box::new(std::io::Error::other(format!(
+                    "Tool '{}' task was aborted unexpectedly",
+                    tool_name
+                ))) as Box<dyn Error + Send + Sync>)
             }
         }
+    }
+}
+
+async fn run_tool_call(
+    tools: Arc<Vec<Arc<dyn Tool>>>,
+    truncation: TruncationService,
+    tool_name: String,
+    args: String,
+    ctx: ToolContext,
+) -> String {
+    let tool = tools.iter().find(|t| t.name() == tool_name);
+    if let Some(t) = tool {
+        info!("Executing tool: {}", tool_name);
+        let args_val: serde_json::Value = match serde_json::from_str(&args) {
+            Ok(v) => v,
+            Err(e) => return format!("Error: Failed to parse arguments: {}", e),
+        };
+        match execute_tool_with_panic_recovery(t.clone(), args_val, ctx).await {
+            Ok(res) => {
+                let truncation_result = truncation.truncate(&res.output, false);
+                if truncation_result.truncated {
+                    format!(
+                        "{}\n\n[Output truncated - {} bytes saved to {}]",
+                        truncation_result.content,
+                        truncation_result.content.len(),
+                        truncation_result
+                            .output_path
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default()
+                    )
+                } else {
+                    res.output
+                }
+            }
+            Err(e) => {
+                warn!("Tool '{}' failed: {}", tool_name, e);
+                format!("Error: {}", e)
+            }
+        }
+    } else {
+        format!("Tool not found: {}", tool_name)
+    }
+}
+
+#[derive(Clone)]
+struct PreparedToolCall {
+    tool_call_id: String,
+    tool_name: String,
+    args: String,
+    ctx: ToolContext,
+    start_metadata: serde_json::Value,
+}
+
+struct CompletedToolCall {
+    tool_call_id: String,
+    tool_name: String,
+    output: String,
+}
+
+struct ToolExecutionHarness {
+    tools: Arc<Vec<Arc<dyn Tool>>>,
+    truncation: TruncationService,
+    session_id: String,
+    context_metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ToolExecutionHarness {
+    fn new(agent: &Agent) -> Self {
+        Self {
+            tools: agent.tools.clone(),
+            truncation: agent.truncation.clone(),
+            session_id: agent.session_id.clone(),
+            context_metadata: agent.tool_context_metadata.clone(),
+        }
+    }
+
+    fn policy_for(&self, tool_name: &str) -> ToolExecutionPolicy {
+        self.tools
+            .iter()
+            .find(|tool| tool.name() == tool_name)
+            .map(|tool| tool.execution_policy())
+            .unwrap_or(ToolExecutionPolicy::Serial)
+    }
+
+    fn is_parallel_safe_task(&self, call: &ToolCall) -> bool {
+        call.function.name == "task"
+            && self.policy_for(&call.function.name) == ToolExecutionPolicy::ParallelSafe
+    }
+
+    fn parallel_wave_end(&self, calls: &[ToolCall], start: usize) -> usize {
+        let mut end = start;
+        while end < calls.len() && self.is_parallel_safe_task(&calls[end]) {
+            end += 1;
+        }
+        end
+    }
+
+    fn prepare(&self, call: ToolCall, message_id: &mut String) -> PreparedToolCall {
+        self.prepare_with_metadata(call, message_id, serde_json::Map::new())
+    }
+
+    fn prepare_with_metadata(
+        &self,
+        call: ToolCall,
+        message_id: &mut String,
+        extra_metadata: serde_json::Map<String, serde_json::Value>,
+    ) -> PreparedToolCall {
+        let tool_name = call.function.name;
+        let args = call.function.arguments;
+        let tool_call_id = call.id;
+        let mut ctx = ToolContext::new(&self.session_id, message_id.as_str())
+            .with_tool_call_id(tool_call_id.clone());
+        ctx.metadata.extend(self.context_metadata.clone());
+        ctx.metadata.extend(extra_metadata);
+        let start_metadata = self
+            .tools
+            .iter()
+            .find(|tool| tool.name() == tool_name)
+            .and_then(|tool| tool.start_metadata(&args, &ctx).ok())
+            .unwrap_or(serde_json::Value::Null);
+        if !start_metadata.is_null() {
+            ctx.metadata
+                .insert("tool_start_metadata".to_string(), start_metadata.clone());
+        }
+        *message_id = Uuid::new_v4().to_string();
+        PreparedToolCall {
+            tool_call_id,
+            tool_name,
+            args,
+            ctx,
+            start_metadata,
+        }
+    }
+
+    async fn execute_one(&self, prepared: PreparedToolCall) -> CompletedToolCall {
+        let output = run_tool_call(
+            self.tools.clone(),
+            self.truncation.clone(),
+            prepared.tool_name.clone(),
+            prepared.args,
+            prepared.ctx,
+        )
+        .await;
+        CompletedToolCall {
+            tool_call_id: prepared.tool_call_id,
+            tool_name: prepared.tool_name,
+            output,
+        }
+    }
+
+    async fn execute_parallel(
+        &self,
+        prepared_calls: Vec<PreparedToolCall>,
+    ) -> Vec<CompletedToolCall> {
+        let mut handles = Vec::with_capacity(prepared_calls.len());
+        for prepared in prepared_calls {
+            let tools = self.tools.clone();
+            let truncation = self.truncation.clone();
+            handles.push(tokio::spawn(async move {
+                let output = run_tool_call(
+                    tools,
+                    truncation,
+                    prepared.tool_name.clone(),
+                    prepared.args,
+                    prepared.ctx,
+                )
+                .await;
+                CompletedToolCall {
+                    tool_call_id: prepared.tool_call_id,
+                    tool_name: prepared.tool_name,
+                    output,
+                }
+            }));
+        }
+
+        let mut outputs = Vec::with_capacity(handles.len());
+        for handle in handles {
+            outputs.push(match handle.await {
+                Ok(output) => output,
+                Err(err) => CompletedToolCall {
+                    tool_call_id: "unknown".to_string(),
+                    tool_name: "task".to_string(),
+                    output: format!("Error: Tool task join failed: {}", err),
+                },
+            });
+        }
+        outputs
     }
 }
 
@@ -158,6 +382,8 @@ impl Default for AgentBuilder {
             max_turns: None,
             memory: None,
             context_limit: 128_000,
+            session_id: None,
+            tool_context_metadata: Default::default(),
         }
     }
 }
@@ -167,15 +393,20 @@ impl Agent {
         AgentBuilder::default()
     }
 
-    pub async fn reset(&mut self) {
-        self.memory.clear().await;
+    pub async fn reset(&mut self) -> Result<()> {
+        self.memory
+            .clear()
+            .await
+            .map_err(|e| anyhow::anyhow!("Memory::clear failed: {}", e))?;
         if !self.system_prompt.is_empty() {
             self.memory
                 .add_message(Message::System {
                     content: self.system_prompt.clone(),
                 })
-                .await;
+                .await
+                .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
         }
+        Ok(())
     }
 
     pub fn ask<'a>(
@@ -184,10 +415,12 @@ impl Agent {
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
         async_stream::try_stream! {
             if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
-                 self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
+                 self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await
+                    .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
             }
 
-            self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await;
+            self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await
+                .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
 
             let mut turn = 0;
             let mut recent_tool_calls: VecDeque<(String, String)> = VecDeque::new();
@@ -198,11 +431,11 @@ impl Agent {
                     info!("History compacted.");
                 }
 
-                if let Some(max) = self.max_turns {
-                    if turn >= max {
-                        yield AgentEvent::Error { error: "Max turns reached without final answer.".to_string() };
-                        break;
-                    }
+                if let Some(max) = self.max_turns
+                    && turn >= max
+                {
+                    yield AgentEvent::Error { error: "Max turns reached without final answer.".to_string() };
+                    break;
                 }
                 turn += 1;
 
@@ -245,7 +478,16 @@ impl Agent {
                                 tc.function.arguments.push_str(&delta);
                             }
                         }
-                        ProviderEvent::Finish { .. } => {
+                        ProviderEvent::Finish { reason } => {
+                            if is_max_output_stop(reason.as_deref()) {
+                                yield AgentEvent::Error {
+                                    error: format!(
+                                        "Model output was truncated by the provider output-token limit (finish reason: {}). Increase max_output_tokens / GEWU_MAX_OUTPUT_TOKENS and retry.",
+                                        reason.as_deref().unwrap_or("unknown")
+                                    ),
+                                };
+                                return;
+                            }
                         }
                         ProviderEvent::Error { error } => {
                             yield AgentEvent::Error { error };
@@ -254,23 +496,34 @@ impl Agent {
                     }
                 }
 
+                let normalized_content = normalize_assistant_output(&current_content);
+
                 let assistant_msg = Message::Assistant {
-                    content: if current_content.is_empty() { None } else { Some(current_content.clone()) },
+                    content: if normalized_content.is_empty() { None } else { Some(normalized_content.clone()) },
                     tool_calls: if current_tool_calls.is_empty() { None } else { Some(current_tool_calls.clone()) },
                 };
-                self.memory.add_message(assistant_msg).await;
+                self.memory.add_message(assistant_msg).await
+                    .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
 
                 if current_tool_calls.is_empty() {
-                    yield AgentEvent::Finish { response: current_content };
+                    yield AgentEvent::Finish { response: normalized_content };
                     break;
                 }
 
                 info!("Agent requested {} tool calls", current_tool_calls.len());
 
-                for call in current_tool_calls {
+                let turn_tool_budget = self.context_limit / 3;
+                let mut turn_tool_tokens: usize = 0;
+                let mut pending_consolidation_ids: Vec<String> = Vec::new();
+                let mut pending_consolidation_names: Vec<String> = Vec::new();
+                let mut pending_consolidation_contents: Vec<String> = Vec::new();
+                let harness = ToolExecutionHarness::new(self);
+
+                let mut call_index = 0usize;
+                while call_index < current_tool_calls.len() {
+                    let call = current_tool_calls[call_index].clone();
                     let tool_name = call.function.name.clone();
                     let args = call.function.arguments.clone();
-                    let call_id = call.id;
 
                     let current_call_sig = (tool_name.clone(), args.clone());
                     recent_tool_calls.push_back(current_call_sig.clone());
@@ -285,60 +538,149 @@ impl Agent {
                     }
 
                     if tool_name.is_empty() {
-                         let error_msg = "Tool name is empty, skipping execution".to_string();
-                         yield AgentEvent::Error { error: error_msg };
-                         continue;
+                          let error_msg = "Tool name is empty, skipping execution".to_string();
+                          yield AgentEvent::Error { error: error_msg };
+                          call_index += 1;
+                          continue;
+                     }
+
+                    if harness.is_parallel_safe_task(&call) {
+                        let block_start = call_index;
+                        let block_end = harness.parallel_wave_end(&current_tool_calls, block_start);
+                        let wave_parent_message_id = message_id.clone();
+                        let wave_expected_count = (block_end - block_start) as i64;
+                        let mut prepared_calls = Vec::new();
+                        for parallel_call in current_tool_calls[block_start..block_end].iter().cloned() {
+                            let mut extra_metadata = serde_json::Map::new();
+                            extra_metadata.insert(
+                                "parallel_wave_parent_message_id".to_string(),
+                                serde_json::Value::String(wave_parent_message_id.clone()),
+                            );
+                            extra_metadata.insert(
+                                "parallel_wave_expected_count".to_string(),
+                                serde_json::Value::Number(wave_expected_count.into()),
+                            );
+                            let prepared = harness.prepare_with_metadata(
+                                parallel_call,
+                                &mut message_id,
+                                extra_metadata,
+                            );
+                            yield AgentEvent::ToolStart {
+                                tool_call_id: prepared.tool_call_id.clone(),
+                                tool: prepared.tool_name.clone(),
+                                input: prepared.args.clone(),
+                                metadata: prepared.start_metadata.clone(),
+                            };
+                            prepared_calls.push(prepared);
+                        }
+
+                        for completed in harness.execute_parallel(prepared_calls).await {
+                            yield AgentEvent::ToolFinish {
+                                tool_call_id: completed.tool_call_id.clone(),
+                                tool: completed.tool_name.clone(),
+                                output: completed.output.clone(),
+                            };
+
+                            let result_tokens = compaction::estimate_tokens(&completed.output);
+                            turn_tool_tokens += result_tokens;
+                            pending_consolidation_ids.push(completed.tool_call_id.clone());
+                            pending_consolidation_names.push(completed.tool_name.clone());
+                            pending_consolidation_contents.push(completed.output.clone());
+                            let media_parts = extract_media_parts(&completed.output);
+                            self.memory.add_message(Message::Tool {
+                                tool_call_id: completed.tool_call_id,
+                                tool_name: Some(completed.tool_name),
+                                content: completed.output,
+                                media: media_parts,
+                            }).await
+                                .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
+                        }
+
+                        call_index = block_end;
+                        continue;
                     }
 
-                    yield AgentEvent::ToolStart { tool: tool_name.clone(), input: args.clone() };
-
-                    let ctx = ToolContext::new(&self.session_id, &message_id);
-                    message_id = Uuid::new_v4().to_string();
-
-                    let tool = self.tools.iter().find(|t| t.name() == tool_name);
-
-                    let result_content = if let Some(t) = tool {
-                        info!("Executing tool: {}", tool_name);
-                        let args_val: serde_json::Value = match serde_json::from_str(&args) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                yield AgentEvent::Error { error: format!("Failed to parse arguments: {}", e) };
-                                continue;
-                            }
-                        };
-                        match execute_tool_with_panic_recovery(t.clone(), args_val, ctx.clone()).await {
-                            Ok(res) => {
-                                let truncation_result = self.truncation.truncate(&res.output, false);
-                                let output = if truncation_result.truncated {
-                                    format!(
-                                        "{}\n\n[Output truncated - {} bytes saved to {}]",
-                                        truncation_result.content,
-                                        truncation_result.content.len(),
-                                        truncation_result.output_path.map(|p| p.display().to_string()).unwrap_or_default()
-                                    )
-                                } else {
-                                    res.output
-                                };
-                                output
-                            }
-                            Err(e) => {
-                                warn!("Tool '{}' failed: {}", tool_name, e);
-                                format!("Error: {}", e)
-                            }
-                        }
-                    } else {
-                        format!("Tool not found: {}", tool_name)
+                    let prepared = harness.prepare(call, &mut message_id);
+                    yield AgentEvent::ToolStart {
+                        tool_call_id: prepared.tool_call_id.clone(),
+                        tool: prepared.tool_name.clone(),
+                        input: prepared.args.clone(),
+                        metadata: prepared.start_metadata.clone(),
                     };
 
-                    yield AgentEvent::ToolFinish { tool: tool_name.clone(), output: result_content.clone() };
+                    let completed = harness.execute_one(prepared).await;
 
-                    let media_parts = extract_media_parts(&result_content);
+                    yield AgentEvent::ToolFinish {
+                        tool_call_id: completed.tool_call_id.clone(),
+                        tool: completed.tool_name.clone(),
+                        output: completed.output.clone(),
+                    };
+
+                    let result_tokens = compaction::estimate_tokens(&completed.output);
+                    turn_tool_tokens += result_tokens;
+
+                    pending_consolidation_ids.push(completed.tool_call_id.clone());
+                    pending_consolidation_names.push(completed.tool_name.clone());
+                    pending_consolidation_contents.push(completed.output.clone());
+
+                    let media_parts = extract_media_parts(&completed.output);
                     self.memory.add_message(Message::Tool {
-                        tool_call_id: call_id,
-                        tool_name: Some(tool_name.clone()),
-                        content: result_content,
+                        tool_call_id: completed.tool_call_id,
+                        tool_name: Some(completed.tool_name.clone()),
+                        content: completed.output,
                         media: media_parts,
-                    }).await;
+                    }).await
+                        .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
+
+                    if turn_tool_tokens > turn_tool_budget && pending_consolidation_ids.len() >= 3 {
+                        info!(
+                            "Tool output consolidation triggered ({} tokens > {} budget, {} calls)",
+                            turn_tool_tokens, turn_tool_budget, pending_consolidation_ids.len()
+                        );
+
+                        let input = ConsolidationInput {
+                            tool_call_ids: pending_consolidation_ids.clone(),
+                            tool_names: pending_consolidation_names.clone(),
+                            tool_contents: pending_consolidation_contents.clone(),
+                        };
+                        let raw_text = build_consolidation_text(&input);
+                        let file_path = save_consolidation_file(&raw_text);
+                        let prompt_messages = build_consolidation_prompt(&raw_text, input.tool_call_ids.len());
+
+                        let provider = self.llm.clone();
+                        match provider.stream_response(&prompt_messages, &[]).await {
+                            Ok(mut summary_stream) => {
+                                let mut summary_text = String::new();
+                                while let Some(event_result) = summary_stream.next().await {
+                                    if let Ok(ProviderEvent::ContentDelta { delta }) = event_result {
+                                        summary_text.push_str(&delta);
+                                    }
+                                }
+
+                                if !summary_text.is_empty() {
+                                    let mut all_messages = self.memory.messages().to_vec();
+                                    apply_consolidation_to_memory(
+                                        &mut all_messages,
+                                        &pending_consolidation_ids,
+                                        &summary_text,
+                                        &file_path,
+                                    );
+                                    self.memory.replace(all_messages).await
+                                        .map_err(|e| anyhow::anyhow!("Memory::replace failed: {}", e))?;
+                                    info!("Consolidated {} tool outputs into summary ({} chars)", pending_consolidation_ids.len(), summary_text.len());
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Consolidation summarization failed: {}, keeping original outputs", e);
+                            }
+                        }
+
+                        pending_consolidation_ids.clear();
+                        pending_consolidation_names.clear();
+                        pending_consolidation_contents.clear();
+                        turn_tool_tokens = 0;
+                    }
+                    call_index += 1;
                 }
             }
         }
@@ -409,7 +751,11 @@ When constructing the summary, try to stick to this template:
         if summary_text.is_empty() {
             compaction::prune(self.memory.messages_mut());
             if is_overflow(
-                self.memory.messages().iter().map(|m| estimate_message_tokens(m)).sum(),
+                self.memory
+                    .messages()
+                    .iter()
+                    .map(estimate_message_tokens)
+                    .sum(),
                 self.context_limit,
             ) {
                 return Err(anyhow::anyhow!(
@@ -448,8 +794,30 @@ When constructing the summary, try to stick to this template:
             new_history.push(last_user_msg.clone());
         }
 
-        self.memory.replace(new_history).await;
+        self.memory
+            .replace(new_history)
+            .await
+            .map_err(|e| anyhow::anyhow!("Memory::replace failed: {}", e))?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod normalization_tests {
+    use super::normalize_assistant_output;
+
+    #[test]
+    fn strips_think_analysis_and_reasoning_blocks() {
+        let raw = "<think>internal</think> {\"ok\":true} <analysis>drop</analysis> <reasoning>drop2</reasoning>";
+        let cleaned = normalize_assistant_output(raw);
+        assert_eq!(cleaned, "{\"ok\":true}");
+    }
+
+    #[test]
+    fn preserves_regular_text_when_no_tags_present() {
+        let raw = "plain response";
+        let cleaned = normalize_assistant_output(raw);
+        assert_eq!(cleaned, "plain response");
     }
 }
 
@@ -460,7 +828,7 @@ impl ToolRegistry for Agent {
         name: &str,
         args: serde_json::Value,
         ctx: &ToolContext,
-) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let tool = self.tools.iter().find(|t| t.name() == name);
         match tool {
             Some(t) => t.execute(args, ctx).await,
@@ -499,6 +867,19 @@ impl AgentBuilder {
         self
     }
 
+    pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn tool_context_metadata(
+        mut self,
+        metadata: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        self.tool_context_metadata = metadata;
+        self
+    }
+
     pub fn memory(mut self, memory: Box<dyn Memory>) -> Self {
         self.memory = Some(memory);
         self
@@ -514,7 +895,10 @@ impl AgentBuilder {
             memory: self.memory.unwrap_or_else(|| Box::new(Vec::new())),
             context_limit: self.context_limit,
             truncation: TruncationService::new(),
-            session_id: Uuid::new_v4().to_string(),
+            session_id: self
+                .session_id
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            tool_context_metadata: self.tool_context_metadata,
         };
         Ok(agent)
     }

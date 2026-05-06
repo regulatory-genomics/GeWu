@@ -9,6 +9,7 @@
 //! - [`Capabilities`] - Model capabilities for input/output modalities
 //! - [`ToolResult`] - Structured result from tool execution
 //! - [`ToolContext`] - Execution context passed to tools
+//! - [`ExecutionRun`] / [`ExecutionEvent`] - Observable execution trace records
 //! - [`FileAttachment`] - File attachment in tool results
 //! - [`TruncationResult`] - Result of output truncation
 
@@ -159,9 +160,19 @@ pub enum AgentEvent {
     /// A delta of text content from the model.
     ContentDelta { delta: String },
     /// The agent has started executing a tool.
-    ToolStart { tool: String, input: String },
+    ToolStart {
+        tool_call_id: String,
+        tool: String,
+        input: String,
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        metadata: serde_json::Value,
+    },
     /// A tool has finished executing.
-    ToolFinish { tool: String, output: String },
+    ToolFinish {
+        tool_call_id: String,
+        tool: String,
+        output: String,
+    },
     /// The agent has finished with a final response.
     Finish { response: String },
     /// An error occurred during agent execution.
@@ -233,6 +244,105 @@ pub struct ToolResult {
     pub output_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolExecutionPolicy {
+    Serial,
+    ParallelSafe,
+    Exclusive,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionRunKind {
+    ChatMessage,
+    Tool,
+    Workflow,
+    WorkflowNode,
+    Specialist,
+}
+
+impl ExecutionRunKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ChatMessage => "chat_message",
+            Self::Tool => "tool",
+            Self::Workflow => "workflow",
+            Self::WorkflowNode => "workflow_node",
+            Self::Specialist => "specialist",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "chat_message" => Some(Self::ChatMessage),
+            "tool" => Some(Self::Tool),
+            "workflow" => Some(Self::Workflow),
+            "workflow_node" => Some(Self::WorkflowNode),
+            "specialist" => Some(Self::Specialist),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionRunStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Skipped,
+}
+
+impl ExecutionRunStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "running" => Some(Self::Running),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            "skipped" => Some(Self::Skipped),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionRun {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub session_id: Option<String>,
+    pub kind: ExecutionRunKind,
+    pub name: String,
+    pub status: ExecutionRunStatus,
+    pub input_json: Option<serde_json::Value>,
+    pub output_json: Option<serde_json::Value>,
+    pub error: Option<String>,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionEvent {
+    pub id: String,
+    pub run_id: String,
+    pub event_type: String,
+    pub payload_json: serde_json::Value,
+    pub created_at: i64,
+}
+
 impl ToolResult {
     pub fn new(title: impl Into<String>, output: impl Into<String>) -> Self {
         Self {
@@ -250,6 +360,7 @@ impl ToolResult {
 pub struct ToolContext {
     pub session_id: String,
     pub message_id: String,
+    pub tool_call_id: Option<String>,
     pub abort: Arc<std::sync::atomic::AtomicBool>,
     pub metadata: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -259,9 +370,15 @@ impl ToolContext {
         Self {
             session_id: session_id.into(),
             message_id: message_id.into(),
+            tool_call_id: None,
             abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metadata: Default::default(),
         }
+    }
+
+    pub fn with_tool_call_id(mut self, tool_call_id: impl Into<String>) -> Self {
+        self.tool_call_id = Some(tool_call_id.into());
+        self
     }
 
     pub fn is_aborted(&self) -> bool {
@@ -278,4 +395,257 @@ pub struct TruncationResult {
     pub content: String,
     pub truncated: bool,
     pub output_path: Option<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
+// Capability / tool-provider types
+// ---------------------------------------------------------------------------
+
+/// Metadata describing a capability (logical tool) exposed by a `ToolProvider`.
+///
+/// Capability names are the string ids referenced by specialists. A descriptor
+/// carries the human-readable description, an optional JSON schema for the
+/// tool's input, and a provider-kind tag ("builtin", "plugin", "cli", "script",
+/// "mcp", "http", "python", "container", "database", "graph").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityDescriptor {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub provider_kind: String,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub input_schema: serde_json::Value,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
+}
+
+impl CapabilityDescriptor {
+    pub fn new(name: impl Into<String>, provider_kind: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: String::new(),
+            provider_kind: provider_kind.into(),
+            input_schema: serde_json::Value::Null,
+            metadata: serde_json::Value::Null,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Specialist assembly types
+// ---------------------------------------------------------------------------
+
+/// Declarative description of a specialist agent.
+///
+/// Used by both builtins and plugins — one type, one assembly path.
+/// Capabilities are string-based IDs resolved by `ToolFactory` implementations
+/// at assembly time.
+///
+/// Well-known builtin capability IDs:
+/// `"read_file"`, `"write_file"`, `"edit_file"`, `"glob"`, `"bash"`,
+/// `"bash_safe"`, `"grep"`, `"web_fetch"`, `"web_search"`, `"list"`,
+/// `"code_search"`, `"todo"`, `"task"`, `"report_result"`
+#[derive(Debug, Clone)]
+pub struct SpecialistDescriptor {
+    pub id: String,
+    pub description: String,
+    pub capabilities: Vec<String>,
+    pub skills: Vec<String>,
+    pub system_prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecialistExecutionRequest {
+    pub task_id: String,
+    pub specialist_id: String,
+    pub session_id: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    #[serde(default)]
+    pub metadata_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolExecutionRecord {
+    pub tool_name: String,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecialistAgentEventRecord {
+    pub event_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    pub payload_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecialistLlmIoRecord {
+    pub system_prompt: String,
+    pub user_prompt: String,
+    pub final_response: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecialistExecutionEnvelope {
+    pub task_id: String,
+    pub session_id: String,
+    pub specialist_id: String,
+    pub status: TaskStatus,
+    pub attempt: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_json: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_outputs: Vec<ToolExecutionRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<SpecialistAgentEventRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub llm_io: Vec<SpecialistLlmIoRecord>,
+}
+
+// ---------------------------------------------------------------------------
+// Durable task types
+// ---------------------------------------------------------------------------
+
+/// Lifecycle status of a durable task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskStatus {
+    Ready,
+    Running,
+    Blocked,
+    Succeeded,
+    Failed,
+}
+
+impl TaskStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::Blocked => "blocked",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "ready" => Some(Self::Ready),
+            "running" => Some(Self::Running),
+            "blocked" => Some(Self::Blocked),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Runtime-level task execution state. This answers whether execution is still
+/// running, ended normally, or ended through an operational failure/cancel path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskExecutionStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+    Timeout,
+    Interrupted,
+}
+
+impl TaskExecutionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+            Self::Timeout => "timeout",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "canceled" => Some(Self::Canceled),
+            "timeout" => Some(Self::Timeout),
+            "interrupted" => Some(Self::Interrupted),
+            _ => None,
+        }
+    }
+}
+
+/// Result-level task quality state. This answers whether a completed execution
+/// actually produced a usable task result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskResultStatus {
+    Pending,
+    Accepted,
+    Empty,
+    Incomplete,
+    Invalid,
+    NeedsReview,
+}
+
+impl TaskResultStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+            Self::Empty => "empty",
+            Self::Incomplete => "incomplete",
+            Self::Invalid => "invalid",
+            Self::NeedsReview => "needs_review",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "accepted" => Some(Self::Accepted),
+            "empty" => Some(Self::Empty),
+            "incomplete" => Some(Self::Incomplete),
+            "invalid" => Some(Self::Invalid),
+            "needs_review" => Some(Self::NeedsReview),
+            _ => None,
+        }
+    }
+}
+
+/// Persisted record for a durable task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRecord {
+    pub task_id: String,
+    pub specialist_id: String,
+    pub prompt: String,
+    pub status: TaskStatus,
+    pub execution_status: TaskExecutionStatus,
+    pub result_status: TaskResultStatus,
+    pub attempt: u32,
+    pub block_reason: Option<String>,
+    pub result_json: Option<String>,
+    pub finish_reason: Option<String>,
+    pub error: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub child_session_id: Option<String>,
+    pub root_run_id: Option<String>,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
 }

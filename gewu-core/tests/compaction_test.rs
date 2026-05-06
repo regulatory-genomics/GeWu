@@ -104,7 +104,7 @@ async fn test_compaction_trigger() {
         .build()
         .unwrap();
 
-    agent.reset().await; // Ensure system prompt is in history
+    agent.reset().await.unwrap(); // Ensure system prompt is in history
 
     // Fill history with junk to exceed 100 tokens
     // 1 token ~ 4 chars. 100 tokens ~ 400 chars.
@@ -114,7 +114,8 @@ async fn test_compaction_trigger() {
         .add_message(Message::User {
             content: vec![gewu_core::types::ContentPart::Text { text: long_text }],
         })
-        .await;
+        .await
+        .unwrap();
 
     // This call should trigger compaction because history > 100
     let mut stream = Box::pin(agent.ask("Hello"));

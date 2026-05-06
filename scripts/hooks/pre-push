@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# pre-push hook for GeWu
+# Enable with: git config core.hooksPath scripts/hooks
+set -euo pipefail
+
+echo "[pre-push] cargo fmt --all -- --check"
+cargo fmt --all -- --check
+
+echo "[pre-push] cargo test --workspace"
+cargo test --workspace
+
+echo "[pre-push] OK"

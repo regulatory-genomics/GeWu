@@ -4,9 +4,9 @@ use futures::Stream;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::marker::Send as StdSend;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::marker::Send as StdSend;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -143,8 +143,7 @@ impl StreamWriter {
 #[derive(Clone)]
 pub struct NodeHandler<S: State> {
     name: String,
-    handler:
-        Arc<dyn Fn(S) -> Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>> + Send + Sync>,
+    handler: Arc<dyn Fn(S) -> Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>> + Send + Sync>,
     subgraph: Option<Box<CompiledGraph<S>>>,
 }
 
@@ -166,13 +165,12 @@ impl<S: State + 'static> NodeHandler<S> {
     {
         let handler = Arc::new(handler);
         let wrapper: Arc<
-                dyn Fn(S) -> Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>> + Send + Sync,
-            > = Arc::new(move |state: S| {
-                let h = handler.clone();
-                Box::pin(async move {
-                    h(state).await
-                }) as Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>>
-            });
+            dyn Fn(S) -> Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>> + Send + Sync,
+        > = Arc::new(move |state: S| {
+            let h = handler.clone();
+            Box::pin(async move { h(state).await })
+                as Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>>
+        });
         Self {
             name: name.to_string(),
             handler: wrapper,
@@ -187,12 +185,11 @@ impl<S: State + 'static> NodeHandler<S> {
     /// as a partial update.
     pub fn with_subgraph(subgraph: CompiledGraph<S>) -> Self {
         let wrapper: Arc<
-                dyn Fn(S) -> Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>> + Send + Sync,
-            > = Arc::new(move |_: S| {
-                Box::pin(async move {
-                    NodeResult::map_partial(S::Partial::default())
-                }) as Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>>
-            });
+            dyn Fn(S) -> Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>> + Send + Sync,
+        > = Arc::new(move |_: S| {
+            Box::pin(async move { NodeResult::map_partial(S::Partial::default()) })
+                as Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>>
+        });
         Self {
             name: subgraph.entry_point.clone().unwrap_or_default(),
             handler: wrapper,
@@ -298,17 +295,17 @@ impl<S: State + 'static> StateGraph<S> {
     /// executing `end`. Edges are evaluated after the source node
     /// returns, and all outgoing edges are followed.
     ///
-    /// # Panics
-    /// Panics if `start` is `START` or `end` is `END`.
-    pub fn add_edge(&mut self, start: &str, end: &str) -> &mut Self {
+    /// # Errors
+    /// Returns `GraphError::ExecutionError` if `start` is `END` or `end` is `START`.
+    pub fn add_edge(&mut self, start: &str, end: &str) -> Result<&mut Self, GraphError> {
         if start == END {
-            panic!("START cannot be END node");
+            return Err(GraphError::ExecutionError("END cannot be used as edge start".into()));
         }
         if end == START {
-            panic!("END cannot be START node");
+            return Err(GraphError::ExecutionError("START cannot be used as edge end".into()));
         }
         self.edges.insert((start.to_string(), end.to_string()));
-        self
+        Ok(self)
     }
 
     /// Adds a conditional edge that routes execution based on the current state.
@@ -436,11 +433,7 @@ impl<S: State + 'static> CompiledGraph<S> {
         self.ainvoke_internal(input, 0).await
     }
 
-    async fn ainvoke_internal(
-        &self,
-        input: S,
-        depth: usize,
-    ) -> Result<S, GraphError> {
+    async fn ainvoke_internal(&self, input: S, depth: usize) -> Result<S, GraphError> {
         if depth > MAX_SUBGRAPH_DEPTH {
             return Err(GraphError::SubgraphDepthLimitExceeded(MAX_SUBGRAPH_DEPTH));
         }
@@ -463,10 +456,11 @@ impl<S: State + 'static> CompiledGraph<S> {
             if let Some(subgraph) = &handler.subgraph {
                 let subgraph = subgraph.clone();
                 let new_depth = depth + 1;
-                current_state = Box::pin(async move {
-                    subgraph.ainvoke_internal(current_state, new_depth).await
-                })
-                .await?;
+                current_state =
+                    Box::pin(
+                        async move { subgraph.ainvoke_internal(current_state, new_depth).await },
+                    )
+                    .await?;
             } else {
                 let result = (handler.handler)(current_state.clone()).await;
                 let is_send = matches!(result, NodeResult::Send(_));
@@ -546,28 +540,25 @@ impl<S: State + 'static> CompiledGraph<S> {
 
         for result in results {
             match result {
-                Ok(SendResult::Partial(node_result)) => {
-                    match node_result {
-                        NodeResult::Partial(partial) => {
-                            current_state = current_state.merge(partial);
-                        }
-                        NodeResult::Send(nested_sends) => {
-                            let nested_sends = nested_sends;
-                            let this = self;
-                            let d = depth + 1;
-                            current_state = Box::pin(async move {
-                                this.process_sends(nested_sends, current_state, d).await
-                            })
-                            .await?;
-                        }
-                        NodeResult::Custom(_) => {}
+                Ok(SendResult::Partial(node_result)) => match node_result {
+                    NodeResult::Partial(partial) => {
+                        current_state = current_state.merge(partial);
                     }
-                }
+                    NodeResult::Send(nested_sends) => {
+                        let nested_sends = nested_sends;
+                        let this = self;
+                        let d = depth + 1;
+                        current_state = Box::pin(async move {
+                            this.process_sends(nested_sends, current_state, d).await
+                        })
+                        .await?;
+                    }
+                    NodeResult::Custom(_) => {}
+                },
                 Ok(SendResult::Subgraph(subgraph, state)) => {
-                    current_state = Box::pin(async {
-                        subgraph.ainvoke_internal(state, depth + 1).await
-                    })
-                    .await?;
+                    current_state =
+                        Box::pin(async { subgraph.ainvoke_internal(state, depth + 1).await })
+                            .await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -711,10 +702,7 @@ impl<S: State + 'static> CompiledGraph<S> {
     ///
     /// This is a convenience method that filters the stream to only
     /// yield `StreamOutput::Value` items, ignoring updates and other events.
-    pub async fn astream(
-        &self,
-        input: S,
-    ) -> impl Stream<Item = Result<S, GraphError>> + '_ {
+    pub async fn astream(&self, input: S) -> impl Stream<Item = Result<S, GraphError>> + '_ {
         self.stream(input).filter_map(|r| async move {
             match r {
                 Ok(StreamOutput::Value(v)) => Some(Ok(v)),
@@ -734,8 +722,8 @@ impl<S: State + 'static> CompiledGraph<S> {
     /// can be computed concurrently, with state merges happening between
     /// supersteps.
     ///
-    /// # Panics
-    /// Panics if the graph contains subgraph nodes (subgraphs are not supported).
+    /// # Errors
+    /// Returns `GraphError::ExecutionError` if the graph contains subgraph nodes.
     pub async fn invoke_parallel(&self, input: S) -> Result<S, GraphError> {
         let entry = self.entry_point.clone().ok_or(GraphError::NoEntryPoint)?;
 
@@ -770,8 +758,7 @@ impl<S: State + 'static> CompiledGraph<S> {
                 break;
             }
 
-            let results: Vec<(String, NodeResult<S>)> =
-                futures::future::join_all(futures).await;
+            let results: Vec<(String, NodeResult<S>)> = futures::future::join_all(futures).await;
 
             let mut next_ready: Vec<String> = Vec::new();
 
@@ -829,7 +816,11 @@ impl<S: State + 'static> CompiledGraph<S> {
         if let Some(conditions) = self.conditional_edges.get(node_name) {
             for cond in conditions {
                 let path_result = (cond.path_fn)(state);
-                let dest = cond.path_map.get(&path_result).cloned().unwrap_or(path_result);
+                let dest = cond
+                    .path_map
+                    .get(&path_result)
+                    .cloned()
+                    .unwrap_or(path_result);
                 outgoing.push(dest);
             }
         }

@@ -1,6 +1,6 @@
 //! Topic channel implementation for FIFO queue behavior.
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -49,9 +49,7 @@ impl<T: Clone + Send + Sync + Serialize + DeserializeOwned + 'static> TopicChann
     }
 }
 
-impl<T: Clone + Send + Sync + Serialize + DeserializeOwned + 'static> Default
-    for TopicChannel<T>
-{
+impl<T: Clone + Send + Sync + Serialize + DeserializeOwned + 'static> Default for TopicChannel<T> {
     fn default() -> Self {
         Self::new(100)
     }

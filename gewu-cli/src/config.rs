@@ -8,11 +8,32 @@ use gewu_tools::mcp::types::McpServerConfig;
 #[derive(Debug, Deserialize, Default)]
 pub struct Config {
     pub base_url: Option<String>,
+    pub endpoint: Option<String>,
     pub api_key: Option<String>,
     pub model: Option<String>,
+    #[serde(
+        alias = "maxTokens",
+        alias = "max_output_tokens",
+        alias = "maxOutputTokens"
+    )]
+    pub max_output_tokens: Option<u32>,
     pub provider: Option<String>,
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
+    #[serde(default)]
+    pub plugins: std::collections::HashMap<String, serde_json::Value>,
+    #[serde(rename = "specialistDirs", default)]
+    pub specialist_dirs: Vec<String>,
+    #[serde(rename = "workflowDirs", default)]
+    pub workflow_dirs: Vec<String>,
+    #[serde(rename = "toolProviderDirs", default)]
+    pub tool_provider_dirs: Vec<String>,
+    #[serde(rename = "runtimePluginDirs", default)]
+    pub runtime_plugin_dirs: Vec<String>,
+    #[serde(rename = "skillDirs", default)]
+    pub skill_dirs: Vec<String>,
+    #[serde(rename = "tachyonBrowser", default)]
+    pub tachyon_browser: serde_json::Value,
 }
 
 #[derive(Debug)]

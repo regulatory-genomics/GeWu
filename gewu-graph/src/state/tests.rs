@@ -126,21 +126,21 @@ mod tests {
 
     #[test]
     fn test_last_value_default() {
-        let reducer = LastValue::default();
+        let reducer = LastValue;
         let result = reducer.reduce(5, 10);
         assert_eq!(result, 10);
     }
 
     #[test]
     fn test_append_default() {
-        let reducer = Append::default();
+        let reducer = Append;
         let result = reducer.reduce(vec![], vec![1, 2]);
         assert_eq!(result, vec![1, 2]);
     }
 
     #[test]
     fn test_sum_default() {
-        let reducer = Sum::default();
+        let reducer = Sum;
         let result = reducer.reduce(5, 3);
         assert_eq!(result, 8);
     }

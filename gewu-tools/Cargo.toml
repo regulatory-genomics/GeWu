@@ -2,6 +2,7 @@
 name = "gewu-tools"
 version = "0.1.0"
 edition = "2024"
+description = "Built-in tool implementations (file I/O, search, web fetch, etc.) for GeWu agents"
 
 [dependencies]
 gewu-core = { path = "../gewu-core" }
@@ -12,6 +13,7 @@ serde_json = "1.0"
 thiserror = "2.0"
 schemars = "0.8"
 tokio = { version = "1", features = ["full"] }
+dirs = "6.0.0"
 glob = "0.3"
 grep = "0.4"
 ignore = "0.4"
@@ -26,3 +28,6 @@ regex = "1.0"
 [dev-dependencies]
 tempfile = "3.10"
 mockito = "1.4"
+
+[lints]
+workspace = true

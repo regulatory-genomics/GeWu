@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::document::chunker::{ChildChunk, DocumentChunker, Bm25SparseVector};
+use crate::document::chunker::{Bm25SparseVector, ChildChunk, DocumentChunker};
 use crate::document::pdf_processor::PdfProcessor;
 use crate::retrieval::parent_store::ParentStore;
 use crate::retrieval::qdrant_store::QdrantStore;
@@ -62,7 +62,8 @@ impl DocumentIndexer {
         for md_path in &md_entries {
             info!("Reading markdown file: {:?}", md_path);
             let content = std::fs::read_to_string(md_path)?;
-            let source_name = md_path.file_stem()
+            let source_name = md_path
+                .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "unknown".to_string());
 
@@ -82,7 +83,8 @@ impl DocumentIndexer {
         for pdf_path in &pdf_entries {
             info!("Processing PDF file: {:?}", pdf_path);
             let markdown = pdf_processor.process(pdf_path)?;
-            let source_name = pdf_path.file_stem()
+            let source_name = pdf_path
+                .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "unknown".to_string());
 
@@ -118,10 +120,16 @@ impl DocumentIndexer {
         }
 
         let sparse_vectors: Option<Vec<Bm25SparseVector>> = if self.config.enable_sparse {
-            info!("Computing SPLADE sparse vectors for {} chunks", all_child_chunks.len());
+            info!(
+                "Computing SPLADE sparse vectors for {} chunks",
+                all_child_chunks.len()
+            );
             let mut sparse = Vec::new();
             for chunk in &all_child_chunks {
-                let sv = self.vector_store.compute_sparse_from_text(&chunk.content).await?;
+                let sv = self
+                    .vector_store
+                    .compute_sparse_from_text(&chunk.content)
+                    .await?;
                 sparse.push(sv);
             }
             Some(sparse)
@@ -130,7 +138,9 @@ impl DocumentIndexer {
         };
 
         info!("Adding {} chunks to vector store", all_child_chunks.len());
-        self.vector_store.add_chunks(&all_child_chunks, sparse_vectors.as_deref()).await?;
+        self.vector_store
+            .add_chunks(&all_child_chunks, sparse_vectors.as_deref())
+            .await?;
 
         info!("Indexing complete!");
         Ok(())
@@ -144,7 +154,9 @@ impl DocumentIndexer {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let path = md_path.as_ref();
         let content = std::fs::read_to_string(path)?;
-        let source_name = path.file_stem().map(|s| s.to_string_lossy().to_string())
+        let source_name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
         let parent_chunks = self.chunker.create_parent_chunks(&content, &source_name);
@@ -161,7 +173,11 @@ impl DocumentIndexer {
         let sparse_vectors: Option<Vec<Bm25SparseVector>> = if self.config.enable_sparse {
             let mut sparse = Vec::new();
             for chunk in &all_child_chunks {
-                sparse.push(self.vector_store.compute_sparse_from_text(&chunk.content).await?);
+                sparse.push(
+                    self.vector_store
+                        .compute_sparse_from_text(&chunk.content)
+                        .await?,
+                );
             }
             Some(sparse)
         } else {
@@ -169,17 +185,16 @@ impl DocumentIndexer {
         };
 
         if !all_child_chunks.is_empty() {
-            self.vector_store.add_chunks(&all_child_chunks, sparse_vectors.as_deref()).await?;
+            self.vector_store
+                .add_chunks(&all_child_chunks, sparse_vectors.as_deref())
+                .await?;
         }
 
         for parent in parent_chunks {
             self.parent_store.save(&parent)?;
         }
 
-        info!(
-            "Indexed {} child chunks",
-            all_child_chunks.len()
-        );
+        info!("Indexed {} child chunks", all_child_chunks.len());
 
         Ok(())
     }
@@ -193,7 +208,9 @@ impl DocumentIndexer {
         let path = pdf_path.as_ref();
         let pdf_processor = PdfProcessor::new();
         let markdown = pdf_processor.process(path)?;
-        let source_name = path.file_stem().map(|s| s.to_string_lossy().to_string())
+        let source_name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
         if markdown.trim().is_empty() {
@@ -215,7 +232,11 @@ impl DocumentIndexer {
         let sparse_vectors: Option<Vec<Bm25SparseVector>> = if self.config.enable_sparse {
             let mut sparse = Vec::new();
             for chunk in &all_child_chunks {
-                sparse.push(self.vector_store.compute_sparse_from_text(&chunk.content).await?);
+                sparse.push(
+                    self.vector_store
+                        .compute_sparse_from_text(&chunk.content)
+                        .await?,
+                );
             }
             Some(sparse)
         } else {
@@ -223,27 +244,30 @@ impl DocumentIndexer {
         };
 
         if !all_child_chunks.is_empty() {
-            self.vector_store.add_chunks(&all_child_chunks, sparse_vectors.as_deref()).await?;
+            self.vector_store
+                .add_chunks(&all_child_chunks, sparse_vectors.as_deref())
+                .await?;
         }
 
         for parent in parent_chunks {
             self.parent_store.save(&parent)?;
         }
 
-        info!(
-            "Indexed {} child chunks from PDF",
-            all_child_chunks.len()
-        );
+        info!("Indexed {} child chunks from PDF", all_child_chunks.len());
 
         Ok(())
     }
 
     #[allow(dead_code)]
-    pub async fn delete_collection(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn delete_collection(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.vector_store.delete_collection().await
     }
 
-    pub async fn recreate_collection(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn recreate_collection(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.vector_store.delete_collection().await?;
         self.vector_store.ensure_collection().await?;
         Ok(())
@@ -258,7 +282,8 @@ pub fn pdf_to_markdown(
     let processor = crate::document::pdf_processor::PdfProcessor::new();
     let markdown = processor.process(&pdf_path)?;
 
-    let output_path = output_dir.as_ref()
+    let output_path = output_dir
+        .as_ref()
         .join(pdf_path.as_ref().file_stem().unwrap())
         .with_extension("md");
 

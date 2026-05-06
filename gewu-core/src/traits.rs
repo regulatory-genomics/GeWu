@@ -41,11 +41,17 @@
 //! }
 //! ```
 
-use crate::types::{Message, ProviderEvent, ToolContext, ToolResult};
+use crate::types::{
+    CapabilityDescriptor, Message, ProviderEvent, SpecialistDescriptor, ToolContext,
+    ToolExecutionPolicy, ToolResult,
+};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use schemars::schema::RootSchema;
+use serde_json::Value;
+use sqlx::SqlitePool;
 use std::error::Error;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[async_trait]
@@ -55,6 +61,18 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
 
     fn schema(&self) -> RootSchema;
+
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::Serial
+    }
+
+    fn start_metadata(
+        &self,
+        _args: &str,
+        _ctx: &ToolContext,
+    ) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
+        Ok(serde_json::Value::Null)
+    }
 
     async fn init(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok(())
@@ -111,13 +129,14 @@ pub trait Memory: Send + Sync {
 
     fn messages(&self) -> &[Message];
 
-    async fn add_message(&mut self, message: Message);
+    async fn add_message(&mut self, message: Message) -> Result<(), Box<dyn Error + Send + Sync>>;
 
-    async fn clear(&mut self);
+    async fn clear(&mut self) -> Result<(), Box<dyn Error + Send + Sync>>;
 
     fn messages_mut(&mut self) -> &mut [Message];
 
-    async fn replace(&mut self, messages: Vec<Message>);
+    async fn replace(&mut self, messages: Vec<Message>)
+    -> Result<(), Box<dyn Error + Send + Sync>>;
 }
 
 #[async_trait]
@@ -133,19 +152,131 @@ impl Memory for Vec<Message> {
         self
     }
 
-    async fn add_message(&mut self, message: Message) {
+    async fn add_message(&mut self, message: Message) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.push(message);
+        Ok(())
     }
 
-    async fn clear(&mut self) {
+    async fn clear(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.clear();
+        Ok(())
     }
 
     fn messages_mut(&mut self) -> &mut [Message] {
         self.as_mut_slice()
     }
 
-    async fn replace(&mut self, messages: Vec<Message>) {
+    async fn replace(
+        &mut self,
+        messages: Vec<Message>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         *self = messages;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plugin system traits
+// ---------------------------------------------------------------------------
+
+/// Context passed to tool factories during specialist assembly.
+///
+/// Contains the shared resources that tool constructors typically need.
+pub struct AssemblyContext {
+    pub working_directory: PathBuf,
+    pub provider: Arc<dyn LlmProvider>,
+    pub pool: SqlitePool,
+    pub metadata_json: Value,
+}
+
+/// Platform-level context provided to plugins during initialization.
+///
+/// Contains shared infrastructure resources and plugin-specific configuration
+/// so plugins don't need to reach into global environment state.
+pub struct PluginPlatformContext {
+    pub provider: Arc<dyn LlmProvider>,
+    pub pool: SqlitePool,
+    pub working_directory: PathBuf,
+    pub plugin_config: Value,
+}
+
+/// A factory that produces tool instances from capability names.
+///
+/// Implement this trait to provide custom tools that can be assembled into
+/// specialists. Each factory declares which capability names it handles and
+/// creates the corresponding tool instances on demand.
+pub trait ToolFactory: Send + Sync {
+    /// The capability names this factory handles (e.g., `["count_lines"]`).
+    fn capabilities(&self) -> Vec<String>;
+
+    /// Create tool instances for the given capability name.
+    fn create_tools(
+        &self,
+        capability: &str,
+        ctx: &AssemblyContext,
+    ) -> Result<Vec<Box<dyn Tool>>, Box<dyn Error + Send + Sync>>;
+}
+
+/// A unified source of tools, keyed by capability id.
+///
+/// `ToolProvider` is a strict superset of `ToolFactory`: in addition to naming
+/// capabilities, it supplies rich `CapabilityDescriptor`s (kind, description,
+/// schema, metadata). This is the abstraction used by `CapabilityRegistry` to
+/// resolve capabilities declared in manifests.
+///
+/// Any `ToolFactory` can be adapted via
+/// `gewu_runtime::capability::ToolFactoryProvider`.
+pub trait ToolProvider: Send + Sync {
+    /// A short identifier for the provider kind:
+    /// "builtin" | "plugin" | "cli" | "script" | "mcp" | "http" | "python"
+    /// | "container" | "database" | "graph".
+    fn kind(&self) -> &str;
+
+    /// Optional stable id for this provider instance (used for diagnostics and
+    /// namespacing). Defaults to the kind.
+    fn id(&self) -> &str {
+        self.kind()
+    }
+
+    /// The capabilities this provider handles.
+    fn capabilities(&self) -> Vec<CapabilityDescriptor>;
+
+    /// Build concrete tool(s) for a capability name. Returning an empty vec
+    /// signals the capability is not handled.
+    fn build_tools(
+        &self,
+        capability: &str,
+        ctx: &AssemblyContext,
+    ) -> Result<Vec<Box<dyn Tool>>, Box<dyn Error + Send + Sync>>;
+}
+
+/// A plugin that provides tool factories and/or specialist descriptors.
+///
+/// This is the single integration point for external crates. Implement this
+/// trait and pass it to `GeWuRuntime::builder().register_plugin(...)`.
+pub trait Plugin: Send + Sync {
+    /// A human-readable name for this plugin.
+    fn name(&self) -> &str;
+
+    /// Tool factories provided by this plugin.
+    fn tool_factories(&self) -> Vec<Box<dyn ToolFactory>>;
+
+    /// Specialist descriptors provided by this plugin.
+    fn specialist_descriptors(&self) -> Vec<SpecialistDescriptor>;
+
+    /// Optional directory containing YAML specialist manifests bundled with
+    /// this plugin. Loaded by `CapabilityRegistry` / `SpecialistManifestLoader`
+    /// when the runtime is built. Returning `None` means the plugin ships no
+    /// manifests (the default).
+    fn specialist_manifest_dir(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// Optional directory containing YAML workflow manifests bundled with
+    /// this plugin. Loaded by `WorkflowManifestLoader` when the runtime is
+    /// built. Returning `None` means the plugin ships no workflows (the
+    /// default).
+    fn workflow_manifest_dir(&self) -> Option<PathBuf> {
+        None
     }
 }

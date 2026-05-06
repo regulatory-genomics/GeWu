@@ -170,13 +170,19 @@ fn build_config(cli: &Cli, config_file: &Option<ConfigFile>) -> Config {
     let mut config = Config::new();
 
     if let Some(cf) = config_file {
-        config.qdrant_url = cf.qdrant_url.clone()
+        config.qdrant_url = cf
+            .qdrant_url
+            .clone()
             .unwrap_or_else(|| "http://localhost:6334".to_string());
         config.qdrant_api_key = cf.qdrant_api_key.clone();
-        config.parent_store_path = cf.parent_store_path.as_ref()
+        config.parent_store_path = cf
+            .parent_store_path
+            .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("parent_store"));
-        config.child_collection = cf.collection.clone()
+        config.child_collection = cf
+            .collection
+            .clone()
             .unwrap_or_else(|| "document_child_chunks".to_string());
         config.chunk_size = cf.chunk_size.unwrap_or(500);
         config.chunk_overlap = cf.chunk_overlap.unwrap_or(100);
@@ -185,14 +191,20 @@ fn build_config(cli: &Cli, config_file: &Option<ConfigFile>) -> Config {
         config.max_iterations = cf.max_iterations.unwrap_or(10);
         config.max_tool_calls = cf.max_tool_calls.unwrap_or(8);
         config.similarity_threshold = cf.similarity_threshold.unwrap_or(0.7);
-        config.docs_dir = cf.docs_dir.as_ref()
+        config.docs_dir = cf
+            .docs_dir
+            .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("markdown_docs"));
-        config.parent_store_path = cf.output_dir.as_ref()
+        config.parent_store_path = cf
+            .output_dir
+            .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("parent_store"));
         config.enable_sparse = cf.enable_sparse.unwrap_or(false);
-        config.sparse_model = cf.sparse_model.clone()
+        config.sparse_model = cf
+            .sparse_model
+            .clone()
             .unwrap_or_else(|| "prithivida/Splade_PP_en_v1".to_string());
     }
 
@@ -278,7 +290,7 @@ async fn run_interactive(rag_system: &RagSystem) -> Result<()> {
             continue;
         }
 
-        print!("\n");
+        println!();
         match rag_system.query(input).await {
             Ok(response) => {
                 println!("\n=== Answer ===\n{}\n", response);
@@ -353,9 +365,9 @@ async fn main() -> Result<()> {
     info!("Using model: {}", model);
     info!("Using endpoint: {}", endpoint);
 
-    let llm: Arc<dyn gewu_core::LlmProvider> = Arc::new(
-        OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model)
-    );
+    let llm: Arc<dyn gewu_core::LlmProvider> = Arc::new(OpenAIProvider::new_with_endpoint(
+        &api_key, &endpoint, &model,
+    ));
 
     if let Some(ref index_dir) = cli.index {
         let mut index_config = config.clone();
@@ -374,7 +386,9 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Failed to create RAG system: {}", e))?;
         run_query(&rag_system, cli.query.as_ref().unwrap()).await?;
     } else {
-        anyhow::bail!("Either --query, --interactive, or --index must be provided. Use --help for usage.");
+        anyhow::bail!(
+            "Either --query, --interactive, or --index must be provided. Use --help for usage."
+        );
     }
 
     Ok(())

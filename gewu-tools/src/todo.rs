@@ -21,16 +21,10 @@ pub struct TodoWriteArgs {
     pub todos: Vec<TodoItem>,
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Default)]
 pub struct TodoReadArgs {
     #[serde(default)]
     pub _placeholder: Option<String>,
-}
-
-impl Default for TodoReadArgs {
-    fn default() -> Self {
-        Self { _placeholder: None }
-    }
 }
 
 pub struct TodoWriteTool {
@@ -85,7 +79,10 @@ impl Tool for TodoWriteTool {
             .iter()
             .filter(|t| t.status != "completed")
             .count();
-        Ok(ToolResult::new("todowrite", format!("{} todos", non_completed)))
+        Ok(ToolResult::new(
+            "todowrite",
+            format!("{} todos", non_completed),
+        ))
     }
 }
 
@@ -113,11 +110,14 @@ impl Tool for TodoReadTool {
             .iter()
             .filter(|t| t.status != "completed")
             .count();
-        Ok(ToolResult::new("todoread", format!(
-            "{} todos\n\n{}",
-            non_completed,
-            serde_json::to_string_pretty(&*todos_guard).map_err(into_tool_error)?
-        )))
+        Ok(ToolResult::new(
+            "todoread",
+            format!(
+                "{} todos\n\n{}",
+                non_completed,
+                serde_json::to_string_pretty(&*todos_guard).map_err(into_tool_error)?
+            ),
+        ))
     }
 }
 
@@ -143,7 +143,10 @@ mod tests {
         let result = write_tool.execute(input, &ctx).await.unwrap();
         assert_eq!(result.output, "2 todos");
 
-        let read_result = read_tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        let read_result = read_tool
+            .execute(serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
         assert!(read_result.output.contains("2 todos"));
     }
 }

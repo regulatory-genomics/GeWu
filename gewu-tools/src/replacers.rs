@@ -250,21 +250,21 @@ fn block_anchor_replace(content: &str, search: &str) -> Option<(usize, usize)> {
         }
     }
 
-    if max_similarity >= MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD {
-        if let Some(best) = best_match {
-            let mut match_start_index = 0;
-            for k in 0..best.start_line {
-                match_start_index += original_lines[k].len() + 1;
-            }
-            let mut match_end_index = match_start_index;
-            for k in best.start_line..=best.end_line {
-                match_end_index += original_lines[k].len();
-                if k < best.end_line {
-                    match_end_index += 1;
-                }
-            }
-            return Some((match_start_index, match_end_index));
+    if max_similarity >= MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD
+        && let Some(best) = best_match
+    {
+        let mut match_start_index = 0;
+        for k in 0..best.start_line {
+            match_start_index += original_lines[k].len() + 1;
         }
+        let mut match_end_index = match_start_index;
+        for k in best.start_line..=best.end_line {
+            match_end_index += original_lines[k].len();
+            if k < best.end_line {
+                match_end_index += 1;
+            }
+        }
+        return Some((match_start_index, match_end_index));
     }
 
     None
@@ -472,10 +472,8 @@ pub fn smart_replace(
             let suffix = &content[end..];
             return Ok(format!("{}{}{}", prefix, new_string, suffix));
         }
-    } else {
-        if occurrence_count > 0 {
-            return Ok(content.replace(old_string, new_string));
-        }
+    } else if occurrence_count > 0 {
+        return Ok(content.replace(old_string, new_string));
     }
 
     for strategy in &[
