@@ -251,7 +251,9 @@ fn build_research_graph(
     graph.add_node("synthesize", synthesize);
     graph.add_node("respond", format_response);
 
-    graph.add_edge("generate_queries", "search").expect("valid edge");
+    graph
+        .add_edge("generate_queries", "search")
+        .expect("valid edge");
     graph.add_edge("search", "synthesize").expect("valid edge");
     graph.add_edge("synthesize", "respond").expect("valid edge");
 

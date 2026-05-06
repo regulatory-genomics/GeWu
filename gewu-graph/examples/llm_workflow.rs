@@ -315,9 +315,15 @@ fn build_graph() -> CompiledGraph<AgentState> {
     graph.add_node("general_assist", general_assist);
     graph.add_node("synthesizer", synthesizer);
 
-    graph.add_edge("code_assist", "synthesizer").expect("valid edge");
-    graph.add_edge("qa_assist", "synthesizer").expect("valid edge");
-    graph.add_edge("general_assist", "synthesizer").expect("valid edge");
+    graph
+        .add_edge("code_assist", "synthesizer")
+        .expect("valid edge");
+    graph
+        .add_edge("qa_assist", "synthesizer")
+        .expect("valid edge");
+    graph
+        .add_edge("general_assist", "synthesizer")
+        .expect("valid edge");
 
     graph.set_entry_point("classify_intent");
     graph.set_finish_point("synthesizer");
