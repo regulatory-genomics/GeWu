@@ -5,7 +5,9 @@ use axum::{
     routing::{delete, get, post},
 };
 use clap::Parser;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::ServeDir;
@@ -16,6 +18,7 @@ use tracing_subscriber::FmtSubscriber;
 pub mod auth;
 pub mod auth_middleware;
 pub mod fallback;
+pub mod plugin_suite;
 pub mod routes;
 pub mod sidecar;
 pub mod state;
@@ -23,6 +26,8 @@ pub mod state;
 use auth::AuthMode;
 use gewu_cli::mcp_loader;
 use gewu_runtime::PluginRegistry;
+use fallback::{RuntimeFrontendAssets, RuntimeFrontendPlugin, RuntimeFrontendSidecar};
+use plugin_suite::{FrontendAssetKind, PluginSuiteConfig};
 use state::{AppState, PluginRegistrar};
 
 #[derive(Parser, Debug)]
@@ -120,14 +125,17 @@ where
 
     let mcp_servers = loaded_config.config.mcp_servers;
 
-    let tachyon_browser_cfg: sidecar::TachyonBrowserConfig =
-        serde_json::from_value(loaded_config.config.tachyon_browser.clone())
-            .context("Failed to parse tachyonBrowser config")?;
-    let tachyon_suite_cfg: sidecar::TachyonPluginSuiteConfig =
-        serde_json::from_value(loaded_config.config.tachyon_plugin_suite.clone())
-            .context("Failed to parse tachyonPluginSuite config")?;
-    let effective_tachyon_browser_cfg =
-        tachyon_suite_cfg.effective_sidecar_config(&tachyon_browser_cfg);
+    let tachyon_browser_cfg = parse_tachyon_browser_config(loaded_config.config.tachyon_browser.clone())?;
+    let tachyon_suite_cfg = parse_tachyon_plugin_suite_config(loaded_config.config.tachyon_plugin_suite.clone())?;
+    let plugin_suites = plugin_suite::normalize_plugin_suites(
+        loaded_config.config.plugin_suites.clone(),
+        loaded_config.config.tachyon_browser.clone(),
+        loaded_config.config.tachyon_plugin_suite.clone(),
+    )?;
+    let effective_tachyon_browser_cfg = tachyon_browser_from_plugin_suites(&plugin_suites)?
+        .unwrap_or_else(|| tachyon_suite_cfg.effective_sidecar_config(&tachyon_browser_cfg));
+    let mut runtime_plugin_dirs = loaded_config.config.runtime_plugin_dirs;
+    append_plugin_manifest_dirs(&mut runtime_plugin_dirs, &plugin_suites);
 
     let env_tachyon_url = std::env::var("TACHYON_BROWSER_URL").ok();
     let mut config = state::ServerConfig {
@@ -139,7 +147,8 @@ where
         temperature: None,
         db_path,
         plugins: loaded_config.config.plugins,
-        runtime_plugin_dirs: loaded_config.config.runtime_plugin_dirs,
+        plugin_sidecars: HashMap::new(),
+        runtime_plugin_dirs,
         skill_dirs: loaded_config.config.skill_dirs,
         tachyon_browser_url: env_tachyon_url.clone(),
         tachyon_browser: effective_tachyon_browser_cfg,
@@ -153,19 +162,20 @@ where
     if let Some(sidecar) = managed_tachyon_browser.as_ref() {
         config.tachyon_browser_url = Some(sidecar.url().to_string());
     }
-    let runtime_assets = tachyon_suite_cfg.runtime_assets(config.tachyon_browser_url.as_deref());
+    let runtime_assets = runtime_frontend_assets(&plugin_suites, config.tachyon_browser_url.as_deref())?;
+    config.plugin_sidecars = plugin_sidecar_map(&runtime_assets);
+    let browser_runtime_assets = browser_runtime_frontend_assets(&runtime_assets);
     // SAFETY: environment is configured during single-threaded startup before the router serves
     // index.html or static assets.
     unsafe {
         if let Some(url) = config.tachyon_browser_url.as_deref() {
             std::env::set_var("TACHYON_BROWSER_URL", url);
         }
-        if let Some(style) = runtime_assets.renderer_style.as_deref() {
-            std::env::set_var("GEWU_TACHYON_RENDERER_STYLE", style);
-        }
-        if let Some(script) = runtime_assets.renderer_script.as_deref() {
-            std::env::set_var("GEWU_TACHYON_RENDERER_SCRIPT", script);
-        }
+        std::env::set_var(
+            "GEWU_FRONTEND_PLUGINS",
+            serde_json::to_string(&browser_runtime_assets)
+                .unwrap_or_else(|_| "{\"plugins\":[]}".to_string()),
+        );
     }
 
     let auth_mode = AuthMode::from_cli(cli.password.as_deref())?;
@@ -175,7 +185,7 @@ where
             cli.host
         );
     }
-    let content_security_policy = build_content_security_policy(config.tachyon_browser_url.as_deref());
+    let content_security_policy = build_content_security_policy(&browser_runtime_assets);
     let plugin_registrar: PluginRegistrar = Arc::new(register_plugins);
     let app_state =
         Arc::new(AppState::new(config, auth_mode.clone(), mcp_tools, plugin_registrar).await?);
@@ -278,6 +288,11 @@ where
             post(routes::canvas::handle_patch),
         )
         .route(
+            "/api/plugins/{plugin_id}/{sidecar_id}/{*path}",
+            get(routes::plugin_proxy::handle_plugin_get)
+                .post(routes::plugin_proxy::handle_plugin_post),
+        )
+        .route(
             "/api/browser/{*path}",
             get(routes::canvas::handle_browser_get).post(routes::canvas::handle_browser_post),
         )
@@ -362,22 +377,229 @@ async fn shutdown_signal() {
     }
 }
 
-fn build_content_security_policy(tachyon_browser_url: Option<&str>) -> HeaderValue {
+fn tachyon_browser_from_plugin_suites(
+    suites: &[PluginSuiteConfig],
+) -> Result<Option<sidecar::TachyonBrowserConfig>> {
+    let Some(suite) = suites
+        .iter()
+        .find(|suite| suite.enabled && suite.id == "tachyon")
+    else {
+        return Ok(None);
+    };
+    let Some(browser) = suite.browser_sidecar_config()? else {
+        return Ok(None);
+    };
+    Ok(Some(sidecar::TachyonBrowserConfig {
+        enabled: browser.enabled,
+        auto_start: browser.auto_start,
+        url: browser.url,
+        command: browser.command,
+        args: browser.args,
+        health_path: browser.health_path,
+        startup_timeout_ms: browser.startup_timeout_ms,
+        working_directory: browser.working_directory,
+    }))
+}
+
+fn parse_tachyon_browser_config(value: serde_json::Value) -> Result<sidecar::TachyonBrowserConfig> {
+    if value.is_null() {
+        return Ok(sidecar::TachyonBrowserConfig::default());
+    }
+    serde_json::from_value(value).context("Failed to parse tachyonBrowser config")
+}
+
+fn parse_tachyon_plugin_suite_config(
+    value: serde_json::Value,
+) -> Result<sidecar::TachyonPluginSuiteConfig> {
+    if value.is_null() {
+        return Ok(sidecar::TachyonPluginSuiteConfig::default());
+    }
+    serde_json::from_value(value).context("Failed to parse tachyonPluginSuite config")
+}
+
+fn runtime_frontend_assets(
+    suites: &[PluginSuiteConfig],
+    tachyon_browser_url: Option<&str>,
+) -> Result<RuntimeFrontendAssets> {
+    let mut plugins = Vec::new();
+    for suite in suites.iter().filter(|suite| suite.enabled) {
+        let frontend = suite.runtime_frontend()?;
+        let sidecars = frontend
+            .sidecars
+            .into_iter()
+            .map(|sidecar| RuntimeFrontendSidecar {
+                url: if suite.id == "tachyon" && sidecar.id == "browser" {
+                    tachyon_browser_url.unwrap_or(&sidecar.url).to_string()
+                } else {
+                    sidecar.url
+                },
+                id: sidecar.id,
+            })
+            .collect();
+        let mut styles = Vec::new();
+        let mut scripts = Vec::new();
+        for asset in frontend.assets {
+            match asset.kind {
+                FrontendAssetKind::Style => styles.push(asset.url),
+                FrontendAssetKind::Script => scripts.push(asset.url),
+            }
+        }
+        plugins.push(RuntimeFrontendPlugin {
+            id: frontend.plugin_id,
+            sidecars,
+            styles,
+            scripts,
+        });
+    }
+    Ok(RuntimeFrontendAssets { plugins })
+}
+
+fn plugin_sidecar_map(assets: &RuntimeFrontendAssets) -> HashMap<String, HashMap<String, String>> {
+    assets
+        .plugins
+        .iter()
+        .map(|plugin| {
+            let sidecars = plugin
+                .sidecars
+                .iter()
+                .map(|sidecar| (sidecar.id.clone(), sidecar.url.clone()))
+                .collect();
+            (plugin.id.clone(), sidecars)
+        })
+        .collect()
+}
+
+fn browser_runtime_frontend_assets(assets: &RuntimeFrontendAssets) -> RuntimeFrontendAssets {
+    let plugins = assets
+        .plugins
+        .iter()
+        .map(|plugin| {
+            let sidecars: Vec<RuntimeFrontendSidecar> = plugin
+                .sidecars
+                .iter()
+                .map(|sidecar| RuntimeFrontendSidecar {
+                    id: sidecar.id.clone(),
+                    url: plugin_proxy_base(&plugin.id, &sidecar.id),
+                })
+                .collect();
+
+            let styles = plugin
+                .styles
+                .iter()
+                .map(|url| rewrite_plugin_asset_url(plugin, url))
+                .collect();
+            let scripts = plugin
+                .scripts
+                .iter()
+                .map(|url| rewrite_plugin_asset_url(plugin, url))
+                .collect();
+
+            RuntimeFrontendPlugin {
+                id: plugin.id.clone(),
+                sidecars,
+                styles,
+                scripts,
+            }
+        })
+        .collect();
+
+    RuntimeFrontendAssets { plugins }
+}
+
+fn rewrite_plugin_asset_url(plugin: &RuntimeFrontendPlugin, url: &str) -> String {
+    for sidecar in &plugin.sidecars {
+        if let Some(proxy_url) = rewrite_url_for_sidecar(&plugin.id, sidecar, url) {
+            return proxy_url;
+        }
+    }
+    url.to_string()
+}
+
+fn rewrite_url_for_sidecar(
+    plugin_id: &str,
+    sidecar: &RuntimeFrontendSidecar,
+    url: &str,
+) -> Option<String> {
+    let sidecar_url = sidecar.url.trim_end_matches('/');
+    let suffix = url.strip_prefix(sidecar_url)?;
+    if !suffix.is_empty() && !suffix.starts_with('/') && !suffix.starts_with('?') {
+        return None;
+    }
+    Some(format!(
+        "{}{}",
+        plugin_proxy_base(plugin_id, &sidecar.id),
+        suffix
+    ))
+}
+
+fn plugin_proxy_base(plugin_id: &str, sidecar_id: &str) -> String {
+    format!("/api/plugins/{plugin_id}/{sidecar_id}")
+}
+
+fn append_plugin_manifest_dirs(dirs: &mut Vec<String>, suites: &[PluginSuiteConfig]) {
+    for suite in suites.iter().filter(|suite| suite.enabled) {
+        let Some(manifest) = suite.manifest.as_deref().filter(|path| !path.trim().is_empty()) else {
+            continue;
+        };
+        let dir = Path::new(manifest)
+            .parent()
+            .unwrap_or_else(|| Path::new(manifest))
+            .to_string_lossy()
+            .to_string();
+        if !dirs.iter().any(|existing| existing == &dir) {
+            dirs.push(dir);
+        }
+    }
+}
+
+fn build_content_security_policy(assets: &RuntimeFrontendAssets) -> HeaderValue {
+    let mut origins = plugin_csp_origins(assets);
+    origins.sort();
+    origins.dedup();
+
     let mut connect_src = "connect-src 'self'".to_string();
-    if let Some(origin) = tachyon_browser_csp_origin(tachyon_browser_url) {
+    let mut script_src = "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net".to_string();
+    let mut style_src = "style-src 'self' 'unsafe-inline'".to_string();
+    for origin in origins {
         connect_src.push(' ');
         connect_src.push_str(&origin);
+        script_src.push(' ');
+        script_src.push_str(&origin);
+        style_src.push(' ');
+        style_src.push_str(&origin);
     }
     let csp = format!(
         "default-src 'self'; img-src 'self' data:; \
-         script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; \
+         {script_src}; {style_src}; \
          {connect_src}; font-src 'self' data:"
     );
     HeaderValue::from_str(&csp).unwrap_or_else(|_| HeaderValue::from_static("default-src 'self'"))
 }
 
-fn tachyon_browser_csp_origin(tachyon_browser_url: Option<&str>) -> Option<String> {
-    let raw = tachyon_browser_url?.trim();
+fn plugin_csp_origins(assets: &RuntimeFrontendAssets) -> Vec<String> {
+    let mut origins = Vec::new();
+    for plugin in &assets.plugins {
+        for sidecar in &plugin.sidecars {
+            if let Some(origin) = csp_origin(&sidecar.url) {
+                origins.push(origin);
+            }
+        }
+        for style in &plugin.styles {
+            if let Some(origin) = csp_origin(style) {
+                origins.push(origin);
+            }
+        }
+        for script in &plugin.scripts {
+            if let Some(origin) = csp_origin(script) {
+                origins.push(origin);
+            }
+        }
+    }
+    origins
+}
+
+fn csp_origin(url: &str) -> Option<String> {
+    let raw = url.trim();
     if raw.is_empty() {
         return None;
     }
@@ -438,10 +660,85 @@ mod tests {
     use super::*;
 
     #[test]
+    fn missing_legacy_tachyon_configs_default_for_plugin_suites() {
+        let browser = parse_tachyon_browser_config(serde_json::Value::Null).unwrap();
+        let suite = parse_tachyon_plugin_suite_config(serde_json::Value::Null).unwrap();
+
+        assert!(!browser.enabled);
+        assert!(!suite.enabled);
+    }
+
+    #[test]
     fn content_security_policy_allows_configured_tachyon_browser_url() {
-        let csp = build_content_security_policy(Some("http://127.0.0.1:8400"));
+        let assets = RuntimeFrontendAssets {
+            plugins: vec![RuntimeFrontendPlugin {
+                id: "tachyon".to_string(),
+                sidecars: vec![RuntimeFrontendSidecar {
+                    id: "browser".to_string(),
+                    url: "http://127.0.0.1:8400".to_string(),
+                }],
+                styles: Vec::new(),
+                scripts: Vec::new(),
+            }],
+        };
+        let csp = build_content_security_policy(&assets);
         let csp = csp.to_str().unwrap();
 
         assert!(csp.contains("connect-src 'self' http://127.0.0.1:8400"));
+    }
+
+    #[test]
+    fn content_security_policy_allows_plugin_asset_origins() {
+        let assets = RuntimeFrontendAssets {
+            plugins: vec![RuntimeFrontendPlugin {
+                id: "tachyon".to_string(),
+                sidecars: vec![RuntimeFrontendSidecar {
+                    id: "browser".to_string(),
+                    url: "http://127.0.0.1:8400".to_string(),
+                }],
+                styles: vec!["http://127.0.0.1:8400/assets/tachyon-canvas.css".to_string()],
+                scripts: vec!["http://127.0.0.1:8400/assets/tachyon-canvas.iife.js".to_string()],
+            }],
+        };
+        let csp = build_content_security_policy(&assets);
+        let csp = csp.to_str().unwrap();
+
+        assert!(csp.contains("script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net http://127.0.0.1:8400"));
+        assert!(csp.contains("style-src 'self' 'unsafe-inline' http://127.0.0.1:8400"));
+        assert!(csp.contains("connect-src 'self' http://127.0.0.1:8400"));
+    }
+
+    #[test]
+    fn browser_runtime_assets_use_same_origin_plugin_proxy_urls() {
+        let internal_assets = RuntimeFrontendAssets {
+            plugins: vec![RuntimeFrontendPlugin {
+                id: "tachyon".to_string(),
+                sidecars: vec![RuntimeFrontendSidecar {
+                    id: "browser".to_string(),
+                    url: "http://127.0.0.1:8400".to_string(),
+                }],
+                styles: vec!["http://127.0.0.1:8400/assets/tachyon-canvas.css".to_string()],
+                scripts: vec!["http://127.0.0.1:8400/assets/tachyon-canvas.iife.js".to_string()],
+            }],
+        };
+
+        let browser_assets = browser_runtime_frontend_assets(&internal_assets);
+
+        assert_eq!(
+            plugin_sidecar_map(&internal_assets)["tachyon"]["browser"],
+            "http://127.0.0.1:8400"
+        );
+        assert_eq!(
+            browser_assets.plugins[0].sidecars[0].url,
+            "/api/plugins/tachyon/browser"
+        );
+        assert_eq!(
+            browser_assets.plugins[0].styles[0],
+            "/api/plugins/tachyon/browser/assets/tachyon-canvas.css"
+        );
+        assert_eq!(
+            browser_assets.plugins[0].scripts[0],
+            "/api/plugins/tachyon/browser/assets/tachyon-canvas.iife.js"
+        );
     }
 }

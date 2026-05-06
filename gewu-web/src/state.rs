@@ -11,7 +11,6 @@ use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tachyon_browser_client::{TachyonClientConfig, tachyon_tools};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::AbortHandle;
 use tracing::info;
@@ -89,6 +88,8 @@ pub struct ServerConfig {
     pub db_path: Option<String>,
     #[serde(default)]
     pub plugins: HashMap<String, Value>,
+    #[serde(default)]
+    pub plugin_sidecars: HashMap<String, HashMap<String, String>>,
     #[serde(rename = "runtimePluginDirs", default)]
     pub runtime_plugin_dirs: Vec<String>,
     #[serde(rename = "skillDirs", default)]
@@ -117,6 +118,7 @@ impl Default for ServerConfig {
             temperature: None,
             db_path: None,
             plugins: HashMap::new(),
+            plugin_sidecars: HashMap::new(),
             runtime_plugin_dirs: Vec::new(),
             skill_dirs: Vec::new(),
             tachyon_browser_url: None,
@@ -275,22 +277,7 @@ impl AppState {
         };
 
         let canvases = CanvasManager::new();
-        let mut canvas_tools_vec = canvas_tools(Arc::new(canvases.clone()));
-
-        let tachyon_url = config
-            .tachyon_browser_url
-            .clone()
-            .or_else(|| std::env::var("TACHYON_BROWSER_URL").ok())
-            .unwrap_or_default();
-        if !tachyon_url.trim().is_empty() {
-            let genome = tachyon_tools(TachyonClientConfig {
-                base_url: tachyon_url,
-                timeout: std::time::Duration::from_secs(60),
-            });
-            info!("registering {} genome.* tools", genome.len());
-            canvas_tools_vec.extend(genome);
-        }
-        let canvas_tools = Arc::new(canvas_tools_vec);
+        let canvas_tools = Arc::new(canvas_tools(Arc::new(canvases.clone())));
 
         {
             let coordinator = BackgroundTaskCoordinator::new(db_pool.clone());

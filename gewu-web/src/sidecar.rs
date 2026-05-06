@@ -59,16 +59,27 @@ impl TachyonPluginSuiteConfig {
         &self,
         browser_url: Option<&str>,
     ) -> crate::fallback::RuntimeFrontendAssets {
+        if !self.enabled {
+            return crate::fallback::RuntimeFrontendAssets::default();
+        }
+
+        let sidecars = browser_url
+            .map(ToOwned::to_owned)
+            .or_else(|| self.sidecar.url.clone())
+            .map(|url| crate::fallback::RuntimeFrontendSidecar {
+                id: "browser".to_string(),
+                url,
+            })
+            .into_iter()
+            .collect();
+
         crate::fallback::RuntimeFrontendAssets {
-            tachyon_browser_url: if self.enabled {
-                browser_url
-                    .map(ToOwned::to_owned)
-                    .or_else(|| self.sidecar.url.clone())
-            } else {
-                None
-            },
-            renderer_style: self.renderer.style.clone(),
-            renderer_script: self.renderer.script.clone(),
+            plugins: vec![crate::fallback::RuntimeFrontendPlugin {
+                id: self.id.clone(),
+                sidecars,
+                styles: self.renderer.style.clone().into_iter().collect(),
+                scripts: self.renderer.script.clone().into_iter().collect(),
+            }],
         }
     }
 }
@@ -345,18 +356,10 @@ mod tests {
 
         let assets = suite.runtime_assets(Some("http://127.0.0.1:8400"));
 
-        assert_eq!(
-            assets.tachyon_browser_url.as_deref(),
-            Some("http://127.0.0.1:8400")
-        );
-        assert_eq!(
-            assets.renderer_script.as_deref(),
-            Some("/plugins/tachyon/tachyon-canvas.iife.js")
-        );
-        assert_eq!(
-            assets.renderer_style.as_deref(),
-            Some("/plugins/tachyon/tachyon-canvas.css")
-        );
+        assert_eq!(assets.plugins[0].id, "tachyon");
+        assert_eq!(assets.plugins[0].sidecars[0].url, "http://127.0.0.1:8400");
+        assert_eq!(assets.plugins[0].scripts[0], "/plugins/tachyon/tachyon-canvas.iife.js");
+        assert_eq!(assets.plugins[0].styles[0], "/plugins/tachyon/tachyon-canvas.css");
     }
 
     #[test]
@@ -371,9 +374,6 @@ mod tests {
 
         let assets = suite.runtime_assets(Some("http://127.0.0.1:8500"));
 
-        assert_eq!(
-            assets.tachyon_browser_url.as_deref(),
-            Some("http://127.0.0.1:8500")
-        );
+        assert_eq!(assets.plugins[0].sidecars[0].url, "http://127.0.0.1:8500");
     }
 }
