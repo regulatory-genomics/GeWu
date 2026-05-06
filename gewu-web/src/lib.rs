@@ -1,8 +1,7 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use axum::{
-    middleware,
+    Router, middleware,
     routing::{delete, get, post},
-    Router,
 };
 use clap::Parser;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -123,6 +122,11 @@ where
     let tachyon_browser_cfg: sidecar::TachyonBrowserConfig =
         serde_json::from_value(loaded_config.config.tachyon_browser.clone())
             .context("Failed to parse tachyonBrowser config")?;
+    let tachyon_suite_cfg: sidecar::TachyonPluginSuiteConfig =
+        serde_json::from_value(loaded_config.config.tachyon_plugin_suite.clone())
+            .context("Failed to parse tachyonPluginSuite config")?;
+    let effective_tachyon_browser_cfg =
+        tachyon_suite_cfg.effective_sidecar_config(&tachyon_browser_cfg);
 
     let env_tachyon_url = std::env::var("TACHYON_BROWSER_URL").ok();
     let mut config = state::ServerConfig {
@@ -137,7 +141,7 @@ where
         runtime_plugin_dirs: loaded_config.config.runtime_plugin_dirs,
         skill_dirs: loaded_config.config.skill_dirs,
         tachyon_browser_url: env_tachyon_url.clone(),
-        tachyon_browser: tachyon_browser_cfg,
+        tachyon_browser: effective_tachyon_browser_cfg,
     };
 
     let mcp_tools = mcp_loader::load_mcp_tools(mcp_servers).await?;
@@ -147,9 +151,19 @@ where
             .await?;
     if let Some(sidecar) = managed_tachyon_browser.as_ref() {
         config.tachyon_browser_url = Some(sidecar.url().to_string());
-        // SAFETY: set before any thread spawns and reads env. Single-threaded init.
-        unsafe {
-            std::env::set_var("TACHYON_BROWSER_URL", "");
+    }
+    let runtime_assets = tachyon_suite_cfg.runtime_assets(config.tachyon_browser_url.as_deref());
+    // SAFETY: environment is configured during single-threaded startup before the router serves
+    // index.html or static assets.
+    unsafe {
+        if let Some(url) = config.tachyon_browser_url.as_deref() {
+            std::env::set_var("TACHYON_BROWSER_URL", url);
+        }
+        if let Some(style) = runtime_assets.renderer_style.as_deref() {
+            std::env::set_var("GEWU_TACHYON_RENDERER_STYLE", style);
+        }
+        if let Some(script) = runtime_assets.renderer_script.as_deref() {
+            std::env::set_var("GEWU_TACHYON_RENDERER_SCRIPT", script);
         }
     }
 
@@ -355,7 +369,7 @@ async fn shutdown_signal() {
 /// user's machine. Honors `GEWU_CORS_ALLOW_ORIGIN` (comma-separated origins)
 /// when an explicit allowlist is needed.
 fn build_cors_layer() -> CorsLayer {
-    use axum::http::{header, HeaderValue, Method};
+    use axum::http::{HeaderValue, Method, header};
 
     let methods = [Method::GET, Method::POST, Method::DELETE, Method::OPTIONS];
     let headers = [header::CONTENT_TYPE, header::ACCEPT];
