@@ -1,8 +1,8 @@
 use crate::state::AppState;
 use axum::{
+    Json,
     extract::State,
     response::sse::{Event, KeepAlive, Sse},
-    Json,
 };
 use futures::Stream;
 use futures::StreamExt;

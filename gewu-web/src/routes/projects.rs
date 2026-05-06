@@ -1,6 +1,6 @@
 use crate::routes::sessions::{AppError, SessionChildInfo};
 use crate::state::{AppState, ProjectInfo, SessionInfo};
-use axum::{extract::State, Json};
+use axum::{Json, extract::State};
 use sqlx::Row;
 use std::sync::Arc;
 

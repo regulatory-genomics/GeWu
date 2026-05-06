@@ -16,14 +16,14 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
-use axum::Json;
 use gewu_canvas::CanvasStatePatch;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 
@@ -130,7 +130,7 @@ async fn proxy_browser_request(
             return Err((
                 StatusCode::METHOD_NOT_ALLOWED,
                 "unsupported method".to_string(),
-            ))
+            ));
         }
     };
     let upstream = request.send().await.map_err(|e| {
