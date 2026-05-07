@@ -154,6 +154,20 @@ The CLI and Web UI use a JSON config file. By default, they look for `config.jso
 
 GeWu supports domain plugins that contribute specialist agents and tools. Plugins are loaded at startup via the `PluginHost`, driven by the `plugins` section in your config file.
 
+### Project-local Skills
+
+GeWu scans Markdown skills from project-local `.gewu/skills/**/SKILL.md` by default. Skill files use YAML frontmatter with at least `name` and `description`.
+
+Specialists opt in with manifest `skills: [...]`. A specialist receives a compact `<available_skills>` list containing only those declared skill names and descriptions; full skill bodies are not injected automatically. When the specialist needs deeper instructions, it calls `load_skill` to load one of its declared skills on demand.
+
+Additional skill directories can be provided via `skillDirs`. `~/.gewu/skills` is not scanned unless it is explicitly listed there.
+
+`skills: [...]` is an access boundary for summaries, `load_skill`, and skill-declared `capabilities`. If a skill declares `capabilities`, GeWu makes those capabilities available only to specialists that list that skill.
+
+Specialists opt in with `skills: - gene-locus-resolver`. The gene workflow lives at `.gewu/skills/gene-locus-resolver/SKILL.md` and instructs agents to call `gene.resolve_symbol` before Genome Canvas open/update calls for gene-symbol requests.
+
+The web chat transcript shows `load_skill` tool calls like any other tool call, but the web UI does not show a global Skills panel.
+
 GeWu also supports YAML runtime plugins for HTTP-backed tools and lifecycle hooks. Runtime plugins do not require recompiling GeWu: place `*.yaml` manifests in `.gewu/runtime-plugins/`, `~/.gewu/runtime-plugins/`, or directories listed in `runtimePluginDirs`.
 
 ```jsonc

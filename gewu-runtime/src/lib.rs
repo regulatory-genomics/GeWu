@@ -12,12 +12,16 @@ pub mod providers;
 pub mod registry;
 pub mod runtime;
 pub mod skill_registry;
+pub mod skill_tools;
 pub mod sop_registry;
 pub mod tools;
 pub mod trace_diff;
 pub mod workflow;
 pub mod workflow_registry;
 pub mod workflow_tools;
+
+#[cfg(test)]
+mod test_support;
 
 pub use background_tasks::{
     BackgroundGroupCompletedEvent, BackgroundTaskCoordinator, TaskSettledEvent,
@@ -49,6 +53,7 @@ pub use registry::{
 };
 pub use runtime::{GeWuRuntime, GeWuRuntimeBuilder, SpecialistExecutionEvent};
 pub use skill_registry::SkillRegistry;
+pub use skill_tools::{LoadSkillArgs, LoadSkillTool};
 pub use sop_registry::{SopDescriptor, SopMetadata, SopRegistry};
 pub use tools::TaskTool;
 pub use trace_diff::{DiffEntry, DiffKind, DiffOptions, diff_blackboards, format_diff};
