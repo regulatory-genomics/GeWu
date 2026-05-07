@@ -9,6 +9,9 @@ use gewu_core::types::{
     TaskExecutionStatus, TaskResultStatus, TaskStatus, ToolContext, ToolExecutionRecord,
     ToolResult,
 };
+use gewu_resource_core::{
+    CatalogLoader, InMemoryResourceProvider, ResourceRegistry, ResourceToolFactory,
+};
 use gewu_storage::{SqliteMemory, TaskStore};
 use gewu_tools::{BatchTool, report_result::ReportResultArgs};
 use schemars::schema::RootSchema;
@@ -61,6 +64,7 @@ impl GeWuRuntime {
             runtime_plugin_dirs: Vec::new(),
             skill_dirs: Vec::new(),
             workflow_dirs: Vec::new(),
+            resource_dirs: Vec::new(),
             provider: None,
             pool: None,
         }
@@ -1386,6 +1390,7 @@ pub struct GeWuRuntimeBuilder {
     runtime_plugin_dirs: Vec<PathBuf>,
     skill_dirs: Vec<PathBuf>,
     workflow_dirs: Vec<PathBuf>,
+    resource_dirs: Vec<PathBuf>,
     provider: Option<Arc<dyn LlmProvider>>,
     pool: Option<SqlitePool>,
 }
@@ -1452,6 +1457,16 @@ impl GeWuRuntimeBuilder {
         self
     }
 
+    pub fn with_resource_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.resource_dirs.push(dir.into());
+        self
+    }
+
+    pub fn with_resource_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.resource_dirs.extend(dirs);
+        self
+    }
+
     pub fn register_plugin(mut self, plugin: Box<dyn Plugin>) -> Self {
         let name = plugin.name().to_string();
         for factory in plugin.tool_factories() {
@@ -1496,6 +1511,14 @@ impl GeWuRuntimeBuilder {
         let workflow_registry = WorkflowRegistry::from_dirs(&self.workflow_dirs)?;
         let sop_registry = Arc::new(SopRegistry::from_workflows(workflow_registry.as_map()));
         let mut hook_registry = HookRegistry::new();
+
+        if let Some(factory) = load_resource_tool_factory(&self.resource_dirs) {
+            registry.register(Arc::new(ToolFactoryProvider::new(
+                "builtin",
+                "resources",
+                Box::new(factory),
+            )));
+        }
 
         // Load command-backed tools from ~/.gewu/tools/
         let tools_dir = CommandToolRegistry::default_dir();
@@ -1720,6 +1743,47 @@ impl GeWuRuntimeBuilder {
             trace_sink,
         })
     }
+}
+
+fn load_resource_tool_factory(resource_dirs: &[PathBuf]) -> Option<ResourceToolFactory> {
+    let mut registry = ResourceRegistry::new();
+    for dir in default_resource_dirs()
+        .into_iter()
+        .chain(resource_dirs.iter().cloned())
+    {
+        if !dir.is_dir() {
+            continue;
+        }
+        match CatalogLoader::load_dir(&dir) {
+            Ok(resources) if !resources.is_empty() => {
+                tracing::info!(
+                    "Loaded {} resource(s) from {}",
+                    resources.len(),
+                    dir.display()
+                );
+                registry.register(InMemoryResourceProvider::new(
+                    dir.display().to_string(),
+                    resources,
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                "Failed to load resource catalogs from {}: {}",
+                dir.display(),
+                err
+            ),
+        }
+    }
+
+    (registry.provider_count() > 0).then(|| ResourceToolFactory::new(Arc::new(registry)))
+}
+
+fn default_resource_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![PathBuf::from(".gewu/resources")];
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".gewu/resources"));
+    }
+    dirs
 }
 
 fn default_workflow_output_dir() -> PathBuf {

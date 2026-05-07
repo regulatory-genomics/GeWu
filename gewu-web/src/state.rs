@@ -450,7 +450,7 @@ impl AppState {
             plugins,
             working_directory.clone(),
         )?;
-        let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs(
+        let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs_in_directory(
             provider.clone(),
             pool.clone(),
             &plugin_host,
@@ -458,6 +458,7 @@ impl AppState {
             &runtime_plugin_dirs,
             &skill_dirs,
             &[],
+            &working_directory,
         )?;
         let (agent, _registry) = runtime
             .build_specialist_with_metadata_in_directory(
@@ -888,7 +889,7 @@ impl AppState {
             plugins,
             working_directory.clone(),
         )?;
-        let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs(
+        let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs_in_directory(
             provider.clone(),
             pool.clone(),
             &plugin_host,
@@ -896,6 +897,7 @@ impl AppState {
             &runtime_plugin_dirs,
             &skill_dirs,
             &[],
+            &working_directory,
         )?;
         let (agent, _registry) = runtime
             .build_specialist_with_metadata_in_directory(

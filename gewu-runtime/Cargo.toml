@@ -7,6 +7,7 @@ description = "Runtime factory, plugin host, and specialist agent builder for Ge
 [dependencies]
 gewu-core = { path = "../gewu-core" }
 gewu-graph = { path = "../gewu-graph" }
+gewu-resource-core = { path = "../gewu-resource-core" }
 gewu-tools = { path = "../gewu-tools" }
 gewu-storage = { path = "../gewu-storage" }
 anyhow = "1.0"

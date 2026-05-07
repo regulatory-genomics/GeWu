@@ -551,7 +551,7 @@ where
         working_directory.clone(),
         extra_register,
     )?;
-    let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs(
+    let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs_in_directory(
         provider.clone(),
         pool.clone(),
         &plugin_host,
@@ -559,6 +559,7 @@ where
         &runtime_plugin_dirs,
         &skill_dirs,
         &workflow_dirs,
+        &working_directory,
     )?;
 
     if let Some(workflow_id) = cli.workflow.as_deref() {

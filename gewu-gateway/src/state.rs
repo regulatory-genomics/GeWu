@@ -32,10 +32,10 @@ impl AppState {
             &plugin_registry,
             provider.clone(),
             pool.clone(),
-            working_directory,
+            working_directory.clone(),
         )?;
 
-        let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs(
+        let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs_in_directory(
             provider,
             pool.clone(),
             &plugin_host,
@@ -43,6 +43,7 @@ impl AppState {
             &config.runtime_plugin_dirs,
             &config.skill_dirs,
             &config.workflow_dirs,
+            &working_directory,
         )?;
 
         let jobs = JobStore::new(pool.clone()).await?;

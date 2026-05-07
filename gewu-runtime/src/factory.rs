@@ -1,7 +1,7 @@
 use anyhow::Result;
 use gewu_core::traits::LlmProvider;
 use sqlx::SqlitePool;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::plugin_host::PluginHost;
@@ -48,6 +48,30 @@ impl RuntimeFactory {
         skill_dirs: &[PathBuf],
         workflow_dirs: &[PathBuf],
     ) -> Result<GeWuRuntime> {
+        let working_directory = std::env::current_dir()?;
+        Self::build_with_manifest_and_runtime_plugin_dirs_in_directory(
+            provider,
+            pool,
+            plugin_host,
+            manifest_dirs,
+            runtime_plugin_dirs,
+            skill_dirs,
+            workflow_dirs,
+            &working_directory,
+        )
+    }
+
+    /// Build a runtime using an explicit project/session working directory for project-local config.
+    pub fn build_with_manifest_and_runtime_plugin_dirs_in_directory(
+        provider: Arc<dyn LlmProvider>,
+        pool: SqlitePool,
+        plugin_host: &PluginHost,
+        manifest_dirs: &[PathBuf],
+        runtime_plugin_dirs: &[PathBuf],
+        skill_dirs: &[PathBuf],
+        workflow_dirs: &[PathBuf],
+        working_directory: &Path,
+    ) -> Result<GeWuRuntime> {
         let mut builder = GeWuRuntime::builder()
             .provider(provider)
             .pool(pool)
@@ -76,6 +100,8 @@ impl RuntimeFactory {
         for dir in workflow_dirs {
             builder = builder.with_workflow_dir(dir);
         }
+
+        builder = builder.with_resource_dir(working_directory.join(".gewu/resources"));
 
         let home_specialists = dirs::home_dir()
             .map(|h| h.join(".gewu").join("specialists"))
