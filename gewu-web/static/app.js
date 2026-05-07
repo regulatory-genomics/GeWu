@@ -810,6 +810,7 @@ async function switchSession(session, forceReload = false) {
     if (!forceReload && state.currentSession?.id === session.id) return;
     state.currentSession = session;
     state.currentSessionId = session.id;
+    window.canvasController?.setSession?.(session.id);
     const project = session.project_id ? state.projects.find(p => p.project_id === session.project_id) : findProjectForSession(session.id);
     if (project) selectProject(project.project_id);
     agentSelector.value = session.agent_type;
@@ -1438,10 +1439,13 @@ async function createSession(agentType = 'general') {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ agent_type: agentType, project_id: state.currentProjectId })
         });
-        const data = await resp.json();
+        const data = await readJsonResponse(resp);
+        if (!resp.ok) throw new Error(data?.error || 'Failed to create session');
         const session = data.session;
+        if (!session?.id) throw new Error('Session response missing session id');
         state.currentSession = session;
         state.currentSessionId = session.id;
+        window.canvasController?.setSession?.(session.id);
         state.currentProjectId = session.project_id || state.currentProjectId;
         agentSelector.value = session.agent_type;
         upsertSessionInProject(session);

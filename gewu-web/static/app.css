@@ -5,6 +5,8 @@
     --work-panel-width: 420px;
     --work-panel-min: 320px;
     --work-panel-max: 900px;
+    --canvas-popup-width: 1100px;
+    --canvas-popup-height: 760px;
     --header-height: 64px;
     --input-height: 104px;
 
@@ -1579,8 +1581,10 @@ button {
 }
 .canvas-overlay-frame {
     position: relative;
-    width: min(96vw, 1400px);
-    height: min(92vh, 900px);
+    width: min(var(--canvas-popup-width), 96vw);
+    height: min(var(--canvas-popup-height), 92vh);
+    min-width: 520px;
+    min-height: 360px;
     background: var(--bg-primary, #fff);
     color: var(--text-primary, #111);
     border-radius: 10px;
@@ -1588,6 +1592,7 @@ button {
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    resize: both;
 }
 .canvas-overlay-header {
     display: flex;
@@ -1625,6 +1630,21 @@ button {
     padding: 0 4px;
 }
 .canvas-overlay-close:hover { color: var(--accent-red, #dc2626); }
+.canvas-overlay-dock {
+    border: 1px solid var(--border-color, #e3e3e6);
+    background: var(--surface, #fff);
+    color: var(--text-secondary, #4b5563);
+    border-radius: 999px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 5px 10px;
+}
+
+.canvas-overlay-dock:hover {
+    border-color: rgba(29, 78, 216, 0.36);
+    color: var(--accent-blue, #2563eb);
+}
 .canvas-overlay-body {
     flex: 1;
     overflow: auto;
