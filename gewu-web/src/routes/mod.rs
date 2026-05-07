@@ -6,4 +6,5 @@ pub mod plugin_proxy;
 pub mod projects;
 pub mod runs;
 pub mod sessions;
+pub mod skills;
 pub mod work_graph;

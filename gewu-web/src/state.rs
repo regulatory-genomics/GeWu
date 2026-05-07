@@ -27,6 +27,23 @@ pub struct SessionInfo {
     pub created_at: i64,
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+}
+
+struct RuntimeListingContext {
+    api_key: String,
+    endpoint: String,
+    model: String,
+    max_output_tokens: Option<u32>,
+    temperature: Option<f32>,
+    plugins: HashMap<String, Value>,
+    runtime_plugin_dirs: Vec<PathBuf>,
+    skill_dirs: Vec<PathBuf>,
+}
+
 impl From<SessionRecord> for SessionInfo {
     fn from(r: SessionRecord) -> Self {
         Self {
@@ -203,51 +220,87 @@ impl AppState {
         )
     }
 
-    pub async fn list_available_agents(&self) -> Result<Vec<(String, String)>> {
+    async fn runtime_listing_context(&self) -> Result<RuntimeListingContext> {
         let config = self.config.read().await;
-        let api_key = config.api_key.clone().context("API key not configured")?;
-        let endpoint = config.endpoint.clone().context("Endpoint not configured")?;
-        let model = config
-            .model
-            .clone()
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-        let max_output_tokens = config.max_output_tokens;
-        let temperature = config.temperature;
-        let plugins = config.plugins.clone();
-        let runtime_plugin_dirs: Vec<PathBuf> = config
-            .runtime_plugin_dirs
-            .iter()
-            .map(|s| expand_config_path(s))
-            .collect();
-        let skill_dirs: Vec<PathBuf> = config
-            .skill_dirs
-            .iter()
-            .map(|s| expand_config_path(s))
-            .collect();
-        drop(config);
+        Ok(RuntimeListingContext {
+            api_key: config.api_key.clone().context("API key not configured")?,
+            endpoint: config.endpoint.clone().context("Endpoint not configured")?,
+            model: config
+                .model
+                .clone()
+                .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+            max_output_tokens: config.max_output_tokens,
+            temperature: config.temperature,
+            plugins: config.plugins.clone(),
+            runtime_plugin_dirs: config
+                .runtime_plugin_dirs
+                .iter()
+                .map(|s| expand_config_path(s))
+                .collect(),
+            skill_dirs: config
+                .skill_dirs
+                .iter()
+                .map(|s| expand_config_path(s))
+                .collect(),
+        })
+    }
+
+    pub async fn list_available_agents(&self) -> Result<Vec<(String, String)>> {
+        let ctx = self.runtime_listing_context().await?;
 
         let pool = &self.db_pool;
 
         let provider = Arc::new(
-            OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model)
-                .with_max_output_tokens(max_output_tokens)
-                .with_temperature(temperature),
+            OpenAIProvider::new_with_endpoint(&ctx.api_key, &ctx.endpoint, &ctx.model)
+                .with_max_output_tokens(ctx.max_output_tokens)
+                .with_temperature(ctx.temperature),
         );
 
-        let plugin_host = self.build_plugin_host(provider.clone(), pool.clone(), plugins)?;
+        let plugin_host = self.build_plugin_host(provider.clone(), pool.clone(), ctx.plugins)?;
         let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs(
             provider,
             pool.clone(),
             &plugin_host,
             &[],
-            &runtime_plugin_dirs,
-            &skill_dirs,
+            &ctx.runtime_plugin_dirs,
+            &ctx.skill_dirs,
             &[],
         )?;
         Ok(runtime
             .list_specialists()
             .into_iter()
             .map(|agent| (agent.name, agent.description))
+            .collect())
+    }
+
+    pub async fn list_available_skills(&self) -> Result<Vec<SkillInfo>> {
+        let ctx = self.runtime_listing_context().await?;
+
+        let pool = &self.db_pool;
+
+        let provider = Arc::new(
+            OpenAIProvider::new_with_endpoint(&ctx.api_key, &ctx.endpoint, &ctx.model)
+                .with_max_output_tokens(ctx.max_output_tokens)
+                .with_temperature(ctx.temperature),
+        );
+
+        let plugin_host = self.build_plugin_host(provider.clone(), pool.clone(), ctx.plugins)?;
+        let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs(
+            provider,
+            pool.clone(),
+            &plugin_host,
+            &[],
+            &ctx.runtime_plugin_dirs,
+            &ctx.skill_dirs,
+            &[],
+        )?;
+        Ok(runtime
+            .skill_summaries()
+            .into_iter()
+            .map(|skill| SkillInfo {
+                name: skill.name,
+                description: skill.description,
+            })
             .collect())
     }
 
