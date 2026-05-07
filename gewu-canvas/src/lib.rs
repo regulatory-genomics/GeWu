@@ -34,7 +34,7 @@ pub mod manager;
 pub mod state;
 pub mod tools;
 
-pub use manager::{CanvasError, CanvasManager};
+pub use manager::{CanvasError, CanvasManager, CanvasValidationIssue};
 pub use state::{
     CANVAS_STATE_VERSION, CanvasEvent, CanvasKind, CanvasMode, CanvasState, CanvasStatePatch,
     GenomeCanvasState, GenomeSelection, GenomeViewport, SampleSpec, TrackSpec, TrackType,

@@ -27,7 +27,7 @@ use schemars::schema::RootSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::manager::CanvasManager;
+use crate::manager::{CanvasError, CanvasManager};
 use crate::state::{CanvasEvent, CanvasKind, CanvasMode, CanvasState, CanvasStatePatch};
 
 /// Build the canonical six canvas tools, sharing a single manager.
@@ -132,7 +132,7 @@ impl Tool for CanvasOpenTool {
         _ctx: &ToolContext,
     ) -> Result<Value, Box<dyn Error + Send + Sync>> {
         let parsed: OpenArgs = serde_json::from_str(args).map_err(box_err)?;
-        let preview = preview_canvas_state(&parsed);
+        let preview = preview_canvas_state(&parsed)?;
         let event = CanvasEvent::Open {
             canvas_id: preview.canvas_id.clone(),
             kind: preview.kind,
@@ -149,7 +149,7 @@ impl Tool for CanvasOpenTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: OpenArgs = serde_json::from_value(args).map_err(box_err)?;
         let mode = input.mode.unwrap_or_default();
-        let state = self
+        let state = match self
             .manager
             .open(
                 &ctx.session_id,
@@ -159,7 +159,11 @@ impl Tool for CanvasOpenTool {
                 input.title,
                 input.initial_state,
             )
-            .await;
+            .await
+        {
+            Ok(state) => state,
+            Err(e) => return Ok(ToolResult::new("canvas.open", error_output(e))),
+        };
 
         // Tool result string carries the same canvas:open event the frontend
         // already mounted from start_metadata, plus the authoritative state
@@ -182,15 +186,16 @@ impl Tool for CanvasOpenTool {
     }
 }
 
-fn preview_canvas_state(args: &OpenArgs) -> CanvasState {
+fn preview_canvas_state(args: &OpenArgs) -> Result<CanvasState, CanvasError> {
     let id = args.canvas_id.clone().unwrap_or_else(|| "pending".into());
     let mut state = CanvasState::new(id, args.kind);
     state.mode = args.mode.unwrap_or_default();
     state.title = args.title.clone().filter(|t| !t.is_empty());
     if let Some(payload) = &args.initial_state {
         state.payload = payload.clone();
+        state.validate_payload()?;
     }
-    state
+    Ok(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -388,14 +393,29 @@ impl Tool for CanvasSetStateTool {
                 });
                 Ok(ToolResult::new("canvas.set_state", output.to_string()))
             }
-            Err(e) => Ok(ToolResult::new(
-                "canvas.set_state",
-                json!({
-                    "error": { "code": "canvas_not_found", "message": e.to_string() }
-                })
-                .to_string(),
-            )),
+            Err(e) => Ok(ToolResult::new("canvas.set_state", error_output(e))),
         }
+    }
+}
+
+fn error_output(error: CanvasError) -> String {
+    match error {
+        CanvasError::NotFound { .. } => json!({
+            "error": { "code": "canvas_not_found", "message": error.to_string() }
+        })
+        .to_string(),
+        CanvasError::InvalidPatch(_) => json!({
+            "error": { "code": "invalid_patch", "message": error.to_string() }
+        })
+        .to_string(),
+        CanvasError::InvalidGenomeCanvasPayload(details) => json!({
+            "error": {
+                "code": "invalid_genome_canvas_payload",
+                "message": "invalid genome canvas payload",
+                "details": details
+            }
+        })
+        .to_string(),
     }
 }
 
@@ -494,6 +514,20 @@ mod tests {
         ToolContext::new(session, "msg-1")
     }
 
+    fn error_details(output: &str) -> Value {
+        serde_json::from_str::<Value>(output).unwrap()["error"]["details"].clone()
+    }
+
+    fn assert_validation_issue(details: &Value, path: &str, code: &str) {
+        let issues = details.as_array().unwrap();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue["path"] == path && issue["code"] == code),
+            "expected issue {path}/{code}, got {details}"
+        );
+    }
+
     #[tokio::test]
     async fn open_then_get_state_round_trip() {
         let m = Arc::new(CanvasManager::new());
@@ -503,7 +537,7 @@ mod tests {
 
         let opened_raw = open
             .execute(
-                json!({ "kind": "genome", "initial_state": { "region": "chr1:1-100" } }),
+                json!({ "kind": "genome", "initial_state": { "assembly": "hg38", "region": "chr1:1-100" } }),
                 &ctx("s1"),
             )
             .await
@@ -517,6 +551,284 @@ mod tests {
             .unwrap();
         let got_json: Value = serde_json::from_str(&got.output).unwrap();
         assert_eq!(got_json["state"]["payload"]["region"], "chr1:1-100");
+    }
+
+    #[tokio::test]
+    async fn open_rejects_malformed_genome_payload_with_structured_error() {
+        let m = Arc::new(CanvasManager::new());
+        let open = CanvasOpenTool { manager: m.clone() };
+
+        let result = open
+            .execute(
+                json!({
+                    "kind": "genome",
+                    "initial_state": {
+                        "assembly": "hg38",
+                        "region": "chr1:1-100",
+                        "samples": [{ "sample_id": "tumor" }],
+                        "tracks": [{ "id": "t1", "type": "signal", "sample_id": "tumor" }]
+                    }
+                }),
+                &ctx("s1"),
+            )
+            .await
+            .unwrap();
+
+        let json: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(json["error"]["code"], "invalid_genome_canvas_payload");
+        assert_validation_issue(
+            &json["error"]["details"],
+            "samples[0].id",
+            "missing_required",
+        );
+        assert_validation_issue(
+            &json["error"]["details"],
+            "samples[0].sample_id",
+            "unexpected_field",
+        );
+        assert!(m.list("s1").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_rejects_missing_assembly() {
+        let open = CanvasOpenTool {
+            manager: Arc::new(CanvasManager::new()),
+        };
+
+        let result = open
+            .execute(
+                json!({
+                    "kind": "genome",
+                    "initial_state": { "region": "chr1:1-100" }
+                }),
+                &ctx("s1"),
+            )
+            .await
+            .unwrap();
+
+        assert_validation_issue(
+            &error_details(&result.output),
+            "assembly",
+            "missing_required",
+        );
+    }
+
+    #[tokio::test]
+    async fn open_rejects_empty_region() {
+        let open = CanvasOpenTool {
+            manager: Arc::new(CanvasManager::new()),
+        };
+
+        let result = open
+            .execute(
+                json!({
+                    "kind": "genome",
+                    "initial_state": { "assembly": "hg38", "region": "" }
+                }),
+                &ctx("s1"),
+            )
+            .await
+            .unwrap();
+
+        assert_validation_issue(&error_details(&result.output), "region", "missing_required");
+    }
+
+    #[tokio::test]
+    async fn open_rejects_empty_assembly() {
+        let open = CanvasOpenTool {
+            manager: Arc::new(CanvasManager::new()),
+        };
+
+        let result = open
+            .execute(
+                json!({
+                    "kind": "genome",
+                    "initial_state": { "assembly": "", "region": "chr1:1-100" }
+                }),
+                &ctx("s1"),
+            )
+            .await
+            .unwrap();
+
+        assert_validation_issue(
+            &error_details(&result.output),
+            "assembly",
+            "missing_required",
+        );
+    }
+
+    #[tokio::test]
+    async fn reopening_existing_with_invalid_initial_state_preserves_previous_payload() {
+        let m = Arc::new(CanvasManager::new());
+        m.open(
+            "s1",
+            Some("c-1".into()),
+            CanvasKind::Genome,
+            CanvasMode::Overlay,
+            None,
+            Some(json!({
+                "assembly": "hg38",
+                "region": "chr1:1-100",
+                "samples": [{ "id": "normal" }],
+                "tracks": []
+            })),
+        )
+        .await
+        .unwrap();
+        let open = CanvasOpenTool { manager: m.clone() };
+
+        let result = open
+            .execute(
+                json!({
+                    "kind": "genome",
+                    "canvas_id": "c-1",
+                    "initial_state": {
+                        "assembly": "hg38",
+                        "region": "chr2:1-100",
+                        "tracks": [{ "id": "t1", "type": "signal", "sample_id": "missing" }]
+                    }
+                }),
+                &ctx("s1"),
+            )
+            .await
+            .unwrap();
+
+        let json: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(json["error"]["code"], "invalid_genome_canvas_payload");
+        assert_validation_issue(
+            &json["error"]["details"],
+            "tracks[0].sample_id",
+            "unknown_reference",
+        );
+
+        let stored = m.get_state("s1", "c-1").await.unwrap();
+        assert_eq!(stored.payload["region"], "chr1:1-100");
+        assert_eq!(stored.payload["samples"][0]["id"], "normal");
+        assert_eq!(stored.payload["tracks"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn reopening_existing_with_invalid_initial_state_preserves_canvas_list_state() {
+        let m = Arc::new(CanvasManager::new());
+        m.open(
+            "s1",
+            Some("target".into()),
+            CanvasKind::Genome,
+            CanvasMode::Overlay,
+            Some("original title".into()),
+            Some(json!({
+                "assembly": "hg38",
+                "region": "chr1:1-100",
+                "samples": [{ "id": "normal" }],
+                "tracks": []
+            })),
+        )
+        .await
+        .unwrap();
+        m.open(
+            "s1",
+            Some("sibling".into()),
+            CanvasKind::Genome,
+            CanvasMode::Overlay,
+            Some("sibling title".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let open = CanvasOpenTool { manager: m.clone() };
+
+        let result = open
+            .execute(
+                json!({
+                    "kind": "genome",
+                    "canvas_id": "target",
+                    "title": "mutated title",
+                    "initial_state": {
+                        "assembly": "hg38",
+                        "region": "chr2:1-100",
+                        "tracks": [{ "id": "bad", "type": "signal", "sample_id": "missing" }]
+                    }
+                }),
+                &ctx("s1"),
+            )
+            .await
+            .unwrap();
+
+        let json: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(json["error"]["code"], "invalid_genome_canvas_payload");
+        assert_validation_issue(
+            &json["error"]["details"],
+            "tracks[0].sample_id",
+            "unknown_reference",
+        );
+
+        let target = m.get_state("s1", "target").await.unwrap();
+        assert_eq!(target.title.as_deref(), Some("original title"));
+        assert!(!target.focused);
+        assert!(target.visible);
+        assert_eq!(target.payload["region"], "chr1:1-100");
+
+        let sibling = m.get_state("s1", "sibling").await.unwrap();
+        assert_eq!(sibling.title.as_deref(), Some("sibling title"));
+        assert!(sibling.focused);
+        assert!(sibling.visible);
+    }
+
+    #[test]
+    fn start_metadata_reports_malformed_genome_payload_for_direct_callers() {
+        let open = CanvasOpenTool {
+            manager: Arc::new(CanvasManager::new()),
+        };
+        let args = serde_json::to_string(&json!({
+            "kind": "genome",
+            "initial_state": { "assembly": "hg38", "samples": [] }
+        }))
+        .unwrap();
+
+        let error = open.start_metadata(&args, &ctx("s1")).unwrap_err();
+
+        assert!(error.to_string().contains("invalid genome canvas payload"));
+    }
+
+    #[tokio::test]
+    async fn set_state_rejects_mismatched_genome_track_sample_without_mutating_state() {
+        let m = Arc::new(CanvasManager::new());
+        let opened = m
+            .open(
+                "s1",
+                Some("c-1".into()),
+                CanvasKind::Genome,
+                CanvasMode::Overlay,
+                None,
+                Some(json!({
+                    "assembly": "hg38",
+                    "region": "chr1:1-100",
+                    "samples": [{ "id": "normal" }],
+                    "tracks": []
+                })),
+            )
+            .await
+            .unwrap();
+        let set = CanvasSetStateTool { manager: m.clone() };
+
+        let result = set
+            .execute(
+                json!({
+                    "canvas_id": opened.canvas_id,
+                    "patch": { "payload": { "tracks": [{ "id": "t1", "type": "signal", "sample_id": "tumor" }] } }
+                }),
+                &ctx("s1"),
+            )
+            .await
+            .unwrap();
+
+        let json: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(json["error"]["code"], "invalid_genome_canvas_payload");
+        assert_eq!(json["error"]["details"][0]["path"], "tracks[0].sample_id");
+        assert_eq!(json["error"]["details"][0]["code"], "unknown_reference");
+
+        let stored = m.get_state("s1", "c-1").await.unwrap();
+        assert_eq!(stored.payload["tracks"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -546,9 +858,10 @@ mod tests {
                 CanvasKind::Genome,
                 CanvasMode::Overlay,
                 None,
-                Some(json!({"region": "chr1:1-100"})),
+                Some(json!({"assembly": "hg38", "region": "chr1:1-100"})),
             )
-            .await;
+            .await
+            .unwrap();
         let set = CanvasSetStateTool { manager: m };
         let result = set
             .execute(
@@ -577,7 +890,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .unwrap();
         m.open(
             "s2",
             None,
@@ -586,7 +900,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .unwrap();
         let list = CanvasListTool { manager: m };
 
         let r1 = list.execute(json!({}), &ctx("s1")).await.unwrap();

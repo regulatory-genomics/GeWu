@@ -5,7 +5,7 @@
 //! `AppState::active_turns`). A sqlite-backed variant lives in Phase 6 of
 //! the implementation plan.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -23,6 +23,15 @@ pub enum CanvasError {
     },
     #[error("invalid patch: {0}")]
     InvalidPatch(String),
+    #[error("invalid genome canvas payload")]
+    InvalidGenomeCanvasPayload(Vec<CanvasValidationIssue>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CanvasValidationIssue {
+    pub path: String,
+    pub code: &'static str,
+    pub message: String,
 }
 
 /// Thread-safe handle around the canvas registry.
@@ -60,13 +69,25 @@ impl CanvasManager {
         mode: CanvasMode,
         title: Option<String>,
         initial_payload: Option<serde_json::Value>,
-    ) -> CanvasState {
+    ) -> Result<CanvasState, CanvasError> {
         let mut guard = self.inner.write().await;
         let session = guard.sessions.entry(session_id.to_string()).or_default();
 
         if let Some(id) = canvas_id.as_deref()
             && session.contains_key(id)
         {
+            let existing = session.get(id).expect("contains_key returned true above");
+            let mut candidate = existing.clone();
+            candidate.visible = true;
+            candidate.focused = true;
+            if let Some(t) = title {
+                candidate.title = if t.is_empty() { None } else { Some(t) };
+            }
+            if let Some(p) = initial_payload {
+                candidate.payload = p;
+                candidate.validate_payload()?;
+            }
+
             // Defocus everything else first so we never end up with
             // two focused canvases after a re-open.
             for (other_id, state) in session.iter_mut() {
@@ -75,14 +96,8 @@ impl CanvasManager {
             let existing = session
                 .get_mut(id)
                 .expect("contains_key returned true above");
-            existing.visible = true;
-            if let Some(t) = title {
-                existing.title = if t.is_empty() { None } else { Some(t) };
-            }
-            if let Some(p) = initial_payload {
-                existing.payload = p;
-            }
-            return existing.clone();
+            *existing = candidate;
+            return Ok(existing.clone());
         }
 
         // New canvas: defocus existing canvases (single-focus model).
@@ -98,9 +113,10 @@ impl CanvasManager {
         }
         if let Some(p) = initial_payload {
             state.payload = p;
+            state.validate_payload()?;
         }
         session.insert(id, state.clone());
-        state
+        Ok(state)
     }
 
     pub async fn close(
@@ -172,6 +188,14 @@ impl CanvasManager {
                 session_id: session_id.into(),
                 canvas_id: canvas_id.into(),
             })?;
+        if let Some(payload_patch) = &patch.payload {
+            let mut candidate = state.clone();
+            candidate.apply_patch(CanvasStatePatch {
+                payload: Some(payload_patch.clone()),
+                ..Default::default()
+            });
+            candidate.validate_payload()?;
+        }
         state.apply_patch(patch);
         Ok(state.clone())
     }
@@ -200,6 +224,142 @@ impl CanvasManager {
     }
 }
 
+impl CanvasState {
+    pub fn validate_payload(&self) -> Result<(), CanvasError> {
+        validate_payload(self.kind, &self.payload)
+    }
+}
+
+fn validate_payload(kind: CanvasKind, payload: &serde_json::Value) -> Result<(), CanvasError> {
+    if kind != CanvasKind::Genome {
+        return Ok(());
+    }
+    let mut issues = Vec::new();
+    let Some(object) = payload.as_object() else {
+        issues.push(CanvasValidationIssue {
+            path: "payload".to_string(),
+            code: "invalid_type",
+            message: "genome canvas payload must be an object".to_string(),
+        });
+        return Err(CanvasError::InvalidGenomeCanvasPayload(issues));
+    };
+
+    match object.get("assembly").and_then(serde_json::Value::as_str) {
+        Some(assembly) if !assembly.trim().is_empty() => {}
+        _ => issues.push(CanvasValidationIssue {
+            path: "assembly".to_string(),
+            code: "missing_required",
+            message: "genome canvas payload requires non-empty assembly".to_string(),
+        }),
+    }
+
+    match object.get("region").and_then(serde_json::Value::as_str) {
+        Some(region) if !region.trim().is_empty() => {}
+        _ => issues.push(CanvasValidationIssue {
+            path: "region".to_string(),
+            code: "missing_required",
+            message: "genome canvas payload requires non-empty region".to_string(),
+        }),
+    }
+
+    let sample_ids = validate_samples(object.get("samples"), &mut issues);
+    validate_tracks(object.get("tracks"), &sample_ids, &mut issues);
+
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(CanvasError::InvalidGenomeCanvasPayload(issues))
+    }
+}
+
+fn validate_samples(
+    samples: Option<&serde_json::Value>,
+    issues: &mut Vec<CanvasValidationIssue>,
+) -> HashSet<String> {
+    let mut sample_ids = HashSet::new();
+    let Some(samples) = samples else {
+        return sample_ids;
+    };
+    let Some(samples) = samples.as_array() else {
+        issues.push(CanvasValidationIssue {
+            path: "samples".to_string(),
+            code: "invalid_type",
+            message: "samples must be an array".to_string(),
+        });
+        return sample_ids;
+    };
+
+    for (index, sample) in samples.iter().enumerate() {
+        let path = format!("samples[{index}]");
+        let Some(sample) = sample.as_object() else {
+            issues.push(CanvasValidationIssue {
+                path,
+                code: "invalid_type",
+                message: "sample must be an object".to_string(),
+            });
+            continue;
+        };
+        match sample.get("id").and_then(serde_json::Value::as_str) {
+            Some(id) if !id.trim().is_empty() => {
+                sample_ids.insert(id.to_string());
+            }
+            _ => issues.push(CanvasValidationIssue {
+                path: format!("{path}.id"),
+                code: "missing_required",
+                message: "sample requires non-empty id".to_string(),
+            }),
+        }
+        if sample.contains_key("sample_id") {
+            issues.push(CanvasValidationIssue {
+                path: format!("{path}.sample_id"),
+                code: "unexpected_field",
+                message: "samples use canonical id, not sample_id".to_string(),
+            });
+        }
+    }
+    sample_ids
+}
+
+fn validate_tracks(
+    tracks: Option<&serde_json::Value>,
+    sample_ids: &HashSet<String>,
+    issues: &mut Vec<CanvasValidationIssue>,
+) {
+    let Some(tracks) = tracks else {
+        return;
+    };
+    let Some(tracks) = tracks.as_array() else {
+        issues.push(CanvasValidationIssue {
+            path: "tracks".to_string(),
+            code: "invalid_type",
+            message: "tracks must be an array".to_string(),
+        });
+        return;
+    };
+
+    for (index, track) in tracks.iter().enumerate() {
+        let path = format!("tracks[{index}]");
+        let Some(track) = track.as_object() else {
+            issues.push(CanvasValidationIssue {
+                path,
+                code: "invalid_type",
+                message: "track must be an object".to_string(),
+            });
+            continue;
+        };
+        if let Some(sample_id) = track.get("sample_id").and_then(serde_json::Value::as_str)
+            && !sample_id.trim().is_empty()
+            && !sample_ids.contains(sample_id)
+        {
+            issues.push(CanvasValidationIssue {
+                path: format!("{path}.sample_id"),
+                code: "unknown_reference",
+                message: format!("track references unknown sample_id '{sample_id}'"),
+            });
+        }
+    }
+}
+
 fn short_canvas_id() -> String {
     let raw = Uuid::new_v4().to_string();
     let suffix: String = raw.chars().filter(|c| *c != '-').take(8).collect();
@@ -222,7 +382,8 @@ mod tests {
                 None,
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         let fetched = m.get_state("s1", &opened.canvas_id).await.unwrap();
         assert_eq!(fetched.canvas_id, opened.canvas_id);
         assert!(fetched.focused);
@@ -240,7 +401,8 @@ mod tests {
             Some("first".into()),
             None,
         )
-        .await;
+        .await
+        .unwrap();
         // Open another canvas to make first one lose focus
         m.open(
             "s1",
@@ -250,7 +412,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .unwrap();
         let first = m.get_state("s1", "c-fixed").await.unwrap();
         assert!(!first.focused);
         // Re-opening focuses it again, no duplicate created
@@ -263,7 +426,8 @@ mod tests {
                 None,
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         assert!(reopened.focused);
         assert_eq!(reopened.title.as_deref(), Some("first"));
         assert_eq!(m.list("s1").await.len(), 2);
@@ -279,9 +443,10 @@ mod tests {
                 CanvasKind::Genome,
                 CanvasMode::Overlay,
                 None,
-                Some(serde_json::json!({"region": "chr1:1-100"})),
+                Some(serde_json::json!({"assembly": "hg38", "region": "chr1:1-100"})),
             )
-            .await;
+            .await
+            .unwrap();
         let original_ts = opened.updated_at.clone();
 
         // Wait long enough for timestamp resolution to advance
@@ -318,7 +483,8 @@ mod tests {
                 None,
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         let closed = m.close("s1", &opened.canvas_id).await.unwrap();
         assert!(!closed.visible);
         assert!(!closed.focused);
@@ -339,7 +505,8 @@ mod tests {
                 None,
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         let b = m
             .open(
                 "s1",
@@ -349,7 +516,8 @@ mod tests {
                 None,
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         // After opening b, only b is focused
         assert!(!m.get_state("s1", &a.canvas_id).await.unwrap().focused);
         assert!(m.get_state("s1", &b.canvas_id).await.unwrap().focused);
@@ -370,7 +538,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .unwrap();
         m.drop_session("s1").await;
         assert!(m.list("s1").await.is_empty());
     }
@@ -392,7 +561,8 @@ mod tests {
                 None,
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         let b = m
             .open(
                 "s1",
@@ -402,7 +572,8 @@ mod tests {
                 None,
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         assert!(!m.get_state("s1", &a.canvas_id).await.unwrap().focused);
         assert!(m.get_state("s1", &b.canvas_id).await.unwrap().focused);
 
@@ -416,7 +587,8 @@ mod tests {
                 None,
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         assert!(reopened.focused);
         assert!(!m.get_state("s1", "b").await.unwrap().focused);
         let focused: Vec<_> = m
