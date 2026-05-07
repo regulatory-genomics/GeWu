@@ -1027,6 +1027,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "gewu-resource-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "gewu-core",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "gewu-runtime"
 version = "0.1.0"
 dependencies = [
@@ -1038,6 +1055,7 @@ dependencies = [
  "futures",
  "gewu-core",
  "gewu-graph",
+ "gewu-resource-core",
  "gewu-storage",
  "gewu-tools",
  "reqwest",

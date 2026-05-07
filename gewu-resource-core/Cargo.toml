@@ -1,0 +1,23 @@
+[package]
+name = "gewu-resource-core"
+version = "0.1.0"
+edition = "2024"
+description = "Domain-neutral resource registry, catalog, and tools for GeWu"
+
+[dependencies]
+gewu-core = { path = "../gewu-core" }
+anyhow = "1.0"
+async-trait = "0.1"
+schemars = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+thiserror = "2.0"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
