@@ -10,6 +10,7 @@ use gewu_runtime::command_tool_registry::CommandToolRegistry;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::PathBuf;
 use tempfile::TempDir;
 
 fn ctx() -> ToolContext {
@@ -267,6 +268,64 @@ async fn full_pipeline_register_reload_execute() {
     let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
     assert_eq!(output["tool_run_id"], "fw-mock");
     assert_eq!(output["summary"], "ok");
+}
+
+#[tokio::test]
+async fn gene_resolve_symbol_example_executes_against_real_ucf_when_configured() {
+    let Ok(manifest_path) = std::env::var("GEWU_ANNO_CLI_MANIFEST") else {
+        eprintln!("skipping: set GEWU_ANNO_CLI_MANIFEST to bio-anno/Cargo.toml");
+        return;
+    };
+    let Ok(gene_info_path) = std::env::var("GEWU_GENE_INFO_UCF") else {
+        eprintln!("skipping: set GEWU_GENE_INFO_UCF to gene_info.ucf");
+        return;
+    };
+    if !PathBuf::from(&manifest_path).exists() || !PathBuf::from(&gene_info_path).exists() {
+        eprintln!("skipping: configured gene resolver paths do not exist");
+        return;
+    }
+
+    let yaml_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("gewu-runtime has a parent repo directory")
+        .join("examples/tools/gene.resolve_symbol.yaml");
+    let yaml =
+        std::fs::read_to_string(&yaml_path).expect("example gene.resolve_symbol YAML exists");
+    let def: CommandToolDef = serde_yaml::from_str(&yaml).expect("example YAML parses");
+    let tool = CommandTool::new(def);
+
+    let result = tool
+        .execute(
+            json!({
+                "symbol": "SPI1",
+                "assembly": "hg38",
+                "species": "human",
+                "locus_mode": "gene_body"
+            }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+    assert_eq!(output["status"], "ok");
+    assert_eq!(output["query_symbol"], "SPI1");
+    assert_eq!(output["assembly"], "hg38");
+    assert_eq!(output["species"], "human");
+    assert_eq!(output["source"], gene_info_path);
+    assert_eq!(output["primary"]["region"], "chr11:47354860-47395607");
+}
+
+#[test]
+fn examples_tool_directory_is_not_the_default_command_tool_registry() {
+    let default_dir = CommandToolRegistry::default_dir();
+    let examples_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("gewu-runtime has a parent repo directory")
+        .join("examples/tools");
+
+    assert_ne!(default_dir, examples_dir);
+    assert!(examples_dir.join("gene.resolve_symbol.yaml").exists());
 }
 
 // ---------------------------------------------------------------------------

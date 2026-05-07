@@ -1,0 +1,40 @@
+name: gene.resolve_symbol
+description: Resolve a gene symbol to a locus before Genome Canvas open/update.
+command: /bin/bash
+args:
+  - -lc
+  - |
+      manifest_path="${GEWU_ANNO_CLI_MANIFEST:?set GEWU_ANNO_CLI_MANIFEST to the bio-anno Cargo.toml path}"
+      gene_info_path="${GEWU_GENE_INFO_UCF:?set GEWU_GENE_INFO_UCF to the gene_info.ucf path}"
+      exec /data/litian/.cargo/bin/cargo run --manifest-path "$manifest_path" --quiet -p anno-cli -- gene-locus --gene-info "$gene_info_path" --stdin-json
+timeout_ms: 30000
+input_schema:
+  type: object
+  required:
+    - symbol
+    - assembly
+  properties:
+    symbol:
+      type: string
+      description: Gene symbol to resolve.
+    assembly:
+      type: string
+      enum:
+        - hg38
+        - GRCh38
+      description: Supported genome assembly.
+    species:
+      type: string
+      default: human
+      description: Species label for resolution.
+    locus_mode:
+      type: string
+      enum:
+        - gene_body
+        - tss_flank
+      default: gene_body
+      description: Whether to return the gene body or a TSS flank locus.
+    flank_bp:
+      type: integer
+      minimum: 0
+      description: Flank size in base pairs when locus_mode is tss_flank.
