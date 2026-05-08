@@ -151,3 +151,29 @@ pub struct ValidateResponse {
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub details: Value,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RegisterRequest {
+    pub resource: Resource,
+    #[serde(default)]
+    pub mode: RegisterMode,
+    #[serde(default = "default_catalog")]
+    pub catalog: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RegisterMode {
+    CreateOnly,
+    UpdateOnly,
+    #[default]
+    Upsert,
+}
+
+fn default_catalog() -> String {
+    "agent-registered.yaml".into()
+}

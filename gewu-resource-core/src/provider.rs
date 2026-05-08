@@ -1,3 +1,5 @@
+use std::sync::{Arc, RwLock};
+
 use async_trait::async_trait;
 
 use crate::error::ResourceResult;
@@ -8,6 +10,9 @@ use crate::uri::ResourceUri;
 #[async_trait]
 pub trait ResourceProvider: Send + Sync {
     fn id(&self) -> &str;
+    fn is_mutable(&self) -> bool {
+        false
+    }
     fn kinds(&self) -> Vec<String>;
     async fn search(&self, request: &SearchRequest) -> ResourceResult<Vec<Resource>>;
     async fn describe(&self, request: &DescribeRequest) -> ResourceResult<Option<Resource>>;
@@ -125,5 +130,129 @@ impl ResourceProvider for InMemoryResourceProvider {
             suggested_fix: None,
             details: serde_json::Value::Null,
         })
+    }
+}
+
+#[derive(Debug)]
+pub struct MutableResourceProvider {
+    id: String,
+    resources: RwLock<Vec<Resource>>,
+}
+
+impl MutableResourceProvider {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            resources: RwLock::new(Vec::new()),
+        }
+    }
+
+    pub fn contains_uri(&self, uri: &ResourceUri) -> ResourceResult<bool> {
+        let resources = self
+            .resources
+            .read()
+            .map_err(|err| crate::error::ResourceError::Provider(err.to_string()))?;
+        Ok(resources.iter().any(|resource| &resource.uri == uri))
+    }
+
+    pub fn upsert(&self, resource: Resource) -> ResourceResult<()> {
+        self.upsert_many(vec![resource])
+    }
+
+    pub fn upsert_many(&self, resources_to_upsert: Vec<Resource>) -> ResourceResult<()> {
+        let mut resources = self
+            .resources
+            .write()
+            .map_err(|err| crate::error::ResourceError::Provider(err.to_string()))?;
+        for resource in resources_to_upsert {
+            if let Some(existing) = resources
+                .iter_mut()
+                .find(|existing| existing.uri == resource.uri)
+            {
+                *existing = resource;
+            } else {
+                resources.push(resource);
+            }
+        }
+        Ok(())
+    }
+
+    fn snapshot(&self) -> ResourceResult<Vec<Resource>> {
+        let resources = self
+            .resources
+            .read()
+            .map_err(|err| crate::error::ResourceError::Provider(err.to_string()))?;
+        Ok(resources.clone())
+    }
+}
+
+#[async_trait]
+impl ResourceProvider for MutableResourceProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn is_mutable(&self) -> bool {
+        true
+    }
+
+    fn kinds(&self) -> Vec<String> {
+        let Ok(resources) = self.resources.read() else {
+            return Vec::new();
+        };
+        let mut kinds = resources
+            .iter()
+            .map(|resource| resource.kind.clone())
+            .collect::<Vec<_>>();
+        kinds.sort();
+        kinds.dedup();
+        kinds
+    }
+
+    async fn search(&self, request: &SearchRequest) -> ResourceResult<Vec<Resource>> {
+        Ok(self
+            .snapshot()?
+            .into_iter()
+            .filter(|resource| InMemoryResourceProvider::matches_search(resource, request))
+            .collect())
+    }
+
+    async fn describe(&self, request: &DescribeRequest) -> ResourceResult<Option<Resource>> {
+        Ok(self
+            .snapshot()?
+            .into_iter()
+            .find(|resource| resource.uri == request.uri))
+    }
+
+    async fn validate(&self, request: &ValidateRequest) -> ResourceResult<ValidateResponse> {
+        let provider = InMemoryResourceProvider::new(self.id.clone(), self.snapshot()?);
+        provider.validate(request).await
+    }
+}
+
+#[async_trait]
+impl ResourceProvider for Arc<MutableResourceProvider> {
+    fn id(&self) -> &str {
+        self.as_ref().id()
+    }
+
+    fn is_mutable(&self) -> bool {
+        true
+    }
+
+    fn kinds(&self) -> Vec<String> {
+        self.as_ref().kinds()
+    }
+
+    async fn search(&self, request: &SearchRequest) -> ResourceResult<Vec<Resource>> {
+        self.as_ref().search(request).await
+    }
+
+    async fn describe(&self, request: &DescribeRequest) -> ResourceResult<Option<Resource>> {
+        self.as_ref().describe(request).await
+    }
+
+    async fn validate(&self, request: &ValidateRequest) -> ResourceResult<ValidateResponse> {
+        self.as_ref().validate(request).await
     }
 }

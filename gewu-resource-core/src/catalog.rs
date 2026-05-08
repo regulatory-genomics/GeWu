@@ -28,6 +28,19 @@ pub struct ResourceCatalogEntry {
 }
 
 impl ResourceCatalogEntry {
+    pub fn from_resource(resource: Resource) -> Self {
+        Self {
+            uri: resource.uri,
+            name: resource.name,
+            aliases: resource.aliases,
+            labels: resource.labels,
+            annotations: resource.annotations,
+            spec: resource.spec,
+            status: resource.status,
+            provenance: resource.provenance,
+        }
+    }
+
     fn into_resource(self) -> Resource {
         Resource {
             kind: self.uri.kind().to_string(),
