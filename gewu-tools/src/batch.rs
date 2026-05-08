@@ -2,7 +2,7 @@ use crate::fs_utils::into_tool_error;
 use anyhow::Result;
 use async_trait::async_trait;
 use gewu_core::traits::{Tool, ToolRegistry};
-use gewu_core::types::{ToolContext, ToolResult};
+use gewu_core::types::{ToolContext, ToolExecutionPolicy, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::error::Error;
@@ -102,6 +102,24 @@ impl Tool for BatchTool {
                         .into());
                     }
 
+                    match registry.execution_policy(&tool_name) {
+                        Some(ToolExecutionPolicy::ParallelSafe) => {}
+                        Some(policy) => {
+                            return Err(format!(
+                                "Tool '{}' is not allowed in batch because its execution policy is {:?}; batch only runs ParallelSafe tools",
+                                tool_name, policy
+                            )
+                            .into());
+                        }
+                        None => {
+                            return Err(format!(
+                                "Tool '{}' is not allowed in batch because its execution policy is unknown",
+                                tool_name
+                            )
+                            .into());
+                        }
+                    }
+
                     registry.execute(&tool_name, params, &ctx).await
                 }
                 .await;
@@ -173,5 +191,97 @@ impl Tool for BatchTool {
         }
 
         Ok(ToolResult::new("batch", output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TestRegistry {
+        policies: BTreeMap<String, ToolExecutionPolicy>,
+        executions: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ToolRegistry for TestRegistry {
+        async fn execute(
+            &self,
+            name: &str,
+            _args: Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::new(name, "ok"))
+        }
+
+        fn list_tools(&self) -> Vec<String> {
+            self.policies.keys().cloned().collect()
+        }
+
+        fn execution_policy(&self, name: &str) -> Option<ToolExecutionPolicy> {
+            self.policies.get(name).copied()
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_non_parallel_safe_tools_without_executing_them() {
+        let registry = Arc::new(TestRegistry {
+            policies: BTreeMap::from([(
+                "resource.register".to_string(),
+                ToolExecutionPolicy::Serial,
+            )]),
+            executions: AtomicUsize::new(0),
+        });
+        let batch = BatchTool::new(registry.clone());
+
+        let result = batch
+            .execute(
+                serde_json::json!({
+                    "tool_calls": [{
+                        "tool": "resource.register",
+                        "parameters": {"dry_run": true}
+                    }]
+                }),
+                &ToolContext::new("s1", "m1"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(registry.executions.load(Ordering::SeqCst), 0);
+        assert!(result.output.contains("0/1 tools successfully"));
+        assert!(result.output.contains("resource.register"));
+        assert!(result.output.contains("ParallelSafe"));
+    }
+
+    #[tokio::test]
+    async fn batch_runs_parallel_safe_tools() {
+        let registry = Arc::new(TestRegistry {
+            policies: BTreeMap::from([(
+                "resource.search".to_string(),
+                ToolExecutionPolicy::ParallelSafe,
+            )]),
+            executions: AtomicUsize::new(0),
+        });
+        let batch = BatchTool::new(registry.clone());
+
+        let result = batch
+            .execute(
+                serde_json::json!({
+                    "tool_calls": [{
+                        "tool": "resource.search",
+                        "parameters": {"query": "docs"}
+                    }]
+                }),
+                &ToolContext::new("s1", "m1"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(registry.executions.load(Ordering::SeqCst), 1);
+        assert!(result.output.contains("All 1 tools executed successfully"));
     }
 }
