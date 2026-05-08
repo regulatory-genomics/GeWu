@@ -358,8 +358,14 @@ mod tests {
 
         assert_eq!(assets.plugins[0].id, "tachyon");
         assert_eq!(assets.plugins[0].sidecars[0].url, "http://127.0.0.1:8400");
-        assert_eq!(assets.plugins[0].scripts[0], "/plugins/tachyon/tachyon-canvas.iife.js");
-        assert_eq!(assets.plugins[0].styles[0], "/plugins/tachyon/tachyon-canvas.css");
+        assert_eq!(
+            assets.plugins[0].scripts[0],
+            "/plugins/tachyon/tachyon-canvas.iife.js"
+        );
+        assert_eq!(
+            assets.plugins[0].styles[0],
+            "/plugins/tachyon/tachyon-canvas.css"
+        );
     }
 
     #[test]

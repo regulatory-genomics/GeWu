@@ -14,7 +14,8 @@ pub async fn handle_plugin_get(
     Path((plugin_id, sidecar_id, path)): Path<(String, String, String)>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, (StatusCode, String)> {
-    let target = plugin_target_url(&app, &plugin_id, &sidecar_id, &path, raw_query.as_deref()).await?;
+    let target =
+        plugin_target_url(&app, &plugin_id, &sidecar_id, &path, raw_query.as_deref()).await?;
     proxy_plugin_request(Method::GET, target, None).await
 }
 
@@ -48,7 +49,11 @@ pub async fn plugin_target_url(
             format!("sidecar {sidecar_id} is not configured for plugin {plugin_id}"),
         ));
     };
-    let mut target = format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/'));
+    let mut target = format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
     if let Some(query) = raw_query.filter(|query| !query.is_empty()) {
         target.push('?');
         target.push_str(query);
@@ -58,7 +63,10 @@ pub async fn plugin_target_url(
 
 fn validate_proxy_path(path: &str) -> Result<(), (StatusCode, String)> {
     if path.contains("..") || path.contains('\\') {
-        return Err((StatusCode::BAD_REQUEST, "invalid plugin proxy path".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid plugin proxy path".to_string(),
+        ));
     }
     Ok(())
 }

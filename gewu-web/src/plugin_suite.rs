@@ -133,7 +133,11 @@ impl PluginSuiteConfig {
             None => Vec::new(),
         };
 
-        let renderer = self.config.get("renderer").cloned().unwrap_or_else(|| json!({}));
+        let renderer = self
+            .config
+            .get("renderer")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
         let mut assets = Vec::new();
         if let Some(style) = renderer.get("style").and_then(Value::as_str) {
             assets.push(RuntimeFrontendAsset {

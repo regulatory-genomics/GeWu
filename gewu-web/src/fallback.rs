@@ -66,15 +66,22 @@ fn escape_attr(value: &str) -> String {
 }
 
 pub fn inject_runtime_assets(html: &str, assets: &RuntimeFrontendAssets) -> String {
-    let runtime_json = serde_json::to_string(assets).unwrap_or_else(|_| "{\"plugins\":[]}".to_string());
-    let runtime_script = format!("<script>window.__GEWU_PLUGINS__ = {};</script>", runtime_json);
+    let runtime_json =
+        serde_json::to_string(assets).unwrap_or_else(|_| "{\"plugins\":[]}".to_string());
+    let runtime_script = format!(
+        "<script>window.__GEWU_PLUGINS__ = {};</script>",
+        runtime_json
+    );
     let mut out = inject_before_head_close(html, &runtime_script);
 
     for plugin in &assets.plugins {
         for style in &plugin.styles {
             out = inject_before_head_close(
                 &out,
-                &format!("<link rel=\"stylesheet\" href=\"{}\" />", escape_attr(style)),
+                &format!(
+                    "<link rel=\"stylesheet\" href=\"{}\" />",
+                    escape_attr(style)
+                ),
             );
         }
     }
@@ -183,12 +190,12 @@ mod tests {
         assert!(out.contains("window.__GEWU_PLUGINS__"));
         assert!(out.contains("\"tachyon\""));
         assert!(out.contains("http://127.0.0.1:8400"));
-        assert!(
-            out.contains(
-                "<link rel=\"stylesheet\" href=\"http://127.0.0.1:8400/assets/tachyon-canvas.css\" />"
-            )
-        );
-        assert!(out.contains("<script src=\"http://127.0.0.1:8400/assets/tachyon-canvas.iife.js\"></script>"));
+        assert!(out.contains(
+            "<link rel=\"stylesheet\" href=\"http://127.0.0.1:8400/assets/tachyon-canvas.css\" />"
+        ));
+        assert!(out.contains(
+            "<script src=\"http://127.0.0.1:8400/assets/tachyon-canvas.iife.js\"></script>"
+        ));
         let renderer_pos = out
             .find("src=\"http://127.0.0.1:8400/assets/tachyon-canvas.iife.js\"")
             .unwrap();
