@@ -36,6 +36,10 @@ pub async fn handle_list(
     State(app): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session_id = app
+        .resolve_session_id(&session_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let canvases = app.canvases.list(&session_id).await;
     Ok(Json(json!({ "canvases": canvases })))
 }
@@ -44,6 +48,10 @@ pub async fn handle_get(
     State(app): State<Arc<AppState>>,
     Path((session_id, canvas_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session_id = app
+        .resolve_session_id(&session_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let state = app.canvases.get_state(&session_id, &canvas_id).await;
     match state {
         Some(s) => Ok(Json(json!({ "state": s }))),
@@ -56,6 +64,10 @@ pub async fn handle_patch(
     Path((session_id, canvas_id)): Path<(String, String)>,
     Json(body): Json<PatchBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session_id = app
+        .resolve_session_id(&session_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     match app
         .canvases
         .set_state(&session_id, &canvas_id, body.patch)
@@ -70,6 +82,10 @@ pub async fn handle_close(
     State(app): State<Arc<AppState>>,
     Path((session_id, canvas_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session_id = app
+        .resolve_session_id(&session_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     match app.canvases.close(&session_id, &canvas_id).await {
         Ok(state) => Ok(Json(json!({ "closed": true, "state": state }))),
         Err(e) => Err((StatusCode::NOT_FOUND, e.to_string())),
@@ -154,4 +170,82 @@ async fn proxy_browser_request(
         HeaderValue::from_static("application/json"),
     );
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::AppState;
+    use std::sync::Arc;
+
+    /// Verifies that canvas routes resolve session_id prefixes correctly.
+    ///
+    /// Setup:
+    /// 1. Store a session with full UUID in the session_store
+    /// 2. Open a canvas under the full session_id
+    /// 3. Call handle_list with a short prefix of the session_id
+    /// 4. Assert the canvas appears in the list
+    #[tokio::test]
+    async fn canvas_list_resolves_session_prefix() {
+        let config = crate::state::ServerConfig {
+            api_key: Some("test-key".to_string()),
+            endpoint: Some("http://localhost".to_string()),
+            model: Some("test".to_string()),
+            ..Default::default()
+        };
+
+        let app = AppState::new(
+            config,
+            crate::auth::AuthMode::None,
+            vec![],
+            Arc::new(|_| {}),
+        )
+        .await
+        .expect("AppState should be created");
+
+        let app = Arc::new(app);
+
+        let full_session_id = uuid::Uuid::new_v4().to_string();
+        app.session_store
+            .insert(&full_session_id, None, None, "test-agent", 1000)
+            .await
+            .expect("session should be inserted");
+
+        // Open a canvas under the full session_id
+        let canvas_state = app
+            .canvases
+            .open(
+                &full_session_id,
+                Some("test-canvas".to_string()),
+                gewu_canvas::CanvasKind::Genome,
+                gewu_canvas::CanvasMode::Overlay,
+                Some("Test Canvas".to_string()),
+                None,
+            )
+            .await
+            .expect("canvas should open");
+
+        // Call handle_list with a short prefix - this is the key test:
+        // the handler should resolve "48995146" to "48995146-9994-4ca5-923c-e90ca3afa9dd"
+        let prefix = &full_session_id[..8];
+        let result = handle_list(State(app.clone()), Path(prefix.to_string())).await;
+
+        // Assert the result contains the canvas we opened
+        let Ok(Json(response)) = result else {
+            panic!("handle_list failed: {:?}", result);
+        };
+
+        let canvases = response["canvases"]
+            .as_array()
+            .expect("response should have canvases array");
+
+        assert!(
+            !canvases.is_empty(),
+            "canvas list should not be empty when using session prefix"
+        );
+        assert!(
+            canvases.iter().any(|c| c["canvas_id"] == canvas_state.canvas_id),
+            "opened canvas should appear in list when queried with session prefix"
+        );
+    }
 }
