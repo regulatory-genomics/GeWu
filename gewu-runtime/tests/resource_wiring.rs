@@ -215,6 +215,43 @@ async fn runtime_resource_register_available_for_explicit_empty_resource_dir() {
 }
 
 #[tokio::test]
+async fn build_specialist_can_use_resources_and_gene_resolver_in_project_workdir() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = pool().await;
+    let provider: Arc<dyn LlmProvider> = Arc::new(FinishLlm);
+    let plugin_host = PluginHost::empty();
+    let runtime = RuntimeFactory::build_with_manifest_and_runtime_plugin_dirs_in_directory(
+        provider,
+        pool,
+        &plugin_host,
+        &[],
+        &[],
+        &[],
+        &[],
+        dir.path(),
+    )
+    .unwrap();
+
+    let build = runtime.find_specialist("build").unwrap();
+    assert!(build.capabilities.contains(&"resource.register".to_string()));
+    assert!(build.capabilities.contains(&"resource.resolve".to_string()));
+    assert!(build.capabilities.contains(&"resource.search".to_string()));
+    assert!(build.capabilities.contains(&"gene.resolve_symbol".to_string()));
+
+    let tools = runtime
+        .resolve_capabilities_in_directory(
+            &build.capabilities,
+            dir.path(),
+        )
+        .unwrap();
+    let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
+    assert!(names.contains(&"resource.register"));
+    assert!(names.contains(&"resource.resolve"));
+    assert!(names.contains(&"resource.search"));
+    assert!(names.contains(&"gene.resolve_symbol"));
+}
+
+#[tokio::test]
 async fn runtime_factory_registers_resource_tools_from_non_cwd_workdir() {
     let original_cwd = std::env::current_dir().unwrap();
     let cwd_dir = tempfile::tempdir().unwrap();

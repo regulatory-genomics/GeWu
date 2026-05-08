@@ -1713,6 +1713,8 @@ impl GeWuRuntimeBuilder {
             }
         }
 
+        add_registered_local_capabilities_to_default_specialists(&mut specialists, &registry);
+
         // Register the composer specialist and its tools. The composer
         // context captures a snapshot of the specialists and capabilities
         // that are already registered — so it must come last.
@@ -1811,6 +1813,34 @@ fn load_resource_tool_factory(resource_dirs: &[PathBuf]) -> Option<ResourceToolF
         }
         None if registry.provider_count() > 0 => Some(ResourceToolFactory::new(Arc::new(registry))),
         None => None,
+    }
+}
+
+fn add_registered_local_capabilities_to_default_specialists(
+    specialists: &mut [SpecialistDescriptor],
+    registry: &CapabilityRegistry,
+) {
+    let local_capabilities = [
+        "resource.describe",
+        "resource.resolve",
+        "resource.search",
+        "resource.validate",
+        "resource.register",
+        "gene.resolve_symbol",
+    ];
+
+    for specialist in specialists {
+        if specialist.id != "build" && specialist.id != "general" {
+            continue;
+        }
+
+        for capability in local_capabilities {
+            if registry.contains(capability)
+                && !specialist.capabilities.iter().any(|name| name == capability)
+            {
+                specialist.capabilities.push(capability.to_string());
+            }
+        }
     }
 }
 
