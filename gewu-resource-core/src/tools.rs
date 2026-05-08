@@ -133,13 +133,85 @@ resource_tool!(
     "Describe a resource by URI",
     describe
 );
-resource_tool!(
-    ResourceValidateTool,
-    ValidateRequest,
-    "resource.validate",
-    "Validate that a resource value is usable",
-    validate
-);
+
+pub struct ResourceValidateTool {
+    registry: Arc<ResourceRegistry>,
+}
+
+impl ResourceValidateTool {
+    pub fn new(registry: Arc<ResourceRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait]
+impl Tool for ResourceValidateTool {
+    fn name(&self) -> &str {
+        "resource.validate"
+    }
+
+    fn description(&self) -> &str {
+        "Validate that a resource value is usable"
+    }
+
+    fn schema(&self) -> RootSchema {
+        schema_for!(ValidateRequest)
+    }
+
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::ParallelSafe
+    }
+
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let request: ValidateRequest = match serde_json::from_value(args) {
+            Ok(request) => request,
+            Err(error) => {
+                return recoverable_error_result(
+                    "resource.validate",
+                    "invalid_args",
+                    error.to_string(),
+                    "Call this tool with arguments matching its JSON schema.",
+                );
+            }
+        };
+        let response = match self.registry.validate(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                return recoverable_error_result(
+                    "resource.validate",
+                    "resource_error",
+                    error.to_string(),
+                    "Check the resource registry configuration and retry with a valid resource query.",
+                );
+            }
+        };
+
+        if response.ok {
+            success_result("resource.validate", response)
+        } else {
+            let tool_result = ToolResult::new(
+                "resource.validate",
+                serde_json::to_string(&json!({
+                    "ok": false,
+                    "error": {
+                        "code": response.code.unwrap_or_else(|| "resource_validation_failed".into()),
+                        "retryable": response.retryable.unwrap_or(false),
+                        "message": response.message,
+                        "field": response.field,
+                        "suggested_fix": response.suggested_fix,
+                        "details": response.details,
+                        "warnings": response.warnings
+                    }
+                }))?,
+            );
+            Ok(tool_result)
+        }
+    }
+}
 
 pub struct ResourceRegisterTool {
     registry: Arc<ResourceRegistry>,
@@ -424,6 +496,17 @@ impl Tool for ResourceRegisterTool {
         args: Value,
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        // Check for object URI before generic parsing
+        if let Some(uri_value) = args.pointer("/resource/uri") {
+            if uri_value.is_object() {
+                return recoverable_error_result(
+                    self.name(),
+                    "invalid_args",
+                    "resource.uri must be a canonical URI string, not an object",
+                    "Use a string like \"uri\": \"gewu://sample/ucf_atac_hg38\". Resource kind and id are encoded in the URI.",
+                );
+            }
+        }
         if let Some(uri) = args
             .get("resource")
             .and_then(|resource| resource.get("uri"))
@@ -595,6 +678,7 @@ impl Tool for ResourceRegisterTool {
 
         let operation = if exists { "update" } else { "create" };
         let uri = resource.uri.to_string();
+        let uri_for_next_actions = uri.clone();
         if request.dry_run {
             return success_result(
                 self.name(),
@@ -607,6 +691,10 @@ impl Tool for ResourceRegisterTool {
                     "available_now": false,
                     "will_update_registry": true,
                     "verify": {"tool":"resource.resolve","args":{"query": uri}},
+                    "next_actions": [
+                        {"tool":"resource.resolve","args":{"query": uri_for_next_actions},"purpose":"Verify the newly registered resource is available in the current registry."},
+                        {"tool":"resource.describe","args":{"uri": uri_for_next_actions},"purpose":"Inspect the authoritative registered resource metadata."}
+                    ]
                 }),
             );
         }
@@ -668,6 +756,10 @@ impl Tool for ResourceRegisterTool {
                 "available_now": available_now,
                 "will_update_registry": true,
                 "verify": {"tool":"resource.resolve","args":{"query": uri}},
+                "next_actions": [
+                    {"tool":"resource.resolve","args":{"query": uri.clone()},"purpose":"Verify the newly registered resource is available in the current registry."},
+                    {"tool":"resource.describe","args":{"uri": uri.clone()},"purpose":"Inspect the authoritative registered resource metadata."}
+                ]
             }),
         )
     }

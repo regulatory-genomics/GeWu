@@ -91,15 +91,21 @@ impl ResourceProvider for InMemoryResourceProvider {
     async fn validate(&self, request: &ValidateRequest) -> ResourceResult<ValidateResponse> {
         let uri: Option<ResourceUri> = request.value.as_str().and_then(|value| value.parse().ok());
         let Some(uri) = uri else {
+            let suggested_uri = generate_uri_suggestion(&request.value, request.kind.as_deref());
             return Ok(ValidateResponse {
                 ok: false,
                 message: "value is not a valid resource uri".into(),
                 warnings: Vec::new(),
-                code: None,
-                field: None,
-                retryable: None,
-                suggested_fix: None,
-                details: serde_json::Value::Null,
+                code: Some("invalid_resource_uri".into()),
+                field: Some("value".into()),
+                retryable: Some(false),
+                suggested_fix: Some(format!(
+                    "Pass a canonical resource URI string such as {suggested_uri}, not an object."
+                )),
+                details: serde_json::json!({
+                    "expected_format": "gewu://<kind>/<id>",
+                    "example": "gewu://sample/ucf_atac_hg38"
+                }),
             });
         };
         if request.kind.as_ref().is_some_and(|kind| uri.kind() != kind) {
@@ -107,22 +113,46 @@ impl ResourceProvider for InMemoryResourceProvider {
                 ok: false,
                 message: "resource kind does not match request".into(),
                 warnings: Vec::new(),
-                code: None,
-                field: None,
-                retryable: None,
-                suggested_fix: None,
-                details: serde_json::Value::Null,
+                code: Some("resource_kind_mismatch".into()),
+                field: Some("kind".into()),
+                retryable: Some(false),
+                suggested_fix: Some(
+                    request
+                        .kind
+                        .as_ref()
+                        .map(|kind| {
+                            format!(
+                                "Use a URI whose kind matches the requested kind, for example gewu://{kind}/<id> for kind={kind}."
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            "Use a URI whose kind matches the requested kind.".into()
+                        }),
+                ),
+                details: serde_json::json!({
+                    "uri_kind": uri.kind(),
+                    "requested_kind": request.kind
+                }),
             });
         }
         let exists = self.describe(&DescribeRequest { uri }).await?.is_some();
+        if !exists {
+            return Ok(ValidateResponse {
+                ok: false,
+                message: "resource not found".into(),
+                warnings: Vec::new(),
+                code: Some("resource_not_found".into()),
+                field: Some("value".into()),
+                retryable: Some(false),
+                suggested_fix: Some(
+                    "Register this resource with 'resource.register' or search with 'resource.search' to find similar resources".into()
+                ),
+                details: serde_json::Value::Null,
+            });
+        }
         Ok(ValidateResponse {
-            ok: exists,
-            message: if exists {
-                "resource found"
-            } else {
-                "resource not found"
-            }
-            .into(),
+            ok: true,
+            message: "resource found".into(),
             warnings: Vec::new(),
             code: None,
             field: None,
@@ -131,6 +161,50 @@ impl ResourceProvider for InMemoryResourceProvider {
             details: serde_json::Value::Null,
         })
     }
+}
+
+fn generate_uri_suggestion(value: &serde_json::Value, requested_kind: Option<&str>) -> String {
+    let obj = match value.as_object() {
+        Some(obj) => obj,
+        None => return "gewu://sample/unnamed".to_string(),
+    };
+
+    let kind = requested_kind
+        .map(String::from)
+        .or_else(|| {
+            if obj.contains_key("assay") {
+                obj.get("assay")
+                    .and_then(|v| v.as_str())
+                    .map(|_| "sample".to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "sample".to_string());
+
+    let id = if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
+        let assay_part = obj
+            .get("assay")
+            .and_then(|v| v.as_str())
+            .map(|s| format!("_{}", s.to_lowercase().replace('-', "_")))
+            .unwrap_or_default();
+
+        let genome_part = if path.contains("/data2/") || path.contains("/human/") {
+            "_hg38".to_string()
+        } else {
+            String::new()
+        };
+
+        if assay_part.is_empty() {
+            format!("ucf_unnamed{}", genome_part)
+        } else {
+            format!("ucf{}{}", assay_part, genome_part)
+        }
+    } else {
+        "unnamed".to_string()
+    };
+
+    format!("gewu://{}/{}", kind, id)
 }
 
 #[derive(Debug)]

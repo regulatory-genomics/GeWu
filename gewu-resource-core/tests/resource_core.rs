@@ -480,3 +480,128 @@ fn resource_register_capability_only_appears_with_registration_factory() {
             .contains(&"resource.register".into())
     );
 }
+
+#[tokio::test]
+async fn resource_validate_invalid_value_returns_top_level_failure_with_guidance() {
+    let registry = Arc::new(registry_with(vec![]));
+    let tool = gewu_resource_core::tools::ResourceValidateTool::new(registry);
+
+    let result = tool
+        .execute(
+            json!({"value":{"path":"/data2/example.ucf","assay":"ATAC"},"kind":"sample"}),
+            &ToolContext::new("session", "message"),
+        )
+        .await
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+    assert_eq!(output["ok"], false, "expected top-level ok=false");
+    let error = &output["error"];
+    assert_eq!(
+        error["code"].as_str().unwrap(),
+        "invalid_resource_uri",
+        "expected error.code=invalid_resource_uri"
+    );
+    assert_eq!(
+        error["field"].as_str().unwrap(),
+        "value",
+        "expected error.field=value"
+    );
+    assert!(
+        error["suggested_fix"]
+            .as_str()
+            .unwrap()
+            .contains("gewu://sample/ucf_atac_hg38"),
+        "expected suggested_fix to contain gewu://sample/ucf_atac_hg38"
+    );
+}
+
+#[tokio::test]
+async fn resource_register_object_uri_error_shows_canonical_uri_example() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_registry, _provider, tool) = resource_register_subject(dir.path());
+
+    let result = tool
+        .execute(
+            json!({"resource": {"uri": {"kind":"sample","id":"ucf_atac_hg38"}, "name": "UCF Sample"}}),
+            &ToolContext::new("session", "message"),
+        )
+        .await
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+    assert_eq!(output["ok"], false, "expected top-level ok=false");
+    let error = &output["error"];
+    assert_eq!(
+        error["code"].as_str().unwrap(),
+        "invalid_args",
+        "expected error.code=invalid_args"
+    );
+    assert!(
+        error["suggested_fix"]
+            .as_str()
+            .unwrap()
+            .contains("\"uri\": \"gewu://sample/ucf_atac_hg38\""),
+        "expected suggested_fix to contain the canonical URI example"
+    );
+}
+
+#[tokio::test]
+async fn resource_register_success_returns_next_actions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_registry, _provider, tool) = resource_register_subject(dir.path());
+
+    let result = tool
+        .execute(
+            json!({"resource": register_resource()}),
+            &ToolContext::new("session", "message"),
+        )
+        .await
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+    assert_eq!(output["ok"], true, "expected top-level ok=true");
+    let data = &output["data"];
+    assert!(
+        data["next_actions"].is_array(),
+        "expected data.next_actions to be an array"
+    );
+    assert_eq!(
+        data["next_actions"][0]["tool"].as_str().unwrap(),
+        "resource.resolve",
+        "expected next_actions[0].tool == resource.resolve"
+    );
+    assert_eq!(
+        data["next_actions"][0]["args"]["query"].as_str().unwrap(),
+        "gewu://document/registered",
+        "expected next_actions[0].args.query == gewu://document/registered"
+    );
+}
+
+#[tokio::test]
+async fn resource_validate_missing_resource_returns_top_level_failure() {
+    let registry = Arc::new(registry_with(vec![]));
+    let tool = gewu_resource_core::tools::ResourceValidateTool::new(registry);
+
+    let result = tool
+        .execute(
+            json!({"value":"gewu://sample/missing","kind":"sample"}),
+            &ToolContext::new("session", "message"),
+        )
+        .await
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+    assert_eq!(output["ok"], false, "expected top-level ok=false");
+    let error = &output["error"];
+    assert_eq!(
+        error["code"].as_str().unwrap(),
+        "resource_not_found",
+        "expected error.code=resource_not_found"
+    );
+    assert_eq!(
+        error["retryable"].as_bool().unwrap(),
+        false,
+        "expected error.retryable=false"
+    );
+}
