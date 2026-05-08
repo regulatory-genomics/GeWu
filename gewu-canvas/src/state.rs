@@ -359,6 +359,14 @@ pub fn build_genome_canvas_payload(
                 message: format!("track references unknown sample_id '{}'", track.sample_id),
             });
         }
+
+        if let Err(message) = normalize_signal_source(track.source.as_deref()) {
+            issues.push(CanvasValidationIssue {
+                path: format!("tracks[{index}].source"),
+                code: "source_invalid",
+                message,
+            });
+        }
     }
 
     if !issues.is_empty() {
@@ -375,7 +383,7 @@ pub fn build_genome_canvas_payload(
                 obj["label"] = serde_json::json!(label);
             }
             if let Some(assay) = &s.assay {
-                obj["assay"] = serde_json::json!(assay);
+                obj["assay"] = serde_json::json!(normalize_genome_assay(assay));
             }
             if let Some(uri) = &s.uri {
                 obj["uri"] = serde_json::json!(uri);
@@ -394,11 +402,15 @@ pub fn build_genome_canvas_payload(
                 "sample_id": t.sample_id,
                 "visible": true,
             });
-            if let Some(source) = &t.source {
-                obj["source"] = serde_json::json!(source);
+            if t.track_type == TrackType::Signal {
+                obj["source"] = serde_json::json!(
+                    normalize_signal_source(t.source.as_deref()).expect("validated above")
+                );
+            } else if let Some(source) = &t.source {
+                obj["source"] = serde_json::json!(source.trim().to_ascii_lowercase());
             }
             if let Some(assay) = &t.assay {
-                obj["assay"] = serde_json::json!(assay);
+                obj["assay"] = serde_json::json!(normalize_genome_assay(assay));
             }
             if let Some(uri) = &t.uri {
                 obj["uri"] = serde_json::json!(uri);
@@ -430,6 +442,29 @@ pub fn build_genome_canvas_payload(
     }
 
     Ok(payload)
+}
+
+pub(crate) fn normalize_genome_assay(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "atac" | "atac-seq" | "atacseq" => "atac".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub(crate) fn normalize_signal_source(value: Option<&str>) -> Result<String, String> {
+    let raw = value.unwrap_or("coverage").trim().to_ascii_lowercase();
+    let normalized = if raw.is_empty() || raw == "signal" {
+        "coverage"
+    } else {
+        raw.as_str()
+    };
+    match normalized {
+        "coverage" | "l1" | "l2" | "l3" | "l4" | "l5" | "focus" | "p_sharp" | "p_meso"
+        | "p_macro" => Ok(normalized.to_string()),
+        other => Err(format!(
+            "unsupported signal source '{other}'; use coverage for UCF coverage tracks"
+        )),
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

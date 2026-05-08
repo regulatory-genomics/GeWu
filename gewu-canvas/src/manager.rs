@@ -12,7 +12,9 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::state::{CanvasKind, CanvasMode, CanvasState, CanvasStatePatch};
+use crate::state::{
+    CanvasKind, CanvasMode, CanvasState, CanvasStatePatch, normalize_signal_source,
+};
 
 #[derive(Debug, Error)]
 pub enum CanvasError {
@@ -357,6 +359,28 @@ fn validate_tracks(
                 message: format!("track references unknown sample_id '{sample_id}'"),
             });
         }
+        if track
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|track_type| track_type == "signal")
+            && let Some(source) = track.get("source").and_then(serde_json::Value::as_str)
+        {
+            match normalize_signal_source(Some(source)) {
+                Ok(normalized) if normalized == source.trim().to_ascii_lowercase() => {}
+                Ok(normalized) => issues.push(CanvasValidationIssue {
+                    path: format!("{path}.source"),
+                    code: "source_invalid",
+                    message: format!(
+                        "raw genome payload source '{source}' is not canonical; use '{normalized}'"
+                    ),
+                }),
+                Err(message) => issues.push(CanvasValidationIssue {
+                    path: format!("{path}.source"),
+                    code: "source_invalid",
+                    message,
+                }),
+            }
+        }
     }
 }
 
@@ -606,8 +630,8 @@ mod tests {
     // -------------------------------------------------------------------------
 
     use crate::state::{
-        build_genome_canvas_payload, GenomeCanvasOpenRequest, GenomeCanvasSampleInput,
-        GenomeCanvasTrackInput, TrackType,
+        GenomeCanvasOpenRequest, GenomeCanvasSampleInput, GenomeCanvasTrackInput, TrackType,
+        build_genome_canvas_payload,
     };
 
     #[test]
@@ -629,8 +653,12 @@ mod tests {
                 sample_id: "UCF".to_string(),
                 assay: Some("atac".to_string()),
                 uri: Some("gewu://track/ucf_atac_signal_hg38".to_string()),
-                path: Some("/data2/litian/macrophage_bk/data/ATAC/ucf/P1-2_ATAC3.filtered.ucf".to_string()),
-                url: Some("/data2/litian/macrophage_bk/data/ATAC/ucf/P1-2_ATAC3.filtered.ucf".to_string()),
+                path: Some(
+                    "/data2/litian/macrophage_bk/data/ATAC/ucf/P1-2_ATAC3.filtered.ucf".to_string(),
+                ),
+                url: Some(
+                    "/data2/litian/macrophage_bk/data/ATAC/ucf/P1-2_ATAC3.filtered.ucf".to_string(),
+                ),
             }],
         };
 
@@ -695,12 +723,116 @@ mod tests {
         let err = build_genome_canvas_payload(request).unwrap_err();
         match err {
             CanvasError::InvalidGenomeCanvasPayload(issues) => {
-                let issue = issues.iter().find(|i| i.path == "tracks[0].sample_id").unwrap();
+                let issue = issues
+                    .iter()
+                    .find(|i| i.path == "tracks[0].sample_id")
+                    .unwrap();
                 assert_eq!(issue.code, "unknown_reference");
                 assert!(
                     issue.message.contains("UCF"),
                     "error message should mention the unknown sample_id"
                 );
+            }
+            _ => panic!("expected InvalidGenomeCanvasPayload error"),
+        }
+    }
+
+    #[test]
+    fn genome_canvas_builder_normalizes_atac_assay_and_signal_source() {
+        let request = GenomeCanvasOpenRequest {
+            assembly: "hg38".to_string(),
+            region: "chr11:47354860-47395607".to_string(),
+            gene_symbol: Some("SPI1".to_string()),
+            samples: vec![GenomeCanvasSampleInput {
+                id: "E3-1_ATAC12".to_string(),
+                label: Some("E3-1_ATAC12".to_string()),
+                assay: Some("ATAC-seq".to_string()),
+                uri: Some("gewu://sample/E3-1_ATAC12".to_string()),
+            }],
+            tracks: vec![GenomeCanvasTrackInput {
+                id: "signal-atac-E3-1_ATAC12".to_string(),
+                track_type: TrackType::Signal,
+                source: Some("signal".to_string()),
+                sample_id: "E3-1_ATAC12".to_string(),
+                assay: Some("ATAC-seq".to_string()),
+                uri: Some("gewu://track/E3-1_ATAC12_signal".to_string()),
+                path: None,
+                url: None,
+            }],
+        };
+
+        let payload = build_genome_canvas_payload(request).unwrap();
+        assert_eq!(payload["samples"][0]["assay"], "atac");
+        assert_eq!(payload["tracks"][0]["assay"], "atac");
+        assert_eq!(payload["tracks"][0]["source"], "coverage");
+    }
+
+    #[test]
+    fn genome_canvas_builder_rejects_unsupported_signal_source() {
+        let request = GenomeCanvasOpenRequest {
+            assembly: "hg38".to_string(),
+            region: "chr11:47354860-47395607".to_string(),
+            gene_symbol: None,
+            samples: vec![GenomeCanvasSampleInput {
+                id: "E3-1_ATAC12".to_string(),
+                label: None,
+                assay: Some("atac".to_string()),
+                uri: None,
+            }],
+            tracks: vec![GenomeCanvasTrackInput {
+                id: "bad".to_string(),
+                track_type: TrackType::Signal,
+                source: Some("bogus".to_string()),
+                sample_id: "E3-1_ATAC12".to_string(),
+                assay: Some("atac".to_string()),
+                uri: None,
+                path: None,
+                url: None,
+            }],
+        };
+
+        let err = build_genome_canvas_payload(request).unwrap_err();
+        match err {
+            CanvasError::InvalidGenomeCanvasPayload(issues) => {
+                let issue = issues
+                    .iter()
+                    .find(|issue| issue.path == "tracks[0].source")
+                    .unwrap();
+                assert_eq!(issue.code, "source_invalid");
+                assert!(issue.message.contains("coverage"));
+            }
+            _ => panic!("expected InvalidGenomeCanvasPayload error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn open_rejects_raw_payload_with_noncanonical_signal_source() {
+        let m = CanvasManager::new();
+        let err = m
+            .open(
+                "s1",
+                None,
+                CanvasKind::Genome,
+                CanvasMode::Overlay,
+                None,
+                Some(serde_json::json!({
+                    "assembly": "hg38",
+                    "region": "chr11:47354860-47395607",
+                    "samples": [{"id": "E3-1_ATAC12"}],
+                    "tracks": [{"id": "bad", "type": "signal", "sample_id": "E3-1_ATAC12", "source": "signal"}]
+                })),
+            )
+            .await
+            .unwrap_err();
+
+        match err {
+            CanvasError::InvalidGenomeCanvasPayload(issues) => {
+                let issue = issues
+                    .iter()
+                    .find(|issue| issue.path == "tracks[0].source")
+                    .unwrap();
+                assert_eq!(issue.code, "source_invalid");
+                assert!(issue.message.contains("coverage"));
             }
             _ => panic!("expected InvalidGenomeCanvasPayload error"),
         }

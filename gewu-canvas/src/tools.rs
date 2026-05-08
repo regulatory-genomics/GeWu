@@ -29,8 +29,8 @@ use serde_json::{Value, json};
 
 use crate::manager::{CanvasError, CanvasManager};
 use crate::state::{
-    build_genome_canvas_payload, CanvasEvent, CanvasKind, CanvasMode, CanvasState,
-    CanvasStatePatch, GenomeCanvasOpenRequest,
+    CanvasEvent, CanvasKind, CanvasMode, CanvasState, CanvasStatePatch, GenomeCanvasOpenRequest,
+    build_genome_canvas_payload,
 };
 
 /// Build the canonical six canvas tools, sharing a single manager.
@@ -559,8 +559,16 @@ fn error_output(error: CanvasError) -> String {
         .to_string(),
         CanvasError::InvalidGenomeCanvasPayload(details) => json!({
             "error": {
-                "code": "invalid_genome_canvas_payload",
-                "message": "invalid genome canvas payload",
+                "code": if details.iter().any(|issue| issue.code == "source_invalid") {
+                    "source_invalid"
+                } else {
+                    "invalid_genome_canvas_payload"
+                },
+                "message": details
+                    .iter()
+                    .find(|issue| issue.code == "source_invalid")
+                    .map(|issue| issue.message.clone())
+                    .unwrap_or_else(|| "invalid genome canvas payload".to_string()),
                 "details": details
             }
         })
@@ -682,7 +690,10 @@ mod tests {
         let m = Arc::new(CanvasManager::new());
         let tools = canvas_tools(m.clone());
         let open = tools.iter().find(|t| t.name() == "canvas.open").unwrap();
-        let get = tools.iter().find(|t| t.name() == "canvas.get_state").unwrap();
+        let get = tools
+            .iter()
+            .find(|t| t.name() == "canvas.get_state")
+            .unwrap();
 
         let opened_raw = open
             .execute(
@@ -743,7 +754,10 @@ mod tests {
         let m = Arc::new(CanvasManager::new());
         let tools = canvas_tools(m.clone());
         let open = tools.iter().find(|t| t.name() == "canvas.open").unwrap();
-        let get = tools.iter().find(|t| t.name() == "canvas.get_state").unwrap();
+        let get = tools
+            .iter()
+            .find(|t| t.name() == "canvas.get_state")
+            .unwrap();
 
         let payload = json!({
             "assembly": "hg38",
@@ -791,6 +805,52 @@ mod tests {
         assert_eq!(
             got_json["state"]["payload"]["samples"][0]["id"],
             "AS1-1_ATAC10"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_genome_rejects_ucf_source_with_recovery_hint() {
+        let open_genome = CanvasOpenGenomeTool {
+            manager: Arc::new(CanvasManager::new()),
+        };
+
+        let result = open_genome
+            .execute(
+                json!({
+                    "assembly": "hg38",
+                    "region": "chr11:47354860-47395607",
+                    "samples": [
+                        { "id": "E3-1_ATAC12", "label": "E3-1_ATAC12", "assay": "atac" }
+                    ],
+                    "tracks": [
+                        {
+                            "id": "signal-atac-E3-1_ATAC12",
+                            "type": "signal",
+                            "sample_id": "E3-1_ATAC12",
+                            "assay": "atac",
+                            "source": "ucf"
+                        }
+                    ]
+                }),
+                &ctx("s1"),
+            )
+            .await
+            .unwrap();
+
+        let json: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(json["error"]["code"], "source_invalid");
+        assert!(
+            json["error"]["details"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|issue| issue["code"] == "source_invalid")
+        );
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("coverage")
         );
     }
 
@@ -1182,7 +1242,10 @@ mod tests {
             .iter()
             .find(|tool| tool.name() == "canvas.open_genome")
             .unwrap();
-        let list = tools.iter().find(|tool| tool.name() == "canvas.list").unwrap();
+        let list = tools
+            .iter()
+            .find(|tool| tool.name() == "canvas.list")
+            .unwrap();
 
         let opened = open_genome
             .execute(
@@ -1218,7 +1281,10 @@ mod tests {
         let listed = list.execute(json!({}), &ctx("session-ucf")).await.unwrap();
         let listed_json: Value = serde_json::from_str(&listed.output).unwrap();
         assert_eq!(listed_json["canvases"].as_array().unwrap().len(), 1);
-        assert_eq!(listed_json["canvases"][0]["payload"]["samples"][0]["id"], "UCF");
+        assert_eq!(
+            listed_json["canvases"][0]["payload"]["samples"][0]["id"],
+            "UCF"
+        );
         assert_eq!(
             listed_json["canvases"][0]["payload"]["tracks"][0]["sample_id"],
             "UCF"

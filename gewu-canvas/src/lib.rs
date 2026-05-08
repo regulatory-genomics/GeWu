@@ -36,9 +36,8 @@ pub mod tools;
 
 pub use manager::{CanvasError, CanvasManager, CanvasValidationIssue};
 pub use state::{
-    build_genome_canvas_payload, CANVAS_STATE_VERSION, CanvasEvent, CanvasKind, CanvasMode,
-    CanvasState, CanvasStatePatch, GenomeCanvasOpenRequest, GenomeCanvasSampleInput,
-    GenomeCanvasState, GenomeCanvasTrackInput, GenomeSelection, GenomeViewport, SampleSpec,
-    TrackSpec, TrackType,
+    CANVAS_STATE_VERSION, CanvasEvent, CanvasKind, CanvasMode, CanvasState, CanvasStatePatch,
+    GenomeCanvasOpenRequest, GenomeCanvasSampleInput, GenomeCanvasState, GenomeCanvasTrackInput,
+    GenomeSelection, GenomeViewport, SampleSpec, TrackSpec, TrackType, build_genome_canvas_payload,
 };
 pub use tools::canvas_tools;
