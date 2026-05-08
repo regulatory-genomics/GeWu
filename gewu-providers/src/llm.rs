@@ -1318,10 +1318,8 @@ mod tests {
 
     #[test]
     fn openai_tool_call_events_restore_original_tool_name() {
-        let safe_to_original = HashMap::from([(
-            "canvas_x2e_open".to_string(),
-            "canvas.open".to_string(),
-        )]);
+        let safe_to_original =
+            HashMap::from([("canvas_x2e_open".to_string(), "canvas.open".to_string())]);
         let event = OpenAIProvider::restore_tool_event_name(
             ProviderEvent::ToolCallStart {
                 id: "call_1".to_string(),
