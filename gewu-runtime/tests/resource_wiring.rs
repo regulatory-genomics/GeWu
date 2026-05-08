@@ -233,16 +233,21 @@ async fn build_specialist_can_use_resources_and_gene_resolver_in_project_workdir
     .unwrap();
 
     let build = runtime.find_specialist("build").unwrap();
-    assert!(build.capabilities.contains(&"resource.register".to_string()));
+    assert!(
+        build
+            .capabilities
+            .contains(&"resource.register".to_string())
+    );
     assert!(build.capabilities.contains(&"resource.resolve".to_string()));
     assert!(build.capabilities.contains(&"resource.search".to_string()));
-    assert!(build.capabilities.contains(&"gene.resolve_symbol".to_string()));
+    assert!(
+        build
+            .capabilities
+            .contains(&"gene.resolve_symbol".to_string())
+    );
 
     let tools = runtime
-        .resolve_capabilities_in_directory(
-            &build.capabilities,
-            dir.path(),
-        )
+        .resolve_capabilities_in_directory(&build.capabilities, dir.path())
         .unwrap();
     let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
     assert!(names.contains(&"resource.register"));

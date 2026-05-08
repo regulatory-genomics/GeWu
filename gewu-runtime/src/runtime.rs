@@ -1836,7 +1836,10 @@ fn add_registered_local_capabilities_to_default_specialists(
 
         for capability in local_capabilities {
             if registry.contains(capability)
-                && !specialist.capabilities.iter().any(|name| name == capability)
+                && !specialist
+                    .capabilities
+                    .iter()
+                    .any(|name| name == capability)
             {
                 specialist.capabilities.push(capability.to_string());
             }
@@ -2234,6 +2237,113 @@ Global sentinel body.
             assert!(
                 err.to_string()
                     .contains("Skill is not available to this specialist: gene-locus-resolver")
+            );
+        }
+        .await;
+
+        result
+    }
+
+    fn write_resource_registration_validator_skill(root: &std::path::Path) {
+        let skill_dir = root.join(".gewu/skills/resource-registration-validator");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: resource-registration-validator
+description: Validate genomic resource registration URIs and enforce UCF/ATAC conventions before registering or opening Genome Canvas.
+---
+
+# Resource Registration Validator
+
+## Canonical UCF Mapping
+
+| Assay | Extension | Source Type |
+|-------|-----------|-------------|
+| atac  | .ucf      | coverage    |
+| chip  | .bw       | score       |
+| rna   | .bam      | alignment   |
+
+## Self-Correction Rules
+
+1. **Reject filename-as-sample-id**: If `sample_id` matches the filename basename, derive the sample ID from the parent directory.
+2. **Enforce `assay=atac` for UCF files**: Reject tracks without explicit `assay` label; suggest `atac` for `.ucf` extensions.
+3. **Require `source=coverage` for UCF**: Validate that ATAC tracks specify `source: coverage` in their track definition.
+4. **Report missing registry entries**: Before opening Genome Canvas, verify the sample and track URIs exist in the registry via `resource.search`.
+"#,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn declared_resource_registration_skill_is_recommended_not_preloaded() {
+        let _guard = cwd_lock().lock().unwrap();
+        let original_cwd = std::env::current_dir().unwrap();
+
+        let result = async {
+            let project_root = std::env::temp_dir().join(format!(
+                "gewu-runtime-resource-reg-validator-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&project_root).unwrap();
+            write_resource_registration_validator_skill(&project_root);
+
+            let _restore = CwdRestore {
+                original: original_cwd.clone(),
+            };
+            std::env::set_current_dir(&project_root).unwrap();
+
+            let pool = SqlitePoolOptions::new()
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            gewu_storage::run_migrations(&pool).await.unwrap();
+
+            let runtime = GeWuRuntime::builder()
+                .provider(Arc::new(StubLlm))
+                .pool(pool)
+                .with_skill_dir(&project_root.join(".gewu/skills"))
+                .build()
+                .unwrap();
+
+            std::env::set_current_dir(&original_cwd).unwrap();
+
+            let descriptor = SpecialistDescriptor {
+                id: "genome-resource-canvas-agent".to_string(),
+                description: "Genome resource canvas specialist".to_string(),
+                capabilities: vec!["canvas.open".to_string()],
+                skills: vec!["resource-registration-validator".to_string()],
+                system_prompt: "Base prompt.".to_string(),
+            };
+
+            let effective = runtime.descriptor_with_skills(&descriptor);
+
+            let prompt = runtime.append_skill_prompt(&effective, effective.system_prompt.clone());
+            assert!(
+                prompt.contains("<available_skills>"),
+                "Skill should be listed in available_skills block"
+            );
+            assert!(
+                prompt.contains(
+                    "resource-registration-validator: Validate genomic resource registration URIs"
+                ),
+                "Skill should be recommended in available_skills"
+            );
+            assert!(
+                prompt.contains("Use the `load_skill` tool"),
+                "Load skill instruction should be present"
+            );
+            assert!(
+                !prompt.contains("<skill_content name=\"resource-registration-validator\""),
+                "Skill body should NOT be preloaded"
+            );
+            assert!(
+                !prompt.contains("Reject filename-as-sample-id"),
+                "Skill body content should NOT appear in prompt"
             );
         }
         .await;
