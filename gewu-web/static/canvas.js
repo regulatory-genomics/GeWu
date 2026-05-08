@@ -332,7 +332,7 @@
       note.textContent = `Renderer error: ${errorMessage}`;
     } else if (state.kind === 'genome') {
       note.textContent =
-        'GenomeCanvas is loading. The Work Panel shell is ready and will fill in as soon as the renderer mounts.';
+        'Genome canvas state exists, but no genome renderer is registered yet. Check that the Tachyon canvas plugin script loaded before app.js and called canvasController.registerRenderer("genome", ...).';
     } else {
       note.textContent = `No renderer registered for kind="${state.kind}".`;
     }
@@ -412,6 +412,30 @@
     return true;
   }
 
+  function hydrate(states) {
+    if (!Array.isArray(states)) return false;
+    let focused = null;
+    let firstVisible = null;
+    for (const state of states) {
+      if (!state || !state.canvas_id) continue;
+      canvases.set(state.canvas_id, { state: { ...state } });
+      if (state.focused) focused = state.canvas_id;
+      if (!firstVisible && state.visible !== false) firstVisible = state.canvas_id;
+    }
+    const target = focused || firstVisible || states.find((state) => state && state.canvas_id)?.canvas_id;
+    if (target) {
+      show(target, 'work-panel');
+    } else {
+      mountDock();
+    }
+    renderTray();
+    return Boolean(target);
+  }
+
+  function hasRenderer(kind) {
+    return renderers.has(kind);
+  }
+
   function getCurrent() {
     if (!activeCanvasId) return null;
     return canvases.get(activeCanvasId)?.state || null;
@@ -424,6 +448,7 @@
 
   function registerRenderer(kind, fn) {
     if (typeof kind !== 'string' || typeof fn !== 'function') return;
+    console.info(`[canvas] renderer registered for kind=${kind}`);
     renderers.set(kind, fn);
     if (activeCanvasId) {
       const entry = canvases.get(activeCanvasId);
@@ -496,6 +521,8 @@
   window.canvasController = {
     handle,
     getCurrent,
+    hydrate,
+    hasRenderer,
     registerRenderer,
     pushPatch,
     show,

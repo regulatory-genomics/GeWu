@@ -210,4 +210,34 @@ mod tests {
         assert!(html.contains("/canvas.js"));
         assert!(html.contains("/app.js"));
     }
+
+    #[test]
+    fn canvas_controller_exposes_hydration_api() {
+        let canvas_js = include_str!("../static/canvas.js");
+        assert!(
+            canvas_js.contains("function hydrate"),
+            "canvas.js must contain 'function hydrate'"
+        );
+        assert!(
+            canvas_js.contains("hydrate,"),
+            "canvas.js must expose 'hydrate' in window.canvasController"
+        );
+        assert!(
+            canvas_js.contains("hasRenderer"),
+            "canvas.js must expose 'hasRenderer' in window.canvasController"
+        );
+    }
+
+    #[test]
+    fn app_fetches_canvas_state_for_session_hydration() {
+        let app_js = include_str!("../static/app.js");
+        assert!(
+            app_js.contains("/api/sessions/${encodeURIComponent(sessionId)}/canvas"),
+            "app.js must fetch canvas state from session canvas endpoint"
+        );
+        assert!(
+            app_js.contains("window.canvasController.hydrate"),
+            "app.js must call window.canvasController.hydrate for session hydration"
+        );
+    }
 }

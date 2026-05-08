@@ -837,6 +837,7 @@ async function switchSession(session, forceReload = false) {
         addMessage('assistant', 'Session ready. How can I help you?');
     }
 
+    await hydrateCanvasForSession(session.id);
     renderSessions();
     setStatus('Ready');
     await refreshSessionTree();
@@ -1074,6 +1075,19 @@ function replayCanvasEventFromToolOutput(output) {
             window.canvasController.handle(parsed.event_payload || parsed);
         }
     } catch (e) { /* persisted tool output may be non-JSON */ }
+}
+
+async function hydrateCanvasForSession(sessionId) {
+    if (!sessionId) return;
+    if (!window.canvasController?.hydrate) return;
+    try {
+        const resp = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/canvas`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        window.canvasController.hydrate(data.canvases || []);
+    } catch (e) {
+        console.warn('[canvas] failed to hydrate session canvases', e);
+    }
 }
 
 function isEmptyAssistantTurn(msg) {
