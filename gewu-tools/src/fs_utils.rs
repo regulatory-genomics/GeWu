@@ -64,10 +64,11 @@ pub fn resolve_write_path(root: impl AsRef<Path>, user_path: impl AsRef<Path>) -
 
     if user_path.is_absolute() {
         let normalized = normalize_path(user_path);
-        let gewu_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/"))
-            .join(".gewu");
-        if normalized.starts_with(root.as_ref()) || normalized.starts_with(&gewu_dir) {
+        let gewu_dir = default_home_dir().map(|home| home.join(".gewu"));
+        let is_gewu_config_path = gewu_dir
+            .as_ref()
+            .is_some_and(|allowed| normalized.starts_with(allowed));
+        if normalized.starts_with(root.as_ref()) || is_gewu_config_path {
             Ok(normalized)
         } else {
             Err(anyhow::anyhow!(
@@ -81,23 +82,77 @@ pub fn resolve_write_path(root: impl AsRef<Path>, user_path: impl AsRef<Path>) -
     }
 }
 
+/// Returns the user's home directory when it can be determined.
+fn default_home_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|path| normalize_path(&path))
+}
+
+/// Returns all configured read roots for the given project root.
+/// Combines: project root, detected home directory, and paths from GEWU_READ_ROOTS env var.
+/// If the home directory cannot be detected, it is not added; this avoids accidentally
+/// broadening read access to the filesystem root.
+pub fn configured_read_roots(root: impl AsRef<Path>) -> Vec<PathBuf> {
+    let mut roots = vec![normalize_path(root.as_ref())];
+
+    if let Some(home) = default_home_dir() {
+        roots.push(home);
+    }
+
+    if let Ok(read_roots_var) = std::env::var("GEWU_READ_ROOTS") {
+        for path_str in std::env::split_paths(&read_roots_var) {
+            if path_str.as_os_str().is_empty() {
+                continue;
+            }
+            let normalized = normalize_path(&path_str);
+            roots.push(normalized);
+        }
+    }
+
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// Checks if reading the given path is allowed based on configured read roots.
+pub fn is_read_allowed(root: impl AsRef<Path>, path: impl AsRef<Path>) -> bool {
+    let roots = configured_read_roots(root);
+    let normalized = normalize_path(path.as_ref());
+    roots.iter().any(|r| normalized.starts_with(r))
+}
+
+/// Formats a read denial error message listing all allowed roots.
+fn format_read_denial(path: &Path, roots: &[PathBuf]) -> String {
+    let roots_list: Vec<String> = roots
+        .iter()
+        .map(|r| r.to_string_lossy().into_owned())
+        .collect();
+
+    format!(
+        "Read access denied: {:?} is outside of allowed read roots.\n\nAllowed read roots:\n{}\n\nTo add more paths, set the GEWU_READ_ROOTS environment variable (colon-separated on Unix, semicolon-separated on Windows).",
+        path,
+        roots_list
+            .iter()
+            .map(|r| format!("  - {}", r))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
 /// Resolves a user-provided path for read-only access.
-/// Allows reading from anywhere under the user's home directory or the project root.
+/// Allows reading from the project root, home directory, or paths configured via GEWU_READ_ROOTS env var.
 /// This is less restrictive than resolve_safe_path since reads are non-destructive.
 pub fn resolve_read_path(root: impl AsRef<Path>, user_path: impl AsRef<Path>) -> Result<PathBuf> {
     let user_path = user_path.as_ref();
 
     if user_path.is_absolute() {
         let normalized = normalize_path(user_path);
-        // Allow any absolute path under home dir or project root
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        if normalized.starts_with(&home) || normalized.starts_with(root.as_ref()) {
+        let roots = configured_read_roots(&root);
+
+        // Allow absolute path only if it starts with one of the configured roots
+        if is_read_allowed(&root, &normalized) {
             Ok(normalized)
         } else {
-            Err(anyhow::anyhow!(
-                "Read access denied: {:?} is outside of home directory",
-                normalized
-            ))
+            Err(anyhow::anyhow!("{}", format_read_denial(&normalized, &roots)))
         }
     } else {
         // Relative paths resolve against root (same as before)
@@ -313,7 +368,37 @@ pub fn glob_with_gitignore(root: impl AsRef<Path>, pattern: &str) -> Result<Vec<
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
+    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_read_write_json() -> Result<()> {
@@ -336,5 +421,33 @@ mod tests {
 
         assert_eq!(data, read_data);
         Ok(())
+    }
+
+    #[test]
+    fn resolve_read_path_denies_absolute_path_outside_default_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = std::path::PathBuf::from("/definitely-not-gewu-readable-root/example.txt");
+
+        let err = crate::fs_utils::resolve_read_path(dir.path(), &outside)
+            .expect_err("outside absolute path should be denied by default");
+
+        let message = err.to_string();
+        assert!(message.contains("Read access denied"));
+        assert!(message.contains("Allowed read roots"));
+    }
+
+    #[test]
+    fn resolve_read_path_allows_env_configured_read_root() {
+        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let allowed_file = data_root.path().join("ATAC/ucf/P1-2_ATAC3.filtered.ucf");
+        std::fs::create_dir_all(allowed_file.parent().unwrap()).unwrap();
+        std::fs::write(&allowed_file, "ucf fixture").unwrap();
+
+        let _guard = EnvVarGuard::set("GEWU_READ_ROOTS", data_root.path());
+        let resolved = crate::fs_utils::resolve_read_path(project.path(), &allowed_file).unwrap();
+
+        assert_eq!(resolved, crate::fs_utils::normalize_path(&allowed_file));
     }
 }

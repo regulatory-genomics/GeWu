@@ -18,8 +18,8 @@
 //! - [`GlobTool`] - Finds files using glob patterns, respects .gitignore
 
 use crate::fs_utils::{
-    glob_with_gitignore, into_tool_error, is_binary_file, mime_type, read_bytes, read_text,
-    resolve_read_path, resolve_write_path, write,
+    glob_with_gitignore, into_tool_error, is_binary_file, is_read_allowed, mime_type, read_bytes,
+    read_text, resolve_read_path, resolve_write_path, write,
 };
 use crate::replacers::smart_replace;
 use anyhow::Result;
@@ -477,13 +477,9 @@ impl Tool for GlobTool {
 
         let paths = glob_with_gitignore(&search_dir, &input.pattern).map_err(into_tool_error)?;
 
-        let home = dirs::home_dir().unwrap_or_default();
         let paths_str: Vec<String> = paths
             .into_iter()
-            .filter(|p| {
-                let normalized = crate::fs_utils::normalize_path(p);
-                normalized.starts_with(&self.working_directory) || normalized.starts_with(&home)
-            })
+            .filter(|p| is_read_allowed(&self.working_directory, p))
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
 
