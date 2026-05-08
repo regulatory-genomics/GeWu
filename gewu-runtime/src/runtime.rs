@@ -10,7 +10,7 @@ use gewu_core::types::{
     ToolResult,
 };
 use gewu_resource_core::{
-    CatalogLoader, InMemoryResourceProvider, ResourceRegistry, ResourceToolFactory,
+    CatalogLoader, MutableResourceProvider, ResourceRegistry, ResourceToolFactory,
 };
 use gewu_storage::{SqliteMemory, TaskStore};
 use gewu_tools::{BatchTool, report_result::ReportResultArgs};
@@ -1380,6 +1380,13 @@ impl ToolRegistry for RuntimeToolRegistry {
     fn list_tools(&self) -> Vec<String> {
         self.tools.iter().map(|t| t.name().to_string()).collect()
     }
+
+    fn execution_policy(&self, name: &str) -> Option<gewu_core::types::ToolExecutionPolicy> {
+        self.tools
+            .iter()
+            .find(|tool| tool.name() == name)
+            .map(|tool| tool.execution_policy())
+    }
 }
 
 pub struct GeWuRuntimeBuilder {
@@ -1747,6 +1754,9 @@ impl GeWuRuntimeBuilder {
 
 fn load_resource_tool_factory(resource_dirs: &[PathBuf]) -> Option<ResourceToolFactory> {
     let mut registry = ResourceRegistry::new();
+    let registration_enabled = !resource_dirs.is_empty();
+    let mutable_provider =
+        registration_enabled.then(|| Arc::new(MutableResourceProvider::new("agent-registered")));
     for dir in default_resource_dirs()
         .into_iter()
         .chain(resource_dirs.iter().cloned())
@@ -1761,10 +1771,26 @@ fn load_resource_tool_factory(resource_dirs: &[PathBuf]) -> Option<ResourceToolF
                     resources.len(),
                     dir.display()
                 );
-                registry.register(InMemoryResourceProvider::new(
-                    dir.display().to_string(),
-                    resources,
-                ));
+                if let Some(provider) = &mutable_provider {
+                    if let Err(err) = provider.upsert_many(resources) {
+                        tracing::warn!(
+                            "Failed to load resource catalogs into mutable provider from {}: {}",
+                            dir.display(),
+                            err
+                        );
+                    }
+                } else {
+                    let provider = MutableResourceProvider::new(dir.display().to_string());
+                    if let Err(err) = provider.upsert_many(resources) {
+                        tracing::warn!(
+                            "Failed to load resource catalogs from {}: {}",
+                            dir.display(),
+                            err
+                        );
+                    } else {
+                        registry.register(provider);
+                    }
+                }
             }
             Ok(_) => {}
             Err(err) => tracing::warn!(
@@ -1775,7 +1801,17 @@ fn load_resource_tool_factory(resource_dirs: &[PathBuf]) -> Option<ResourceToolF
         }
     }
 
-    (registry.provider_count() > 0).then(|| ResourceToolFactory::new(Arc::new(registry)))
+    match mutable_provider {
+        Some(provider) => {
+            registry.register(provider.clone());
+            Some(ResourceToolFactory::with_registration(
+                Arc::new(registry),
+                provider,
+            ))
+        }
+        None if registry.provider_count() > 0 => Some(ResourceToolFactory::new(Arc::new(registry))),
+        None => None,
+    }
 }
 
 fn default_resource_dirs() -> Vec<PathBuf> {

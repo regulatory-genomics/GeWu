@@ -839,6 +839,13 @@ impl ToolRegistry for Agent {
     fn list_tools(&self) -> Vec<String> {
         self.tools.iter().map(|t| t.name().to_string()).collect()
     }
+
+    fn execution_policy(&self, name: &str) -> Option<ToolExecutionPolicy> {
+        self.tools
+            .iter()
+            .find(|tool| tool.name() == name)
+            .map(|tool| tool.execution_policy())
+    }
 }
 
 impl AgentBuilder {

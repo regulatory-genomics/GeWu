@@ -95,6 +95,10 @@ pub trait ToolRegistry: Send + Sync {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>>;
 
     fn list_tools(&self) -> Vec<String>;
+
+    fn execution_policy(&self, _name: &str) -> Option<ToolExecutionPolicy> {
+        None
+    }
 }
 
 #[async_trait]
