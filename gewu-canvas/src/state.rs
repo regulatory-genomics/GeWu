@@ -41,8 +41,8 @@ impl CanvasKind {
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum CanvasMode {
-    #[default]
     Overlay,
+    #[default]
     Docked,
     Fullscreen,
 }
@@ -98,7 +98,7 @@ impl CanvasState {
             canvas_id: canvas_id.into(),
             kind,
             title: None,
-            mode: CanvasMode::Overlay,
+            mode: CanvasMode::Docked,
             visible: true,
             focused: true,
             payload: serde_json::Value::Object(Default::default()),
@@ -301,6 +301,12 @@ pub enum CanvasEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_canvas_defaults_to_docked_mode() {
+        let state = CanvasState::new("c-1", CanvasKind::Genome);
+        assert_eq!(state.mode, CanvasMode::Docked);
+    }
 
     #[test]
     fn apply_patch_merges_payload_shallow() {

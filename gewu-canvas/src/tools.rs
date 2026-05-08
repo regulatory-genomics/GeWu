@@ -88,9 +88,10 @@ impl Tool for CanvasOpenTool {
     }
     fn description(&self) -> &str {
         "Open a new canvas surface (or focus an existing one if canvas_id is provided). \
-         The canvas appears as a wide overlay in the user's browser. Use kind=\"genome\" for a \
-         genomic browser canvas. The canvas is per-session; use canvas.list to inspect what \
-         is open and canvas.get_state to read what the user is currently viewing."
+         By default the canvas appears docked in the user's Work Panel Canvas tab; use \
+         mode=\"overlay\" for an optional popup. Use kind=\"genome\" for a genomic browser \
+         canvas. The canvas is per-session; use canvas.list to inspect what is open and \
+         canvas.get_state to read what the user is currently viewing."
     }
     fn schema(&self) -> RootSchema {
         schema_from(json!({
@@ -108,7 +109,7 @@ impl Tool for CanvasOpenTool {
                 "mode": {
                     "type": "string",
                     "enum": ["overlay", "docked", "fullscreen"],
-                    "description": "Display mode (default overlay)."
+                "description": "Display mode (default docked). Use overlay for an optional popup."
                 },
                 "title": { "type": "string" },
                 "canvas_id": {
@@ -587,6 +588,62 @@ mod tests {
             "unexpected_field",
         );
         assert!(m.list("s1").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_genome_canvas_accepts_resolved_spi1_payload() {
+        let m = Arc::new(CanvasManager::new());
+        let tools = canvas_tools(m.clone());
+        let open = &tools[0];
+        let get = &tools[4];
+
+        let payload = json!({
+            "assembly": "hg38",
+            "region": "chr11:47354860-47395607",
+            "samples": [
+                { "id": "AS1-1_ATAC10", "label": "AS1-1_ATAC10", "assay": "atac" }
+            ],
+            "tracks": [
+                {
+                    "id": "signal-atac-AS1-1_ATAC10",
+                    "type": "signal",
+                    "sample_id": "AS1-1_ATAC10",
+                    "assay": "atac",
+                    "source": "coverage",
+                    "visible": true
+                }
+            ]
+        });
+        let opened_raw = open
+            .execute(
+                json!({ "kind": "genome", "title": "SPI1 ATAC", "initial_state": payload }),
+                &ctx("s1"),
+            )
+            .await
+            .unwrap();
+        let opened: Value = serde_json::from_str(&opened_raw.output).unwrap();
+        let canvas_id = opened["canvas_id"].as_str().unwrap();
+
+        assert_eq!(opened["event"], "canvas:open");
+        assert_eq!(
+            opened["state"]["payload"]["region"],
+            "chr11:47354860-47395607"
+        );
+        assert_eq!(
+            opened["state"]["payload"]["tracks"][0]["source"],
+            "coverage"
+        );
+
+        let got = get
+            .execute(json!({ "canvas_id": canvas_id }), &ctx("s1"))
+            .await
+            .unwrap();
+        let got_json: Value = serde_json::from_str(&got.output).unwrap();
+        assert_eq!(got_json["state"]["payload"]["assembly"], "hg38");
+        assert_eq!(
+            got_json["state"]["payload"]["samples"][0]["id"],
+            "AS1-1_ATAC10"
+        );
     }
 
     #[tokio::test]
