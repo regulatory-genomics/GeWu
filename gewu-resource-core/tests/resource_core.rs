@@ -1,11 +1,12 @@
 use gewu_core::traits::{Tool, ToolFactory};
 use gewu_core::types::{ToolContext, ToolExecutionPolicy};
 use gewu_resource_core::{
-    CatalogLoader, InMemoryResourceProvider, ResolveRequest, ResolveStatus, Resource,
-    ResourceCatalog, ResourceCatalogEntry, ResourceRegistry, ResourceStatus, ResourceToolFactory,
-    ResourceUri, SearchRequest,
+    CatalogLoader, DescribeRequest, InMemoryResourceProvider, MutableResourceProvider,
+    ResolveRequest, ResolveStatus, Resource, ResourceCatalog, ResourceCatalogEntry,
+    ResourceRegistry, ResourceStatus, ResourceToolFactory, ResourceUri, SearchRequest,
 };
 use serde_json::json;
+use std::sync::Arc;
 
 #[test]
 fn resource_uri_parses_formats_and_rejects_invalid_parts() {
@@ -233,5 +234,249 @@ async fn resource_tools_return_json_and_factory_exposes_exact_capabilities() {
             "resource.search",
             "resource.validate"
         ]
+    );
+}
+
+fn resource_register_subject(
+    project_root: &std::path::Path,
+) -> (
+    Arc<ResourceRegistry>,
+    Arc<MutableResourceProvider>,
+    gewu_resource_core::ResourceRegisterTool,
+) {
+    let mutable_provider = Arc::new(MutableResourceProvider::new("agent-registered"));
+    let registry = Arc::new(ResourceRegistry::new().with_provider(mutable_provider.clone()));
+    let tool = gewu_resource_core::ResourceRegisterTool::new(
+        registry.clone(),
+        mutable_provider.clone(),
+        project_root.to_path_buf(),
+    );
+    (registry, mutable_provider, tool)
+}
+
+fn register_resource() -> Resource {
+    Resource::new(
+        ResourceUri::new("document", "registered").unwrap(),
+        "Registered Doc",
+    )
+    .with_aliases(["reg-doc"])
+    .with_label("project", "atlas")
+    .with_spec(json!({"path":"docs/registered.md"}))
+    .with_status(ResourceStatus::Available)
+}
+
+#[tokio::test]
+async fn resource_register_dry_run_does_not_write_or_mutate_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, _provider, tool) = resource_register_subject(dir.path());
+    let catalog_path = dir.path().join(".gewu/resources/agent-registered.yaml");
+
+    let result = tool
+        .execute(
+            json!({"resource": register_resource(), "dry_run": true, "reason":"preview"}),
+            &ToolContext::new("session", "message"),
+        )
+        .await
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+    assert_eq!(output["ok"], true);
+    assert_eq!(output["data"]["dry_run"], true);
+    assert_eq!(output["data"]["operation"], "create");
+    assert_eq!(output["data"]["will_update_registry"], true);
+    assert_eq!(output["data"]["registry_updated"], false);
+    assert_eq!(output["data"]["available_now"], false);
+    assert!(!catalog_path.exists());
+    assert!(!dir.path().join(".gewu/resources").exists());
+
+    let resolved = registry
+        .resolve(ResolveRequest::new("reg-doc"))
+        .await
+        .unwrap();
+    assert_eq!(resolved.status, ResolveStatus::NotFound);
+}
+
+#[tokio::test]
+async fn resource_register_writes_yaml_and_updates_same_registry_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, _provider, tool) = resource_register_subject(dir.path());
+    let catalog_path = dir.path().join(".gewu/resources/agent-registered.yaml");
+
+    let result = tool
+        .execute(
+            json!({"resource": register_resource()}),
+            &ToolContext::new("session", "message"),
+        )
+        .await
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+    assert_eq!(output["ok"], true);
+    assert_eq!(output["data"]["dry_run"], false);
+    assert_eq!(output["data"]["operation"], "create");
+    assert_eq!(output["data"]["uri"], "gewu://document/registered");
+    assert_eq!(output["data"]["registry_updated"], true);
+    assert_eq!(output["data"]["available_now"], true);
+    assert_eq!(
+        output["data"]["verify"],
+        json!({"tool":"resource.resolve","args":{"query":"gewu://document/registered"}})
+    );
+    assert!(catalog_path.exists());
+
+    let loaded = CatalogLoader::load_file(&catalog_path).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].uri.to_string(), "gewu://document/registered");
+
+    let resolved = registry
+        .resolve(ResolveRequest::new("reg-doc"))
+        .await
+        .unwrap();
+    assert_eq!(resolved.status, ResolveStatus::Ok);
+    assert_eq!(resolved.selected.unwrap().uri, "gewu://document/registered");
+    let described = registry
+        .describe(DescribeRequest {
+            uri: "gewu://document/registered".parse().unwrap(),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(described.name, "Registered Doc");
+    let search = registry.search(SearchRequest::new("atlas")).await.unwrap();
+    assert_eq!(search.candidates[0].uri, "gewu://document/registered");
+}
+
+#[tokio::test]
+async fn resource_register_modes_consider_static_catalog_resources() {
+    let dir = tempfile::tempdir().unwrap();
+    let mutable_provider = Arc::new(MutableResourceProvider::new("agent-registered"));
+    let static_resource = Resource::new(
+        ResourceUri::new("document", "registered").unwrap(),
+        "Original Static Doc",
+    )
+    .with_aliases(["reg-doc"])
+    .with_status(ResourceStatus::Available);
+    let mut registry = ResourceRegistry::new();
+    registry.register(mutable_provider.clone());
+    registry.register(InMemoryResourceProvider::new(
+        "static",
+        vec![static_resource],
+    ));
+    let registry = Arc::new(registry);
+    let tool = gewu_resource_core::ResourceRegisterTool::new(
+        registry.clone(),
+        mutable_provider,
+        dir.path().to_path_buf(),
+    );
+
+    let create_only = tool
+        .execute(
+            json!({"resource": register_resource(), "mode": "create_only"}),
+            &ToolContext::new("session", "message"),
+        )
+        .await
+        .unwrap();
+    let create_only_output: serde_json::Value = serde_json::from_str(&create_only.output).unwrap();
+    assert_eq!(create_only_output["ok"], false);
+    assert_eq!(create_only_output["error"]["code"], "resource_exists");
+
+    let update_only = tool
+        .execute(
+            json!({"resource": register_resource(), "mode": "update_only"}),
+            &ToolContext::new("session", "message"),
+        )
+        .await
+        .unwrap();
+    let update_only_output: serde_json::Value = serde_json::from_str(&update_only.output).unwrap();
+    assert_eq!(update_only_output["ok"], true);
+    assert_eq!(update_only_output["data"]["operation"], "update");
+
+    let described = registry
+        .describe(DescribeRequest {
+            uri: "gewu://document/registered".parse().unwrap(),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(described.name, "Registered Doc");
+    assert_eq!(described.spec["path"], "docs/registered.md");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resource_register_rejects_symlinked_resource_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".gewu")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join(".gewu/resources")).unwrap();
+    let (_registry, _provider, tool) = resource_register_subject(dir.path());
+
+    let result = tool
+        .execute(
+            json!({"resource": register_resource()}),
+            &ToolContext::new("session", "message"),
+        )
+        .await
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+    assert_eq!(output["ok"], false);
+    assert_eq!(output["error"]["code"], "unsafe_catalog_path");
+    assert!(!outside.path().join("agent-registered.yaml").exists());
+}
+
+#[tokio::test]
+async fn resource_register_rejects_unsafe_catalog_paths_and_kind_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_registry, _provider, tool) = resource_register_subject(dir.path());
+
+    for unsafe_catalog in [
+        "/tmp/agent-registered.yaml",
+        "../agent-registered.yaml",
+        ".gewu/resources/nested/catalog.yaml",
+        "agent-registered.json",
+    ] {
+        let result = tool
+            .execute(
+                json!({"resource": register_resource(), "catalog": unsafe_catalog}),
+                &ToolContext::new("session", "message"),
+            )
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["ok"], false, "{unsafe_catalog}");
+        assert_eq!(output["error"]["code"], "unsafe_catalog_path");
+    }
+
+    let mut mismatched = register_resource();
+    mismatched.kind = "artifact".into();
+    let result = tool
+        .execute(
+            json!({"resource": mismatched}),
+            &ToolContext::new("session", "message"),
+        )
+        .await
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+    assert_eq!(output["ok"], false);
+    assert_eq!(output["error"]["code"], "kind_mismatch");
+}
+
+#[test]
+fn resource_register_capability_only_appears_with_registration_factory() {
+    let mutable_provider = Arc::new(MutableResourceProvider::new("agent-registered"));
+    let registry = Arc::new(ResourceRegistry::new().with_provider(mutable_provider.clone()));
+
+    let read_only = ResourceToolFactory::new(registry.clone());
+    assert!(
+        !read_only
+            .capabilities()
+            .contains(&"resource.register".into())
+    );
+
+    let registration = ResourceToolFactory::with_registration(registry, mutable_provider);
+    assert!(
+        registration
+            .capabilities()
+            .contains(&"resource.register".into())
     );
 }

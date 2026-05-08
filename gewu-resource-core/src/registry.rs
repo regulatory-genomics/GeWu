@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::error::ResourceResult;
@@ -38,12 +39,19 @@ impl ResourceRegistry {
     }
 
     pub async fn search(&self, request: SearchRequest) -> ResourceResult<SearchResponse> {
-        let mut resources = Vec::new();
+        let mut resources_by_uri = BTreeMap::new();
         for provider in &self.providers {
-            resources.extend(provider.search(&request).await?);
+            for resource in provider.search(&request).await? {
+                if provider.is_mutable() {
+                    resources_by_uri.insert(resource.uri.clone(), resource);
+                } else {
+                    resources_by_uri
+                        .entry(resource.uri.clone())
+                        .or_insert(resource);
+                }
+            }
         }
-        resources.sort_by(|left, right| left.uri.cmp(&right.uri));
-        resources.dedup_by(|left, right| left.uri == right.uri);
+        let resources = resources_by_uri.into_values().collect::<Vec<_>>();
         let total = resources.len();
         let limit = request.limit.max(1);
         let truncated = total > limit;
@@ -66,23 +74,29 @@ impl ResourceRegistry {
             labels: request.labels,
             limit: usize::MAX,
         };
-        let mut resources = Vec::new();
+        let mut resources_by_uri = BTreeMap::new();
         for provider in &self.providers {
-            resources.extend(
-                provider
-                    .search(&search)
-                    .await?
-                    .into_iter()
-                    .filter(|resource| {
-                        resource.uri.to_string() == search.query
-                            || resource.uri.id() == search.query
-                            || resource.name == search.query
-                            || resource.aliases.iter().any(|alias| alias == &search.query)
-                    }),
-            );
+            for resource in provider
+                .search(&search)
+                .await?
+                .into_iter()
+                .filter(|resource| {
+                    resource.uri.to_string() == search.query
+                        || resource.uri.id() == search.query
+                        || resource.name == search.query
+                        || resource.aliases.iter().any(|alias| alias == &search.query)
+                })
+            {
+                if provider.is_mutable() {
+                    resources_by_uri.insert(resource.uri.clone(), resource);
+                } else {
+                    resources_by_uri
+                        .entry(resource.uri.clone())
+                        .or_insert(resource);
+                }
+            }
         }
-        resources.sort_by(|left, right| left.uri.cmp(&right.uri));
-        resources.dedup_by(|left, right| left.uri == right.uri);
+        let resources = resources_by_uri.into_values().collect::<Vec<_>>();
         match resources.as_slice() {
             [] => Ok(ResolveResponse {
                 status: ResolveStatus::NotFound,
@@ -109,12 +123,18 @@ impl ResourceRegistry {
     }
 
     pub async fn describe(&self, request: DescribeRequest) -> ResourceResult<Option<Resource>> {
+        let mut first_hit = None;
         for provider in &self.providers {
             if let Some(resource) = provider.describe(&request).await? {
-                return Ok(Some(resource));
+                if provider.is_mutable() {
+                    return Ok(Some(resource));
+                }
+                if first_hit.is_none() {
+                    first_hit = Some(resource);
+                }
             }
         }
-        Ok(None)
+        Ok(first_hit)
     }
 
     pub async fn validate(&self, request: ValidateRequest) -> ResourceResult<ValidateResponse> {
