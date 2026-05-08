@@ -182,29 +182,33 @@ fn generate_uri_suggestion(value: &serde_json::Value, requested_kind: Option<&st
         })
         .unwrap_or_else(|| "sample".to_string());
 
-    let id = if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
-        let assay_part = obj
-            .get("assay")
-            .and_then(|v| v.as_str())
-            .map(|s| format!("_{}", s.to_lowercase().replace('-', "_")))
-            .unwrap_or_default();
-
-        let genome_part = if path.contains("/data2/") || path.contains("/human/") {
-            "_hg38".to_string()
-        } else {
-            String::new()
-        };
-
-        if assay_part.is_empty() {
-            format!("ucf_unnamed{}", genome_part)
-        } else {
-            format!("ucf{}{}", assay_part, genome_part)
-        }
-    } else {
-        "unnamed".to_string()
-    };
+    let id = obj
+        .get("sample")
+        .and_then(|value| value.as_str())
+        .or_else(|| obj.get("sample_id").and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            obj.get("path")
+                .and_then(|value| value.as_str())
+                .and_then(canonical_sample_id_from_ucf_path)
+        })
+        .unwrap_or_else(|| "unnamed".to_string());
 
     format!("gewu://{}/{}", kind, id)
+}
+
+fn canonical_sample_id_from_ucf_path(path: &str) -> Option<String> {
+    let file_name = std::path::Path::new(path).file_name()?.to_str()?.trim();
+    if file_name.is_empty() {
+        return None;
+    }
+
+    file_name
+        .strip_suffix(".filtered.ucf")
+        .or_else(|| file_name.strip_suffix(".ucf"))
+        .map(ToOwned::to_owned)
 }
 
 #[derive(Debug)]

@@ -511,9 +511,83 @@ async fn resource_validate_invalid_value_returns_top_level_failure_with_guidance
         error["suggested_fix"]
             .as_str()
             .unwrap()
-            .contains("gewu://sample/ucf_atac_hg38"),
-        "expected suggested_fix to contain gewu://sample/ucf_atac_hg38"
+            .contains("gewu://sample/example"),
+        "expected suggested_fix to contain gewu://sample/example"
     );
+}
+
+#[tokio::test]
+async fn resource_validate_ucf_object_suggests_canonical_sample_uri() {
+    let registry = Arc::new(registry_with(vec![]));
+    let tool = gewu_resource_core::tools::ResourceValidateTool::new(registry);
+
+    let result = tool
+        .execute(
+            json!({
+                "value": {
+                    "path": "/data2/litian/macrophage_bk/data/ATAC/ucf/E3-1_ATAC12.filtered.ucf",
+                    "assay": "ATAC-seq"
+                },
+                "kind": "sample"
+            }),
+            &ToolContext::new("session", "message"),
+        )
+        .await
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+    assert_eq!(output["ok"], false);
+    assert_eq!(output["error"]["code"], "invalid_resource_uri");
+    assert!(
+        output["error"]["suggested_fix"]
+            .as_str()
+            .unwrap()
+            .contains("gewu://sample/E3-1_ATAC12")
+    );
+}
+
+#[tokio::test]
+async fn resource_validate_suggestion_prefers_sample_then_sample_id_then_path_basename() {
+    let registry = Arc::new(registry_with(vec![]));
+    let tool = gewu_resource_core::tools::ResourceValidateTool::new(registry);
+
+    for (value, expected_uri) in [
+        (
+            json!({
+                "sample": "preferred_sample",
+                "sample_id": "secondary_sample",
+                "path": "/data2/example.ucf"
+            }),
+            "gewu://sample/preferred_sample",
+        ),
+        (
+            json!({
+                "sample_id": "secondary_sample",
+                "path": "/data2/example.ucf"
+            }),
+            "gewu://sample/secondary_sample",
+        ),
+        (
+            json!({"path": "/data2/example.filtered.ucf"}),
+            "gewu://sample/example",
+        ),
+    ] {
+        let result = tool
+            .execute(
+                json!({"value": value, "kind": "sample"}),
+                &ToolContext::new("session", "message"),
+            )
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            output["error"]["suggested_fix"]
+                .as_str()
+                .unwrap()
+                .contains(expected_uri),
+            "expected suggested_fix to contain {expected_uri}"
+        );
+    }
 }
 
 #[tokio::test]
