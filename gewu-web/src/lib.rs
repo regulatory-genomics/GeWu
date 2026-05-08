@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use axum::{
+    Router,
     http::HeaderValue,
-    Router, middleware,
+    middleware,
     routing::{delete, get, post},
 };
 use clap::Parser;
@@ -24,9 +25,9 @@ pub mod sidecar;
 pub mod state;
 
 use auth::AuthMode;
+use fallback::{RuntimeFrontendAssets, RuntimeFrontendPlugin, RuntimeFrontendSidecar};
 use gewu_cli::mcp_loader;
 use gewu_runtime::PluginRegistry;
-use fallback::{RuntimeFrontendAssets, RuntimeFrontendPlugin, RuntimeFrontendSidecar};
 use plugin_suite::{FrontendAssetKind, PluginSuiteConfig};
 use state::{AppState, PluginRegistrar};
 
@@ -125,8 +126,10 @@ where
 
     let mcp_servers = loaded_config.config.mcp_servers;
 
-    let tachyon_browser_cfg = parse_tachyon_browser_config(loaded_config.config.tachyon_browser.clone())?;
-    let tachyon_suite_cfg = parse_tachyon_plugin_suite_config(loaded_config.config.tachyon_plugin_suite.clone())?;
+    let tachyon_browser_cfg =
+        parse_tachyon_browser_config(loaded_config.config.tachyon_browser.clone())?;
+    let tachyon_suite_cfg =
+        parse_tachyon_plugin_suite_config(loaded_config.config.tachyon_plugin_suite.clone())?;
     let plugin_suites = plugin_suite::normalize_plugin_suites(
         loaded_config.config.plugin_suites.clone(),
         loaded_config.config.tachyon_browser.clone(),
@@ -162,7 +165,8 @@ where
     if let Some(sidecar) = managed_tachyon_browser.as_ref() {
         config.tachyon_browser_url = Some(sidecar.url().to_string());
     }
-    let runtime_assets = runtime_frontend_assets(&plugin_suites, config.tachyon_browser_url.as_deref())?;
+    let runtime_assets =
+        runtime_frontend_assets(&plugin_suites, config.tachyon_browser_url.as_deref())?;
     config.plugin_sidecars = plugin_sidecar_map(&runtime_assets);
     let browser_runtime_assets = browser_runtime_frontend_assets(&runtime_assets);
     // SAFETY: environment is configured during single-threaded startup before the router serves
@@ -221,6 +225,7 @@ where
     let protected = Router::new()
         .route("/api/info", get(routes::sessions::handle_server_info))
         .route("/api/agents", get(routes::sessions::handle_list_agents))
+        .route("/api/skills", get(routes::skills::handle_list_skills))
         .route("/api/chat", post(routes::chat::handle_chat))
         .route("/api/events", get(routes::events::handle_events))
         .route("/api/projects", get(routes::projects::handle_list_projects))
@@ -538,7 +543,11 @@ fn plugin_proxy_base(plugin_id: &str, sidecar_id: &str) -> String {
 
 fn append_plugin_manifest_dirs(dirs: &mut Vec<String>, suites: &[PluginSuiteConfig]) {
     for suite in suites.iter().filter(|suite| suite.enabled) {
-        let Some(manifest) = suite.manifest.as_deref().filter(|path| !path.trim().is_empty()) else {
+        let Some(manifest) = suite
+            .manifest
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+        else {
             continue;
         };
         let dir = Path::new(manifest)
@@ -703,7 +712,9 @@ mod tests {
         let csp = build_content_security_policy(&assets);
         let csp = csp.to_str().unwrap();
 
-        assert!(csp.contains("script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net http://127.0.0.1:8400"));
+        assert!(csp.contains(
+            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net http://127.0.0.1:8400"
+        ));
         assert!(csp.contains("style-src 'self' 'unsafe-inline' http://127.0.0.1:8400"));
         assert!(csp.contains("connect-src 'self' http://127.0.0.1:8400"));
     }

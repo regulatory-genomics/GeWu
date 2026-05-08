@@ -394,6 +394,28 @@ mod tests {
         assert_eq!(content["_trace"]["root_run_id"], "run_workflow_trace");
         assert_eq!(content["workflow_id"], "daily_opencode_rollup");
     }
+
+    #[test]
+    fn agents_and_skills_responses_are_serializable() {
+        let agents = AgentsResponse {
+            agents: vec![AgentInfoResponse {
+                name: "build".to_string(),
+                description: "build agent".to_string(),
+            }],
+        };
+        let skills = crate::routes::skills::SkillsResponse {
+            skills: vec![crate::state::SkillInfo {
+                name: "gene-locus-resolver".to_string(),
+                description: "Resolve gene symbols".to_string(),
+            }],
+        };
+
+        let agents_json = serde_json::to_value(agents).unwrap();
+        let skills_json = serde_json::to_value(skills).unwrap();
+
+        assert_eq!(agents_json["agents"][0]["name"], "build");
+        assert_eq!(skills_json["skills"][0]["name"], "gene-locus-resolver");
+    }
 }
 
 /// Probe whether the caller is authenticated. The middleware enforces auth
