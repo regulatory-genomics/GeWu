@@ -46,6 +46,15 @@ async fn build_runtime(project_root: &std::path::Path) -> GeWuRuntime {
         .unwrap()
 }
 
+async fn build_bare_runtime() -> GeWuRuntime {
+    GeWuRuntime::builder()
+        .provider(Arc::new(FinishLlm))
+        .pool(pool().await)
+        .register_builtin_capabilities()
+        .build()
+        .unwrap()
+}
+
 async fn pool() -> sqlx::SqlitePool {
     let pool = SqlitePoolOptions::new()
         .connect("sqlite::memory:")
@@ -117,10 +126,92 @@ async fn runtime_registers_resource_tools_when_catalog_exists() {
 #[tokio::test]
 async fn runtime_does_not_register_resource_tools_without_catalogs() {
     let dir = tempfile::tempdir().unwrap();
-    let runtime = build_runtime(dir.path()).await;
+    let original_cwd = std::env::current_dir().unwrap();
+
+    struct RestoreCwd(std::path::PathBuf);
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    let _restore = RestoreCwd(original_cwd);
+    std::env::set_current_dir(dir.path()).unwrap();
+
+    let runtime = build_bare_runtime().await;
 
     assert!(!runtime.capability_registry().contains("resource.search"));
     assert!(!runtime.capability_registry().contains("resource.resolve"));
+    assert!(!runtime.capability_registry().contains("resource.register"));
+}
+
+#[tokio::test]
+async fn runtime_resource_register_available_for_explicit_empty_resource_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = build_runtime(dir.path()).await;
+
+    assert!(runtime.capability_registry().contains("resource.register"));
+    assert!(runtime.capability_registry().contains("resource.resolve"));
+
+    let tools = runtime
+        .resolve_capabilities_in_directory(
+            &[
+                "resource.register".to_string(),
+                "resource.resolve".to_string(),
+            ],
+            dir.path(),
+        )
+        .unwrap();
+    let register = tools
+        .iter()
+        .find(|tool| tool.name() == "resource.register")
+        .unwrap();
+
+    let result = register
+        .execute(
+            json!({
+                "resource": {
+                    "uri": "gewu://document/registered-runtime",
+                    "kind": "document",
+                    "name": "Registered Runtime Doc",
+                    "aliases": ["runtime-doc"],
+                    "labels": {"project":"runtime"},
+                    "spec": {"path":"docs/runtime.md"},
+                    "status": "available"
+                },
+                "reason": "runtime wiring test"
+            }),
+            &ToolContext::new("session", "message"),
+        )
+        .await
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+    assert_eq!(output["ok"], true);
+    assert_eq!(output["data"]["available_now"], true);
+
+    let resolve = tools
+        .iter()
+        .find(|tool| tool.name() == "resource.resolve")
+        .unwrap();
+    let result = resolve
+        .execute(
+            json!({"query":"runtime-doc"}),
+            &ToolContext::new("session", "message"),
+        )
+        .await
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+    assert_eq!(output["ok"], true);
+    assert_eq!(output["data"]["status"], "ok");
+    assert_eq!(
+        output["data"]["selected"]["uri"],
+        "gewu://document/registered-runtime"
+    );
+    assert!(
+        dir.path()
+            .join(".gewu/resources/agent-registered.yaml")
+            .exists()
+    );
 }
 
 #[tokio::test]
