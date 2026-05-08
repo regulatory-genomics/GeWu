@@ -249,6 +249,189 @@ pub enum TrackType {
     Qc,
 }
 
+// ---------------------------------------------------------------------------
+// Genome canvas payload builder input types
+// ---------------------------------------------------------------------------
+
+/// Input for building a canonical genome canvas payload.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GenomeCanvasOpenRequest {
+    pub assembly: String,
+    pub region: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gene_symbol: Option<String>,
+    #[serde(default)]
+    pub samples: Vec<GenomeCanvasSampleInput>,
+    #[serde(default)]
+    pub tracks: Vec<GenomeCanvasTrackInput>,
+}
+
+/// Input for a sample within [`GenomeCanvasOpenRequest`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GenomeCanvasSampleInput {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assay: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+}
+
+/// Input for a track within [`GenomeCanvasOpenRequest`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GenomeCanvasTrackInput {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub track_type: TrackType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub sample_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assay: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// Build a canonical genome canvas payload from an open request.
+pub fn build_genome_canvas_payload(
+    request: GenomeCanvasOpenRequest,
+) -> Result<serde_json::Value, crate::manager::CanvasError> {
+    use crate::manager::{CanvasError, CanvasValidationIssue};
+
+    let mut issues = Vec::new();
+
+    // Validate required fields
+    if request.assembly.trim().is_empty() {
+        issues.push(CanvasValidationIssue {
+            path: "assembly".to_string(),
+            code: "missing_required",
+            message: "genome canvas payload requires non-empty assembly".to_string(),
+        });
+    }
+
+    if request.region.trim().is_empty() {
+        issues.push(CanvasValidationIssue {
+            path: "region".to_string(),
+            code: "missing_required",
+            message: "genome canvas payload requires non-empty region".to_string(),
+        });
+    }
+
+    // Validate and collect sample ids
+    let mut sample_ids = std::collections::HashSet::new();
+    for (index, sample) in request.samples.iter().enumerate() {
+        if sample.id.trim().is_empty() {
+            issues.push(CanvasValidationIssue {
+                path: format!("samples[{index}].id"),
+                code: "missing_required",
+                message: "sample requires non-empty id".to_string(),
+            });
+        } else {
+            sample_ids.insert(sample.id.clone());
+        }
+    }
+
+    // Validate track ids and sample references
+    for (index, track) in request.tracks.iter().enumerate() {
+        if track.id.trim().is_empty() {
+            issues.push(CanvasValidationIssue {
+                path: format!("tracks[{index}].id"),
+                code: "missing_required",
+                message: "track requires non-empty id".to_string(),
+            });
+        }
+
+        if track.sample_id.trim().is_empty() {
+            issues.push(CanvasValidationIssue {
+                path: format!("tracks[{index}].sample_id"),
+                code: "unknown_reference",
+                message: "track requires non-empty sample_id".to_string(),
+            });
+        } else if !sample_ids.contains(&track.sample_id) {
+            issues.push(CanvasValidationIssue {
+                path: format!("tracks[{index}].sample_id"),
+                code: "unknown_reference",
+                message: format!("track references unknown sample_id '{}'", track.sample_id),
+            });
+        }
+    }
+
+    if !issues.is_empty() {
+        return Err(CanvasError::InvalidGenomeCanvasPayload(issues));
+    }
+
+    // Build canonical JSON payload
+    let samples: Vec<serde_json::Value> = request
+        .samples
+        .iter()
+        .map(|s| {
+            let mut obj = serde_json::json!({ "id": s.id });
+            if let Some(label) = &s.label {
+                obj["label"] = serde_json::json!(label);
+            }
+            if let Some(assay) = &s.assay {
+                obj["assay"] = serde_json::json!(assay);
+            }
+            if let Some(uri) = &s.uri {
+                obj["uri"] = serde_json::json!(uri);
+            }
+            obj
+        })
+        .collect();
+
+    let tracks: Vec<serde_json::Value> = request
+        .tracks
+        .iter()
+        .map(|t| {
+            let mut obj = serde_json::json!({
+                "id": t.id,
+                "type": t.track_type,
+                "sample_id": t.sample_id,
+                "visible": true,
+            });
+            if let Some(source) = &t.source {
+                obj["source"] = serde_json::json!(source);
+            }
+            if let Some(assay) = &t.assay {
+                obj["assay"] = serde_json::json!(assay);
+            }
+            if let Some(uri) = &t.uri {
+                obj["uri"] = serde_json::json!(uri);
+            }
+            if let Some(path) = &t.path {
+                obj["path"] = serde_json::json!(path);
+            }
+            if let Some(url) = &t.url {
+                obj["url"] = serde_json::json!(url);
+            }
+            obj
+        })
+        .collect();
+
+    let mut payload = serde_json::json!({
+        "assembly": request.assembly,
+        "region": request.region,
+        "samples": samples,
+        "tracks": tracks,
+    });
+
+    if let Some(gene_symbol) = &request.gene_symbol {
+        if !gene_symbol.trim().is_empty() {
+            payload["gene"] = serde_json::json!({
+                "symbol": gene_symbol,
+                "region": request.region,
+            });
+        }
+    }
+
+    Ok(payload)
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GenomeSelection {
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -600,4 +600,109 @@ mod tests {
         assert_eq!(focused.len(), 1, "exactly one canvas may be focused");
         assert_eq!(focused[0].canvas_id, "a");
     }
+
+    // -------------------------------------------------------------------------
+    // genome_canvas_payload_builder tests
+    // -------------------------------------------------------------------------
+
+    use crate::state::{
+        build_genome_canvas_payload, GenomeCanvasOpenRequest, GenomeCanvasSampleInput,
+        GenomeCanvasTrackInput, TrackType,
+    };
+
+    #[test]
+    fn genome_canvas_builder_creates_canonical_ucf_spi1_payload() {
+        let request = GenomeCanvasOpenRequest {
+            assembly: "hg38".to_string(),
+            region: "chr11:47354860-47395607".to_string(),
+            gene_symbol: Some("SPI1".to_string()),
+            samples: vec![GenomeCanvasSampleInput {
+                id: "UCF".to_string(),
+                label: Some("UCF".to_string()),
+                assay: Some("atac".to_string()),
+                uri: Some("gewu://sample/ucf_atac_hg38".to_string()),
+            }],
+            tracks: vec![GenomeCanvasTrackInput {
+                id: "signal-atac-UCF".to_string(),
+                track_type: TrackType::Signal,
+                source: Some("coverage".to_string()),
+                sample_id: "UCF".to_string(),
+                assay: Some("atac".to_string()),
+                uri: Some("gewu://track/ucf_atac_signal_hg38".to_string()),
+                path: Some("/data2/litian/macrophage_bk/data/ATAC/ucf/P1-2_ATAC3.filtered.ucf".to_string()),
+                url: Some("/data2/litian/macrophage_bk/data/ATAC/ucf/P1-2_ATAC3.filtered.ucf".to_string()),
+            }],
+        };
+
+        let payload = build_genome_canvas_payload(request).expect("should build payload");
+
+        // Verify top-level fields
+        assert_eq!(payload["assembly"], "hg38");
+        assert_eq!(payload["region"], "chr11:47354860-47395607");
+        assert_eq!(payload["gene"]["symbol"], "SPI1");
+        assert_eq!(payload["gene"]["region"], "chr11:47354860-47395607");
+
+        // Verify samples[0]
+        let sample = &payload["samples"][0];
+        assert_eq!(sample["id"], "UCF");
+        assert_eq!(sample["label"], "UCF");
+        assert_eq!(sample["assay"], "atac");
+        assert_eq!(sample["uri"], "gewu://sample/ucf_atac_hg38");
+        // Samples must NOT have sample_id
+        assert!(
+            !sample.as_object().unwrap().contains_key("sample_id"),
+            "sample should not have sample_id field"
+        );
+
+        // Verify tracks[0]
+        let track = &payload["tracks"][0];
+        assert_eq!(track["id"], "signal-atac-UCF");
+        assert_eq!(track["type"], "signal");
+        assert_eq!(track["source"], "coverage");
+        assert_eq!(track["sample_id"], "UCF");
+        assert_eq!(track["assay"], "atac");
+        assert_eq!(track["uri"], "gewu://track/ucf_atac_signal_hg38");
+        assert_eq!(
+            track["path"],
+            "/data2/litian/macrophage_bk/data/ATAC/ucf/P1-2_ATAC3.filtered.ucf"
+        );
+        assert_eq!(
+            track["url"],
+            "/data2/litian/macrophage_bk/data/ATAC/ucf/P1-2_ATAC3.filtered.ucf"
+        );
+        assert_eq!(track["visible"], true);
+    }
+
+    #[test]
+    fn genome_canvas_builder_rejects_track_unknown_sample() {
+        let request = GenomeCanvasOpenRequest {
+            assembly: "hg38".to_string(),
+            region: "chr1:1-100".to_string(),
+            gene_symbol: None,
+            samples: vec![], // No samples
+            tracks: vec![GenomeCanvasTrackInput {
+                id: "track1".to_string(),
+                track_type: TrackType::Signal,
+                source: None,
+                sample_id: "UCF".to_string(), // References unknown sample
+                assay: None,
+                uri: None,
+                path: None,
+                url: None,
+            }],
+        };
+
+        let err = build_genome_canvas_payload(request).unwrap_err();
+        match err {
+            CanvasError::InvalidGenomeCanvasPayload(issues) => {
+                let issue = issues.iter().find(|i| i.path == "tracks[0].sample_id").unwrap();
+                assert_eq!(issue.code, "unknown_reference");
+                assert!(
+                    issue.message.contains("UCF"),
+                    "error message should mention the unknown sample_id"
+                );
+            }
+            _ => panic!("expected InvalidGenomeCanvasPayload error"),
+        }
+    }
 }

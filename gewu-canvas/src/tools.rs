@@ -28,12 +28,18 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::manager::{CanvasError, CanvasManager};
-use crate::state::{CanvasEvent, CanvasKind, CanvasMode, CanvasState, CanvasStatePatch};
+use crate::state::{
+    build_genome_canvas_payload, CanvasEvent, CanvasKind, CanvasMode, CanvasState,
+    CanvasStatePatch, GenomeCanvasOpenRequest,
+};
 
 /// Build the canonical six canvas tools, sharing a single manager.
 pub fn canvas_tools(manager: Arc<CanvasManager>) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(CanvasOpenTool {
+            manager: manager.clone(),
+        }),
+        Arc::new(CanvasOpenGenomeTool {
             manager: manager.clone(),
         }),
         Arc::new(CanvasCloseTool {
@@ -197,6 +203,148 @@ fn preview_canvas_state(args: &OpenArgs) -> Result<CanvasState, CanvasError> {
         state.validate_payload()?;
     }
     Ok(state)
+}
+
+// ---------------------------------------------------------------------------
+// canvas.open_genome
+// ---------------------------------------------------------------------------
+
+pub struct CanvasOpenGenomeTool {
+    pub manager: Arc<CanvasManager>,
+}
+
+#[derive(Deserialize)]
+struct OpenGenomeArgs {
+    #[serde(flatten)]
+    request: GenomeCanvasOpenRequest,
+    #[serde(default)]
+    mode: Option<CanvasMode>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    canvas_id: Option<String>,
+}
+
+#[async_trait]
+impl Tool for CanvasOpenGenomeTool {
+    fn name(&self) -> &str {
+        "canvas.open_genome"
+    }
+    fn description(&self) -> &str {
+        "Open a genome canvas with a canonical payload. Prefer this over hand-writing \
+         canvas.open payloads for genome views. Samples use `id`; tracks use `sample_id`."
+    }
+    fn schema(&self) -> RootSchema {
+        schema_from(json!({
+            "type": "object",
+            "properties": {
+                "assembly": {
+                    "type": "string",
+                    "description": "Genome assembly (e.g., hg38, mm10)."
+                },
+                "region": {
+                    "type": "string",
+                    "description": "Genomic region (e.g., chr1:1-100)."
+                },
+                "gene_symbol": { "type": "string" },
+                "title": { "type": "string" },
+                "mode": {
+                    "type": "string",
+                    "enum": ["overlay", "docked", "fullscreen"]
+                },
+                "canvas_id": { "type": "string" },
+                "samples": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "label": { "type": "string" },
+                            "assay": { "type": "string" },
+                            "uri": { "type": "string", "pattern": "^gewu://[^/]+/[^/]+$" }
+                        },
+                        "required": ["id"],
+                        "additionalProperties": false
+                    }
+                },
+                "tracks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "type": {
+                                "type": "string",
+                                "enum": ["signal", "peak", "gene", "annotation", "qc"]
+                            },
+                            "source": { "type": "string" },
+                            "sample_id": { "type": "string" },
+                            "assay": { "type": "string" },
+                            "uri": { "type": "string", "pattern": "^gewu://[^/]+/[^/]+$" },
+                            "path": { "type": "string" },
+                            "url": { "type": "string" }
+                        },
+                        "required": ["id", "type", "sample_id"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["assembly", "region"],
+            "additionalProperties": false
+        }))
+    }
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::ParallelSafe
+    }
+
+    async fn execute(
+        &self,
+        args: Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let input: OpenGenomeArgs = serde_json::from_value(args).map_err(box_err)?;
+
+        let payload = match build_genome_canvas_payload(input.request) {
+            Ok(p) => p,
+            Err(e) => return Ok(ToolResult::new("canvas.open_genome", error_output(e))),
+        };
+
+        let mode = input.mode.unwrap_or_default();
+        let state = match self
+            .manager
+            .open(
+                &ctx.session_id,
+                input.canvas_id.clone(),
+                CanvasKind::Genome,
+                mode,
+                input.title,
+                Some(payload),
+            )
+            .await
+        {
+            Ok(state) => state,
+            Err(e) => return Ok(ToolResult::new("canvas.open_genome", error_output(e))),
+        };
+
+        let event = CanvasEvent::Open {
+            canvas_id: state.canvas_id.clone(),
+            kind: state.kind,
+            mode: state.mode,
+            initial_state: state.clone(),
+        };
+        let output = json!({
+            "canvas_id": state.canvas_id,
+            "state": state,
+            "event": "canvas:open",
+            "event_payload": event,
+            "next_actions": [{
+                "tool": "canvas.list",
+                "args": {},
+                "purpose": "Verify the canvas is visible in this session."
+            }]
+        });
+        Ok(ToolResult::new("canvas.open_genome", output.to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -533,8 +681,8 @@ mod tests {
     async fn open_then_get_state_round_trip() {
         let m = Arc::new(CanvasManager::new());
         let tools = canvas_tools(m.clone());
-        let open = &tools[0];
-        let get = &tools[4];
+        let open = tools.iter().find(|t| t.name() == "canvas.open").unwrap();
+        let get = tools.iter().find(|t| t.name() == "canvas.get_state").unwrap();
 
         let opened_raw = open
             .execute(
@@ -594,8 +742,8 @@ mod tests {
     async fn open_genome_canvas_accepts_resolved_spi1_payload() {
         let m = Arc::new(CanvasManager::new());
         let tools = canvas_tools(m.clone());
-        let open = &tools[0];
-        let get = &tools[4];
+        let open = tools.iter().find(|t| t.name() == "canvas.open").unwrap();
+        let get = tools.iter().find(|t| t.name() == "canvas.get_state").unwrap();
 
         let payload = json!({
             "assembly": "hg38",
@@ -976,5 +1124,104 @@ mod tests {
             .unwrap();
         let json: Value = serde_json::from_str(&result.output).unwrap();
         assert!(json["state"].is_null());
+    }
+
+    #[tokio::test]
+    async fn open_genome_tool_builds_canonical_payload_and_emits_open_event() {
+        let m = Arc::new(CanvasManager::new());
+        let tools = canvas_tools(m.clone());
+
+        // Find canvas.open_genome tool by name
+        let open_genome = tools
+            .iter()
+            .find(|t| t.name() == "canvas.open_genome")
+            .expect("canvas.open_genome tool must be registered");
+
+        // Execute with canonical genome payload
+        let result = open_genome
+            .execute(
+                json!({
+                    "assembly": "hg38",
+                    "region": "chr11:47354860-47395607",
+                    "gene_symbol": "SPI1",
+                    "title": "ATAC UCF hg38 — SPI1",
+                    "samples": [{
+                        "id": "UCF",
+                        "label": "UCF",
+                        "assay": "atac",
+                        "uri": "gewu://sample/ucf_atac_hg38"
+                    }],
+                    "tracks": [{
+                        "id": "signal-atac-UCF",
+                        "type": "signal",
+                        "source": "coverage",
+                        "sample_id": "UCF",
+                        "assay": "atac",
+                        "uri": "gewu://track/ucf_atac_signal_hg38",
+                        "path": "/data2/litian/macrophage_bk/data/ATAC/ucf/P1-2_ATAC3.filtered.ucf",
+                        "url": "/data2/litian/macrophage_bk/data/ATAC/ucf/P1-2_ATAC3.filtered.ucf"
+                    }]
+                }),
+                &ctx("s1"),
+            )
+            .await
+            .unwrap();
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+
+        assert_eq!(output["event"], "canvas:open");
+        assert_eq!(output["state"]["kind"], "genome");
+        assert_eq!(output["state"]["payload"]["samples"][0]["id"], "UCF");
+        assert_eq!(output["state"]["payload"]["tracks"][0]["sample_id"], "UCF");
+    }
+
+    #[tokio::test]
+    async fn ucf_spi1_open_genome_workflow_is_canonical() {
+        let m = Arc::new(CanvasManager::new());
+        let tools = canvas_tools(m.clone());
+        let open_genome = tools
+            .iter()
+            .find(|tool| tool.name() == "canvas.open_genome")
+            .unwrap();
+        let list = tools.iter().find(|tool| tool.name() == "canvas.list").unwrap();
+
+        let opened = open_genome
+            .execute(
+                json!({
+                    "assembly": "hg38",
+                    "region": "chr11:47354860-47395607",
+                    "gene_symbol": "SPI1",
+                    "title": "ATAC UCF hg38 — SPI1",
+                    "samples": [{
+                        "id": "UCF",
+                        "label": "UCF",
+                        "assay": "atac",
+                        "uri": "gewu://sample/ucf_atac_hg38"
+                    }],
+                    "tracks": [{
+                        "id": "signal-atac-UCF",
+                        "type": "signal",
+                        "source": "coverage",
+                        "sample_id": "UCF",
+                        "assay": "atac",
+                        "uri": "gewu://track/ucf_atac_signal_hg38",
+                        "path": "/data2/litian/macrophage_bk/data/ATAC/ucf/P1-2_ATAC3.filtered.ucf",
+                        "url": "/data2/litian/macrophage_bk/data/ATAC/ucf/P1-2_ATAC3.filtered.ucf"
+                    }]
+                }),
+                &ctx("session-ucf"),
+            )
+            .await
+            .unwrap();
+        let opened_json: Value = serde_json::from_str(&opened.output).unwrap();
+        assert_eq!(opened_json["event"], "canvas:open");
+
+        let listed = list.execute(json!({}), &ctx("session-ucf")).await.unwrap();
+        let listed_json: Value = serde_json::from_str(&listed.output).unwrap();
+        assert_eq!(listed_json["canvases"].as_array().unwrap().len(), 1);
+        assert_eq!(listed_json["canvases"][0]["payload"]["samples"][0]["id"], "UCF");
+        assert_eq!(
+            listed_json["canvases"][0]["payload"]["tracks"][0]["sample_id"],
+            "UCF"
+        );
     }
 }
