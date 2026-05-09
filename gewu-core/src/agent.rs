@@ -43,10 +43,13 @@ use crate::compaction::{
     build_consolidation_text, save_consolidation_file,
 };
 use crate::middleware::TruncationService;
+use crate::permission::{
+    PermissionDecision, PermissionDecisionKind, PermissionGrant, ToolPermissionRequest,
+};
 use crate::traits::{LlmProvider, Memory, Tool, ToolRegistry};
 use crate::types::{
-    AgentEvent, ContentPart, FunctionCall, Message, ProviderEvent, ToolCall, ToolContext,
-    ToolExecutionPolicy, ToolResult,
+    AgentEvent, ContentPart, FunctionCall, Message, PermissionBroker, ProviderEvent, ToolCall,
+    ToolContext, ToolExecutionPolicy, ToolResult,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -108,6 +111,7 @@ pub struct Agent {
     truncation: TruncationService,
     session_id: String,
     tool_context_metadata: serde_json::Map<String, serde_json::Value>,
+    permission_broker: Option<Arc<dyn PermissionBroker>>,
 }
 
 pub struct AgentBuilder {
@@ -119,6 +123,48 @@ pub struct AgentBuilder {
     context_limit: usize,
     session_id: Option<String>,
     tool_context_metadata: serde_json::Map<String, serde_json::Value>,
+    permission_broker: Option<Arc<dyn PermissionBroker>>,
+}
+
+fn permission_request_from_output(output: &str) -> Option<ToolPermissionRequest> {
+    let value: serde_json::Value = serde_json::from_str(output).ok()?;
+    if value
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(serde_json::Value::as_str)
+        != Some("permission_required")
+    {
+        return None;
+    }
+
+    value
+        .get("permission_request")
+        .cloned()
+        .and_then(|request| serde_json::from_value(request).ok())
+}
+
+fn permission_grant_from_decision(
+    request: &ToolPermissionRequest,
+    decision: &PermissionDecision,
+) -> Option<PermissionGrant> {
+    if decision.request_id != request.id || decision.decision != PermissionDecisionKind::Approve {
+        return None;
+    }
+
+    Some(PermissionGrant {
+        session_id: request.session_id.clone(),
+        action: request.action.clone(),
+        scope: request.scope.clone(),
+        duration: decision.duration,
+    })
+}
+
+fn add_permission_grant_to_context(ctx: &mut ToolContext, grant: PermissionGrant) {
+    let mut grants = ctx.permission_grants();
+    grants.push(grant);
+    if let Ok(value) = serde_json::to_value(grants) {
+        ctx.metadata.insert("permission_grants".to_string(), value);
+    }
 }
 
 fn extract_panic_message(panic_payload: Box<dyn Any + Send>) -> String {
@@ -169,9 +215,9 @@ async fn execute_tool_with_panic_recovery(
                                 arguments or checking the tool's requirements."
                         ))) as Box<dyn Error + Send + Sync>)
                     }
-                Err(_) => Err(Box::new(std::io::Error::other(format!(
-                    "Tool '{tool_name}' panicked but could not retrieve panic payload"
-                ))) as Box<dyn Error + Send + Sync>),
+                    Err(_) => Err(Box::new(std::io::Error::other(format!(
+                        "Tool '{tool_name}' panicked but could not retrieve panic payload"
+                    ))) as Box<dyn Error + Send + Sync>),
                 }
             } else {
                 Err(Box::new(std::io::Error::other(format!(
@@ -243,6 +289,7 @@ struct ToolExecutionHarness {
     truncation: TruncationService,
     session_id: String,
     context_metadata: serde_json::Map<String, serde_json::Value>,
+    permission_broker: Option<Arc<dyn PermissionBroker>>,
 }
 
 impl ToolExecutionHarness {
@@ -252,6 +299,7 @@ impl ToolExecutionHarness {
             truncation: agent.truncation.clone(),
             session_id: agent.session_id.clone(),
             context_metadata: agent.tool_context_metadata.clone(),
+            permission_broker: agent.permission_broker.clone(),
         }
     }
 
@@ -291,6 +339,7 @@ impl ToolExecutionHarness {
         let tool_call_id = call.id;
         let mut ctx = ToolContext::new(&self.session_id, message_id.as_str())
             .with_tool_call_id(tool_call_id.clone());
+        ctx.permission_broker = self.permission_broker.clone();
         ctx.metadata.extend(self.context_metadata.clone());
         ctx.metadata.extend(extra_metadata);
         let start_metadata = self
@@ -313,20 +362,65 @@ impl ToolExecutionHarness {
         }
     }
 
-    async fn execute_one(&self, prepared: PreparedToolCall) -> CompletedToolCall {
+    async fn execute_one(
+        &self,
+        mut prepared: PreparedToolCall,
+    ) -> (CompletedToolCall, Option<AgentEvent>) {
         let output = run_tool_call(
             self.tools.clone(),
             self.truncation.clone(),
             prepared.tool_name.clone(),
-            prepared.args,
-            prepared.ctx,
+            prepared.args.clone(),
+            prepared.ctx.clone(),
         )
         .await;
-        CompletedToolCall {
-            tool_call_id: prepared.tool_call_id,
-            tool_name: prepared.tool_name,
-            output,
+
+        if let Some(request) = permission_request_from_output(&output)
+            && let Some(broker) = &self.permission_broker
+        {
+            let decision = broker.request_permission(request.clone()).await;
+            let approved = decision.decision == PermissionDecisionKind::Approve;
+            let event = AgentEvent::ToolPermissionResolved {
+                request_id: request.id.clone(),
+                approved,
+            };
+            if let Some(grant) = permission_grant_from_decision(&request, &decision) {
+                add_permission_grant_to_context(&mut prepared.ctx, grant);
+                let retry_output = run_tool_call(
+                    self.tools.clone(),
+                    self.truncation.clone(),
+                    prepared.tool_name.clone(),
+                    prepared.args.clone(),
+                    prepared.ctx,
+                )
+                .await;
+                return (
+                    CompletedToolCall {
+                        tool_call_id: prepared.tool_call_id,
+                        tool_name: prepared.tool_name,
+                        output: retry_output,
+                    },
+                    Some(event),
+                );
+            }
+            return (
+                CompletedToolCall {
+                    tool_call_id: prepared.tool_call_id,
+                    tool_name: prepared.tool_name,
+                    output,
+                },
+                Some(event),
+            );
         }
+
+        (
+            CompletedToolCall {
+                tool_call_id: prepared.tool_call_id,
+                tool_name: prepared.tool_name,
+                output,
+            },
+            None,
+        )
     }
 
     async fn execute_parallel(
@@ -380,6 +474,7 @@ impl Default for AgentBuilder {
             context_limit: 128_000,
             session_id: None,
             tool_context_metadata: Default::default(),
+            permission_broker: None,
         }
     }
 }
@@ -387,6 +482,10 @@ impl Default for AgentBuilder {
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::default()
+    }
+
+    pub fn set_permission_broker(&mut self, broker: Arc<dyn PermissionBroker>) {
+        self.permission_broker = Some(broker);
     }
 
     pub async fn reset(&mut self) -> Result<()> {
@@ -604,7 +703,11 @@ impl Agent {
                         metadata: prepared.start_metadata.clone(),
                     };
 
-                    let completed = harness.execute_one(prepared).await;
+                    let (completed, permission_event) = harness.execute_one(prepared).await;
+
+                    if let Some(event) = permission_event {
+                        yield event;
+                    }
 
                     yield AgentEvent::ToolFinish {
                         tool_call_id: completed.tool_call_id.clone(),
@@ -773,9 +876,7 @@ When constructing the summary, try to stick to this template:
         }
 
         new_history.push(Message::Assistant {
-            content: Some(format!(
-                "Summary of previous conversation:\n{summary_text}"
-            )),
+            content: Some(format!("Summary of previous conversation:\n{summary_text}")),
             tool_calls: None,
         });
 
@@ -882,6 +983,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn permission_broker(mut self, broker: Arc<dyn PermissionBroker>) -> Self {
+        self.permission_broker = Some(broker);
+        self
+    }
+
     pub fn memory(mut self, memory: Box<dyn Memory>) -> Self {
         self.memory = Some(memory);
         self
@@ -901,6 +1007,7 @@ impl AgentBuilder {
                 .session_id
                 .unwrap_or_else(|| Uuid::new_v4().to_string()),
             tool_context_metadata: self.tool_context_metadata,
+            permission_broker: self.permission_broker,
         };
         Ok(agent)
     }

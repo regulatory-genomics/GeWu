@@ -1,7 +1,11 @@
 use anyhow::{Context, Result, bail};
 use gewu_canvas::{CanvasManager, canvas_tools};
-use gewu_core::permission::PermissionGrant;
+use gewu_core::permission::{
+    GrantDuration, PermissionDecision, PermissionDecisionKind, PermissionGrant,
+    ToolPermissionRequest,
+};
 use gewu_core::traits::Tool;
+use gewu_core::types::PermissionBroker;
 use gewu_providers::OpenAIProvider;
 use gewu_runtime::{BackgroundTaskCoordinator, PluginHost, PluginRegistry, RuntimeFactory};
 use gewu_storage::session_store::{SessionRecord, SessionStore};
@@ -12,7 +16,7 @@ use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, oneshot};
 use tokio::task::AbortHandle;
 use tracing::info;
 use uuid::Uuid;
@@ -160,6 +164,47 @@ pub struct AgentHandle {
     pub agent_type: String,
 }
 
+struct PendingPermissionRequest {
+    request: ToolPermissionRequest,
+    tx: oneshot::Sender<PermissionDecision>,
+}
+
+#[derive(Clone)]
+pub struct AppPermissionBroker {
+    pending_permissions: Arc<RwLock<HashMap<String, PendingPermissionRequest>>>,
+}
+
+impl std::fmt::Debug for AppPermissionBroker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppPermissionBroker")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl PermissionBroker for AppPermissionBroker {
+    async fn request_permission(&self, request: ToolPermissionRequest) -> PermissionDecision {
+        let request_id = request.id.clone();
+        let (tx, rx) = oneshot::channel();
+        self.pending_permissions.write().await.insert(
+            request_id.clone(),
+            PendingPermissionRequest {
+                request: request.clone(),
+                tx,
+            },
+        );
+
+        match rx.await {
+            Ok(decision) => decision,
+            Err(_) => PermissionDecision {
+                request_id,
+                decision: PermissionDecisionKind::Deny,
+                duration: request.default_duration,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ActiveTurnInfo {
     pub session_id: String,
@@ -188,6 +233,7 @@ pub struct AppState {
     pub canvases: CanvasManager,
     pub canvas_tools: Arc<Vec<Arc<dyn Tool>>>,
     pub permission_grants: Arc<RwLock<HashMap<String, Vec<PermissionGrant>>>>,
+    pending_permissions: Arc<RwLock<HashMap<String, PendingPermissionRequest>>>,
     rebuild_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
@@ -391,6 +437,7 @@ impl AppState {
             canvases,
             canvas_tools,
             permission_grants: Arc::new(RwLock::new(HashMap::new())),
+            pending_permissions: Arc::new(RwLock::new(HashMap::new())),
             rebuild_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -409,7 +456,10 @@ impl AppState {
         Ok(())
     }
 
-    pub async fn permission_grants_for_session(&self, session_id: &str) -> Result<Vec<PermissionGrant>> {
+    pub async fn permission_grants_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<PermissionGrant>> {
         let session_id = self.resolve_session_id(session_id).await?;
         Ok(self
             .permission_grants
@@ -418,6 +468,31 @@ impl AppState {
             .get(&session_id)
             .cloned()
             .unwrap_or_default())
+    }
+
+    pub fn permission_broker(&self) -> Arc<dyn PermissionBroker> {
+        Arc::new(AppPermissionBroker {
+            pending_permissions: self.pending_permissions.clone(),
+        })
+    }
+
+    pub async fn resolve_permission_decision(
+        &self,
+        request: &ToolPermissionRequest,
+        decision: PermissionDecisionKind,
+        duration: Option<GrantDuration>,
+    ) -> PermissionDecision {
+        let decision = PermissionDecision {
+            request_id: request.id.clone(),
+            decision,
+            duration: duration.unwrap_or(request.default_duration),
+        };
+        if let Some(pending) = self.pending_permissions.write().await.remove(&request.id) {
+            if pending.request.session_id == request.session_id {
+                let _ = pending.tx.send(decision.clone());
+            }
+        }
+        decision
     }
 
     pub async fn create_session(
@@ -493,10 +568,17 @@ impl AppState {
                 &agent_type,
                 session_id.clone(),
                 mcp_tools,
-                self.session_metadata_with_permissions(&session_id, project.as_ref(), &working_directory).await?,
+                self.session_metadata_with_permissions(
+                    &session_id,
+                    project.as_ref(),
+                    &working_directory,
+                )
+                .await?,
                 working_directory,
             )
             .await?;
+        let mut agent = agent;
+        agent.set_permission_broker(self.permission_broker());
         info!("Agent created successfully");
 
         let created_at = std::time::SystemTime::now()
@@ -932,10 +1014,17 @@ impl AppState {
                 agent_type,
                 session_id.to_string(),
                 mcp_tools,
-                self.session_metadata_with_permissions(session_id, project.as_ref(), &working_directory).await?,
+                self.session_metadata_with_permissions(
+                    session_id,
+                    project.as_ref(),
+                    &working_directory,
+                )
+                .await?,
                 working_directory,
             )
             .await?;
+        let mut agent = agent;
+        agent.set_permission_broker(self.permission_broker());
 
         Ok(Arc::new(AgentHandle {
             agent: Arc::new(Mutex::new(agent)),

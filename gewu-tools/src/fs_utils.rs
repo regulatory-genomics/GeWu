@@ -142,7 +142,10 @@ pub(crate) fn classify_path_permission(
 
     if is_hard_denied(&canonical_path) {
         return Ok(PathPermissionDecision::Denied {
-            reason: format!("{} is blocked by GeWu hard-deny policy", canonical_path.display()),
+            reason: format!(
+                "{} is blocked by GeWu hard-deny policy",
+                canonical_path.display()
+            ),
         });
     }
 
@@ -154,7 +157,11 @@ pub(crate) fn classify_path_permission(
         return Ok(PathPermissionDecision::Allowed { canonical_path });
     }
 
-    let scope = if canonical_path.is_dir() {
+    let scope = if action == PermissionAction::Read && canonical_path.is_dir() {
+        PermissionScope::DirectoryTree {
+            path: canonical_path.clone(),
+        }
+    } else if canonical_path.is_dir() {
         PermissionScope::Directory {
             path: canonical_path.clone(),
         }
@@ -164,25 +171,33 @@ pub(crate) fn classify_path_permission(
         }
     };
 
-    Ok(PathPermissionDecision::Requires(ToolPermissionRequest::new(
-        session_id,
-        tool_name,
-        action,
-        canonical_path.clone(),
-        scope,
-        format!("{tool_name} requested {}", canonical_path.display()),
-        destructive,
-    )))
+    Ok(PathPermissionDecision::Requires(
+        ToolPermissionRequest::new(
+            session_id,
+            tool_name,
+            action,
+            canonical_path.clone(),
+            scope,
+            format!("{tool_name} requested {}", canonical_path.display()),
+            destructive,
+        ),
+    ))
 }
 
 fn canonicalize_for_action(action: PermissionAction, requested_path: &Path) -> Result<PathBuf> {
     match action {
         PermissionAction::Write if !requested_path.exists() => {
             let parent = requested_path.parent().ok_or_else(|| {
-                anyhow::anyhow!("Write path {} has no parent directory", requested_path.display())
+                anyhow::anyhow!(
+                    "Write path {} has no parent directory",
+                    requested_path.display()
+                )
             })?;
             let canonical_parent = parent.canonicalize().with_context(|| {
-                format!("Failed to canonicalize parent directory: {}", parent.display())
+                format!(
+                    "Failed to canonicalize parent directory: {}",
+                    parent.display()
+                )
             })?;
             let file_name = requested_path.file_name().ok_or_else(|| {
                 anyhow::anyhow!("Write path {} has no file name", requested_path.display())
@@ -196,13 +211,19 @@ fn canonicalize_for_action(action: PermissionAction, requested_path: &Path) -> R
 }
 
 fn is_hard_denied(path: &Path) -> bool {
-    if path == Path::new("/etc/shadow") || path == Path::new("/proc/kcore") || path == Path::new("/dev/mem") {
+    if path == Path::new("/etc/shadow")
+        || path == Path::new("/proc/kcore")
+        || path == Path::new("/dev/mem")
+    {
         return true;
     }
     if let Some(home) = default_home_dir() {
         let ssh_dir = home.join(".ssh");
         if path.starts_with(&ssh_dir) {
-            let name = path.file_name().and_then(|part| part.to_str()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .and_then(|part| part.to_str())
+                .unwrap_or_default();
             return matches!(name, "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519");
         }
     }
@@ -306,7 +327,10 @@ pub fn resolve_read_path(root: impl AsRef<Path>, user_path: impl AsRef<Path>) ->
         if is_read_allowed(&root, &normalized) {
             Ok(normalized)
         } else {
-            Err(anyhow::anyhow!("{}", format_read_denial(&normalized, &roots)))
+            Err(anyhow::anyhow!(
+                "{}",
+                format_read_denial(&normalized, &roots)
+            ))
         }
     } else {
         // Relative paths resolve against root (same as before)
@@ -486,8 +510,8 @@ pub fn glob_with_gitignore(root: impl AsRef<Path>, pattern: &str) -> Result<Vec<
         .git_ignore(true)
         .build();
 
-    let glob_pattern = glob::Pattern::new(pattern)
-        .with_context(|| format!("Invalid glob pattern: {pattern}"))?;
+    let glob_pattern =
+        glob::Pattern::new(pattern).with_context(|| format!("Invalid glob pattern: {pattern}"))?;
 
     let mut matches = Vec::new();
 
@@ -638,6 +662,66 @@ mod tests {
             }
             other => panic!("expected permission request, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn outside_read_root_requires_directory_tree_scope_for_directory() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let canonical = outside.path().canonicalize().unwrap();
+
+        let decision = classify_path_permission_for_test(
+            PermissionAction::Read,
+            outside.path(),
+            &[allowed.path().to_path_buf()],
+            &[],
+            "list",
+            "session-1",
+            false,
+        )
+        .unwrap();
+
+        match decision {
+            PathPermissionDecision::Requires(request) => {
+                assert_eq!(request.action, PermissionAction::Read);
+                assert_eq!(
+                    request.scope,
+                    PermissionScope::DirectoryTree {
+                        path: canonical.clone()
+                    }
+                );
+                assert_eq!(request.requested_path, canonical);
+            }
+            other => panic!("expected directory tree permission request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approved_directory_tree_grant_allows_child_file() {
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("nested").join("sample.txt");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "hello").unwrap();
+        let root = outside.path().canonicalize().unwrap();
+        let grant = PermissionGrant {
+            session_id: "session-1".to_string(),
+            action: PermissionAction::Read,
+            scope: PermissionScope::DirectoryTree { path: root },
+            duration: GrantDuration::Session,
+        };
+
+        let decision = classify_path_permission_for_test(
+            PermissionAction::Read,
+            &target,
+            &[],
+            &[grant],
+            "read_file",
+            "session-1",
+            false,
+        )
+        .unwrap();
+
+        assert!(matches!(decision, PathPermissionDecision::Allowed { .. }));
     }
 
     #[test]

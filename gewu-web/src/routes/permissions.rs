@@ -25,12 +25,15 @@ pub async fn handle_permission_decision(
     Json(req): Json<PermissionDecisionRequest>,
 ) -> Result<Json<PermissionDecisionResponse>, axum::http::StatusCode> {
     let approved = req.decision == PermissionDecisionKind::Approve;
+    let decision = app
+        .resolve_permission_decision(&req.request, req.decision.clone(), req.duration)
+        .await;
     if approved {
         let grant = PermissionGrant {
             session_id: req.request.session_id.clone(),
             action: req.request.action.clone(),
             scope: req.request.scope.clone(),
-            duration: req.duration.unwrap_or(req.request.default_duration),
+            duration: decision.duration,
         };
         app.add_permission_grant(grant)
             .await
