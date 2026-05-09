@@ -50,7 +50,7 @@ fn spawn_memory_profile_hook() -> String {
         );
         stream.write_all(response.as_bytes()).unwrap();
     });
-    format!("http://{}", addr)
+    format!("http://{addr}")
 }
 
 fn spawn_capture_hook(expected_requests: usize) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
@@ -83,7 +83,7 @@ fn spawn_capture_hook(expected_requests: usize) -> (String, Arc<Mutex<Vec<serde_
             stream.write_all(response.as_bytes()).unwrap();
         }
     });
-    (format!("http://{}", addr), captures)
+    (format!("http://{addr}"), captures)
 }
 
 #[tokio::test]

@@ -185,7 +185,7 @@ make_tool!(FusionTool, "fw_fusion", |args: Value| {
             .get("polarity")
             .and_then(|t| t.as_str())
             .unwrap_or("neutral");
-        let key = format!("{}/{}", topic, polarity);
+        let key = format!("{topic}/{polarity}");
         groups.entry(key).or_default().push(c.clone());
     }
     let grouped: Vec<Value> = groups

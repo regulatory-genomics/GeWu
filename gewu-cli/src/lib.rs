@@ -136,19 +136,19 @@ async fn run_runtime_agent(
         match event_result? {
             SpecialistExecutionEvent::Agent(event) => match event {
                 AgentEvent::ContentDelta { delta } => {
-                    print!("{}", delta);
+                    print!("{delta}");
                     std::io::stdout().flush()?;
                 }
                 AgentEvent::ReasoningDelta { delta } => {
                     if !reasoning_started {
                         reasoning_started = true;
-                        print!("{}[thinking] ", DIM_GRAY);
+                        print!("{DIM_GRAY}[thinking] ");
                     }
-                    print!("{}{}", delta, RESET);
+                    print!("{delta}{RESET}");
                     std::io::stdout().flush()?;
                 }
                 AgentEvent::ToolStart { tool, input, .. } => {
-                    println!("\n[Tool Start: {}] Input: {}", tool, input);
+                    println!("\n[Tool Start: {tool}] Input: {input}");
                 }
                 AgentEvent::ToolFinish { tool, output, .. } => {
                     let display_output = if output.len() > 200 {
@@ -162,7 +162,7 @@ async fn run_runtime_agent(
                     } else {
                         output
                     };
-                    println!("\n[Tool Finish: {}] Output: {}", tool, display_output);
+                    println!("\n[Tool Finish: {tool}] Output: {display_output}");
                 }
                 AgentEvent::ToolPermissionRequest(request) => {
                     println!(
@@ -173,7 +173,7 @@ async fn run_runtime_agent(
                     );
                 }
                 AgentEvent::ToolPermissionResolved { request_id, approved } => {
-                    println!("\n[Permission Resolved: {}] approved={}", request_id, approved);
+                    println!("\n[Permission Resolved: {request_id}] approved={approved}");
                 }
                 AgentEvent::Finish { .. } => {
                     println!();
@@ -186,7 +186,7 @@ async fn run_runtime_agent(
                 if envelope.output_json.is_none()
                     && let Some(reason) = envelope.block_reason
                 {
-                    println!("{}", reason);
+                    println!("{reason}");
                 }
             }
         }
@@ -287,8 +287,8 @@ fn parse_workflow_input(raw: Option<&str>) -> Result<serde_json::Value> {
     };
     if let Some(path) = s.strip_prefix('@') {
         let content = std::fs::read_to_string(path)
-            .with_context(|| format!("reading workflow input file: {}", path))?;
-        serde_json::from_str(&content).with_context(|| format!("parsing JSON from {}", path))
+            .with_context(|| format!("reading workflow input file: {path}"))?;
+        serde_json::from_str(&content).with_context(|| format!("parsing JSON from {path}"))
     } else {
         serde_json::from_str(s).with_context(|| "parsing --workflow-input as JSON")
     }
@@ -393,7 +393,7 @@ where
         } else {
             &m.description
         };
-        println!("  - {}: {}", id, desc);
+        println!("  - {id}: {desc}");
     }
     Ok(())
 }
@@ -419,7 +419,7 @@ async fn run_workflow(
     let bb = Blackboard::from_value(input);
     let out = graph.ainvoke(bb).await?;
     let pretty = serde_json::to_string_pretty(out.as_value())?;
-    println!("{}", pretty);
+    println!("{pretty}");
     Ok(())
 }
 
@@ -494,11 +494,11 @@ where
             Ok(models) => {
                 println!("Available Models:");
                 for model in models {
-                    println!("  - {}", model);
+                    println!("  - {model}");
                 }
             }
             Err(e) => {
-                eprintln!("Error listing models: {}", e);
+                eprintln!("Error listing models: {e}");
             }
         }
         return Ok(());
@@ -546,7 +546,7 @@ where
     gewu_storage::run_migrations(&pool).await?;
 
     let session_id = cli.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-    println!("Session ID: {}", session_id);
+    println!("Session ID: {session_id}");
 
     let working_directory = resolve_cli_workdir(cli.workdir.as_deref())?;
 
@@ -584,7 +584,7 @@ where
     if let Some(prompt_parts) = cli.prompt {
         let prompt = prompt_parts.join(" ");
         if !prompt.is_empty() {
-            println!("> {}", prompt);
+            println!("> {prompt}");
             if let Err(e) = run_runtime_agent(
                 &runtime,
                 &cli.agent,

@@ -62,6 +62,7 @@ impl RuntimeFactory {
     }
 
     /// Build a runtime using an explicit project/session working directory for project-local config.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_with_manifest_and_runtime_plugin_dirs_in_directory(
         provider: Arc<dyn LlmProvider>,
         pool: SqlitePool,

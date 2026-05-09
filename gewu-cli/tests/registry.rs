@@ -5,9 +5,9 @@ use std::collections::HashSet;
 fn list_available_agents_contains_builtins() {
     let agents = list_available_agents();
     let names: HashSet<_> = agents.iter().map(|a| a.name.as_str()).collect();
-    assert!(names.contains("build"), "missing 'build': {:?}", names);
-    assert!(names.contains("explore"), "missing 'explore': {:?}", names);
-    assert!(names.contains("general"), "missing 'general': {:?}", names);
+    assert!(names.contains("build"), "missing 'build': {names:?}");
+    assert!(names.contains("explore"), "missing 'explore': {names:?}");
+    assert!(names.contains("general"), "missing 'general': {names:?}");
 }
 
 #[test]

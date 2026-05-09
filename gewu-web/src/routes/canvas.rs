@@ -232,7 +232,7 @@ mod tests {
 
         // Assert the result contains the canvas we opened
         let Ok(Json(response)) = result else {
-            panic!("handle_list failed: {:?}", result);
+            panic!("handle_list failed: {result:?}");
         };
 
         let canvases = response["canvases"]

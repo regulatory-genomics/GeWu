@@ -73,12 +73,11 @@ async fn test_resolve_tools_produces_correct_tool_names() {
     // Explore should have these tools
     assert!(
         names.contains(&"read_file"),
-        "missing read_file, got: {:?}",
-        names
+        "missing read_file, got: {names:?}"
     );
-    assert!(names.contains(&"glob"), "missing glob, got: {:?}", names);
-    assert!(names.contains(&"bash"), "missing bash, got: {:?}", names);
-    assert!(names.contains(&"grep"), "missing grep, got: {:?}", names);
+    assert!(names.contains(&"glob"), "missing glob, got: {names:?}");
+    assert!(names.contains(&"bash"), "missing bash, got: {names:?}");
+    assert!(names.contains(&"grep"), "missing grep, got: {names:?}");
 
     // Explore should NOT have these tools
     assert!(

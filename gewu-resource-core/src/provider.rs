@@ -196,7 +196,7 @@ fn generate_uri_suggestion(value: &serde_json::Value, requested_kind: Option<&st
         })
         .unwrap_or_else(|| "unnamed".to_string());
 
-    format!("gewu://{}/{}", kind, id)
+    format!("gewu://{kind}/{id}")
 }
 
 fn canonical_sample_id_from_ucf_path(path: &str) -> Option<String> {

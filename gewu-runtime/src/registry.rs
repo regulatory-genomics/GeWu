@@ -181,7 +181,7 @@ impl ToolFactory for BuiltinToolFactory {
                 crate::composer::default_specialists_dir(),
             ))]),
             "report_result" => Ok(vec![Box::new(ReportResultTool)]),
-            _ => Err(format!("Unknown capability: {}", capability).into()),
+            _ => Err(format!("Unknown capability: {capability}").into()),
         }
     }
 }
@@ -240,7 +240,7 @@ pub async fn create_agent(
         .register_builtin_capabilities()
         .register_builtin_specialists()
         .build()
-        .map_err(|e| anyhow!("Failed to build runtime: {}", e))?;
+        .map_err(|e| anyhow!("Failed to build runtime: {e}"))?;
 
     runtime
         .build_specialist(name, session_id, additional_tools)

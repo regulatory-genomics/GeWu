@@ -80,7 +80,7 @@ impl Tool for LoadSkillTool {
         }
         let skill = self.registry.get(&name).ok_or_else(|| {
             let available = self.available_names().join(", ");
-            format!("Unknown skill: {}. Available skills: {}", name, available)
+            format!("Unknown skill: {name}. Available skills: {available}")
         })?;
 
         let output = format!(
@@ -113,11 +113,11 @@ mod tests {
         for (name, content) in skills {
             registry.insert(SkillManifest {
                 name: (*name).to_string(),
-                description: format!("{} description", name),
+                description: format!("{name} description"),
                 capabilities: vec![],
                 specialists: vec![],
                 content: (*content).to_string(),
-                location: PathBuf::from(format!("/tmp/{}/SKILL.md", name)),
+                location: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
             });
         }
         Arc::new(registry)

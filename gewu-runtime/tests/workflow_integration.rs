@@ -290,5 +290,5 @@ edges: []
     let m: WorkflowManifest = serde_yaml::from_str(yaml).unwrap();
     let compiler = WorkflowCompiler::new(rt.clone());
     let err = compiler.compile(&m).unwrap_err().to_string();
-    assert!(err.contains("unknown capability"), "got: {}", err);
+    assert!(err.contains("unknown capability"), "got: {err}");
 }

@@ -225,7 +225,7 @@ impl WorkflowCompiler {
 
                 // For inline specialists, build directly with the descriptor
                 if let Some(desc) = &inline_desc {
-                    let session = format!("{}:{}", session_id, node_id);
+                    let session = format!("{session_id}:{node_id}");
                     let effective_desc = runtime.descriptor_with_skills(desc);
                     let specialist_run = match runtime
                         .start_trace_run(StartTraceRun {
@@ -297,7 +297,7 @@ impl WorkflowCompiler {
                 let req = SpecialistExecutionRequest {
                     task_id,
                     specialist_id: specialist_id.clone(),
-                    session_id: format!("{}:{}", session_id, node_id),
+                    session_id: format!("{session_id}:{node_id}"),
                     prompt: prompt_text,
                     workdir: metadata
                         .get("workdir")
@@ -378,7 +378,7 @@ impl WorkflowCompiler {
                         None => {
                             return error_partial(
                                 &write_path,
-                                format!("no tool produced for capability {}", cap),
+                                format!("no tool produced for capability {cap}"),
                             );
                         }
                     },
@@ -454,7 +454,7 @@ impl WorkflowCompiler {
         let sub_manifest = self
             .workflows
             .get(workflow_id)
-            .ok_or_else(|| anyhow!("Unknown subworkflow: {}", workflow_id))?
+            .ok_or_else(|| anyhow!("Unknown subworkflow: {workflow_id}"))?
             .clone();
         let subgraph = self.compile(&sub_manifest)?;
         let input_path = input.map(|s| s.to_string());
@@ -512,7 +512,7 @@ fn to_partial(write_path: &str, result: std::result::Result<Value, String>) -> B
 fn error_partial(write_path: &str, msg: String) -> Blackboard {
     let mut bb = Blackboard::default();
     let key = write_path.replace('.', "_");
-    bb.set_path(&format!("_errors.{}", key), Value::String(msg));
+    bb.set_path(&format!("_errors.{key}"), Value::String(msg));
     bb
 }
 
@@ -546,10 +546,9 @@ fn build_prompt(template: Option<&str>, tool_hint: Option<&str>, input: &Value) 
         None => input_str,
     };
     match tool_hint {
-        Some(t) => format!(
-            "{}\n\nHint: the `{}` tool is available and relevant to this step.",
-            base, t
-        ),
+        Some(t) => {
+            format!("{base}\n\nHint: the `{t}` tool is available and relevant to this step.")
+        }
         None => base,
     }
 }
@@ -579,11 +578,11 @@ impl Predicate {
         } else if let Some(i) = s.find("!=") {
             (s[..i].trim(), PredOp::Neq, s[i + 2..].trim())
         } else {
-            return Err(anyhow!("Predicate must contain '==' or '!=': {}", expr));
+            return Err(anyhow!("Predicate must contain '==' or '!=': {expr}"));
         };
         let path = lhs.strip_prefix("$.").unwrap_or(lhs).to_string();
         if path.is_empty() {
-            return Err(anyhow!("Predicate path is empty: {}", expr));
+            return Err(anyhow!("Predicate path is empty: {expr}"));
         }
         let rhs_val = parse_literal(rhs)?;
         Ok(Self {
@@ -613,7 +612,7 @@ fn parse_literal(s: &str) -> Result<Value> {
     if s == "null" {
         return Ok(Value::Null);
     }
-    serde_json::from_str::<Value>(s).map_err(|e| anyhow!("invalid literal `{}`: {}", s, e))
+    serde_json::from_str::<Value>(s).map_err(|e| anyhow!("invalid literal `{s}`: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -737,9 +736,7 @@ fn validate_node_refs_with_ids(
             SpecialistRef::ById(id) => {
                 if !known_specialists.contains(id) {
                     return Err(anyhow!(
-                        "node '{}' references unknown specialist: {}",
-                        node_id,
-                        id
+                        "node '{node_id}' references unknown specialist: {id}"
                     ));
                 }
             }
@@ -759,9 +756,7 @@ fn validate_node_refs_with_ids(
         NodeSpec::Tool { tool, .. } => {
             if !known_capabilities.contains(tool) {
                 return Err(anyhow!(
-                    "node '{}' references unknown capability: {}",
-                    node_id,
-                    tool
+                    "node '{node_id}' references unknown capability: {tool}"
                 ));
             }
         }
@@ -779,9 +774,7 @@ fn validate_node_refs_with_ids(
         NodeSpec::Workflow { workflow, .. } => {
             if !workflows.contains_key(workflow) {
                 return Err(anyhow!(
-                    "node '{}' references unknown workflow: {}",
-                    node_id,
-                    workflow
+                    "node '{node_id}' references unknown workflow: {workflow}"
                 ));
             }
         }
@@ -812,11 +805,7 @@ fn validate_node_refs(
         NodeSpec::Specialist { specialist, .. } => match specialist {
             SpecialistRef::ById(sid) => {
                 if runtime.find_specialist(sid).is_none() {
-                    return Err(anyhow!(
-                        "node '{}' references unknown specialist: {}",
-                        id,
-                        sid
-                    ));
+                    return Err(anyhow!("node '{id}' references unknown specialist: {sid}"));
                 }
             }
             SpecialistRef::Inline(inline) => {
@@ -834,11 +823,7 @@ fn validate_node_refs(
         },
         NodeSpec::Tool { tool, .. } => {
             if !runtime.capability_registry().contains(tool) {
-                return Err(anyhow!(
-                    "node '{}' references unknown capability: {}",
-                    id,
-                    tool
-                ));
+                return Err(anyhow!("node '{id}' references unknown capability: {tool}"));
             }
         }
         NodeSpec::Parallel { branches } => {
@@ -849,9 +834,7 @@ fn validate_node_refs(
         NodeSpec::Workflow { workflow, .. } => {
             if !workflows.contains_key(workflow) {
                 return Err(anyhow!(
-                    "node '{}' references unknown workflow: {}",
-                    id,
-                    workflow
+                    "node '{id}' references unknown workflow: {workflow}"
                 ));
             }
         }
@@ -865,7 +848,7 @@ fn validate_structure(m: &WorkflowManifest) -> Result<()> {
     }
     for fin in &m.finish {
         if !m.nodes.contains_key(fin) {
-            return Err(anyhow!("finish '{}' is not a node", fin));
+            return Err(anyhow!("finish '{fin}' is not a node"));
         }
     }
     for edge in &m.edges {
@@ -890,7 +873,7 @@ fn validate_structure(m: &WorkflowManifest) -> Result<()> {
     }
     for id in m.nodes.keys() {
         if !reachable.contains(id) {
-            return Err(anyhow!("node '{}' is unreachable from entry", id));
+            return Err(anyhow!("node '{id}' is unreachable from entry"));
         }
     }
     if !m.finish.is_empty() && !m.finish.iter().any(|f| reachable.contains(f)) {
@@ -923,9 +906,7 @@ fn validate_parallel_writes(m: &WorkflowManifest) -> Result<()> {
                 let write = branch_write_key(bid, bspec);
                 if !seen.insert(write.clone()) {
                     return Err(anyhow!(
-                        "parallel node '{}' has duplicate branch write key '{}'",
-                        id,
-                        write
+                        "parallel node '{id}' has duplicate branch write key '{write}'"
                     ));
                 }
             }
@@ -998,7 +979,7 @@ edges: []
         let m: WorkflowManifest = serde_yaml::from_str(yaml).unwrap();
         // structure-only check (no runtime)
         let err = validate_structure(&m).unwrap_err().to_string();
-        assert!(err.contains("unreachable"), "got: {}", err);
+        assert!(err.contains("unreachable"), "got: {err}");
     }
 
     #[test]
@@ -1013,7 +994,7 @@ edges: []
 "#;
         let m: WorkflowManifest = serde_yaml::from_str(yaml).unwrap();
         let err = validate_structure(&m).unwrap_err().to_string();
-        assert!(err.contains("entry"), "got: {}", err);
+        assert!(err.contains("entry"), "got: {err}");
     }
 
     #[test]
@@ -1032,7 +1013,7 @@ edges: []
 "#;
         let m: WorkflowManifest = serde_yaml::from_str(yaml).unwrap();
         let err = validate_parallel_writes(&m).unwrap_err().to_string();
-        assert!(err.contains("duplicate branch write key"), "got: {}", err);
+        assert!(err.contains("duplicate branch write key"), "got: {err}");
     }
 
     #[test]
@@ -1048,7 +1029,7 @@ edges:
 "#;
         let m: WorkflowManifest = serde_yaml::from_str(yaml).unwrap();
         let err = validate_predicates(&m).unwrap_err().to_string();
-        assert!(err.contains("max_loops > 0"), "got: {}", err);
+        assert!(err.contains("max_loops > 0"), "got: {err}");
     }
 
     #[test]

@@ -69,7 +69,7 @@ async fn tool_names_from_wrapper(
         agent_name,
         provider,
         pool,
-        format!("wrapper-{}", agent_name),
+        format!("wrapper-{agent_name}"),
         additional_tools,
     )
     .await
@@ -97,7 +97,7 @@ async fn tool_names_from_runtime(
     let (_, registry) = runtime
         .build_specialist(
             agent_name,
-            format!("runtime-{}", agent_name),
+            format!("runtime-{agent_name}"),
             additional_tools,
         )
         .await

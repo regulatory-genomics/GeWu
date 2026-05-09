@@ -5,15 +5,21 @@ pub const MAX_LINES: usize = 2000;
 pub const MAX_BYTES: usize = 50 * 1024;
 pub const TRUNCATION_DIR: &str = ".gewu/truncation";
 
-/// Recursively truncate a JSON value to fit within a byte budget.
+#[derive(Clone)]
+pub struct TruncationService {
+    max_lines: usize,
+    max_bytes: usize,
+    truncation_dir: PathBuf,
+}
+
 fn truncate_json_value(val: &serde_json::Value, budget: usize) -> serde_json::Value {
     match val {
         serde_json::Value::Array(arr) => {
             let mut result = Vec::new();
-            let mut used = 2; // [] delimiters
+            let mut used = 2;
             for item in arr {
                 let item_str = serde_json::to_string(item).unwrap_or_default();
-                let cost = item_str.len() + if result.is_empty() { 0 } else { 1 }; // comma
+                let cost = item_str.len() + if result.is_empty() { 0 } else { 1 };
                 if used + cost > budget {
                     break;
                 }
@@ -24,15 +30,12 @@ fn truncate_json_value(val: &serde_json::Value, budget: usize) -> serde_json::Va
         }
         serde_json::Value::Object(map) => {
             let mut result = serde_json::Map::new();
-            let mut used = 2; // {}
+            let mut used = 2;
             for (k, v) in map {
                 let v_budget = budget.saturating_sub(used).saturating_sub(k.len() + 4);
                 let truncated_v = truncate_json_value(v, v_budget);
-                let entry_str = format!(
-                    "\"{}\":{}",
-                    k,
-                    serde_json::to_string(&truncated_v).unwrap_or_default()
-                );
+                let serialized = serde_json::to_string(&truncated_v).unwrap_or_default();
+                let entry_str = format!("\"{k}\":{serialized}");
                 let cost = entry_str.len() + if result.is_empty() { 0 } else { 1 };
                 if used + cost > budget {
                     break;
@@ -44,13 +47,6 @@ fn truncate_json_value(val: &serde_json::Value, budget: usize) -> serde_json::Va
         }
         other => other.clone(),
     }
-}
-
-#[derive(Clone)]
-pub struct TruncationService {
-    max_lines: usize,
-    max_bytes: usize,
-    truncation_dir: PathBuf,
 }
 
 impl Default for TruncationService {
@@ -178,7 +174,7 @@ mod tests {
     #[test]
     fn test_truncation_by_lines() {
         let service = TruncationService::new();
-        let text: String = (0..3000).map(|i| format!("line {}\n", i)).collect();
+        let text: String = (0..3000).map(|i| format!("line {i}\n")).collect();
         let result = service.truncate(&text, false);
         assert!(result.truncated);
         assert!(result.output_path.is_some());
@@ -189,7 +185,7 @@ mod tests {
     fn test_truncation_by_bytes() {
         let service = TruncationService::new();
         let line = "x".repeat(100);
-        let text: String = (0..600).map(|_| format!("{}\n", line)).collect();
+        let text: String = (0..600).map(|_| format!("{line}\n")).collect();
         let result = service.truncate(&text, false);
         assert!(result.truncated);
         assert!(result.output_path.is_some());

@@ -99,7 +99,7 @@ impl CommandToolRegistry {
 
     /// Remove a tool definition by name.
     pub fn unregister(&mut self, name: &str) -> Result<()> {
-        let path = self.dir.join(format!("{}.yaml", name));
+        let path = self.dir.join(format!("{name}.yaml"));
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
@@ -157,7 +157,7 @@ impl ToolProvider for CommandToolProvider {
             .defs
             .iter()
             .find(|d| d.name == capability)
-            .ok_or_else(|| format!("No command tool definition for '{}'", capability))?;
+            .ok_or_else(|| format!("No command tool definition for '{capability}'"))?;
         Ok(vec![Box::new(CommandTool::new(def.clone()))])
     }
 }

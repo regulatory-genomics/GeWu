@@ -46,7 +46,7 @@ impl DiffOptions {
     pub fn is_ignored(&self, path: &str) -> bool {
         self.ignore_prefixes
             .iter()
-            .any(|p| path == p || path.starts_with(&format!("{}.", p)))
+            .any(|p| path == p || path.starts_with(&format!("{p}.")))
     }
 }
 
@@ -71,7 +71,7 @@ fn walk_diff(lhs: &Value, rhs: &Value, path: &str, opts: &DiffOptions, out: &mut
                 let sub_path = if path.is_empty() {
                     k.clone()
                 } else {
-                    format!("{}.{}", path, k)
+                    format!("{path}.{k}")
                 };
                 match (a.get(k), b.get(k)) {
                     (Some(av), Some(bv)) => walk_diff(av, bv, &sub_path, opts, out),
@@ -173,7 +173,7 @@ mod tests {
         let a = Blackboard(json!({ "x": 1, "_errors": { "a": "boom" } }));
         let b = Blackboard(json!({ "x": 1 }));
         let d = diff_blackboards(&a, &b, &DiffOptions::ignoring(vec!["_errors".to_string()]));
-        assert!(d.is_empty(), "got: {:?}", d);
+        assert!(d.is_empty(), "got: {d:?}");
     }
 
     #[test]

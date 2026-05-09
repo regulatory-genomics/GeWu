@@ -37,12 +37,12 @@ impl AuthMode {
     pub fn from_cli(password: Option<&str>) -> Result<Self> {
         match password {
             None => Ok(Self::None),
-            Some(plaintext) if plaintext.is_empty() => Ok(Self::None),
+            Some("") => Ok(Self::None),
             Some(plaintext) => {
                 let salt = SaltString::generate(&mut PwOsRng);
                 let hash = Argon2::default()
                     .hash_password(plaintext.as_bytes(), &salt)
-                    .map_err(|e| anyhow::anyhow!("argon2 hash failed: {}", e))?
+                    .map_err(|e| anyhow::anyhow!("argon2 hash failed: {e}"))?
                     .to_string();
                 Ok(Self::Password { argon2_hash: hash })
             }

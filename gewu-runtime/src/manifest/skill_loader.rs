@@ -170,7 +170,7 @@ description: {name}.
         let _guard = cwd_lock().lock().unwrap();
         let original_cwd = std::env::current_dir().unwrap();
 
-        let result = (|| {
+        let result = {
             let project = tempfile::tempdir().unwrap();
             let root = project.path().join(".gewu/skills");
             write_skill(&root, "real", "real");
@@ -189,7 +189,7 @@ description: {name}.
             };
             std::env::set_current_dir(project.path()).unwrap();
             SkillManifestLoader::with_default_dirs().load().unwrap()
-        })();
+        };
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "real");
@@ -200,7 +200,7 @@ description: {name}.
         let _guard = cwd_lock().lock().unwrap();
         let original_cwd = std::env::current_dir().unwrap();
 
-        let result = (|| {
+        let result = {
             let project = tempfile::tempdir().unwrap();
             let skill_dir = project.path().join(".gewu/skills/local-only");
             std::fs::create_dir_all(&skill_dir).unwrap();
@@ -221,7 +221,7 @@ description: Project-local skill.
             };
             std::env::set_current_dir(project.path()).unwrap();
             SkillManifestLoader::with_default_dirs().load().unwrap()
-        })();
+        };
 
         assert!(result.iter().any(|skill| skill.name == "local-only"));
     }
@@ -231,14 +231,14 @@ description: Project-local skill.
         let _guard = cwd_lock().lock().unwrap();
         let original_cwd = std::env::current_dir().unwrap();
 
-        let loaded = (|| {
+        let loaded = {
             let project = tempfile::tempdir().unwrap();
             let _restore = CwdRestore {
                 original: original_cwd.clone(),
             };
             std::env::set_current_dir(project.path()).unwrap();
             SkillManifestLoader::with_default_dirs().load().unwrap()
-        })();
+        };
 
         let home_skill_dir = dirs::home_dir().unwrap().join(".gewu").join("skills");
         assert!(

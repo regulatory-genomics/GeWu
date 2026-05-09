@@ -63,7 +63,7 @@ impl ToolProvider for DatabaseToolProvider {
             .capabilities
             .iter()
             .find(|c| c.name == capability)
-            .ok_or_else(|| format!("unknown database capability: {}", capability))?;
+            .ok_or_else(|| format!("unknown database capability: {capability}"))?;
         Ok(vec![Box::new(DatabaseTool {
             connection: self.spec.connection.clone(),
             cap: cap.clone(),
@@ -101,7 +101,7 @@ impl Tool for DatabaseTool {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                query = query.replace(&format!(":{}", k), &replacement);
+                query = query.replace(&format!(":{k}"), &replacement);
             }
         }
 

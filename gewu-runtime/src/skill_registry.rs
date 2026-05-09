@@ -160,7 +160,7 @@ description: {description}
         let _guard = cwd_lock().lock().unwrap();
         let original_cwd = std::env::current_dir().unwrap();
 
-        let result = (|| {
+        let result = {
             let project = tempfile::tempdir().unwrap();
             write_skill(
                 project.path(),
@@ -182,7 +182,7 @@ description: {description}
             };
             std::env::set_current_dir(project.path()).unwrap();
             SkillRegistry::from_dirs(&[]).unwrap()
-        })();
+        };
 
         let summaries = result.summaries();
         assert_eq!(summaries.len(), 2);
@@ -197,7 +197,7 @@ description: {description}
         let _guard = cwd_lock().lock().unwrap();
         let original_cwd = std::env::current_dir().unwrap();
 
-        let result = (|| {
+        let result = {
             let project = tempfile::tempdir().unwrap();
             write_skill(
                 project.path(),
@@ -226,7 +226,7 @@ description: {description}
             };
             std::env::set_current_dir(project.path()).unwrap();
             SkillRegistry::from_dirs(&[]).unwrap()
-        })();
+        };
 
         let summaries = result.summaries_for_names(["zeta", "missing", "alpha"]);
         assert_eq!(summaries.len(), 2);
@@ -239,7 +239,7 @@ description: {description}
         let _guard = cwd_lock().lock().unwrap();
         let original_cwd = std::env::current_dir().unwrap();
 
-        let result = (|| {
+        let result = {
             let project = tempfile::tempdir().unwrap();
             write_skill(
                 project.path(),
@@ -261,7 +261,7 @@ description: {description}
             };
             std::env::set_current_dir(project.path()).unwrap();
             SkillRegistry::from_dirs(&[]).unwrap()
-        })();
+        };
 
         assert_eq!(result.all_capabilities(), vec!["alpha", "beta", "gamma"]);
     }
@@ -271,7 +271,7 @@ description: {description}
         let _guard = cwd_lock().lock().unwrap();
         let original_cwd = std::env::current_dir().unwrap();
 
-        let result = (|| {
+        let result = {
             let project = tempfile::tempdir().unwrap();
             write_skill(
                 project.path(),
@@ -286,7 +286,7 @@ description: {description}
             };
             std::env::set_current_dir(project.path()).unwrap();
             SkillRegistry::from_dirs(&[]).unwrap()
-        })();
+        };
 
         assert!(result.get("project-skill").is_some());
     }
@@ -296,7 +296,7 @@ description: {description}
         let _guard = cwd_lock().lock().unwrap();
         let original_cwd = std::env::current_dir().unwrap();
 
-        let result = (|| {
+        let result = {
             let project = tempfile::tempdir().unwrap();
             let extra = tempfile::tempdir().unwrap();
             write_skill(
@@ -319,7 +319,7 @@ description: {description}
             };
             std::env::set_current_dir(project.path()).unwrap();
             SkillRegistry::from_dirs(&[extra.path().to_path_buf()]).unwrap()
-        })();
+        };
 
         assert!(result.get("project-skill").is_some());
         assert!(result.get("extra-skill").is_some());

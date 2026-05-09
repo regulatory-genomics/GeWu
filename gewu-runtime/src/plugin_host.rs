@@ -89,7 +89,7 @@ impl PluginHost {
                     plugin_config: config.clone(),
                 };
                 let plugin = constructor(&ctx)
-                    .map_err(|e| anyhow!("Failed to initialize plugin '{}': {}", name, e))?;
+                    .map_err(|e| anyhow!("Failed to initialize plugin '{name}': {e}"))?;
                 tracing::info!("Loaded plugin: {} ({})", name, plugin.name());
                 plugins.push(plugin);
             } else {

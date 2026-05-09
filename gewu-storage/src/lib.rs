@@ -295,7 +295,7 @@ mod tests {
         };
         mem1.add_message(msg)
             .await
-            .map_err(|e| anyhow::anyhow!("add_message: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("add_message: {e}"))?;
         assert_eq!(mem1.messages().len(), 1);
 
         let mem2 = SqliteMemory::new(pool.clone(), session_id.clone()).await?;

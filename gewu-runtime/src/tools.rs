@@ -264,7 +264,7 @@ impl Tool for TaskTool {
 
         let runtime = builder
             .build()
-            .map_err(|e| format!("Failed to build runtime: {}", e))?;
+            .map_err(|e| format!("Failed to build runtime: {e}"))?;
 
         if input.mode == TaskMode::Async {
             let parent_session_id = ctx.session_id.clone();
@@ -316,7 +316,7 @@ impl Tool for TaskTool {
         let envelope = runtime
             .execute_request(&request, Vec::new())
             .await
-            .map_err(|e| format!("Failed to execute request: {}", e))?;
+            .map_err(|e| format!("Failed to execute request: {e}"))?;
 
         let trace_store = gewu_storage::ExecutionTraceStore::new(self.pool.clone()).await?;
         let root_run = trace_store

@@ -190,7 +190,7 @@ make_tool!(FusionTool, "fw_fusion", |args: Value| {
             .get("polarity")
             .and_then(|t| t.as_str())
             .unwrap_or("neutral");
-        let key = format!("{}/{}", topic, polarity);
+        let key = format!("{topic}/{polarity}");
         groups.entry(key).or_default().push(c.clone());
     }
     let grouped: Vec<Value> = groups
@@ -571,9 +571,7 @@ async fn composer_context_exposes_all_specialists_and_capabilities() {
     ] {
         assert!(
             spec_ids.contains(required),
-            "specialist {} missing from composer snapshot: {:?}",
-            required,
-            spec_ids
+            "specialist {required} missing from composer snapshot: {spec_ids:?}"
         );
     }
 
@@ -592,9 +590,7 @@ async fn composer_context_exposes_all_specialists_and_capabilities() {
     ] {
         assert!(
             cap_names.contains(required),
-            "capability {} missing from composer snapshot: {:?}",
-            required,
-            cap_names
+            "capability {required} missing from composer snapshot: {cap_names:?}"
         );
     }
 }

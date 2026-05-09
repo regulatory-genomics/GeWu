@@ -1,21 +1,17 @@
 use anyhow::{Result, anyhow};
-use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
 use gewu_core::Agent;
-use gewu_core::permission::ToolPermissionRequest;
 use gewu_core::traits::{AssemblyContext, LlmProvider, Plugin, Tool, ToolFactory, ToolRegistry};
 use gewu_core::types::{
     AgentEvent, ExecutionRunKind, SpecialistAgentEventRecord, SpecialistDescriptor,
     SpecialistExecutionEnvelope, SpecialistExecutionRequest, SpecialistLlmIoRecord,
-    TaskExecutionStatus, TaskResultStatus, TaskStatus, ToolContext, ToolExecutionRecord,
-    ToolResult,
+    TaskExecutionStatus, TaskResultStatus, TaskStatus, ToolExecutionRecord,
 };
 use gewu_resource_core::{
     CatalogLoader, MutableResourceProvider, ResourceRegistry, ResourceToolFactory,
 };
 use gewu_storage::{SqliteMemory, TaskStore};
 use gewu_tools::{BatchTool, report_result::ReportResultArgs};
-use schemars::schema::RootSchema;
 use serde_json::Value;
 use sqlx::SqlitePool;
 use std::collections::{BTreeSet, HashMap};
@@ -26,10 +22,12 @@ use crate::capability::{CapabilityRegistry, ToolFactoryProvider};
 use crate::command_tool_registry::CommandToolRegistry;
 use crate::composer::{ComposerContext, ComposerToolFactory, composer_specialist_descriptor};
 use crate::execution_trace::{StartTraceRun, TraceContext, TraceSink, trace_sink_from_pool};
+use crate::hooked_tool::HookedTool;
 use crate::hooks::{HookRegistry, HttpHookProvider};
 use crate::manifest::runtime_plugin_loader::RuntimePluginManifestLoader;
 use crate::manifest::schema::RuntimeHookEvent;
 use crate::registry::{AgentConfig, BuiltinToolFactory};
+use crate::runtime_tool_registry::RuntimeToolRegistry;
 use crate::skill_registry::SkillRegistry;
 use crate::sop_registry::SopRegistry;
 use crate::workflow_registry::WorkflowRegistry;
@@ -318,7 +316,7 @@ impl GeWuRuntime {
                 if factory.capabilities().contains(cap) {
                     let produced = factory
                         .create_tools(cap, &ctx)
-                        .map_err(|e| anyhow!("Factory failed for '{}': {}", cap, e))?;
+                        .map_err(|e| anyhow!("Factory failed for '{cap}': {e}"))?;
                     tools.extend(produced);
                     resolved = true;
                     break;
@@ -332,7 +330,7 @@ impl GeWuRuntime {
                         .resolve(std::slice::from_ref(cap), &ctx)?;
                     tools.extend(produced);
                 } else {
-                    return Err(anyhow!("No factory can resolve capability: {}", cap));
+                    return Err(anyhow!("No factory can resolve capability: {cap}"));
                 }
             }
         }
@@ -381,7 +379,7 @@ impl GeWuRuntime {
         prompt: &str,
         session_id: &str,
         tools: Vec<Box<dyn Tool>>,
-        _metadata_json: Value,
+        metadata_json: Value,
     ) -> Result<Value> {
         let memory = SqliteMemory::new(self.pool.clone(), session_id.to_string()).await?;
 
@@ -397,30 +395,24 @@ impl GeWuRuntime {
             tools_arc,
             descriptor.id.clone(),
             session_id.to_string(),
-            _metadata_json.clone(),
+            metadata_json.clone(),
         );
 
         let tools_for_registry = Arc::new(tools_arc.clone());
-        let registry: Arc<dyn ToolRegistry> = Arc::new(RuntimeToolRegistry {
-            tools: tools_for_registry,
-        });
+        let registry: Arc<dyn ToolRegistry> =
+            Arc::new(RuntimeToolRegistry::new(tools_for_registry));
 
         let batch_tool: Arc<dyn Tool> = Arc::new(BatchTool::new(registry.clone()));
         let mut all_tools = vec![batch_tool];
         all_tools.extend(tools_arc);
 
-        let system_prompt = if descriptor.system_prompt.is_empty() {
-            prompt.to_string()
-        } else {
-            descriptor.system_prompt.clone()
-        };
         let system_prompt = self
             .transform_system_prompt(
                 &descriptor,
-                self.apply_prompt_packs(&descriptor, system_prompt),
+                self.apply_prompt_packs(&descriptor, descriptor.system_prompt.clone()),
                 session_id,
-                Some(prompt),
-                &_metadata_json,
+                None,
+                &metadata_json,
             )
             .await?;
 
@@ -429,7 +421,7 @@ impl GeWuRuntime {
             .with_tools(all_tools)
             .memory(Box::new(memory))
             .system_prompt(&system_prompt)
-            .session_id(session_id.to_string())
+            .session_id(session_id)
             .build()?;
 
         let mut stream = Box::pin(agent.ask(prompt));
@@ -451,12 +443,12 @@ impl GeWuRuntime {
                         }
                     }
                     AgentEvent::Error { error } => {
-                        return Err(anyhow!("Inline specialist error: {}", error));
+                        return Err(anyhow!("Inline specialist error: {error}"));
                     }
                     _ => {}
                 },
                 Err(e) => {
-                    return Err(anyhow!("Inline specialist stream error: {}", e));
+                    return Err(anyhow!("Inline specialist stream error: {e}"));
                 }
             }
         }
@@ -502,7 +494,7 @@ impl GeWuRuntime {
     ) -> Result<(Agent, Arc<dyn ToolRegistry>)> {
         let descriptor = self
             .find_specialist(name)
-            .ok_or_else(|| anyhow!("Unknown specialist: {}", name))?;
+            .ok_or_else(|| anyhow!("Unknown specialist: {name}"))?;
 
         let descriptor = self.descriptor_with_skills(descriptor);
         let metadata_json = metadata_with_workspace_root(metadata_json, &working_directory);
@@ -527,12 +519,9 @@ impl GeWuRuntime {
             metadata_json.clone(),
         );
 
-        let tools_for_registry = Arc::new(tools_arc.clone());
-        let registry: Arc<dyn ToolRegistry> = Arc::new(RuntimeToolRegistry {
-            tools: tools_for_registry,
-        });
+        let registry = RuntimeToolRegistry::new(Arc::new(tools_arc.clone()));
 
-        let batch_tool: Arc<dyn Tool> = Arc::new(BatchTool::new(registry.clone()));
+        let batch_tool: Arc<dyn Tool> = Arc::new(BatchTool::new(Arc::new(registry.clone())));
         let mut all_tools = vec![batch_tool];
         all_tools.extend(tools_arc);
 
@@ -554,7 +543,7 @@ impl GeWuRuntime {
             .session_id(session_id.clone())
             .build()?;
 
-        Ok((agent, registry))
+        Ok((agent, Arc::new(registry)))
     }
 
     pub async fn execute_request(
@@ -625,9 +614,7 @@ impl GeWuRuntime {
         );
 
         let tools_for_registry = Arc::new(tools_arc.clone());
-        let registry: Arc<dyn ToolRegistry> = Arc::new(RuntimeToolRegistry {
-            tools: tools_for_registry,
-        });
+        let registry: Arc<dyn ToolRegistry> = Arc::new(RuntimeToolRegistry::new(tools_for_registry));
 
         let batch_tool: Arc<dyn Tool> = Arc::new(BatchTool::new(registry.clone()));
         let mut all_tools = vec![batch_tool];
@@ -790,7 +777,6 @@ impl GeWuRuntime {
                         yield SpecialistExecutionEvent::Agent(AgentEvent::ToolFinish { tool_call_id, tool, output });
                     }
                     AgentEvent::ToolFinish { tool_call_id, tool, output } => {
-                        let permission_request = tool_permission_request_from_output(&output);
                         let record = SpecialistAgentEventRecord {
                             event_type: "tool_finish".to_string(),
                             tool_name: Some(tool.clone()),
@@ -803,17 +789,6 @@ impl GeWuRuntime {
                             tool_name: tool.clone(),
                             output: output.clone(),
                         });
-                        if let Some(permission_request) = permission_request {
-                            let permission_record = SpecialistAgentEventRecord {
-                                event_type: "tool_permission_request".to_string(),
-                                tool_name: Some(tool.clone()),
-                                payload_json: serde_json::json!({ "request": permission_request.clone() }),
-                            };
-                            self.emit_agent_event_hook(&descriptor, &request, &permission_record)
-                                .await;
-                            events.push(permission_record);
-                            yield SpecialistExecutionEvent::Agent(AgentEvent::ToolPermissionRequest(permission_request));
-                        }
                         yield SpecialistExecutionEvent::Agent(AgentEvent::ToolFinish { tool_call_id, tool, output });
                     }
                     AgentEvent::ToolPermissionRequest(permission_request) => {
@@ -1012,14 +987,14 @@ impl GeWuRuntime {
         tools
             .into_iter()
             .map(|tool| {
-                Arc::new(HookedTool {
-                    inner: tool,
-                    hook_registry: self.hook_registry.clone(),
-                    trace_sink: self.trace_sink.clone(),
-                    specialist_id: specialist_id.clone(),
-                    session_id: session_id.clone(),
-                    metadata_json: metadata_json.clone(),
-                }) as Arc<dyn Tool>
+                Arc::new(HookedTool::new(
+                    tool,
+                    self.hook_registry.clone(),
+                    self.trace_sink.clone(),
+                    specialist_id.clone(),
+                    session_id.clone(),
+                    metadata_json.clone(),
+                )) as Arc<dyn Tool>
             })
             .collect()
     }
@@ -1130,173 +1105,6 @@ impl GeWuRuntime {
     }
 }
 
-struct HookedTool {
-    inner: Arc<dyn Tool>,
-    hook_registry: Arc<HookRegistry>,
-    trace_sink: Arc<dyn TraceSink>,
-    specialist_id: String,
-    session_id: String,
-    metadata_json: Value,
-}
-
-#[async_trait]
-impl Tool for HookedTool {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn description(&self) -> &str {
-        self.inner.description()
-    }
-
-    fn schema(&self) -> RootSchema {
-        self.inner.schema()
-    }
-
-    fn execution_policy(&self) -> gewu_core::types::ToolExecutionPolicy {
-        self.inner.execution_policy()
-    }
-
-    fn start_metadata(
-        &self,
-        args: &str,
-        ctx: &ToolContext,
-    ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.start_metadata(args, ctx)
-    }
-
-    async fn execute(
-        &self,
-        args: Value,
-        ctx: &ToolContext,
-    ) -> std::result::Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
-        let parent_id = ctx
-            .metadata
-            .get("trace_current_run_id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
-        let run = match self
-            .trace_sink
-            .start_run(StartTraceRun {
-                parent_id,
-                session_id: Some(ctx.session_id.clone()),
-                kind: ExecutionRunKind::Tool,
-                name: self.inner.name().to_string(),
-                input_json: Some(args.clone()),
-            })
-            .await
-        {
-            Ok(run) => Some(run),
-            Err(err) => {
-                tracing::warn!("failed to start tool trace run: {}", err);
-                None
-            }
-        };
-
-        if !self.hook_registry.is_empty() {
-            let before_payload = self.tool_hook_payload(
-                RuntimeHookEvent::ToolExecuteBefore,
-                "tool_call",
-                args.to_string(),
-                serde_json::json!({ "args": args.clone() }),
-                ctx,
-            );
-            if let Err(err) = self
-                .hook_registry
-                .call_event(RuntimeHookEvent::ToolExecuteBefore, before_payload)
-                .await
-            {
-                tracing::warn!("tool.execute.before hook failed: {}", err);
-            }
-        }
-
-        let result = self.inner.execute(args.clone(), ctx).await;
-
-        let (content, metadata) = match &result {
-            Ok(output) => (
-                output.output.clone(),
-                serde_json::json!({ "args": args, "status": "ok" }),
-            ),
-            Err(err) => (
-                err.to_string(),
-                serde_json::json!({ "args": args, "status": "error" }),
-            ),
-        };
-        if let Some(run) = &run {
-            let finish = match &result {
-                Ok(output) => self
-                    .trace_sink
-                    .finish_run(&run.id, Some(&serde_json::json!({
-                        "title": output.title,
-                        "output": output.output,
-                        "truncated": output.truncated,
-                        "output_path": output.output_path.as_ref().map(|p| p.display().to_string()),
-                    })))
-                    .await,
-                Err(err) => self.trace_sink.fail_run(&run.id, &err.to_string()).await,
-            };
-            if let Err(err) = finish {
-                tracing::warn!("failed to finish tool trace run: {}", err);
-            }
-        }
-
-        if !self.hook_registry.is_empty() {
-            let after_payload = self.tool_hook_payload(
-                RuntimeHookEvent::ToolExecuteAfter,
-                "tool_result",
-                content,
-                metadata,
-                ctx,
-            );
-            if let Err(err) = self
-                .hook_registry
-                .call_event(RuntimeHookEvent::ToolExecuteAfter, after_payload)
-                .await
-            {
-                tracing::warn!("tool.execute.after hook failed: {}", err);
-            }
-        }
-
-        result
-    }
-}
-
-impl HookedTool {
-    fn tool_hook_payload(
-        &self,
-        event: RuntimeHookEvent,
-        event_kind: &str,
-        content: String,
-        metadata: Value,
-        ctx: &ToolContext,
-    ) -> Value {
-        serde_json::json!({
-            "event": event.as_str(),
-            "event_kind": event_kind,
-            "user_id": self.metadata_json.get("user_id").and_then(Value::as_str).unwrap_or("default"),
-            "project_id": self.metadata_json.get("project_id").and_then(Value::as_str),
-            "workspace_root": workspace_root_from_metadata(&self.metadata_json),
-            "agent_id": self.specialist_id.clone(),
-            "specialist_id": self.specialist_id.clone(),
-            "session_id": self.session_id.clone(),
-            "host": "gewu",
-            "role": if event_kind == "tool_result" { "tool" } else { "assistant" },
-            "layer": "raw",
-            "tool_name": self.inner.name(),
-            "content": content,
-            "content_json": metadata.clone(),
-            "metadata": {
-                "host": "gewu",
-                "hook_event": event.as_str(),
-                "tool_name": self.inner.name(),
-                "tool_context_session_id": ctx.session_id.clone(),
-                "tool_context_message_id": ctx.message_id.clone(),
-                "payload": metadata,
-            },
-        })
-    }
-}
-
 fn request_working_directory(request: &SpecialistExecutionRequest) -> Result<PathBuf> {
     if let Some(workdir) = request.workdir.as_deref().filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(workdir));
@@ -1346,23 +1154,6 @@ fn workspace_root_from_metadata(metadata_json: &Value) -> Option<String> {
         })
 }
 
-fn tool_permission_request_from_output(output: &str) -> Option<ToolPermissionRequest> {
-    let value: Value = serde_json::from_str(output).ok()?;
-    if value
-        .get("error")
-        .and_then(|error| error.get("code"))
-        .and_then(Value::as_str)
-        != Some("permission_required")
-    {
-        return None;
-    }
-
-    value
-        .get("permission_request")
-        .cloned()
-        .and_then(|request| serde_json::from_value(request).ok())
-}
-
 fn append_runtime_context(system_prompt: String) -> String {
     let now = chrono::Local::now();
     format!(
@@ -1408,37 +1199,6 @@ fn classify_task_result(
         return TaskResultStatus::Incomplete;
     }
     TaskResultStatus::Accepted
-}
-
-struct RuntimeToolRegistry {
-    tools: Arc<Vec<Arc<dyn Tool>>>,
-}
-
-#[async_trait]
-impl ToolRegistry for RuntimeToolRegistry {
-    async fn execute(
-        &self,
-        name: &str,
-        args: Value,
-        ctx: &ToolContext,
-    ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
-        let tool = self.tools.iter().find(|t| t.name() == name);
-        match tool {
-            Some(t) => t.execute(args, ctx).await,
-            None => Err(format!("Tool not found: {}", name).into()),
-        }
-    }
-
-    fn list_tools(&self) -> Vec<String> {
-        self.tools.iter().map(|t| t.name().to_string()).collect()
-    }
-
-    fn execution_policy(&self, name: &str) -> Option<gewu_core::types::ToolExecutionPolicy> {
-        self.tools
-            .iter()
-            .find(|tool| tool.name() == name)
-            .map(|tool| tool.execution_policy())
-    }
 }
 
 pub struct GeWuRuntimeBuilder {
@@ -1944,6 +1704,7 @@ mod task_result_tests {
     use async_trait::async_trait;
     use futures::stream::BoxStream;
     use gewu_core::traits::{LlmProvider, Tool};
+    
     use gewu_core::types::{Message, ProviderEvent, SpecialistDescriptor};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::error::Error;
@@ -2057,174 +1818,162 @@ Global sentinel body.
 
     #[tokio::test]
     async fn specialist_without_skills_does_not_see_global_skill_summaries() {
-        let _guard = cwd_lock().lock().unwrap();
         let original_cwd = std::env::current_dir().unwrap();
+        let project_root = std::env::temp_dir().join(format!(
+            "gewu-runtime-global-skill-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&project_root).unwrap();
+        write_global_skill(&project_root);
 
-        let result = async {
-            let project_root = std::env::temp_dir().join(format!(
-                "gewu-runtime-global-skill-test-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&project_root).unwrap();
-            write_global_skill(&project_root);
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        gewu_storage::run_migrations(&pool).await.unwrap();
 
+        let runtime = {
+            let _guard = cwd_lock().lock().unwrap();
             let _restore = CwdRestore {
                 original: original_cwd.clone(),
             };
             std::env::set_current_dir(&project_root).unwrap();
-
-            let pool = SqlitePoolOptions::new()
-                .connect("sqlite::memory:")
-                .await
-                .unwrap();
-            gewu_storage::run_migrations(&pool).await.unwrap();
-
             let runtime = GeWuRuntime::builder()
                 .provider(Arc::new(StubLlm))
                 .pool(pool)
-                .with_skill_dir(&project_root.join(".gewu/skills"))
+                .with_skill_dir(project_root.join(".gewu/skills"))
                 .build()
                 .unwrap();
-
             std::env::set_current_dir(&original_cwd).unwrap();
+            runtime
+        };
 
-            let descriptor = SpecialistDescriptor {
-                id: "general".to_string(),
-                description: "General specialist".to_string(),
-                capabilities: vec!["canvas.open".to_string()],
-                skills: vec![],
-                system_prompt: "Base prompt.".to_string(),
-            };
+        let descriptor = SpecialistDescriptor {
+            id: "general".to_string(),
+            description: "General specialist".to_string(),
+            capabilities: vec!["canvas.open".to_string()],
+            skills: vec![],
+            system_prompt: "Base prompt.".to_string(),
+        };
 
-            let effective = runtime.descriptor_with_skills(&descriptor);
-            assert!(
-                !effective
-                    .capabilities
-                    .iter()
-                    .any(|capability| capability == "bash_safe")
-            );
+        let effective = runtime.descriptor_with_skills(&descriptor);
+        assert!(
+            !effective
+                .capabilities
+                .iter()
+                .any(|capability| capability == "bash_safe")
+        );
 
-            let prompt = runtime.append_skill_prompt(&descriptor, descriptor.system_prompt.clone());
-            assert!(!prompt.contains("<available_skills>"));
-            assert!(!prompt.contains("global-skill"));
-            assert!(!prompt.contains("Use the `load_skill` tool"));
-            assert!(!prompt.contains("<skill_content name=\"global-skill\""));
-            assert!(!prompt.contains("Global sentinel body."));
-        }
-        .await;
-
-        result
+        let prompt = runtime.append_skill_prompt(&descriptor, descriptor.system_prompt.clone());
+        assert!(!prompt.contains("<available_skills>"));
+        assert!(!prompt.contains("global-skill"));
+        assert!(!prompt.contains("Use the `load_skill` tool"));
+        assert!(!prompt.contains("<skill_content name=\"global-skill\""));
+        assert!(!prompt.contains("Global sentinel body."));
     }
 
     #[tokio::test]
     async fn declared_skill_is_recommended_but_not_preloaded() {
-        let _guard = cwd_lock().lock().unwrap();
         let original_cwd = std::env::current_dir().unwrap();
+        let project_root = std::env::temp_dir().join(format!(
+            "gewu-runtime-declared-skill-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&project_root).unwrap();
+        write_skill(&project_root);
+        write_global_skill(&project_root);
 
-        let result = async {
-            let project_root = std::env::temp_dir().join(format!(
-                "gewu-runtime-declared-skill-test-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&project_root).unwrap();
-            write_skill(&project_root);
-            write_global_skill(&project_root);
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        gewu_storage::run_migrations(&pool).await.unwrap();
 
+        let runtime = {
+            let _guard = cwd_lock().lock().unwrap();
             let _restore = CwdRestore {
                 original: original_cwd.clone(),
             };
             std::env::set_current_dir(&project_root).unwrap();
-
-            let pool = SqlitePoolOptions::new()
-                .connect("sqlite::memory:")
-                .await
-                .unwrap();
-            gewu_storage::run_migrations(&pool).await.unwrap();
-
             let runtime = GeWuRuntime::builder()
                 .provider(Arc::new(StubLlm))
                 .pool(pool)
-                .with_skill_dir(&project_root.join(".gewu/skills"))
+                .with_skill_dir(project_root.join(".gewu/skills"))
                 .build()
                 .unwrap();
-
             std::env::set_current_dir(&original_cwd).unwrap();
+            runtime
+        };
 
-            let descriptor = SpecialistDescriptor {
-                id: "genome-canvas-agent".to_string(),
-                description: "Genome canvas specialist".to_string(),
-                capabilities: vec!["canvas.open".to_string()],
-                skills: vec!["gene-locus-resolver".to_string()],
-                system_prompt: "Base prompt.".to_string(),
-            };
+        let descriptor = SpecialistDescriptor {
+            id: "genome-canvas-agent".to_string(),
+            description: "Genome canvas specialist".to_string(),
+            capabilities: vec!["canvas.open".to_string()],
+            skills: vec!["gene-locus-resolver".to_string()],
+            system_prompt: "Base prompt.".to_string(),
+        };
 
-            let effective = runtime.descriptor_with_skills(&descriptor);
-            assert!(
-                effective
-                    .capabilities
-                    .iter()
-                    .any(|capability| capability == "gene.resolve_symbol")
-            );
-            assert!(
-                !effective
-                    .capabilities
-                    .iter()
-                    .any(|capability| capability == "bash_safe")
-            );
+        let effective = runtime.descriptor_with_skills(&descriptor);
+        assert!(
+            effective
+                .capabilities
+                .iter()
+                .any(|capability| capability == "gene.resolve_symbol")
+        );
+        assert!(
+            !effective
+                .capabilities
+                .iter()
+                .any(|capability| capability == "bash_safe")
+        );
 
-            let prompt = runtime.append_skill_prompt(&effective, effective.system_prompt.clone());
-            assert!(prompt.contains("<available_skills>"));
-            assert!(prompt.contains(
-                "gene-locus-resolver: Resolve gene symbols before opening Genome Canvas."
-            ));
-            assert!(!prompt.contains("global-skill"));
-            assert!(!prompt.contains("Recommended for this specialist:"));
-            assert!(prompt.contains("Use the `load_skill` tool"));
-            assert!(!prompt.contains("<skill_content name=\"gene-locus-resolver\""));
-            assert!(!prompt.contains("Do not guess coordinates."));
-        }
-        .await;
-
-        result
+        let prompt = runtime.append_skill_prompt(&effective, effective.system_prompt.clone());
+        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.contains(
+            "gene-locus-resolver: Resolve gene symbols before opening Genome Canvas."
+        ));
+        assert!(!prompt.contains("global-skill"));
+        assert!(!prompt.contains("Recommended for this specialist:"));
+        assert!(prompt.contains("Use the `load_skill` tool"));
+        assert!(!prompt.contains("<skill_content name=\"gene-locus-resolver\""));
+        assert!(!prompt.contains("Do not guess coordinates."));
     }
 
     #[tokio::test]
     async fn load_skill_tool_is_only_added_for_specialists_with_known_skills() {
-        let _guard = cwd_lock().lock().unwrap();
         let original_cwd = std::env::current_dir().unwrap();
+        let project_root = std::env::temp_dir().join(format!(
+            "gewu-runtime-load-skill-tool-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&project_root).unwrap();
+        write_skill(&project_root);
+        write_global_skill(&project_root);
 
-        let result = async {
-            let project_root = std::env::temp_dir().join(format!(
-                "gewu-runtime-load-skill-tool-test-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&project_root).unwrap();
-            write_skill(&project_root);
-            write_global_skill(&project_root);
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        gewu_storage::run_migrations(&pool).await.unwrap();
 
+        let runtime = {
+            let _guard = cwd_lock().lock().unwrap();
             let _restore = CwdRestore {
                 original: original_cwd.clone(),
             };
             std::env::set_current_dir(&project_root).unwrap();
-
-            let pool = SqlitePoolOptions::new()
-                .connect("sqlite::memory:")
-                .await
-                .unwrap();
-            gewu_storage::run_migrations(&pool).await.unwrap();
-
             let runtime = GeWuRuntime::builder()
                 .provider(Arc::new(StubLlm))
                 .pool(pool)
@@ -2239,61 +1988,58 @@ Global sentinel body.
                         system_prompt: "Base prompt.".to_string(),
                     },
                 }))
-                .with_skill_dir(&project_root.join(".gewu/skills"))
+                .with_skill_dir(project_root.join(".gewu/skills"))
                 .build()
                 .unwrap();
-
             std::env::set_current_dir(&original_cwd).unwrap();
+            runtime
+        };
 
-            let (_agent, registry) = runtime
-                .build_specialist("general", "session-1".to_string(), vec![])
-                .await
-                .unwrap();
+        let (_agent, registry) = runtime
+            .build_specialist("general", "session-1".to_string(), vec![])
+            .await
+            .unwrap();
 
-            assert!(
-                !registry
-                    .list_tools()
-                    .iter()
-                    .any(|tool| tool == "load_skill")
-            );
+        assert!(
+            !registry
+                .list_tools()
+                .iter()
+                .any(|tool| tool == "load_skill")
+        );
 
-            let (_agent, registry) = runtime
-                .build_specialist("skill-agent", "session-2".to_string(), vec![])
-                .await
-                .unwrap();
+        let (_agent, registry) = runtime
+            .build_specialist("skill-agent", "session-2".to_string(), vec![])
+            .await
+            .unwrap();
 
-            assert!(
-                registry
-                    .list_tools()
-                    .iter()
-                    .any(|tool| tool == "load_skill")
-            );
-            let ctx = ToolContext::new("session-2", "message-1");
-            let output = registry
-                .execute(
-                    "load_skill",
-                    serde_json::json!({"name": "global-skill"}),
-                    &ctx,
-                )
-                .await
-                .unwrap();
-            assert!(output.output.contains("Global sentinel body."));
-            let err = registry
-                .execute(
-                    "load_skill",
-                    serde_json::json!({"name": "gene-locus-resolver"}),
-                    &ctx,
-                )
-                .await
-                .unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("Skill is not available to this specialist: gene-locus-resolver")
-            );
-        }
-        .await;
-
-        result
+        assert!(
+            registry
+                .list_tools()
+                .iter()
+                .any(|tool| tool == "load_skill")
+        );
+        let ctx = gewu_core::types::ToolContext::new("session-2", "message-1");
+        let output = registry
+            .execute(
+                "load_skill",
+                serde_json::json!({"name": "global-skill"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(output.output.contains("Global sentinel body."));
+        let err = registry
+            .execute(
+                "load_skill",
+                serde_json::json!({"name": "gene-locus-resolver"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Skill is not available to this specialist: gene-locus-resolver")
+        );
     }
 
     fn write_resource_registration_validator_skill(root: &std::path::Path) {
@@ -2329,77 +2075,72 @@ description: Validate genomic resource registration URIs and enforce UCF/ATAC co
 
     #[tokio::test]
     async fn declared_resource_registration_skill_is_recommended_not_preloaded() {
-        let _guard = cwd_lock().lock().unwrap();
         let original_cwd = std::env::current_dir().unwrap();
+        let project_root = std::env::temp_dir().join(format!(
+            "gewu-runtime-resource-reg-validator-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&project_root).unwrap();
+        write_resource_registration_validator_skill(&project_root);
 
-        let result = async {
-            let project_root = std::env::temp_dir().join(format!(
-                "gewu-runtime-resource-reg-validator-test-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&project_root).unwrap();
-            write_resource_registration_validator_skill(&project_root);
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        gewu_storage::run_migrations(&pool).await.unwrap();
 
+        let runtime = {
+            let _guard = cwd_lock().lock().unwrap();
             let _restore = CwdRestore {
                 original: original_cwd.clone(),
             };
             std::env::set_current_dir(&project_root).unwrap();
-
-            let pool = SqlitePoolOptions::new()
-                .connect("sqlite::memory:")
-                .await
-                .unwrap();
-            gewu_storage::run_migrations(&pool).await.unwrap();
-
             let runtime = GeWuRuntime::builder()
                 .provider(Arc::new(StubLlm))
                 .pool(pool)
-                .with_skill_dir(&project_root.join(".gewu/skills"))
+                .with_skill_dir(project_root.join(".gewu/skills"))
                 .build()
                 .unwrap();
-
             std::env::set_current_dir(&original_cwd).unwrap();
+            runtime
+        };
 
-            let descriptor = SpecialistDescriptor {
-                id: "genome-resource-canvas-agent".to_string(),
-                description: "Genome resource canvas specialist".to_string(),
-                capabilities: vec!["canvas.open".to_string()],
-                skills: vec!["resource-registration-validator".to_string()],
-                system_prompt: "Base prompt.".to_string(),
-            };
+        let descriptor = SpecialistDescriptor {
+            id: "genome-resource-canvas-agent".to_string(),
+            description: "Genome resource canvas specialist".to_string(),
+            capabilities: vec!["canvas.open".to_string()],
+            skills: vec!["resource-registration-validator".to_string()],
+            system_prompt: "Base prompt.".to_string(),
+        };
 
-            let effective = runtime.descriptor_with_skills(&descriptor);
+        let effective = runtime.descriptor_with_skills(&descriptor);
 
-            let prompt = runtime.append_skill_prompt(&effective, effective.system_prompt.clone());
-            assert!(
-                prompt.contains("<available_skills>"),
-                "Skill should be listed in available_skills block"
-            );
-            assert!(
-                prompt.contains(
-                    "resource-registration-validator: Validate genomic resource registration URIs"
-                ),
-                "Skill should be recommended in available_skills"
-            );
-            assert!(
-                prompt.contains("Use the `load_skill` tool"),
-                "Load skill instruction should be present"
-            );
-            assert!(
-                !prompt.contains("<skill_content name=\"resource-registration-validator\""),
-                "Skill body should NOT be preloaded"
-            );
-            assert!(
-                !prompt.contains("Reject filename-as-sample-id"),
-                "Skill body content should NOT appear in prompt"
-            );
-        }
-        .await;
-
-        result
+        let prompt = runtime.append_skill_prompt(&effective, effective.system_prompt.clone());
+        assert!(
+            prompt.contains("<available_skills>"),
+            "Skill should be listed in available_skills block"
+        );
+        assert!(
+            prompt.contains(
+                "resource-registration-validator: Validate genomic resource registration URIs"
+            ),
+            "Skill should be recommended in available_skills"
+        );
+        assert!(
+            prompt.contains("Use the `load_skill` tool"),
+            "Load skill instruction should be present"
+        );
+        assert!(
+            !prompt.contains("<skill_content name=\"resource-registration-validator\""),
+            "Skill body should NOT be preloaded"
+        );
+        assert!(
+            !prompt.contains("Reject filename-as-sample-id"),
+            "Skill body content should NOT appear in prompt"
+        );
     }
 }

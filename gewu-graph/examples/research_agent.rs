@@ -52,7 +52,7 @@ async fn call_llm(
     let full_api_key = if api_key.starts_with("sk-") {
         api_key.to_string()
     } else {
-        format!("sk-{}", api_key)
+        format!("sk-{api_key}")
     };
 
     let client = reqwest::Client::new();
@@ -66,8 +66,8 @@ async fn call_llm(
     });
 
     let response = client
-        .post(format!("{}/chat/completions", provider))
-        .header("Authorization", format!("Bearer {}", full_api_key))
+        .post(format!("{provider}/chat/completions"))
+        .header("Authorization", format!("Bearer {full_api_key}"))
         .header("Content-Type", "application/json")
         .json(&request_body)
         .send()
@@ -128,7 +128,7 @@ as if you were searching the web. Include relevant facts, opinions, and details.
 
         let result = match call_llm(provider, api_key, model, system, &query).await {
             Ok(r) => r,
-            Err(_) => format!("Search result for: {}", query),
+            Err(_) => format!("Search result for: {query}"),
         };
         results.push(result);
     }
@@ -328,7 +328,7 @@ async fn main() -> Result<()> {
                 println!("Final Response:\n{}", state.final_response);
             }
             Err(e) => {
-                eprintln!("Error during research: {}", e);
+                eprintln!("Error during research: {e}");
             }
         }
 

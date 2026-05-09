@@ -83,7 +83,7 @@ fn unique_db_path(tag: &str) -> String {
 }
 
 fn write_workflow(dir: &std::path::Path, name: &str, yaml: &str) {
-    std::fs::write(dir.join(format!("{}.yaml", name)), yaml).unwrap();
+    std::fs::write(dir.join(format!("{name}.yaml")), yaml).unwrap();
 }
 
 fn minimal_cli(workflow_dir: &str) -> Cli {
@@ -187,7 +187,7 @@ async fn run_workflow_errors_on_unknown_id() {
     .await;
     assert!(r.is_err());
     let msg = r.unwrap_err().to_string();
-    assert!(msg.contains("not found"), "got: {}", msg);
+    assert!(msg.contains("not found"), "got: {msg}");
 }
 
 #[tokio::test]

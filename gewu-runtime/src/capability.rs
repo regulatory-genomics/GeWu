@@ -148,7 +148,7 @@ impl CapabilityRegistry {
             let (idx, _) = self
                 .index
                 .get(cap)
-                .ok_or_else(|| anyhow!("No provider registered for capability: {}", cap))?;
+                .ok_or_else(|| anyhow!("No provider registered for capability: {cap}"))?;
             let provider = &self.providers[*idx];
             let produced = provider
                 .build_tools(cap, ctx)

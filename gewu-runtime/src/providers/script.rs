@@ -71,7 +71,7 @@ impl ToolProvider for ScriptToolProvider {
             .capabilities
             .iter()
             .find(|c| c.name == capability)
-            .ok_or_else(|| format!("unknown script capability: {}", capability))?;
+            .ok_or_else(|| format!("unknown script capability: {capability}"))?;
         Ok(vec![Box::new(ScriptTool { cap: cap.clone() })])
     }
 }

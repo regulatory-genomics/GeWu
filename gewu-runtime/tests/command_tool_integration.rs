@@ -51,8 +51,8 @@ fn registry_persist_reload_cycle() {
 
     for i in 0..3 {
         reg.register(CommandToolDef {
-            name: format!("tool_{}", i),
-            description: format!("Tool {}", i),
+            name: format!("tool_{i}"),
+            description: format!("Tool {i}"),
             command: "/bin/echo".into(),
             args: vec![],
             working_dir: None,

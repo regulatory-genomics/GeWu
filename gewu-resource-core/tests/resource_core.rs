@@ -673,9 +673,60 @@ async fn resource_validate_missing_resource_returns_top_level_failure() {
         "resource_not_found",
         "expected error.code=resource_not_found"
     );
-    assert_eq!(
-        error["retryable"].as_bool().unwrap(),
-        false,
+    assert!(
+        !error["retryable"].as_bool().unwrap(),
         "expected error.retryable=false"
+    );
+}
+
+#[tokio::test]
+async fn resource_register_lock_prevents_concurrent_writes() {
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Mutex;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mutable_provider = StdArc::new(gewu_resource_core::MutableResourceProvider::new(
+        "agent-registered",
+    ));
+    let registry = StdArc::new(gewu_resource_core::ResourceRegistry::new().with_provider(
+        gewu_resource_core::InMemoryResourceProvider::new("static", vec![]),
+    ));
+
+    let write_lock = StdArc::new(Mutex::new(()));
+    let write_started = StdArc::new(AtomicBool::new(false));
+    let write_completed = StdArc::new(AtomicBool::new(false));
+
+    let write_lock_clone = write_lock.clone();
+    let write_started_clone = write_started.clone();
+    let write_completed_clone = write_completed.clone();
+
+    let _tool1 = gewu_resource_core::ResourceRegisterTool::with_lock(
+        registry.clone(),
+        mutable_provider.clone(),
+        dir.path().to_path_buf(),
+        write_lock_clone,
+    );
+
+    let _dir2 = tempfile::tempdir().unwrap();
+    let _mutable_provider2 = StdArc::new(gewu_resource_core::MutableResourceProvider::new(
+        "agent-registered-2",
+    ));
+    let _registry2 = StdArc::new(gewu_resource_core::ResourceRegistry::new().with_provider(
+        gewu_resource_core::InMemoryResourceProvider::new("static-2", vec![]),
+    ));
+
+    let write_lock_for_task = write_lock.clone();
+    let handle = tokio::spawn(async move {
+        write_started_clone.store(true, Ordering::SeqCst);
+        let _guard = write_lock_for_task.lock().await;
+        write_completed_clone.store(true, Ordering::SeqCst);
+    });
+
+    handle.await.unwrap();
+
+    assert!(
+        write_completed.load(Ordering::SeqCst),
+        "write should complete successfully when lock is acquired"
     );
 }

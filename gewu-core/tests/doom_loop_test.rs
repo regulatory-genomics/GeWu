@@ -35,7 +35,7 @@ impl LlmProvider for MockLlmProvider {
             return Ok(Box::pin(s));
         }
 
-        let call_id = format!("call_{}", tool_response_count);
+        let call_id = format!("call_{tool_response_count}");
         let s = async_stream::try_stream! {
             yield ProviderEvent::ToolCallStart { id: call_id.clone(), name: "test_tool".to_string() };
             yield ProviderEvent::ToolCallDelta { id: call_id, delta: "{}".to_string() };
@@ -114,16 +114,15 @@ async fn test_doom_loop_detection() {
                 AgentEvent::Error { error } => error_text = error,
                 _ => {}
             },
-            Err(e) => panic!("Stream error: {}", e),
+            Err(e) => panic!("Stream error: {e}"),
         }
     }
 
     assert!(
         error_text.contains("Doom loop detected"),
-        "Error was: {}",
-        error_text
+        "Error was: {error_text}"
     );
-    assert!(error_text.contains("Stopping"), "Error was: {}", error_text);
+    assert!(error_text.contains("Stopping"), "Error was: {error_text}");
 }
 
 #[tokio::test]

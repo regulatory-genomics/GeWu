@@ -68,7 +68,7 @@ async fn benchmark_1(provider: &Arc<dyn LlmProvider>, pool: &sqlx::SqlitePool) -
         desc.id,
         desc.capabilities
             .iter()
-            .map(|c| format!("{:?}", c))
+            .map(|c| format!("{c:?}"))
             .collect::<Vec<_>>()
     );
 
@@ -76,7 +76,7 @@ async fn benchmark_1(provider: &Arc<dyn LlmProvider>, pool: &sqlx::SqlitePool) -
     let wd = std::env::current_dir()?;
     let tools = resolve_tools(&desc.capabilities, &wd, provider.clone(), pool.clone());
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-    println!("[2] Resolved tools: {:?}", tool_names);
+    println!("[2] Resolved tools: {tool_names:?}");
 
     // 3. Build agent
     let memory = SqliteMemory::new(pool.clone(), "bench1".to_string()).await?;
@@ -177,7 +177,7 @@ async fn benchmark_2(provider: &Arc<dyn LlmProvider>, pool: &sqlx::SqlitePool) -
     let result1 = task_tool
         .execute(args1, &ctx)
         .await
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let envelope1: Value = serde_json::from_str(&result1.output)?;
 
     println!();
@@ -192,8 +192,7 @@ async fn benchmark_2(provider: &Arc<dyn LlmProvider>, pool: &sqlx::SqlitePool) -
 
     if status1 != "blocked" {
         println!(
-            "[RESULT] Benchmark 2: SKIP (agent didn't block on attempt 1, status={})",
-            status1
+            "[RESULT] Benchmark 2: SKIP (agent didn't block on attempt 1, status={status1})"
         );
         let _ = std::fs::remove_file(&target_file);
         return Ok(());
@@ -216,8 +215,7 @@ async fn benchmark_2(provider: &Arc<dyn LlmProvider>, pool: &sqlx::SqlitePool) -
     let mem_check = SqliteMemory::new(pool.clone(), task_id.clone()).await?;
     let prior_msgs = mem_check.messages().len();
     println!(
-        "[resume] {} prior messages from attempt 1 in SQLite",
-        prior_msgs
+        "[resume] {prior_msgs} prior messages from attempt 1 in SQLite"
     );
     drop(mem_check);
 
@@ -234,7 +232,7 @@ async fn benchmark_2(provider: &Arc<dyn LlmProvider>, pool: &sqlx::SqlitePool) -
     let result2 = task_tool
         .execute(args2, &ctx)
         .await
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let envelope2: Value = serde_json::from_str(&result2.output)?;
 
     println!();

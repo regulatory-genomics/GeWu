@@ -75,7 +75,7 @@ fn normalize_endpoint(endpoint: &str) -> String {
     if endpoint.starts_with('/') {
         endpoint.to_string()
     } else {
-        format!("/{}", endpoint)
+        format!("/{endpoint}")
     }
 }
 
@@ -107,7 +107,7 @@ impl ToolProvider for HttpProviderSpec {
             .capabilities
             .iter()
             .find(|c| c.name == capability)
-            .ok_or_else(|| format!("unknown http capability: {}", capability))?;
+            .ok_or_else(|| format!("unknown http capability: {capability}"))?;
         Ok(vec![Box::new(HttpTool { cap: cap.clone() })])
     }
 }
@@ -156,7 +156,7 @@ impl Tool for HttpTool {
         let mut url = self.cap.url.clone();
         if let Some(obj) = args.as_object() {
             for (k, v) in obj {
-                let placeholder = format!("{{{}}}", k);
+                let placeholder = format!("{{{k}}}");
                 if url.contains(&placeholder) {
                     let val = match v {
                         serde_json::Value::String(s) => s.clone(),
@@ -173,7 +173,7 @@ impl Tool for HttpTool {
             "PUT" => client.put(&url),
             "DELETE" => client.delete(&url),
             "PATCH" => client.patch(&url),
-            m => return Err(format!("unsupported HTTP method: {}", m).into()),
+            m => return Err(format!("unsupported HTTP method: {m}").into()),
         };
 
         for (k, v) in &self.cap.headers {
@@ -185,7 +185,7 @@ impl Tool for HttpTool {
                 let pairs: Vec<(String, String)> = obj
                     .iter()
                     .filter_map(|(k, v)| {
-                        let placeholder = format!("{{{}}}", k);
+                        let placeholder = format!("{{{k}}}");
                         if self.cap.url.contains(&placeholder) {
                             return None;
                         }

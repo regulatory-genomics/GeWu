@@ -69,7 +69,7 @@ impl ToolProvider for ContainerToolProvider {
             .capabilities
             .iter()
             .find(|c| c.name == capability)
-            .ok_or_else(|| format!("unknown container capability: {}", capability))?;
+            .ok_or_else(|| format!("unknown container capability: {capability}"))?;
         Ok(vec![Box::new(ContainerTool {
             engine: self.spec.engine.clone(),
             cap: cap.clone(),

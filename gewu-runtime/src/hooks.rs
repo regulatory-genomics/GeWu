@@ -146,7 +146,7 @@ impl HttpHookProvider {
             "PUT" => self.client.put(&url).json(&payload),
             "PATCH" => self.client.patch(&url).json(&payload),
             "GET" => self.client.get(&url).query(&payload),
-            other => return Err(anyhow!("unsupported hook HTTP method: {}", other)),
+            other => return Err(anyhow!("unsupported hook HTTP method: {other}")),
         };
         let response = request
             .timeout(timeout)
@@ -175,7 +175,7 @@ fn normalize_endpoint(endpoint: &str) -> String {
     if endpoint.starts_with('/') {
         endpoint.to_string()
     } else {
-        format!("/{}", endpoint)
+        format!("/{endpoint}")
     }
 }
 

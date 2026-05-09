@@ -142,23 +142,19 @@ async fn test_plugin_specialist_assembly() {
 
     assert!(
         names.contains(&"count_lines"),
-        "missing custom tool, got: {:?}",
-        names
+        "missing custom tool, got: {names:?}"
     );
     assert!(
         names.contains(&"read_file"),
-        "missing builtin read_file, got: {:?}",
-        names
+        "missing builtin read_file, got: {names:?}"
     );
     assert!(
         names.contains(&"glob"),
-        "missing builtin glob, got: {:?}",
-        names
+        "missing builtin glob, got: {names:?}"
     );
     assert!(
         names.contains(&"report_result"),
-        "missing builtin report_result, got: {:?}",
-        names
+        "missing builtin report_result, got: {names:?}"
     );
 }
 

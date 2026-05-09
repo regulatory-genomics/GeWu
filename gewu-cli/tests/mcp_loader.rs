@@ -25,7 +25,7 @@ fn parses_stdio_mcp_server() {
             assert_eq!(args, &vec!["mcp-server-fs".to_string()]);
             assert_eq!(env.get("FOO").map(|s| s.as_str()), Some("bar"));
         }
-        other => panic!("expected Stdio, got {:?}", other),
+        other => panic!("expected Stdio, got {other:?}"),
     }
 }
 
@@ -53,7 +53,7 @@ fn parses_sse_mcp_server() {
         McpServerConfig::Sse { url } => {
             assert_eq!(url, "http://localhost:8080/sse");
         }
-        other => panic!("expected Sse, got {:?}", other),
+        other => panic!("expected Sse, got {other:?}"),
     }
 }
 

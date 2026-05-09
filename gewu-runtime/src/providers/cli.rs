@@ -67,7 +67,7 @@ impl ToolProvider for CliToolProvider {
             .capabilities
             .iter()
             .find(|c| c.name == capability)
-            .ok_or_else(|| format!("unknown cli capability: {}", capability))?;
+            .ok_or_else(|| format!("unknown cli capability: {capability}"))?;
         Ok(vec![Box::new(CliTool { cap: cap.clone() })])
     }
 }
@@ -110,7 +110,7 @@ impl Tool for CliTool {
         let combined = if stderr.is_empty() {
             stdout.to_string()
         } else {
-            format!("{}\n--- stderr ---\n{}", stdout, stderr)
+            format!("{stdout}\n--- stderr ---\n{stderr}")
         };
 
         Ok(ToolResult::new(&self.cap.name, combined))

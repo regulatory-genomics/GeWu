@@ -165,7 +165,7 @@ impl Tool for ComposeWorkflowTool {
 
         let mut prompt = input.goal.clone();
         if let Some(ref id) = input.id {
-            prompt = format!("{}. The workflow id must be '{}'.", prompt, id);
+            prompt = format!("{prompt}. The workflow id must be '{id}'.");
         }
 
         let task_id = Uuid::new_v4().to_string();
@@ -200,12 +200,12 @@ impl Tool for ComposeWorkflowTool {
             .register_builtin_specialists()
             .with_manifest_dir(crate::composer::default_specialists_dir())
             .build()
-            .map_err(|e| format!("Failed to build runtime: {}", e))?;
+            .map_err(|e| format!("Failed to build runtime: {e}"))?;
 
         let envelope = runtime
             .execute_request(&request, Vec::new())
             .await
-            .map_err(|e| format!("Composer failed: {}", e))?;
+            .map_err(|e| format!("Composer failed: {e}"))?;
 
         Ok(ToolResult::new(
             "compose_workflow",
@@ -318,9 +318,7 @@ impl Tool for RunWorkflowTool {
         for d in &dirs {
             loader.add_dir(d);
         }
-        let loaded = loader
-            .load()
-            .map_err(|e| format!("load workflows: {}", e))?;
+        let loaded = loader.load().map_err(|e| format!("load workflows: {e}"))?;
         let manifests: std::collections::HashMap<String, _> =
             loaded.into_iter().map(|(_, m)| (m.id.clone(), m)).collect();
 
@@ -350,7 +348,7 @@ impl Tool for RunWorkflowTool {
             .with_skill_dirs(self.skill_dirs.clone())
             .with_workflow_dirs(dirs.clone())
             .build()
-            .map_err(|e| format!("Failed to build runtime: {}", e))?;
+            .map_err(|e| format!("Failed to build runtime: {e}"))?;
 
         let runtime = Arc::new(runtime);
 
@@ -368,7 +366,7 @@ impl Tool for RunWorkflowTool {
                 input_json: Some(input.input.clone()),
             })
             .await
-            .map_err(|e| format!("Start workflow trace run: {}", e))?;
+            .map_err(|e| format!("Start workflow trace run: {e}"))?;
 
         let compiler = WorkflowCompiler::new(Arc::clone(&runtime)).with_workflows(manifests);
         let graph = compiler

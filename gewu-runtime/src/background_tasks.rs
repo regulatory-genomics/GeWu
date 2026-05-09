@@ -97,7 +97,7 @@ impl BackgroundTaskCoordinator {
 
         let message = build_completion_message(&group, &members);
         let content = serde_json::to_string(&message)
-            .map_err(|e| anyhow::anyhow!("serialize completion message: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("serialize completion message: {e}"))?;
 
         // Atomically: mark group injected AND insert the parent's notification
         // message. If either step fails the transaction rolls back, leaving
@@ -114,7 +114,7 @@ impl BackgroundTaskCoordinator {
             .bind(content)
             .execute(&mut *tx)
             .await
-            .map_err(|e| anyhow::anyhow!("persist completion message: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("persist completion message: {e}"))?;
         tx.commit().await?;
 
         let summary = build_summary_line(&members);
@@ -146,11 +146,10 @@ fn build_summary_line(tasks: &[TaskRecord]) -> String {
         .count();
     let fail = tasks.len().saturating_sub(ok);
     if fail == 0 {
-        format!("Background tasks completed: {} succeeded.", ok)
+        format!("Background tasks completed: {ok} succeeded.")
     } else {
         format!(
-            "Background tasks completed: {} succeeded, {} failed.",
-            ok, fail
+            "Background tasks completed: {ok} succeeded, {fail} failed."
         )
     }
 }

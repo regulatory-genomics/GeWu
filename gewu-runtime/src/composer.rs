@@ -228,7 +228,7 @@ impl Tool for WriteWorkflowTool {
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let args: WriteArgs =
-            serde_json::from_value(args).map_err(|e| format!("invalid args: {}", e))?;
+            serde_json::from_value(args).map_err(|e| format!("invalid args: {e}"))?;
 
         let result = do_write(&self.ctx, args).await;
         match result {
@@ -252,9 +252,9 @@ impl Tool for WriteWorkflowTool {
 
 async fn do_write(ctx: &ComposerContext, args: WriteArgs) -> Result<Value> {
     let manifest: WorkflowManifest = if let Some(yaml) = args.manifest_yaml.as_deref() {
-        serde_yaml::from_str(yaml).map_err(|e| anyhow!("parse manifest_yaml: {}", e))?
+        serde_yaml::from_str(yaml).map_err(|e| anyhow!("parse manifest_yaml: {e}"))?
     } else if let Some(obj) = args.manifest_json {
-        serde_json::from_value(obj).map_err(|e| anyhow!("parse manifest_json: {}", e))?
+        serde_json::from_value(obj).map_err(|e| anyhow!("parse manifest_json: {e}"))?
     } else {
         return Err(anyhow!(
             "must provide either `manifest_yaml` or `manifest_json`"
@@ -282,7 +282,7 @@ async fn do_write(ctx: &ComposerContext, args: WriteArgs) -> Result<Value> {
             path.display()
         ));
     }
-    let yaml = serde_yaml::to_string(&manifest).map_err(|e| anyhow!("serialize: {}", e))?;
+    let yaml = serde_yaml::to_string(&manifest).map_err(|e| anyhow!("serialize: {e}"))?;
     std::fs::write(&path, yaml).map_err(|e| anyhow!("write {}: {}", path.display(), e))?;
 
     Ok(json!({
@@ -360,7 +360,7 @@ impl Tool for RegisterToolTool {
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let a: RegisterToolArgs =
-            serde_json::from_value(args).map_err(|e| format!("invalid args: {}", e))?;
+            serde_json::from_value(args).map_err(|e| format!("invalid args: {e}"))?;
 
         let def = CommandToolDef {
             name: a.name.clone(),
@@ -374,7 +374,7 @@ impl Tool for RegisterToolTool {
         };
 
         let mut registry = CommandToolRegistry::new(&self.tools_dir)
-            .map_err(|e| format!("open tool registry: {}", e))?;
+            .map_err(|e| format!("open tool registry: {e}"))?;
 
         match registry.register(def) {
             Ok(()) => {
@@ -462,7 +462,7 @@ impl Tool for WriteSpecialistTool {
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let a: WriteSpecialistArgs =
-            serde_json::from_value(args).map_err(|e| format!("invalid args: {}", e))?;
+            serde_json::from_value(args).map_err(|e| format!("invalid args: {e}"))?;
 
         if a.id.is_empty() {
             return Ok(ToolResult::new(
@@ -473,7 +473,7 @@ impl Tool for WriteSpecialistTool {
         }
 
         std::fs::create_dir_all(&self.specialists_dir)
-            .map_err(|e| format!("create specialists dir: {}", e))?;
+            .map_err(|e| format!("create specialists dir: {e}"))?;
 
         let path = self.specialists_dir.join(format!("{}.yaml", a.id));
         if path.exists() && !a.overwrite {
@@ -490,7 +490,7 @@ impl Tool for WriteSpecialistTool {
             "prompt": { "inline": a.system_prompt },
             "capabilities": a.capabilities,
         });
-        let yaml = serde_yaml::to_string(&manifest).map_err(|e| format!("serialize: {}", e))?;
+        let yaml = serde_yaml::to_string(&manifest).map_err(|e| format!("serialize: {e}"))?;
         std::fs::write(&path, yaml).map_err(|e| format!("write {}: {}", path.display(), e))?;
 
         let out = json!({

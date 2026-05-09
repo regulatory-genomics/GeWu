@@ -58,7 +58,7 @@ async fn call_llm(
     let full_api_key = if api_key.starts_with("sk-") {
         api_key.to_string()
     } else {
-        format!("sk-{}", api_key)
+        format!("sk-{api_key}")
     };
 
     let client = reqwest::Client::new();
@@ -72,8 +72,8 @@ async fn call_llm(
     });
 
     let response = client
-        .post(format!("{}/chat/completions", provider))
-        .header("Authorization", format!("Bearer {}", full_api_key))
+        .post(format!("{provider}/chat/completions"))
+        .header("Authorization", format!("Bearer {full_api_key}"))
         .header("Content-Type", "application/json")
         .json(&request_body)
         .send()
@@ -404,7 +404,7 @@ async fn main() -> Result<()> {
                 println!("Final Response:\n{}", result.final_response);
             }
             Err(e) => {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e}");
             }
         }
 
@@ -440,7 +440,7 @@ async fn main() -> Result<()> {
                 println!("\n{}\n", result.final_response);
             }
             Err(e) => {
-                eprintln!("Error: {}\n", e);
+                eprintln!("Error: {e}\n");
             }
         }
     }

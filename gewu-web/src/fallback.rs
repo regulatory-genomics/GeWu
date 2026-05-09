@@ -69,8 +69,7 @@ pub fn inject_runtime_assets(html: &str, assets: &RuntimeFrontendAssets) -> Stri
     let runtime_json =
         serde_json::to_string(assets).unwrap_or_else(|_| "{\"plugins\":[]}".to_string());
     let runtime_script = format!(
-        "<script>window.__GEWU_PLUGINS__ = {};</script>",
-        runtime_json
+        "<script>window.__GEWU_PLUGINS__ = {runtime_json};</script>"
     );
     let mut out = inject_before_head_close(html, &runtime_script);
 
