@@ -1,3 +1,4 @@
+use crate::evolve_tools::{PythonExecuteTool, SkillCreateTool, SkillListTool, SkillLoadTool};
 use crate::tools::TaskTool;
 use anyhow::{Result, anyhow};
 use gewu_core::traits::{AssemblyContext, LlmProvider, Tool, ToolFactory, ToolRegistry};
@@ -50,6 +51,10 @@ pub fn specialist_descriptors() -> Vec<SpecialistDescriptor> {
             ].into_iter().map(String::from).collect(),
             skills: Vec::new(),
             system_prompt: include_str!("prompts/general.txt").into(),
+        },
+        AgentConfig {
+            name: "evolve".to_string(),
+            description: "Self-evolving agent with multi-agent planning, review, and execution.".to_string(),
         },
     ]
 }
@@ -181,7 +186,7 @@ pub async fn create_agent(
     name: &str,
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
-    session_id: String,
+    working_directory: std::path::PathBuf,
     additional_tools: Vec<Arc<dyn Tool>>,
 ) -> Result<(gewu_core::Agent, Arc<dyn ToolRegistry>)> {
     let runtime = crate::runtime::GeWuRuntime::builder()

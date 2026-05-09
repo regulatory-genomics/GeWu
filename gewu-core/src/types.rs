@@ -16,10 +16,67 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::permission::ToolPermissionRequest;
 use crate::permission::PermissionGrant;
+
+/// A stored problem-solving experience that can be recalled by future agents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Experience {
+    pub id: String,
+    pub task_description: String,
+    pub task_type: String,
+    pub problem_summary: String,
+    pub solution_summary: String,
+    pub tools_used: Vec<String>,
+    pub iteration_count: i32,
+    pub success: bool,
+    pub embedding_id: String,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub quality_score: f32,
+    #[serde(default)]
+    pub recall_count: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperienceQuery {
+    pub query_text: String,
+    #[serde(default)]
+    pub task_type_filter: Option<String>,
+    #[serde(default = "default_experience_limit")]
+    pub limit: usize,
+    #[serde(default = "default_experience_score_threshold")]
+    pub score_threshold: f32,
+}
+
+fn default_experience_limit() -> usize {
+    5
+}
+
+fn default_experience_score_threshold() -> f32 {
+    0.7
+}
+
+impl Default for ExperienceQuery {
+    fn default() -> Self {
+        Self {
+            query_text: String::new(),
+            task_type_filter: None,
+            limit: default_experience_limit(),
+            score_threshold: default_experience_score_threshold(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecalledExperience {
+    pub experience: Experience,
+    pub similarity_score: f32,
+}
 
 /// Represents a function call within a tool call.
 ///

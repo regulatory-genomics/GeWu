@@ -1,0 +1,28 @@
+[package]
+name = "gewu-experience"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gewu-core = { path = "../gewu-core" }
+anyhow = "1.0"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+thiserror = "2.0"
+schemars = "0.8"
+uuid = { version = "1.0", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-native-tls"] }
+qdrant-client = "1.16"
+embed_anything = { git = "https://github.com/StarlightSearch/EmbedAnything", rev = "273bf9da0317cd5740b66f6c69de9000fa76049e" }
+directories = "5.0"
+dirs = "5.0"
+json-strip-comments = "3.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+anyhow = "1.0"
+tempfile = "3.10"

@@ -142,7 +142,7 @@ pub struct McpConfig {
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum McpServerConfig {
     Stdio {

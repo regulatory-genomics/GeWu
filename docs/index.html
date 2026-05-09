@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GeWu - Self-Evolving Agent Framework</title>
+    <style>
+        :root {
+            --bg-color: #0d1117;
+            --text-color: #c9d1d9;
+            --link-color: #58a6ff;
+            --link-hover: #79c0ff;
+            --card-bg: #161b22;
+            --card-border: #30363d;
+            --header-gradient-end: #238636;
+            --header-gradient-start: #1a7f37;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+        .header {
+            background: linear-gradient(135deg, var(--header-gradient-start), var(--header-gradient-end));
+            padding: 3rem 2rem;
+            text-align: center;
+        }
+        .header h1 {
+            font-size: 3rem;
+            color: #ffffff;
+            margin-bottom: 0.5rem;
+            font-weight: 700;
+        }
+        .header p {
+            font-size: 1.25rem;
+            color: rgba(255,255,255,0.9);
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 3rem 2rem;
+        }
+        .section-title {
+            font-size: 1.5rem;
+            color: #ffffff;
+            margin-bottom: 1.5rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid var(--card-border);
+        }
+        .intro {
+            margin-bottom: 2rem;
+            font-size: 1.1rem;
+            max-width: 800px;
+        }
+        .crates-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 3rem;
+        }
+        .crate-card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 8px;
+            padding: 1.5rem;
+            transition: border-color 0.2s, transform 0.2s;
+        }
+        .crate-card:hover {
+            border-color: var(--link-color);
+            transform: translateY(-2px);
+        }
+        .crate-card h3 {
+            color: var(--link-color);
+            font-size: 1.25rem;
+            margin-bottom: 0.5rem;
+        }
+        .crate-card h3 a {
+            color: inherit;
+            text-decoration: none;
+        }
+        .crate-card h3 a:hover {
+            color: var(--link-hover);
+            text-decoration: underline;
+        }
+        .crate-card p {
+            font-size: 0.9rem;
+            color: var(--text-color);
+        }
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .feature {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 6px;
+            padding: 1rem;
+        }
+        .feature h4 {
+            color: var(--link-color);
+            margin-bottom: 0.5rem;
+            font-size: 1rem;
+        }
+        .feature p {
+            font-size: 0.85rem;
+            color: var(--text-color);
+        }
+        .quick-start {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        .quick-start h3 {
+            color: #ffffff;
+            margin-bottom: 1rem;
+        }
+        .quick-start code {
+            background: #1a1d21;
+            padding: 0.2rem 0.4rem;
+            border-radius: 4px;
+            font-size: 0.9rem;
+        }
+        .quick-start pre {
+            background: #1a1d21;
+            padding: 1rem;
+            border-radius: 6px;
+            overflow-x: auto;
+            margin: 1rem 0;
+        }
+        .quick-start pre code {
+            background: none;
+            padding: 0;
+        }
+        .footer {
+            text-align: center;
+            padding: 2rem;
+            color: #8b949e;
+            font-size: 0.875rem;
+            border-top: 1px solid var(--card-border);
+            margin-top: 3rem;
+        }
+        .footer a {
+            color: var(--link-color);
+        }
+        @media (max-width: 600px) {
+            .header h1 { font-size: 2rem; }
+            .crates-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>GeWu</h1>
+        <p>Self-Evolving Agent Framework for Building Intelligent AI Systems</p>
+    </div>
+    <div class="container">
+        <div class="intro">
+            <p>GeWu is a comprehensive framework for building AI agents with tool execution, memory management, and self-evolution capabilities. The API documentation below provides detailed information for each crate in the workspace.</p>
+        </div>
+
+        <h2 class="section-title">Core Architecture</h2>
+        <div class="feature-grid">
+            <div class="feature">
+                <h4>Agent Runtime</h4>
+                <p>Loop-based execution with doom loop detection and history compaction</p>
+            </div>
+            <div class="feature">
+                <h4>Tool System</h4>
+                <p>Extensible tool interface with panic recovery and timeout handling</p>
+            </div>
+            <div class="feature">
+                <h4>Memory</h4>
+                <p>Pluggable memory backends with automatic context management</p>
+            </div>
+            <div class="feature">
+                <h4>LLM Providers</h4>
+                <p>OpenAI and Anthropic support with streaming and tool calling</p>
+            </div>
+        </div>
+
+        <h2 class="section-title">Workspace Crates</h2>
+        <div class="crates-grid">
+            <div class="crate-card">
+                <h3><a href="gewu_core/index.html">gewu-core</a></h3>
+                <p>Core library with Agent runtime, traits (Tool, LlmProvider, Memory), and message types</p>
+            </div>
+            <div class="crate-card">
+                <h3><a href="gewu_providers/index.html">gewu-providers</a></h3>
+                <p>LLM provider implementations (OpenAI-compatible, Anthropic Claude)</p>
+            </div>
+            <div class="crate-card">
+                <h3><a href="gewu_tools/index.html">gewu-tools</a></h3>
+                <p>Built-in tools (bash, fs ops, grep, glob, web fetch, MCP, batch, todo)</p>
+            </div>
+            <div class="crate-card">
+                <h3><a href="gewu_storage/index.html">gewu-storage</a></h3>
+                <p>SQLite-based persistent memory via sqlx</p>
+            </div>
+            <div class="crate-card">
+                <h3><a href="gewu_cli/index.html">gewu-cli</a></h3>
+                <p>Command-line interface application for interacting with the agent framework</p>
+            </div>
+            <div class="crate-card">
+                <h3><a href="gewu_web/index.html">gewu-web</a></h3>
+                <p>Web UI built with Axum and SSE streaming</p>
+            </div>
+            <div class="crate-card">
+                <h3><a href="gewu_graph/index.html">gewu-graph</a></h3>
+                <p>Stateful graph execution library (LangGraph-style)</p>
+            </div>
+            <div class="crate-card">
+                <h3><a href="gewu_rag/index.html">gewu-rag</a></h3>
+                <p>RAG system with document processing and Qdrant embeddings</p>
+            </div>
+            <div class="crate-card">
+                <h3><a href="gewu_experience/index.html">gewu-experience</a></h3>
+                <p>Experience memory with Qdrant vector embeddings</p>
+            </div>
+            <div class="crate-card">
+                <h3><a href="gewu_evolve/index.html">gewu-evolve</a></h3>
+                <p>Self-critique, Python sandbox, skill library, and tool creation</p>
+            </div>
+        </div>
+
+        <h2 class="section-title">Quick Start</h2>
+        <div class="quick-start">
+            <h3>Build Your First Agent</h3>
+<pre><code>use gewu_core::{Agent, LlmProvider, Tool};
+use gewu_providers::OpenAIProvider;
+use std::sync::Arc;
+
+let provider = OpenAIProvider::new("your-api-key", "gpt-4");
+let agent = Agent::builder()
+    .llm(Arc::new(provider))
+    .with_tools(vec![...])
+    .system_prompt("You are a helpful assistant.")
+    .build()
+    .unwrap();</code></pre>
+        </div>
+    </div>
+    <div class="footer">
+        Generated by <a href="https://github.com/actions/upload-pages-artifact">GitHub Actions</a> using rustdoc
+    </div>
+</body>
+</html>

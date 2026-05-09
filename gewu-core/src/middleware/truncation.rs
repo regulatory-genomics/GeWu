@@ -1,10 +1,24 @@
+//! Middleware services for agent processing.
+//!
+//! This module provides middleware components that intercept and process
+//! agent operations, such as output truncation for managing response sizes.
+
 use crate::types::TruncationResult;
 use std::path::PathBuf;
 
+/// Maximum number of lines to retain before truncation.
 pub const MAX_LINES: usize = 2000;
+
+/// Maximum bytes to retain before truncation.
 pub const MAX_BYTES: usize = 50 * 1024;
 pub const TRUNCATION_DIR: &str = ".gewu/truncation";
 
+/// Service for truncating long tool outputs.
+///
+/// The `TruncationService` limits the size of tool outputs by truncating
+/// them to a maximum number of lines or bytes. When output is truncated,
+/// the full content is saved to a file and a placeholder message is
+/// returned instead.
 #[derive(Clone)]
 pub struct TruncationService {
     max_lines: usize,
@@ -56,6 +70,9 @@ impl Default for TruncationService {
 }
 
 impl TruncationService {
+    /// Creates a new `TruncationService` with default limits.
+    ///
+    /// Default limits are 2000 lines or 50KB, whichever is reached first.
     pub fn new() -> Self {
         let truncation_dir = dirs::home_dir()
             .map(|h| h.join(".gewu").join("truncation"))
@@ -67,18 +84,39 @@ impl TruncationService {
         }
     }
 
+    /// Sets a custom directory for storing truncated files.
     pub fn with_dir(mut self, dir: PathBuf) -> Self {
         self.truncation_dir = dir;
         self
     }
 
+    /// Sets custom limits for truncation.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_lines` - Maximum lines to retain
+    /// * `max_bytes` - Maximum bytes to retain
     pub fn with_limits(mut self, max_lines: usize, max_bytes: usize) -> Self {
         self.max_lines = max_lines;
         self.max_bytes = max_bytes;
         self
     }
 
-    pub fn truncate(&self, text: &str, _has_task_tool: bool) -> TruncationResult {
+    /// Truncates text if it exceeds the configured limits.
+    ///
+    /// If the text exceeds either the line or byte limit, it is truncated
+    /// and the full content is saved to a file. The returned `TruncationResult`
+    /// contains either the original text (if within limits) or a truncated
+    /// version with a reference to the saved file.
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - The text to potentially truncate
+    ///
+    /// # Returns
+    ///
+    /// A [`TruncationResult`] containing either the original or truncated content
+    pub fn truncate(&self, text: &str) -> TruncationResult {
         let lines: Vec<&str> = text.lines().collect();
         let total_bytes = text.len();
         let total_lines = lines.len();
@@ -165,7 +203,7 @@ mod tests {
     fn test_no_truncation_small_output() {
         let service = TruncationService::new();
         let text = "Hello, world!";
-        let result = service.truncate(text, false);
+        let result = service.truncate(text);
         assert!(!result.truncated);
         assert_eq!(result.content, text);
         assert!(result.output_path.is_none());
@@ -175,7 +213,7 @@ mod tests {
     fn test_truncation_by_lines() {
         let service = TruncationService::new();
         let text: String = (0..3000).map(|i| format!("line {i}\n")).collect();
-        let result = service.truncate(&text, false);
+        let result = service.truncate(&text);
         assert!(result.truncated);
         assert!(result.output_path.is_some());
         assert!(result.content.contains("truncated"));
@@ -186,7 +224,7 @@ mod tests {
         let service = TruncationService::new();
         let line = "x".repeat(100);
         let text: String = (0..600).map(|_| format!("{line}\n")).collect();
-        let result = service.truncate(&text, false);
+        let result = service.truncate(&text);
         assert!(result.truncated);
         assert!(result.output_path.is_some());
     }
@@ -198,7 +236,7 @@ mod tests {
             .map(|i| serde_json::json!({"id": i, "name": format!("item_{}", i)}))
             .collect();
         let text = serde_json::to_string(&arr).unwrap();
-        let result = service.truncate(&text, false);
+        let result = service.truncate(&text);
         assert!(result.truncated);
         // The truncated content should be valid JSON
         let preview = result.content.split("\n\nThe tool call").next().unwrap();
@@ -215,7 +253,7 @@ mod tests {
             "rows": (0..200).map(|i| serde_json::json!({"term": format!("GO:{:07}", i), "fe": 2.5})).collect::<Vec<_>>()
         });
         let text = serde_json::to_string(&obj).unwrap();
-        let result = service.truncate(&text, false);
+        let result = service.truncate(&text);
         assert!(result.truncated);
         let preview = result.content.split("\n\nThe tool call").next().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(preview).unwrap();

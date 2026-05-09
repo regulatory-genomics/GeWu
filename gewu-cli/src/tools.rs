@@ -137,6 +137,13 @@ impl Tool for TaskTool {
             .await
             .map_err(|e| format!("Failed to create agent: {}", e))?;
 
+        let mut agent = match agent_result {
+            crate::registry::AgentResult::Standard(agent) => agent,
+            crate::registry::AgentResult::Evolve { .. } => {
+                return Err("Sub-agent type 'evolve' is not supported for sub-tasks. Use 'build', 'explore', or 'general'.".into());
+            }
+        };
+
         let mut stream = Box::pin(agent.ask(&input.prompt));
         let mut result = String::new();
         use futures::StreamExt;

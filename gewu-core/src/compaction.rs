@@ -21,9 +21,9 @@
 //!   content from old messages. Keeps the structure but replaces long outputs
 //!   with "[Output pruned]". Triggered on every agent turn.
 //!
-//! - **Compaction** ([`Agent::compact_if_needed`](super::agent::Agent::compact_if_needed)):
-//!   Full summarization that uses the LLM to create a summary of the entire
+//! - **Compaction**: Full summarization that uses the LLM to create a summary of the entire
 //!   conversation history. Only triggered when history exceeds context limit.
+//!   See the `Agent::compact_if_needed` method for details.
 
 use crate::types::{ContentPart, Message};
 
@@ -47,8 +47,7 @@ pub fn estimate_tokens(text: &str) -> usize {
 /// Determines if the current token count exceeds the context limit.
 ///
 /// Returns `true` if compaction should be considered. A buffer of
-/// [`COMPACTION_BUFFER`] tokens is reserved to ensure some working space
-/// remains after compaction.
+/// tokens is reserved to ensure some working space remains after compaction.
 ///
 /// # Arguments
 ///
@@ -124,7 +123,7 @@ pub fn estimate_message_tokens(msg: &Message) -> usize {
 ///
 /// This function walks backwards through the message history, skipping the
 /// most recent 2 turns (to keep recent context), and marks old tool outputs
-/// for pruning once the total tool output size exceeds [`PRUNE_PROTECT_THRESHOLD`].
+/// for pruning once the total tool output size exceeds a threshold.
 ///
 /// A message starting with "Summary:" is treated as a compaction summary
 /// and stops the pruning process (preserving the summarized history intact).

@@ -1,3 +1,24 @@
+//! OpenAI API types, HTTP client, and SSE parsing.
+//!
+//! This module provides types for interacting with OpenAI's Chat Completions API,
+//! including request/response structures, streaming support via Server-Sent Events,
+//! and an HTTP client implementation.
+//!
+//! # Request Flow
+//!
+//! 1. Create a [`OpenAIClient`] with [`OpenAIConfig`]
+//! 2. Use [`OpenAIClient::chat()`] to get a [`ChatCompletions`] handle
+//! 3. Call [`ChatCompletions::create_stream()`] to get a streaming response
+//!
+//! # Example
+//!
+//! ```ignore
+//! use gewu_providers::openai::{OpenAIClient, OpenAIConfig};
+//!
+//! let client = OpenAIClient::with_config(OpenAIConfig::new("api-key", "https://api.openai.com/v1"));
+//! // Use client.chat().create_stream(request) to make requests
+//! ```
+
 use bytes::Bytes;
 use futures::Stream;
 use reqwest::Client as HttpClient;
@@ -7,22 +28,26 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use thiserror::Error;
 
+/// Errors that can occur when interacting with the OpenAI API.
 #[derive(Error, Debug)]
 pub enum OpenAIError {
+    /// HTTP request failed (network error, timeout, etc.)
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
+    /// Error parsing Server-Sent Events response.
     #[error("SSE parse error: {0}")]
     SseParse(String),
+    /// API returned an error response.
     #[error("API error: {0}")]
     Api(String),
-    #[error("JSON parse error: {0}")]
-    Json(#[from] serde_json::Error),
+    /// Error building request (missing required fields, etc.).
     #[error("Build error: {0}")]
     Build(String),
     #[error("SSE stream done")]
     Done,
 }
 
+/// Configuration for the OpenAI API client.
 #[derive(Debug, Clone)]
 pub struct OpenAIConfig {
     api_key: String,
@@ -30,6 +55,12 @@ pub struct OpenAIConfig {
 }
 
 impl OpenAIConfig {
+    /// Creates a new configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `api_key` - Your OpenAI API key.
+    /// * `base_url` - The base URL of the API (e.g., <https://api.openai.com/v1>).
     pub fn new(api_key: &str, base_url: &str) -> Self {
         Self {
             api_key: api_key.to_string(),
@@ -38,13 +69,14 @@ impl OpenAIConfig {
     }
 }
 
+/// HTTP client for OpenAI API requests.
 #[derive(Debug)]
-pub struct Client {
+pub struct OpenAIClient {
     config: OpenAIConfig,
     http_client: HttpClient,
 }
 
-impl Client {
+impl OpenAIClient {
     pub fn with_config(config: OpenAIConfig) -> Self {
         Self {
             config,
@@ -62,7 +94,7 @@ impl Client {
 }
 
 pub struct ChatCompletions<'a> {
-    client: &'a Client,
+    client: &'a OpenAIClient,
 }
 
 impl<'a> ChatCompletions<'a> {
@@ -246,7 +278,7 @@ where
 }
 
 pub struct Models<'a> {
-    client: &'a Client,
+    client: &'a OpenAIClient,
 }
 
 impl<'a> Models<'a> {

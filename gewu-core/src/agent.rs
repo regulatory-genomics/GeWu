@@ -198,7 +198,7 @@ async fn run_tool_call(
         };
         match execute_tool_with_panic_recovery(t.clone(), args_val, ctx).await {
             Ok(res) => {
-                let truncation_result = truncation.truncate(&res.output, false);
+                let truncation_result = truncation.truncate(&res.output);
                 if truncation_result.truncated {
                     format!(
                         "{}\n\n[Output truncated - {} bytes saved to {}]",

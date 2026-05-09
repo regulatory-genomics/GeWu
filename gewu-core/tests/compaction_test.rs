@@ -1,95 +1,133 @@
-use async_trait::async_trait;
-use futures::StreamExt;
-use futures::stream::BoxStream;
-use gewu_core::agent::AgentBuilder;
-use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{AgentEvent, Message, ProviderEvent};
-use std::error::Error;
-use std::sync::{Arc, Mutex};
+use gewu_core::compaction::{estimate_tokens, estimate_message_tokens, is_overflow, prune};
+use gewu_core::types::{ContentPart, Message};
 
-struct MockLlm {
-    responses: Arc<Mutex<Vec<Message>>>,
+#[test]
+fn test_estimate_tokens_exact() {
+    assert_eq!(estimate_tokens("hello"), 5 / 4);
+    assert_eq!(estimate_tokens("hello world"), 11 / 4);
 }
 
-#[derive(Debug)]
-#[allow(dead_code)]
-struct MockError(String);
-impl std::fmt::Display for MockError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-impl Error for MockError {}
-
-#[async_trait]
-impl LlmProvider for MockLlm {
-    async fn stream_response<'a>(
-        &'a self,
-        messages: &[Message],
-        _tools: &[Arc<dyn Tool>],
-    ) -> Result<
-        BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
-        Box<dyn Error + Send + Sync>,
-    > {
-        let last_msg = messages.last().unwrap();
-        if let Message::User { content } = last_msg {
-            let text = content
-                .iter()
-                .find_map(|p| match p {
-                    gewu_core::types::ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .unwrap_or("");
-            if text.contains("Provide a detailed prompt for continuing") {
-                let s = async_stream::try_stream! {
-                    yield ProviderEvent::ContentDelta { delta: "## Goal\nTest compaction\n## Accomplished\nNothing yet".to_string() };
-                };
-                return Ok(Box::pin(s));
-            }
-        }
-
-        let mut responses = self.responses.lock().unwrap();
-        let response = if responses.is_empty() {
-            // Fallback default response
-            Message::Assistant {
-                content: Some("Default response".to_string()),
-                tool_calls: None,
-            }
-        } else {
-            responses.remove(0)
-        };
-
-        // Convert Message to Stream events
-        let s = async_stream::try_stream! {
-            if let Message::Assistant { content, tool_calls } = response {
-                if let Some(c) = content {
-                    yield ProviderEvent::ContentDelta { delta: c };
-                }
-                if let Some(calls) = tool_calls {
-                     for call in calls {
-                         yield ProviderEvent::ToolCallStart { id: call.id.clone(), name: call.function.name };
-                         yield ProviderEvent::ToolCallDelta { id: call.id, delta: call.function.arguments };
-                     }
-                }
-            }
-        };
-        Ok(Box::pin(s))
-    }
-
-    async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
-        Ok(vec!["mock".to_string()])
-    }
+#[test]
+fn test_estimate_tokens_empty() {
+    assert_eq!(estimate_tokens(""), 0);
 }
 
-#[tokio::test]
-async fn test_compaction_trigger() {
-    let responses = vec![
-        // Response to "Hello" (after compaction)
-        Message::Assistant {
-            content: Some("I am ready.".to_string()),
-            tool_calls: None,
+#[test]
+fn test_estimate_tokens_long_text() {
+    let text = "A".repeat(100);
+    assert_eq!(estimate_tokens(&text), 25);
+}
+
+#[test]
+fn test_is_overflow_under_limit() {
+    assert!(!is_overflow(50_000, 128_000));
+    assert!(!is_overflow(100_000, 128_000));
+}
+
+#[test]
+fn test_is_overflow_at_limit() {
+    assert!(is_overflow(108_000, 128_000));
+}
+
+#[test]
+fn test_is_overflow_above_limit() {
+    assert!(is_overflow(150_000, 128_000));
+}
+
+#[test]
+fn test_is_overflow_zero_limit() {
+    assert!(!is_overflow(100_000, 0));
+}
+
+#[test]
+fn test_estimate_message_tokens_system() {
+    let msg = Message::System { content: "Hello".to_string() };
+    assert_eq!(estimate_message_tokens(&msg), 5 / 4);
+}
+
+#[test]
+fn test_estimate_message_tokens_user_text() {
+    let msg = Message::User {
+        content: vec![ContentPart::Text { text: "Hello world".to_string() }],
+    };
+    assert_eq!(estimate_message_tokens(&msg), 11 / 4);
+}
+
+#[test]
+fn test_estimate_message_tokens_user_with_media() {
+    let msg = Message::User {
+        content: vec![
+            ContentPart::Text { text: "Hello".to_string() },
+            ContentPart::Image { data: "imagedata".to_string(), mime_type: "image/png".to_string() },
+        ],
+    };
+    let expected = estimate_tokens("Hello") + estimate_tokens("imagedata");
+    assert_eq!(estimate_message_tokens(&msg), expected);
+}
+
+#[test]
+fn test_estimate_message_tokens_assistant() {
+    let msg = Message::Assistant {
+        content: Some("Hello".to_string()),
+        tool_calls: None,
+    };
+    assert_eq!(estimate_message_tokens(&msg), 5 / 4);
+}
+
+#[test]
+fn test_estimate_message_tokens_assistant_with_tool_calls() {
+    let msg = Message::Assistant {
+        content: Some("Calling tool".to_string()),
+        tool_calls: Some(vec![
+            gewu_core::types::ToolCall {
+                id: "call_1".to_string(),
+                r#type: "function".to_string(),
+                function: gewu_core::types::FunctionCall {
+                    name: "get_weather".to_string(),
+                    arguments: "{\"city\":\"NYC\"}".to_string(),
+                },
+            }
+        ]),
+    };
+    let text_tokens = estimate_tokens("Calling tool");
+    let name_tokens = estimate_tokens("get_weather");
+    let args_tokens = estimate_tokens("{\"city\":\"NYC\"}");
+    assert_eq!(estimate_message_tokens(&msg), text_tokens + name_tokens + args_tokens);
+}
+
+#[test]
+fn test_estimate_message_tokens_tool() {
+    let msg = Message::Tool {
+        tool_call_id: "call_1".to_string(),
+        tool_name: Some("read_file".to_string()),
+        content: "File contents here".to_string(),
+        media: vec![],
+    };
+    assert_eq!(estimate_message_tokens(&msg), estimate_tokens("File contents here"));
+}
+
+#[test]
+fn test_prune_does_nothing_when_empty() {
+    let mut messages: Vec<Message> = vec![];
+    assert_eq!(prune(&mut messages), 0);
+}
+
+#[test]
+fn test_prune_does_nothing_when_under_threshold() {
+    let mut messages = vec![
+        Message::System { content: "You are helpful".to_string() },
+        Message::User { content: vec![ContentPart::Text { text: "Hello".to_string() }] },
+        Message::Assistant { content: Some("Hi".to_string()), tool_calls: None },
+        Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            tool_name: Some("tool".to_string()),
+            content: "Short output".to_string(),
+            media: vec![],
         },
     ];
+    let saved = prune(&mut messages);
+    assert_eq!(saved, 0);
+}
 
     let llm = Arc::new(MockLlm {
         responses: Arc::new(Mutex::new(responses)),
@@ -131,20 +169,64 @@ async fn test_compaction_trigger() {
 
     assert_eq!(response, "I am ready.");
 
-    // Verify history structure
-    // 1. System
-    // 2. Summary (Assistant)
-    // 3. User ("Hello")
-    // 4. Assistant ("I am ready.")
+#[test]
+fn test_prune_protects_recent_turns() {
+    let mut messages = vec![
+        Message::System { content: "You are helpful".to_string() },
+        Message::User { content: vec![ContentPart::Text { text: "First".to_string() }] },
+        Message::Assistant { content: Some("Response 1".to_string()), tool_calls: None },
+        Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            tool_name: Some("tool1".to_string()),
+            content: "Old output 1".to_string(),
+            media: vec![],
+        },
+        Message::User { content: vec![ContentPart::Text { text: "Second".to_string() }] },
+        Message::Assistant { content: Some("Response 2".to_string()), tool_calls: None },
+        Message::Tool {
+            tool_call_id: "call_2".to_string(),
+            tool_name: Some("tool2".to_string()),
+            content: "Recent output".to_string(),
+            media: vec![],
+        },
+    ];
 
-    assert_eq!(agent.memory.messages().len(), 4);
+    prune(&mut messages);
 
-    match &agent.memory.messages()[1] {
-        Message::Assistant { content, .. } => {
-            let text = content.as_ref().unwrap();
-            assert!(text.contains("Summary of previous conversation"));
-            assert!(text.contains("## Goal"));
-        }
-        _ => panic!("Expected summary message at index 1"),
+    if let Message::Tool { content, .. } = &messages[3] {
+        assert_eq!(content, "Old output 1");
+    } else {
+        panic!("Expected Tool message at index 3");
+    }
+    if let Message::Tool { content, .. } = &messages[6] {
+        assert_eq!(content, "Recent output");
+    } else {
+        panic!("Expected Tool message at index 6");
+    }
+}
+
+#[test]
+fn test_prune_stops_at_summary() {
+    let mut messages = vec![
+        Message::System { content: "You are helpful".to_string() },
+        Message::Assistant {
+            content: Some("Summary: Previous conversation...".to_string()),
+            tool_calls: None,
+        },
+        Message::User { content: vec![ContentPart::Text { text: "Recent".to_string() }] },
+        Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            tool_name: Some("tool".to_string()),
+            content: "Should not be pruned".to_string(),
+            media: vec![],
+        },
+    ];
+
+    prune(&mut messages);
+
+    if let Message::Tool { content, .. } = &messages[3] {
+        assert_eq!(content, "Should not be pruned");
+    } else {
+        panic!("Expected Tool message at index 3");
     }
 }

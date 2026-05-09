@@ -9,6 +9,8 @@ members = ["gewu-cli",
     "gewu-gateway",
     "gewu-graph",
     "gewu-canvas",
+    "gewu-experience",
+    "gewu-evolve",
 ]
 exclude = ["opencode", "gewu-rag"]
 resolver = "2"

@@ -18,6 +18,7 @@ uuid = { version = "1.0", features = ["v4"] }
 futures = "0.3.32"
 async-stream = "0.3.6"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-native-tls"] }
+chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 gewu-providers = { path = "../gewu-providers" }

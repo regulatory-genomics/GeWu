@@ -1,3 +1,19 @@
+//! Anthropic API types, HTTP client, and SSE parsing.
+//!
+//! This module provides types for interacting with Anthropic's Messages API,
+//! including request/response structures, streaming support via Server-Sent Events,
+//! and an HTTP client implementation.
+//!
+//! # Request Flow
+//!
+//! 1. Create a [`Client`] with [`AnthropicConfig`]
+//! 2. Use [`Client::messages()`] to get a [`Messages`] handle
+//! 3. Call [`Messages::create_stream()`] to get a streaming response
+//!
+//! # Extended Thinking
+//!
+//! Some models support extended thinking via beta headers.
+
 use bytes::Bytes;
 use futures::Stream;
 use reqwest::Client as HttpClient;
@@ -7,28 +23,32 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use thiserror::Error;
 
+/// Errors that can occur when interacting with the Anthropic API.
 #[derive(Error, Debug)]
 pub enum AnthropicError {
+    /// HTTP request failed (network error, timeout, etc.)
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("SSE parse error: {0}")]
-    SseParse(String),
+    /// API returned an error response.
     #[error("API error: {0}")]
     Api(String),
-    #[error("JSON parse error: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("Build error: {0}")]
-    Build(String),
 }
 
+/// Configuration for the Anthropic API client.
 #[derive(Debug, Clone)]
 pub struct AnthropicConfig {
-    api_key: String,
-    base_url: String,
+    pub api_key: String,
+    pub base_url: String,
     pub beta: Option<String>,
 }
 
 impl AnthropicConfig {
+    /// Creates a new configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `api_key` - Your Anthropic API key.
+    /// * `base_url` - The base URL of the API (e.g., <https://api.anthropic.com>).
     pub fn new(api_key: &str, base_url: &str) -> Self {
         Self {
             api_key: api_key.to_string(),
@@ -36,15 +56,12 @@ impl AnthropicConfig {
             beta: None,
         }
     }
-
-    pub fn with_beta(mut self, beta: &str) -> Self {
-        self.beta = Some(beta.to_string());
-        self
-    }
 }
 
+/// HTTP client for Anthropic API requests.
 #[derive(Debug)]
 pub struct Client {
+    /// The configuration used by this client.
     pub config: AnthropicConfig,
     http_client: HttpClient,
 }
@@ -120,12 +137,6 @@ pub struct SourceBlock {
 
 fn default_source_type() -> String {
     "base64".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolUse {
-    pub name: String,
-    pub input: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,14 +389,14 @@ pub enum AnthropicChunk {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessageStartChunk {
-    pub message: Message,
+    pub _message: Message,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Message {
-    pub id: String,
-    pub role: String,
-    pub content: Vec<Value>,
+    pub _id: String,
+    pub _role: String,
+    pub _content: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -397,15 +408,20 @@ pub struct ContentBlockStartChunk {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlockStart {
-    Text { text: String },
+    Text { _text: String },
     ToolUse { id: String, name: String },
-    Thinking { thinking: String, signature: String },
+    Thinking { thinking: String, _signature: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContentBlockDeltaChunk {
     pub index: u32,
     pub delta: ContentDelta,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentBlockStopChunk {
+    pub _index: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -424,14 +440,9 @@ pub enum ContentDelta {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ContentBlockStopChunk {
-    pub index: u32,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct MessageDeltaChunk {
     pub delta: MessageDelta,
-    pub usage: MessageUsage,
+    pub _usage: MessageUsage,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -441,7 +452,7 @@ pub struct MessageDelta {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessageUsage {
-    pub output_tokens: u32,
+    pub _output_tokens: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -452,7 +463,7 @@ pub struct ErrorChunk {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ErrorDetail {
     #[serde(rename = "type")]
-    pub error_type: String,
+    pub _error_type: String,
     pub message: String,
 }
 

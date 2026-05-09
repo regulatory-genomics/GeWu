@@ -1,4 +1,4 @@
-use crate::anthropic_types::{AnthropicChunk, AnthropicConfig, AnthropicMessage, AnthropicStream, AnthropicTool, AssistantMessage as AnthropicAssistantMessage, Client as AnthropicClient, ContentBlock, ContentBlockDeltaChunk, ContentBlockStart, ContentBlockStartChunk, ContentDelta, CreateMessageRequest, MessageStartChunk, ToolCall, UserMessage};
+use crate::anthropic::{AnthropicChunk, AnthropicConfig, AnthropicMessage, AnthropicStream, AnthropicTool, AssistantMessage as AnthropicAssistantMessage, Client as AnthropicClient, ContentBlock, ContentBlockDeltaChunk, ContentBlockStart, ContentBlockStartChunk, ContentDelta, CreateMessageRequest, MessageStartChunk, ToolCall, UserMessage};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::stream::BoxStream;

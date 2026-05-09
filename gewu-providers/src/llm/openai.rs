@@ -1,12 +1,12 @@
 use crate::llm::{RequestBuilder, ResponseParser};
-use crate::openai_types::{
+use crate::openai::{
     AssistantMessage as OpenAIAssistantMessage, ChatCompletionMessageToolCall,
     ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCalls,
     ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartFile,
     ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
     ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionStream, ChatCompletionTool, ChatCompletionTools, Client as OpenAIClient,
+    ChatCompletionStream, ChatCompletionTool, ChatCompletionTools, OpenAIClient,
     CreateChatCompletionRequest, FileData, FunctionCall as OpenAIFunctionCall, FunctionObjectArgs,
     ImageUrl, OpenAIConfig,
 };

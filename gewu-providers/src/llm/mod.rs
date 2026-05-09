@@ -16,12 +16,12 @@ pub trait RequestBuilder: Send + Sync {
         &self,
         messages: &[Message],
         tools: &[Arc<dyn Tool>],
-    ) -> Result<crate::openai_types::CreateChatCompletionRequest, Box<dyn Error + Send + Sync>>;
+    ) -> Result<crate::openai::CreateChatCompletionRequest, Box<dyn Error + Send + Sync>>;
 }
 
 pub trait ResponseParser: Send + Sync {
     fn parse_stream(
         &self,
-        stream: crate::openai_types::ChatCompletionStream,
+        stream: crate::openai::ChatCompletionStream,
     ) -> BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>;
 }

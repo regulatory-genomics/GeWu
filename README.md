@@ -19,6 +19,8 @@ GeWu (格物) is a comprehensive framework for building and deploying AI agents.
 | **`gewu-graph`** | Stateful graph execution library for building complex workflow orchestration with conditional routing, parallel execution, and nested subgraphs. |
 | **`gewu-canvas`** | Canvas state and tooling for browser-based graph and genomics visualization. |
 | **`gewu-rag`** | RAG (Retrieval Augmented Generation) system with document processing (PDF, text), embedding generation, and vector storage integration (Qdrant). |
+| **`gewu-experience`** | Experience memory system with Qdrant vector embeddings for semantic recall of past problem-solving experiences. Includes experience store and recall tools. |
+| **`gewu-evolve`** | Self-evolution capabilities including self-critique, Python sandbox execution, skill library for tool persistence, and LLM-based tool generation. |
 
 ## Architecture
 
@@ -48,14 +50,14 @@ GeWu (格物) is a comprehensive framework for building and deploying AI agents.
 │ - batch    │
 └────────────┘
 
-┌────────────┐  ┌────────────┐
-│ gewu-graph │  │  gewu-rag  │
-│            │  │            │
-│ StateGraph │  │  Document  │
-│ Workflows  │  │  Processing│
-│            │  │  Embedding │
-│            │  │  Retrieval │
-└────────────┘  └────────────┘
+┌────────────┐  ┌────────────┐  ┌─────────────────┐  ┌────────────────┐
+│ gewu-graph │  │  gewu-rag  │  │gewu-experience  │  │  gewu-evolve  │
+│            │  │            │  │                 │  │               │
+│ StateGraph │  │  Document  │  │  Experience    │  │ Self-critique │
+│ Workflows  │  │  Processing│  │  Store with    │  │ Python sandbox│
+│            │  │  Embedding │  │  Qdrant        │  │ Skill library │
+│            │  │  Retrieval │  │  embeddings    │  │ Tool builder  │
+└────────────┘  └────────────┘  └─────────────────┘  └────────────────┘
 ```
 
 ## Agent Types
@@ -67,6 +69,7 @@ The CLI provides pre-configured agent types optimized for different use cases:
 | **build** | Default agent for software engineering tasks | Off | All tools including bash, file edit, task management |
 | **explore** | Fast agent for exploring codebases | On | Read-only tools, restricted bash |
 | **general** | General-purpose agent for research and multi-step tasks | Off | All tools including task management |
+| **evolve** | Self-evolving agent with experience memory and skill creation | Off | Build tools + python_execute, skill_create, skill_list, skill_load + experience tools |
 
 ## Built-in Tools
 
@@ -85,6 +88,12 @@ The CLI provides pre-configured agent types optimized for different use cases:
 | Todo Read | `todo_read` | Read the task list |
 | Todo Write | `todo_write` | Write/update the task list |
 | Batch | `batch` | Execute multiple tools in parallel |
+| Python Execute | `python_execute` | Execute Python code in a sandboxed environment |
+| Skill Create | `skill_create` | Create a new skill from natural language description |
+| Skill List | `skill_list` | List all available skills in the skill library |
+| Skill Load | `skill_load` | Load a skill from the skill library by name |
+| Experience Store | `experience_store` | Store a successful task resolution for future recall |
+| Experience Recall | `experience_recall` | Query past experiences semantically |
 
 ## Getting Started
 
