@@ -62,8 +62,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 fn strip_tag_blocks(input: &str, tag: &str) -> String {
-    let start_tag = format!("<{}>", tag);
-    let end_tag = format!("</{}>", tag);
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
     let mut output = input.to_string();
 
     loop {
@@ -153,10 +153,9 @@ async fn execute_tool_with_panic_recovery(
         Ok(Err(e)) => {
             let panic_msg = extract_panic_message(e);
             Err(Box::new(std::io::Error::other(format!(
-                "Tool '{}' panicked during execution: {}. This may indicate an issue with \
+                "Tool '{tool_name}' panicked during execution: {panic_msg}. This may indicate an issue with \
                     the tool implementation or invalid input. Consider adjusting the tool arguments \
-                    or checking the tool's requirements.",
-                tool_name, panic_msg
+                    or checking the tool's requirements."
             ))) as Box<dyn Error + Send + Sync>)
         }
         Err(join_err) => {
@@ -165,21 +164,18 @@ async fn execute_tool_with_panic_recovery(
                     Ok(panic_payload) => {
                         let panic_msg = extract_panic_message(panic_payload);
                         Err(Box::new(std::io::Error::other(format!(
-                            "Tool '{}' panicked during execution: {}. This may indicate an issue with \
+                            "Tool '{tool_name}' panicked during execution: {panic_msg}. This may indicate an issue with \
                                 the tool implementation or invalid input. Consider adjusting the tool \
-                                arguments or checking the tool's requirements.",
-                            tool_name, panic_msg
+                                arguments or checking the tool's requirements."
                         ))) as Box<dyn Error + Send + Sync>)
                     }
-                    Err(_) => Err(Box::new(std::io::Error::other(format!(
-                        "Tool '{}' panicked but could not retrieve panic payload",
-                        tool_name
-                    ))) as Box<dyn Error + Send + Sync>),
+                Err(_) => Err(Box::new(std::io::Error::other(format!(
+                    "Tool '{tool_name}' panicked but could not retrieve panic payload"
+                ))) as Box<dyn Error + Send + Sync>),
                 }
             } else {
                 Err(Box::new(std::io::Error::other(format!(
-                    "Tool '{}' task was aborted unexpectedly",
-                    tool_name
+                    "Tool '{tool_name}' task was aborted unexpectedly"
                 ))) as Box<dyn Error + Send + Sync>)
             }
         }
@@ -198,7 +194,7 @@ async fn run_tool_call(
         info!("Executing tool: {}", tool_name);
         let args_val: serde_json::Value = match serde_json::from_str(&args) {
             Ok(v) => v,
-            Err(e) => return format!("Error: Failed to parse arguments: {}", e),
+            Err(e) => return format!("Error: Failed to parse arguments: {e}"),
         };
         match execute_tool_with_panic_recovery(t.clone(), args_val, ctx).await {
             Ok(res) => {
@@ -219,11 +215,11 @@ async fn run_tool_call(
             }
             Err(e) => {
                 warn!("Tool '{}' failed: {}", tool_name, e);
-                format!("Error: {}", e)
+                format!("Error: {e}")
             }
         }
     } else {
-        format!("Tool not found: {}", tool_name)
+        format!("Tool not found: {tool_name}")
     }
 }
 
@@ -365,7 +361,7 @@ impl ToolExecutionHarness {
                 Err(err) => CompletedToolCall {
                     tool_call_id: "unknown".to_string(),
                     tool_name: "task".to_string(),
-                    output: format!("Error: Tool task join failed: {}", err),
+                    output: format!("Error: Tool task join failed: {err}"),
                 },
             });
         }
@@ -397,14 +393,14 @@ impl Agent {
         self.memory
             .clear()
             .await
-            .map_err(|e| anyhow::anyhow!("Memory::clear failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Memory::clear failed: {e}"))?;
         if !self.system_prompt.is_empty() {
             self.memory
                 .add_message(Message::System {
                     content: self.system_prompt.clone(),
                 })
                 .await
-                .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {e}"))?;
         }
         Ok(())
     }
@@ -416,11 +412,11 @@ impl Agent {
         async_stream::try_stream! {
             if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
                  self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await
-                    .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {e}"))?;
             }
 
             self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await
-                .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {e}"))?;
 
             let mut turn = 0;
             let mut recent_tool_calls: VecDeque<(String, String)> = VecDeque::new();
@@ -503,7 +499,7 @@ impl Agent {
                     tool_calls: if current_tool_calls.is_empty() { None } else { Some(current_tool_calls.clone()) },
                 };
                 self.memory.add_message(assistant_msg).await
-                    .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {e}"))?;
 
                 if current_tool_calls.is_empty() {
                     yield AgentEvent::Finish { response: normalized_content };
@@ -532,7 +528,7 @@ impl Agent {
                     }
 
                     if recent_tool_calls.len() == 3 && recent_tool_calls.iter().all(|x| x == &current_call_sig) {
-                         let error_msg = format!("Doom loop detected: Tool '{}' called 3 times repeatedly with identical arguments. Stopping.", tool_name);
+                         let error_msg = format!("Doom loop detected: Tool '{tool_name}' called 3 times repeatedly with identical arguments. Stopping.");
                          yield AgentEvent::Error { error: error_msg };
                          return;
                     }
@@ -593,7 +589,7 @@ impl Agent {
                                 content: completed.output,
                                 media: media_parts,
                             }).await
-                                .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
+                                .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {e}"))?;
                         }
 
                         call_index = block_end;
@@ -630,7 +626,7 @@ impl Agent {
                         content: completed.output,
                         media: media_parts,
                     }).await
-                        .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {}", e))?;
+                        .map_err(|e| anyhow::anyhow!("Memory::add_message failed: {e}"))?;
 
                     if turn_tool_tokens > turn_tool_budget && pending_consolidation_ids.len() >= 3 {
                         info!(
@@ -666,7 +662,7 @@ impl Agent {
                                         &file_path,
                                     );
                                     self.memory.replace(all_messages).await
-                                        .map_err(|e| anyhow::anyhow!("Memory::replace failed: {}", e))?;
+                                        .map_err(|e| anyhow::anyhow!("Memory::replace failed: {e}"))?;
                                     info!("Consolidated {} tool outputs into summary ({} chars)", pending_consolidation_ids.len(), summary_text.len());
                                 }
                             }
@@ -737,12 +733,12 @@ When constructing the summary, try to stick to this template:
         let mut stream = provider
             .stream_response(&request_messages, &[])
             .await
-            .map_err(|e| anyhow::anyhow!("Compaction failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Compaction failed: {e}"))?;
 
         let mut summary_text = String::new();
         while let Some(event_result) = stream.next().await {
             let event =
-                event_result.map_err(|e| anyhow::anyhow!("Compaction stream error: {}", e))?;
+                event_result.map_err(|e| anyhow::anyhow!("Compaction stream error: {e}"))?;
             if let ProviderEvent::ContentDelta { delta } = event {
                 summary_text.push_str(&delta);
             }
@@ -778,8 +774,7 @@ When constructing the summary, try to stick to this template:
 
         new_history.push(Message::Assistant {
             content: Some(format!(
-                "Summary of previous conversation:\n{}",
-                summary_text
+                "Summary of previous conversation:\n{summary_text}"
             )),
             tool_calls: None,
         });
@@ -797,7 +792,7 @@ When constructing the summary, try to stick to this template:
         self.memory
             .replace(new_history)
             .await
-            .map_err(|e| anyhow::anyhow!("Memory::replace failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Memory::replace failed: {e}"))?;
         Ok(true)
     }
 }
@@ -832,7 +827,7 @@ impl ToolRegistry for Agent {
         let tool = self.tools.iter().find(|t| t.name() == name);
         match tool {
             Some(t) => t.execute(args, ctx).await,
-            None => Err(format!("Tool not found: {}", name).into()),
+            None => Err(format!("Tool not found: {name}").into()),
         }
     }
 

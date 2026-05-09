@@ -238,18 +238,16 @@ pub fn build_consolidation_prompt(raw_text: &str, n_results: usize) -> Vec<Messa
     vec![
         Message::System {
             content: format!(
-                "You are a data consolidation assistant. You received {} tool call results that need to be summarized into a single concise report. \
-                Preserve ALL key data points: numbers, rankings, names, scores, p-values, fold enrichments, tissue/stage names. \
-                Structure the summary clearly. Do NOT omit any tool's findings — every result must be represented. \
-                Be thorough but eliminate redundant raw data.",
-                n_results
+                "You are a data consolidation assistant. You received {n_results} tool call results that need to be summarized into a single concise report. \
+                 Preserve ALL key data points: numbers, rankings, names, scores, p-values, fold enrichments, tissue/stage names. \
+                 Structure the summary clearly. Do NOT omit any tool's findings — every result must be represented. \
+                 Be thorough but eliminate redundant raw data."
             ),
         },
         Message::User {
             content: vec![ContentPart::Text {
                 text: format!(
-                    "Summarize these {} tool results:\n\n{}",
-                    n_results, raw_text
+                    "Summarize these {n_results} tool results:\n\n{raw_text}"
                 ),
             }],
         },

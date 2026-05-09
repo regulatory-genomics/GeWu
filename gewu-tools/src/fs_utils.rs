@@ -19,11 +19,10 @@ pub fn into_tool_error(e: impl Into<anyhow::Error>) -> Box<dyn std::error::Error
 pub fn parse_empty_args(tool_name: &str, required_params: &[(&str, &str)]) -> String {
     let params: Vec<String> = required_params
         .iter()
-        .map(|(name, type_)| format!("  - {}: {}", name, type_))
+        .map(|(name, type_)| format!("  - {name}: {type_}"))
         .collect();
     format!(
-        "Arguments are required for {}.\n\nRequired parameters:\n{}",
-        tool_name,
+        "Arguments are required for {tool_name}.\n\nRequired parameters:\n{}",
         params.join("\n")
     )
 }
@@ -128,11 +127,10 @@ fn format_read_denial(path: &Path, roots: &[PathBuf]) -> String {
         .collect();
 
     format!(
-        "Read access denied: {:?} is outside of allowed read roots.\n\nAllowed read roots:\n{}\n\nTo add more paths, set the GEWU_READ_ROOTS environment variable (colon-separated on Unix, semicolon-separated on Windows).",
-        path,
+        "Read access denied: {path:?} is outside of allowed read roots.\n\nAllowed read roots:\n{}\n\nTo add more paths, set the GEWU_READ_ROOTS environment variable (colon-separated on Unix, semicolon-separated on Windows).",
         roots_list
             .iter()
-            .map(|r| format!("  - {}", r))
+            .map(|r| format!("  - {r:?}"))
             .collect::<Vec<_>>()
             .join("\n")
     )
@@ -185,9 +183,7 @@ pub fn resolve_safe_path(root: impl AsRef<Path>, user_path: impl AsRef<Path>) ->
         Ok(normalized)
     } else {
         Err(anyhow::anyhow!(
-            "Path traversal detected: {:?} is outside of root {:?}",
-            normalized,
-            root
+            "Path traversal detected: {normalized:?} is outside of root {root:?}",
         ))
     }
 }
@@ -210,7 +206,7 @@ pub async fn read_text(path: impl AsRef<Path>) -> Result<String> {
     let path = path.as_ref();
     fs::read_to_string(path)
         .await
-        .with_context(|| format!("Failed to read text file: {:?}", path))
+        .with_context(|| format!("Failed to read text file: {path:?}"))
 }
 
 /// Reads a file into a byte vector.
@@ -218,14 +214,14 @@ pub async fn read_bytes(path: impl AsRef<Path>) -> Result<Vec<u8>> {
     let path = path.as_ref();
     fs::read(path)
         .await
-        .with_context(|| format!("Failed to read file: {:?}", path))
+        .with_context(|| format!("Failed to read file: {path:?}"))
 }
 
 /// Reads a JSON file and deserializes it into type T.
 pub async fn read_json<T: DeserializeOwned>(path: impl AsRef<Path>) -> Result<T> {
     let path = path.as_ref();
     let content = read_text(path).await?;
-    serde_json::from_str(&content).with_context(|| format!("Failed to parse JSON from: {:?}", path))
+    serde_json::from_str(&content).with_context(|| format!("Failed to parse JSON from: {path:?}"))
 }
 
 /// Writes byte content to a file, creating parent directories if needed.
@@ -235,12 +231,12 @@ pub async fn write(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> Result<
         if !exists(parent).await {
             fs::create_dir_all(parent)
                 .await
-                .with_context(|| format!("Failed to create directory: {:?}", parent))?;
+                .with_context(|| format!("Failed to create directory: {parent:?}"))?;
         }
     }
     fs::write(path, content)
         .await
-        .with_context(|| format!("Failed to write file: {:?}", path))?;
+        .with_context(|| format!("Failed to write file: {path:?}"))?;
     Ok(())
 }
 
@@ -335,7 +331,7 @@ pub fn glob_with_gitignore(root: impl AsRef<Path>, pattern: &str) -> Result<Vec<
         .build();
 
     let glob_pattern = glob::Pattern::new(pattern)
-        .with_context(|| format!("Invalid glob pattern: {}", pattern))?;
+        .with_context(|| format!("Invalid glob pattern: {pattern}"))?;
 
     let mut matches = Vec::new();
 

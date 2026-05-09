@@ -1,0 +1,5 @@
+event: content_block_delta
+data: {"index":0,"delta":{"type":"text_delta","text":"hello"}}
+
+event: message_delta
+data: {"delta":{"stop_reason":"stop"},"usage":{"output_tokens":1}}

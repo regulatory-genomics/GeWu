@@ -16,3 +16,5 @@ task_plan.md
 entities.json
 mempalace.yaml
 .playwright-mcp/
+.playwright-cli/
+.sisyphus/

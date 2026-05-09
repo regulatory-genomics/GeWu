@@ -182,13 +182,13 @@ impl Tool for ReadFileTool {
                 if path.is_symlink() {
                     let sym_meta = tokio::fs::symlink_metadata(&path).await.ok();
                     if sym_meta.as_ref().is_some_and(|m| m.is_dir()) {
-                        entries.push(format!("{}/", name));
+                        entries.push(format!("{name}/"));
                         continue;
                     }
                 }
 
                 if path.is_dir() {
-                    entries.push(format!("{}/", name));
+                    entries.push(format!("{name}/"));
                 } else {
                     entries.push(name);
                 }
@@ -207,19 +207,19 @@ impl Tool for ReadFileTool {
 
             let output = if truncated {
                 format!(
-                    "<path>{}</path>\n<type>directory</type>\n<entries>\n{}\n</entries>\n\n(Showing {} of {} entries. Use 'offset' parameter to read beyond entry {})",
+                    "<path>{}</path>\n<type>directory</type>\n<entries>\n{}\n</entries>\n\n(Showing {sliced_len} of {entries_len} entries. Use 'offset' parameter to read beyond entry {next_entry})",
                     input.file_path,
                     sliced.join("\n"),
-                    sliced.len(),
-                    entries.len(),
-                    input.offset + sliced.len()
+                    sliced_len = sliced.len(),
+                    entries_len = entries.len(),
+                    next_entry = input.offset + sliced.len(),
                 )
             } else {
                 format!(
-                    "<path>{}</path>\n<type>directory</type>\n<entries>\n{}\n</entries>\n\n({} entries)",
+                    "<path>{}</path>\n<type>directory</type>\n<entries>\n{}\n</entries>\n\n({entries_len} entries)",
                     input.file_path,
                     sliced.join("\n"),
-                    entries.len()
+                    entries_len = entries.len(),
                 )
             };
 
@@ -340,18 +340,17 @@ impl Tool for ReadFileTool {
 
         if truncated_by_bytes {
             output.push_str(&format!(
-                "\n\n(Output capped at {}. Showing lines {}-{}. Use offset={} to continue.)",
-                MAX_BYTES_LABEL, input.offset, last_read_line, next_offset
+                "\n\n(Output capped at {MAX_BYTES_LABEL}. Showing lines {}-{} of {total_lines_count}. Use offset={next_offset} to continue.)",
+                input.offset, last_read_line,
             ));
         } else if has_more_lines {
             output.push_str(&format!(
-                "\n\n(Showing lines {}-{} of {}. Use offset={} to continue.)",
-                input.offset, last_read_line, total_lines_count, next_offset
+                "\n\n(Showing lines {}-{} of {total_lines_count}. Use offset={next_offset} to continue.)",
+                input.offset, last_read_line,
             ));
         } else {
             output.push_str(&format!(
-                "\n\n(End of file - total {} lines)",
-                total_lines_count
+                "\n\n(End of file - total {total_lines_count} lines)",
             ));
         }
 
@@ -436,7 +435,7 @@ impl Tool for EditFileTool {
             &input.new_string,
             input.replace_all,
         )
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         write(&file_path, new_content.as_bytes())
             .await

@@ -57,7 +57,7 @@ impl Tool for ListTool {
         if let Some(ignores) = &input.ignore {
             let mut overrides = ignore::overrides::OverrideBuilder::new(&root_path);
             for ignore in ignores {
-                let _ = overrides.add(&format!("!{}", ignore));
+                let _ = overrides.add(&format!("!{ignore}"));
             }
             if let Ok(ov) = overrides.build() {
                 builder.overrides(ov);
@@ -78,7 +78,7 @@ impl Tool for ListTool {
                 let display = relative.to_string_lossy().to_string();
                 let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
                 Some(if is_dir {
-                    format!("{}/", display)
+                    format!("{display}/")
                 } else {
                     display
                 })

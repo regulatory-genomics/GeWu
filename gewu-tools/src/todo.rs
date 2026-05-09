@@ -81,7 +81,7 @@ impl Tool for TodoWriteTool {
             .count();
         Ok(ToolResult::new(
             "todowrite",
-            format!("{} todos", non_completed),
+            format!("{non_completed} todos"),
         ))
     }
 }

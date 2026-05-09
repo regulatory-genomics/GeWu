@@ -87,8 +87,7 @@ impl Tool for BatchTool {
                 let result = async {
                     if DISALLOWED.contains(&tool_name.as_str()) {
                         return Err(format!(
-                            "Tool '{}' is not allowed in batch. Disallowed tools: {:?}",
-                            tool_name, DISALLOWED
+                            "Tool '{tool_name}' is not allowed in batch. Disallowed tools: {DISALLOWED:?}",
                         )
                         .into());
                     }
@@ -106,15 +105,13 @@ impl Tool for BatchTool {
                         Some(ToolExecutionPolicy::ParallelSafe) => {}
                         Some(policy) => {
                             return Err(format!(
-                                "Tool '{}' is not allowed in batch because its execution policy is {:?}; batch only runs ParallelSafe tools",
-                                tool_name, policy
+                                "Tool '{tool_name}' is not allowed in batch because its execution policy is {policy:?}; batch only runs ParallelSafe tools",
                             )
                             .into());
                         }
                         None => {
                             return Err(format!(
-                                "Tool '{}' is not allowed in batch because its execution policy is unknown",
-                                tool_name
+                                "Tool '{tool_name}' is not allowed in batch because its execution policy is unknown",
                             )
                             .into());
                         }
@@ -153,34 +150,31 @@ impl Tool for BatchTool {
 
         if failed > 0 {
             output.push_str(&format!(
-                "Executed {}/{} tools successfully. {} failed.\n\n",
-                successful, total, failed
+                "Executed {successful}/{total} tools successfully. {failed} failed.\n\n",
             ));
         } else {
             output.push_str(&format!(
-                "All {} tools executed successfully.\n\n",
-                successful
+                "All {successful} tools executed successfully.\n\n",
             ));
         }
 
         if !successes.is_empty() {
             output.push_str("Results:\n");
             for (tool_name, _) in &successes {
-                output.push_str(&format!("- {}: success\n", tool_name));
+                output.push_str(&format!("- {tool_name}: success\n"));
             }
         }
 
         if !errors.is_empty() {
             output.push_str("\nErrors:\n");
             for (tool_name, err) in &errors {
-                output.push_str(&format!("- {}: {}\n", tool_name, err));
+                output.push_str(&format!("- {tool_name}: {err}\n"));
             }
         }
 
         if discarded > 0 {
             output.push_str(&format!(
-                "\nNote: {} tool(s) discarded (max {} allowed)",
-                discarded, MAX_TOOLS
+                "\nNote: {discarded} tool(s) discarded (max {MAX_TOOLS} allowed)",
             ));
         }
 

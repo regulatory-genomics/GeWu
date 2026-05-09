@@ -90,11 +90,11 @@ impl<'a> ChatCompletions<'a> {
         let status = response.status();
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            return Err(OpenAIError::Api(format!("{}: {}", status, error_text)));
+            return Err(OpenAIError::Api(format!("{status}: {error_text}")));
         }
 
         let stream = response.bytes_stream();
-        Ok(ChatCompletionStream::new(stream))
+        Ok(ChatCompletionStream::from_stream(stream))
     }
 
     pub async fn create(
@@ -119,7 +119,7 @@ impl<'a> ChatCompletions<'a> {
         let status = response.status();
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            return Err(OpenAIError::Api(format!("{}: {}", status, error_text)));
+            return Err(OpenAIError::Api(format!("{status}: {error_text}")));
         }
 
         let chunk: ChatCompletionResponse = response.json().await?;
@@ -132,7 +132,7 @@ pub struct ChatCompletionStream {
 }
 
 impl ChatCompletionStream {
-    fn new<S>(stream: S) -> Self
+    pub fn from_stream<S>(stream: S) -> Self
     where
         S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     {
@@ -267,7 +267,7 @@ impl<'a> Models<'a> {
         let status = response.status();
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            return Err(OpenAIError::Api(format!("{}: {}", status, error_text)));
+            return Err(OpenAIError::Api(format!("{status}: {error_text}")));
         }
 
         let models: ModelsResponse = response.json().await?;
@@ -705,8 +705,7 @@ mod tests {
 
     fn make_chunk_json(content: &str) -> String {
         format!(
-            r#"{{"id":"c1","choices":[{{"index":0,"delta":{{"content":"{}"}}}}]}}"#,
-            content
+            r#"{{"id":"c1","choices":[{{"index":0,"delta":{{"content":"{content}"}}}}]}}"#,
         )
     }
 
@@ -741,7 +740,7 @@ mod tests {
     async fn multi_line_data_event() {
         let json = make_chunk_json("joined");
         let (first, second) = json.split_at(json.len() / 2);
-        let raw = format!("data: {}\ndata: {}\n\ndata: [DONE]\n\n", first, second);
+        let raw = format!("data: {first}\ndata: {second}\n\ndata: [DONE]\n\n");
         let stream = SseStream::new(bytes_stream(vec![&raw]));
         let items: Vec<_> = stream.collect().await;
         assert_eq!(items.len(), 1);
@@ -790,7 +789,7 @@ mod tests {
     #[tokio::test]
     async fn chunked_tcp_delivery() {
         let json = make_chunk_json("split");
-        let full = format!("data: {}\n\ndata: [DONE]\n\n", json);
+        let full = format!("data: {json}\n\ndata: [DONE]\n\n");
         let mid = full.len() / 2;
         let (a, b) = full.split_at(mid);
         let stream = SseStream::new(bytes_stream(vec![a, b]));

@@ -212,7 +212,7 @@ impl McpClient {
             } else {
                 &endpoint
             };
-            format!("{}/{}", base, path) // Very naive URL join
+            format!("{base}/{path}") // Very naive URL join
         };
 
         Ok(Self {
@@ -235,7 +235,7 @@ impl McpClient {
     ) {
         let mut p = pending.lock().await;
         for (_, sender) in p.drain() {
-            if sender.send(Err(anyhow::anyhow!("{}", reason))).is_err() {
+            if sender.send(Err(anyhow::anyhow!("{reason}"))).is_err() {
                 tracing::debug!("MCP: channel already closed when aborting pending request");
             }
         }
@@ -420,9 +420,7 @@ impl McpClient {
                         let status = response.status();
                         let text = response.text().await.unwrap_or_default();
                         return Err(anyhow::anyhow!(
-                            "Failed to send request via HttpPost: {} - {}",
-                            status,
-                            text
+                            "Failed to send request via HttpPost: {status} - {text}",
                         ));
                     }
 

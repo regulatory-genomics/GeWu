@@ -78,8 +78,7 @@ impl Tool for BashTool {
                 return Ok(ToolResult::new(
                     "bash",
                     format!(
-                        "Command '{}' is not allowed in safe mode. Allowed commands: {:?}",
-                        first_word, allowed
+                        "Command '{first_word}' is not allowed in safe mode. Allowed commands: {allowed:?}",
                     ),
                 ));
             }
@@ -154,7 +153,7 @@ impl Tool for BashTool {
                         result.push_str(&stderr);
                     }
                     result.push_str(&format!("\n--- exit status: {} ---\n", output.status));
-                    return Err(anyhow::anyhow!("Command failed: {}", result).into());
+                    return Err(anyhow::anyhow!("Command failed: {result}").into());
                 }
 
                 let mut result = String::new();

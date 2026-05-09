@@ -198,11 +198,11 @@ impl<'a> Messages<'a> {
         let status = response.status();
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            return Err(AnthropicError::Api(format!("{}: {}", status, error_text)));
+            return Err(AnthropicError::Api(format!("{status}: {error_text}")));
         }
 
         let stream = response.bytes_stream();
-        Ok(AnthropicStream::new(stream))
+        Ok(AnthropicStream::from_stream(stream))
     }
 }
 
@@ -211,7 +211,7 @@ pub struct AnthropicStream {
 }
 
 impl AnthropicStream {
-    fn new<S>(stream: S) -> Self
+    pub fn from_stream<S>(stream: S) -> Self
     where
         S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     {
@@ -476,7 +476,7 @@ impl<'a> Models<'a> {
         let status = response.status();
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            return Err(AnthropicError::Api(format!("{}: {}", status, error_text)));
+            return Err(AnthropicError::Api(format!("{status}: {error_text}")));
         }
 
         let models: ModelsResponse = response.json().await?;

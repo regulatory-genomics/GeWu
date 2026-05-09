@@ -51,7 +51,7 @@ impl Tool for WebFetchTool {
         if url.starts_with("http://") && !url.contains("127.0.0.1") && !url.contains("localhost") {
             url = url.replacen("http://", "https://", 1);
         } else if !url.starts_with("http://") && !url.starts_with("https://") {
-            url = format!("https://{}", url);
+            url = format!("https://{url}");
         }
 
         let client = reqwest::Client::builder()
@@ -66,7 +66,7 @@ impl Tool for WebFetchTool {
         if !status.is_success() {
             return Ok(ToolResult::new(
                 "webfetch",
-                format!("Request failed with status: {}", status),
+                format!("Request failed with status: {status}"),
             ));
         }
 

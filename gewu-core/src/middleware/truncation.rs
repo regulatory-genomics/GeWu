@@ -5,6 +5,47 @@ pub const MAX_LINES: usize = 2000;
 pub const MAX_BYTES: usize = 50 * 1024;
 pub const TRUNCATION_DIR: &str = ".gewu/truncation";
 
+/// Recursively truncate a JSON value to fit within a byte budget.
+fn truncate_json_value(val: &serde_json::Value, budget: usize) -> serde_json::Value {
+    match val {
+        serde_json::Value::Array(arr) => {
+            let mut result = Vec::new();
+            let mut used = 2; // [] delimiters
+            for item in arr {
+                let item_str = serde_json::to_string(item).unwrap_or_default();
+                let cost = item_str.len() + if result.is_empty() { 0 } else { 1 }; // comma
+                if used + cost > budget {
+                    break;
+                }
+                used += cost;
+                result.push(item.clone());
+            }
+            serde_json::Value::Array(result)
+        }
+        serde_json::Value::Object(map) => {
+            let mut result = serde_json::Map::new();
+            let mut used = 2; // {}
+            for (k, v) in map {
+                let v_budget = budget.saturating_sub(used).saturating_sub(k.len() + 4);
+                let truncated_v = truncate_json_value(v, v_budget);
+                let entry_str = format!(
+                    "\"{}\":{}",
+                    k,
+                    serde_json::to_string(&truncated_v).unwrap_or_default()
+                );
+                let cost = entry_str.len() + if result.is_empty() { 0 } else { 1 };
+                if used + cost > budget {
+                    break;
+                }
+                used += cost;
+                result.insert(k.clone(), truncated_v);
+            }
+            serde_json::Value::Object(result)
+        }
+        other => other.clone(),
+    }
+}
+
 #[derive(Clone)]
 pub struct TruncationService {
     max_lines: usize,
@@ -71,7 +112,7 @@ impl TruncationService {
             preview.len()
         );
 
-        let truncated_content = format!("{}\n\n{}", preview, hint);
+        let truncated_content = format!("{preview}\n\n{hint}");
 
         if let Err(e) = std::fs::create_dir_all(&self.truncation_dir) {
             tracing::warn!("Failed to create truncation dir: {}", e);
@@ -113,50 +154,10 @@ impl TruncationService {
 
         let val: serde_json::Value = serde_json::from_str(trimmed).ok()?;
 
-        let truncated = self.truncate_json_value(&val, self.max_bytes);
+        let truncated = truncate_json_value(&val, self.max_bytes);
         let serialized = serde_json::to_string(&truncated).ok()?;
 
         Some(serialized)
-    }
-
-    fn truncate_json_value(&self, val: &serde_json::Value, budget: usize) -> serde_json::Value {
-        match val {
-            serde_json::Value::Array(arr) => {
-                let mut result = Vec::new();
-                let mut used = 2; // [] delimiters
-                for item in arr {
-                    let item_str = serde_json::to_string(item).unwrap_or_default();
-                    let cost = item_str.len() + if result.is_empty() { 0 } else { 1 }; // comma
-                    if used + cost > budget {
-                        break;
-                    }
-                    used += cost;
-                    result.push(item.clone());
-                }
-                serde_json::Value::Array(result)
-            }
-            serde_json::Value::Object(map) => {
-                let mut result = serde_json::Map::new();
-                let mut used = 2; // {}
-                for (k, v) in map {
-                    let v_budget = budget.saturating_sub(used).saturating_sub(k.len() + 4);
-                    let truncated_v = self.truncate_json_value(v, v_budget);
-                    let entry_str = format!(
-                        "\"{}\":{}",
-                        k,
-                        serde_json::to_string(&truncated_v).unwrap_or_default()
-                    );
-                    let cost = entry_str.len() + if result.is_empty() { 0 } else { 1 };
-                    if used + cost > budget {
-                        break;
-                    }
-                    used += cost;
-                    result.insert(k.clone(), truncated_v);
-                }
-                serde_json::Value::Object(result)
-            }
-            other => other.clone(),
-        }
     }
 }
 

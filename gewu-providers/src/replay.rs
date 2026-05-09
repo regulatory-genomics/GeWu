@@ -192,13 +192,13 @@ mod tests {
         assert_eq!(events.len(), 1);
         match events[0].as_ref().unwrap() {
             ProviderEvent::ContentDelta { delta } => assert_eq!(delta, "hi"),
-            other => panic!("expected ContentDelta(\"hi\"), got {:?}", other),
+            other => panic!("expected ContentDelta(\"hi\"), got {other:?}"),
         }
         let stream2 = p.stream_response(&[], &[]).await.unwrap();
         let events2: Vec<_> = stream2.collect().await;
         match events2[0].as_ref().unwrap() {
             ProviderEvent::ContentDelta { delta } => assert_eq!(delta, "bye"),
-            other => panic!("expected ContentDelta(\"bye\"), got {:?}", other),
+            other => panic!("expected ContentDelta(\"bye\"), got {other:?}"),
         }
     }
 
@@ -230,7 +230,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replay.jsonl");
-        std::fs::write(&path, format!("{}\n", line)).unwrap();
+        std::fs::write(&path, format!("{line}\n")).unwrap();
 
         let p = ReplayLlmProvider::load_jsonl(&path).unwrap();
         let stream = p.stream_response(&msgs, &tools).await.unwrap();
@@ -238,7 +238,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         match events[0].as_ref().unwrap() {
             ProviderEvent::ContentDelta { delta } => assert_eq!(delta, "recorded"),
-            other => panic!("expected ContentDelta(\"recorded\"), got {:?}", other),
+            other => panic!("expected ContentDelta(\"recorded\"), got {other:?}"),
         }
     }
 

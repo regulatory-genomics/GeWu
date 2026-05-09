@@ -470,7 +470,7 @@ pub fn smart_replace(
             }
             let prefix = &content[..start];
             let suffix = &content[end..];
-            return Ok(format!("{}{}{}", prefix, new_string, suffix));
+            return Ok(format!("{prefix}{new_string}{suffix}"));
         }
     } else if occurrence_count > 0 {
         return Ok(content.replace(old_string, new_string));
@@ -492,7 +492,7 @@ pub fn smart_replace(
             }
             let prefix = &content[..start];
             let suffix = &content[end..];
-            return Ok(format!("{}{}{}", prefix, new_string, suffix));
+            return Ok(format!("{prefix}{new_string}{suffix}"));
         }
     }
 
