@@ -18,6 +18,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::permission::ToolPermissionRequest;
+use crate::permission::PermissionGrant;
+
 /// Represents a function call within a tool call.
 ///
 /// Contains the name of the function to invoke and its arguments as a JSON string.
@@ -172,6 +175,13 @@ pub enum AgentEvent {
         tool_call_id: String,
         tool: String,
         output: String,
+    },
+    /// A tool requires user approval before it can access a filesystem path.
+    ToolPermissionRequest(ToolPermissionRequest),
+    /// A previously requested tool permission has been approved or denied.
+    ToolPermissionResolved {
+        request_id: String,
+        approved: bool,
     },
     /// The agent has finished with a final response.
     Finish { response: String },
@@ -387,6 +397,14 @@ impl ToolContext {
 
     pub fn abort(&self) {
         self.abort.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn permission_grants(&self) -> Vec<PermissionGrant> {
+        self.metadata
+            .get("permission_grants")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
     }
 }
 
