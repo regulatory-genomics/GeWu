@@ -541,6 +541,7 @@ impl GeWuRuntime {
             .memory(Box::new(memory))
             .system_prompt(&system_prompt)
             .session_id(session_id.clone())
+            .tool_context_metadata(metadata_object_for_tool_context(&metadata_json))
             .build()?;
 
         Ok((agent, Arc::new(registry)))
@@ -1141,6 +1142,12 @@ fn metadata_with_workspace_root(metadata_json: Value, working_directory: &Path) 
     }
 }
 
+fn metadata_object_for_tool_context(
+    metadata_json: &Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    metadata_json.as_object().cloned().unwrap_or_default()
+}
+
 fn workspace_root_from_metadata(metadata_json: &Value) -> Option<String> {
     metadata_json
         .get("workspace_root")
@@ -1704,7 +1711,7 @@ mod task_result_tests {
     use async_trait::async_trait;
     use futures::stream::BoxStream;
     use gewu_core::traits::{LlmProvider, Tool};
-    
+
     use gewu_core::types::{Message, ProviderEvent, SpecialistDescriptor};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::error::Error;
@@ -1937,9 +1944,11 @@ Global sentinel body.
 
         let prompt = runtime.append_skill_prompt(&effective, effective.system_prompt.clone());
         assert!(prompt.contains("<available_skills>"));
-        assert!(prompt.contains(
-            "gene-locus-resolver: Resolve gene symbols before opening Genome Canvas."
-        ));
+        assert!(
+            prompt.contains(
+                "gene-locus-resolver: Resolve gene symbols before opening Genome Canvas."
+            )
+        );
         assert!(!prompt.contains("global-skill"));
         assert!(!prompt.contains("Recommended for this specialist:"));
         assert!(prompt.contains("Use the `load_skill` tool"));
