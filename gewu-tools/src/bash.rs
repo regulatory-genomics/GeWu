@@ -21,6 +21,7 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use gewu_core::permission::PermissionAction;
 use gewu_core::traits::Tool;
 use gewu_core::types::{ToolContext, ToolResult};
 use schemars::schema::RootSchema;
@@ -62,7 +63,7 @@ impl Tool for BashTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: BashArgs = serde_json::from_value(args).map_err(|e| anyhow::anyhow!(e))?;
 
@@ -108,8 +109,28 @@ impl Tool for BashTool {
         }
 
         let work_dir = if let Some(wd) = &input.workdir {
-            crate::fs_utils::resolve_safe_path(&self.working_directory, wd)
-                .map_err(|e| anyhow::anyhow!(e))?
+            match crate::fs_utils::classify_path_permission(
+                PermissionAction::Read,
+                &path_from_tool_input(&self.working_directory, wd),
+                &crate::fs_utils::configured_read_roots(&self.working_directory),
+                &ctx.permission_grants(),
+                "bash",
+                &ctx.session_id,
+                false,
+            )
+            .map_err(|e| anyhow::anyhow!(e))?
+            {
+                crate::fs_utils::PathPermissionDecision::Allowed { canonical_path } => canonical_path,
+                crate::fs_utils::PathPermissionDecision::Requires(request) => {
+                    return Ok(ToolResult::new(
+                        "bash",
+                        crate::fs_utils::permission_required_result(request).to_string(),
+                    ));
+                }
+                crate::fs_utils::PathPermissionDecision::Denied { reason } => {
+                    return Err(anyhow::anyhow!(reason).into());
+                }
+            }
         } else {
             self.working_directory.clone()
         };
@@ -175,6 +196,15 @@ impl Tool for BashTool {
                 format!("Command timed out after {} ms.", input.timeout),
             )),
         }
+    }
+}
+
+fn path_from_tool_input(working_directory: &std::path::Path, input_path: &str) -> PathBuf {
+    let path = std::path::Path::new(input_path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_directory.join(path)
     }
 }
 
