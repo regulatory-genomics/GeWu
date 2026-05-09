@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use gewu_canvas::{CanvasManager, canvas_tools};
+use gewu_core::permission::PermissionGrant;
 use gewu_core::traits::Tool;
 use gewu_providers::OpenAIProvider;
 use gewu_runtime::{BackgroundTaskCoordinator, PluginHost, PluginRegistry, RuntimeFactory};
@@ -186,6 +187,7 @@ pub struct AppState {
     pub plugin_registrar: PluginRegistrar,
     pub canvases: CanvasManager,
     pub canvas_tools: Arc<Vec<Arc<dyn Tool>>>,
+    pub permission_grants: Arc<RwLock<HashMap<String, Vec<PermissionGrant>>>>,
     rebuild_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
@@ -388,8 +390,34 @@ impl AppState {
             plugin_registrar,
             canvases,
             canvas_tools,
+            permission_grants: Arc::new(RwLock::new(HashMap::new())),
             rebuild_locks: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    pub async fn add_permission_grant(&self, grant: PermissionGrant) -> Result<()> {
+        let session_id = self.resolve_session_id(&grant.session_id).await?;
+        let mut normalized = grant;
+        normalized.session_id = session_id.clone();
+        self.permission_grants
+            .write()
+            .await
+            .entry(session_id.clone())
+            .or_default()
+            .push(normalized);
+        self.agents.write().await.remove(&session_id);
+        Ok(())
+    }
+
+    pub async fn permission_grants_for_session(&self, session_id: &str) -> Result<Vec<PermissionGrant>> {
+        let session_id = self.resolve_session_id(session_id).await?;
+        Ok(self
+            .permission_grants
+            .read()
+            .await
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default())
     }
 
     pub async fn create_session(
@@ -465,7 +493,7 @@ impl AppState {
                 &agent_type,
                 session_id.clone(),
                 mcp_tools,
-                session_metadata(project.as_ref(), &working_directory),
+                self.session_metadata_with_permissions(&session_id, project.as_ref(), &working_directory).await?,
                 working_directory,
             )
             .await?;
@@ -904,7 +932,7 @@ impl AppState {
                 agent_type,
                 session_id.to_string(),
                 mcp_tools,
-                session_metadata(project.as_ref(), &working_directory),
+                self.session_metadata_with_permissions(session_id, project.as_ref(), &working_directory).await?,
                 working_directory,
             )
             .await?;
@@ -1043,6 +1071,23 @@ impl AppState {
 
     pub async fn get_config(&self) -> ServerConfig {
         self.config.read().await.clone()
+    }
+
+    async fn session_metadata_with_permissions(
+        &self,
+        session_id: &str,
+        project: Option<&ProjectRecord>,
+        working_directory: &Path,
+    ) -> Result<Value> {
+        let mut metadata = session_metadata(project, working_directory);
+        let grants = self.permission_grants_for_session(session_id).await?;
+        if !grants.is_empty() {
+            let grants_value = serde_json::to_value(grants)?;
+            if let Value::Object(map) = &mut metadata {
+                map.insert("permission_grants".to_string(), grants_value);
+            }
+        }
+        Ok(metadata)
     }
 }
 
