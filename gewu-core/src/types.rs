@@ -19,8 +19,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::permission::ToolPermissionRequest;
-use crate::permission::PermissionGrant;
+use crate::permission::{PermissionDecision, PermissionGrant, ToolPermissionRequest};
 
 /// A stored problem-solving experience that can be recalled by future agents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,10 +235,7 @@ pub enum AgentEvent {
     /// A tool requires user approval before it can access a filesystem path.
     ToolPermissionRequest(ToolPermissionRequest),
     /// A previously requested tool permission has been approved or denied.
-    ToolPermissionResolved {
-        request_id: String,
-        approved: bool,
-    },
+    ToolPermissionResolved { request_id: String, approved: bool },
     /// The agent has finished with a final response.
     Finish { response: String },
     /// An error occurred during agent execution.
@@ -430,6 +426,12 @@ pub struct ToolContext {
     pub tool_call_id: Option<String>,
     pub abort: Arc<std::sync::atomic::AtomicBool>,
     pub metadata: std::collections::HashMap<String, serde_json::Value>,
+    pub permission_broker: Option<Arc<dyn PermissionBroker>>,
+}
+
+#[async_trait::async_trait]
+pub trait PermissionBroker: Send + Sync + std::fmt::Debug {
+    async fn request_permission(&self, request: ToolPermissionRequest) -> PermissionDecision;
 }
 
 impl ToolContext {
@@ -440,6 +442,7 @@ impl ToolContext {
             tool_call_id: None,
             abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metadata: Default::default(),
+            permission_broker: None,
         }
     }
 

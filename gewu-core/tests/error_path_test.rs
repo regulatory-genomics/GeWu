@@ -2,10 +2,17 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use gewu_core::Agent;
+use gewu_core::permission::{
+    GrantDuration, PermissionAction, PermissionDecision, PermissionDecisionKind, PermissionScope,
+    ToolPermissionRequest,
+};
 use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{AgentEvent, Message, ProviderEvent, ToolContext, ToolResult};
+use gewu_core::types::{
+    AgentEvent, Message, PermissionBroker, ProviderEvent, ToolContext, ToolResult,
+};
 use serde_json::Value;
 use std::error::Error;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 struct MockLlmProvider {
@@ -77,11 +84,72 @@ impl Tool for TestTool {
     }
 }
 
+#[derive(Debug)]
+struct ApprovingBroker;
+
+#[async_trait]
+impl PermissionBroker for ApprovingBroker {
+    async fn request_permission(&self, request: ToolPermissionRequest) -> PermissionDecision {
+        PermissionDecision {
+            request_id: request.id,
+            decision: PermissionDecisionKind::Approve,
+            duration: GrantDuration::Session,
+        }
+    }
+}
+
+struct PermissionTool;
+
+#[async_trait]
+impl Tool for PermissionTool {
+    fn name(&self) -> &str {
+        "test_tool"
+    }
+    fn description(&self) -> &str {
+        "test"
+    }
+    fn schema(&self) -> schemars::schema::RootSchema {
+        schemars::schema_for!(serde_json::Value)
+    }
+    async fn execute(
+        &self,
+        _args: Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
+        if ctx.permission_grants().is_empty() {
+            let request = ToolPermissionRequest {
+                id: "perm-test".to_string(),
+                session_id: ctx.session_id.clone(),
+                tool_name: "test_tool".to_string(),
+                action: PermissionAction::Read,
+                requested_path: PathBuf::from("/outside/sample.txt"),
+                scope: PermissionScope::File {
+                    path: PathBuf::from("/outside/sample.txt"),
+                },
+                reason: "test_tool requested /outside/sample.txt".to_string(),
+                destructive: false,
+                default_duration: GrantDuration::Session,
+            };
+            return Ok(ToolResult::new(
+                "test_tool",
+                serde_json::json!({
+                    "ok": false,
+                    "error": { "code": "permission_required" },
+                    "permission_request": request
+                })
+                .to_string(),
+            ));
+        }
+
+        Ok(ToolResult::new("test_tool", "granted".to_string()))
+    }
+}
+
 #[tokio::test]
 async fn test_tool_not_found_error() {
     let llm = MockLlmProvider {
         responses: Arc::new(Mutex::new(vec![])),
-        tool_behavior: "not_found",
+        tool_behavior: "default",
     };
 
     let agent = Agent::builder()
@@ -104,6 +172,52 @@ async fn test_tool_not_found_error() {
     }
 
     assert!(tool_found_error, "Should have received tool not found error in ToolFinish");
+}
+
+#[tokio::test]
+async fn permission_broker_approves_and_retries_tool_in_same_turn() {
+    let llm = MockLlmProvider {
+        responses: Arc::new(Mutex::new(vec![])),
+        tool_behavior: "default",
+    };
+
+    let agent = Agent::builder()
+        .llm(Arc::new(llm))
+        .with_tools(vec![Arc::new(PermissionTool) as Arc<dyn Tool>])
+        .permission_broker(Arc::new(ApprovingBroker))
+        .build()
+        .unwrap();
+
+    let mut agent = agent;
+    let mut stream = Box::pin(agent.ask("Test"));
+    let mut resolved = false;
+    let mut retried_output = false;
+    let mut permission_error_output = false;
+
+    while let Some(event_result) = stream.next().await {
+        match event_result.unwrap() {
+            AgentEvent::ToolPermissionResolved { approved, .. } => {
+                resolved = approved;
+            }
+            AgentEvent::ToolFinish { output, .. } => {
+                if output.contains("permission_required") {
+                    permission_error_output = true;
+                }
+                if output == "granted" {
+                    retried_output = true;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(resolved, "permission broker should approve during the same turn");
+    assert!(retried_output, "tool should retry with the approved grant");
+    assert!(
+        !permission_error_output,
+        "permission_required output should be replaced by retry output"
+    );
 }
 
 #[tokio::test]
