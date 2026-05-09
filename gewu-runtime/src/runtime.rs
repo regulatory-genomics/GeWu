@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
 use gewu_core::Agent;
+use gewu_core::permission::ToolPermissionRequest;
 use gewu_core::traits::{AssemblyContext, LlmProvider, Plugin, Tool, ToolFactory, ToolRegistry};
 use gewu_core::types::{
     AgentEvent, ExecutionRunKind, SpecialistAgentEventRecord, SpecialistDescriptor,
@@ -789,6 +790,7 @@ impl GeWuRuntime {
                         yield SpecialistExecutionEvent::Agent(AgentEvent::ToolFinish { tool_call_id, tool, output });
                     }
                     AgentEvent::ToolFinish { tool_call_id, tool, output } => {
+                        let permission_request = tool_permission_request_from_output(&output);
                         let record = SpecialistAgentEventRecord {
                             event_type: "tool_finish".to_string(),
                             tool_name: Some(tool.clone()),
@@ -801,7 +803,40 @@ impl GeWuRuntime {
                             tool_name: tool.clone(),
                             output: output.clone(),
                         });
+                        if let Some(permission_request) = permission_request {
+                            let permission_record = SpecialistAgentEventRecord {
+                                event_type: "tool_permission_request".to_string(),
+                                tool_name: Some(tool.clone()),
+                                payload_json: serde_json::json!({ "request": permission_request.clone() }),
+                            };
+                            self.emit_agent_event_hook(&descriptor, &request, &permission_record)
+                                .await;
+                            events.push(permission_record);
+                            yield SpecialistExecutionEvent::Agent(AgentEvent::ToolPermissionRequest(permission_request));
+                        }
                         yield SpecialistExecutionEvent::Agent(AgentEvent::ToolFinish { tool_call_id, tool, output });
+                    }
+                    AgentEvent::ToolPermissionRequest(permission_request) => {
+                        let record = SpecialistAgentEventRecord {
+                            event_type: "tool_permission_request".to_string(),
+                            tool_name: Some(permission_request.tool_name.clone()),
+                            payload_json: serde_json::json!({ "request": permission_request.clone() }),
+                        };
+                        self.emit_agent_event_hook(&descriptor, &request, &record)
+                            .await;
+                        events.push(record);
+                        yield SpecialistExecutionEvent::Agent(AgentEvent::ToolPermissionRequest(permission_request));
+                    }
+                    AgentEvent::ToolPermissionResolved { request_id, approved } => {
+                        let record = SpecialistAgentEventRecord {
+                            event_type: "tool_permission_resolved".to_string(),
+                            tool_name: None,
+                            payload_json: serde_json::json!({ "request_id": request_id.clone(), "approved": approved }),
+                        };
+                        self.emit_agent_event_hook(&descriptor, &request, &record)
+                            .await;
+                        events.push(record);
+                        yield SpecialistExecutionEvent::Agent(AgentEvent::ToolPermissionResolved { request_id, approved });
                     }
                     AgentEvent::Error { error } => {
                         let record = SpecialistAgentEventRecord {
@@ -1309,6 +1344,23 @@ fn workspace_root_from_metadata(metadata_json: &Value) -> Option<String> {
                 .ok()
                 .map(|p| p.display().to_string())
         })
+}
+
+fn tool_permission_request_from_output(output: &str) -> Option<ToolPermissionRequest> {
+    let value: Value = serde_json::from_str(output).ok()?;
+    if value
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        != Some("permission_required")
+    {
+        return None;
+    }
+
+    value
+        .get("permission_request")
+        .cloned()
+        .and_then(|request| serde_json::from_value(request).ok())
 }
 
 fn append_runtime_context(system_prompt: String) -> String {
