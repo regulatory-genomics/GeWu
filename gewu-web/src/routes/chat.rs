@@ -58,6 +58,20 @@ impl SseEvent {
         }
     }
 
+    pub fn tool_permission_request(request: gewu_core::permission::ToolPermissionRequest) -> Self {
+        Self {
+            event_type: "tool_permission_request".to_string(),
+            data: serde_json::json!({ "request": request }),
+        }
+    }
+
+    pub fn tool_permission_resolved(request_id: String, approved: bool) -> Self {
+        Self {
+            event_type: "tool_permission_resolved".to_string(),
+            data: serde_json::json!({ "request_id": request_id, "approved": approved }),
+        }
+    }
+
     pub fn finish(response: String) -> Self {
         Self {
             event_type: "finish".to_string(),
@@ -77,6 +91,25 @@ impl SseEvent {
             .event(self.event_type.clone())
             .data(serde_json::to_string(self).unwrap_or_default())
     }
+}
+
+fn tool_permission_request_from_output(
+    output: &str,
+) -> Option<gewu_core::permission::ToolPermissionRequest> {
+    let value: serde_json::Value = serde_json::from_str(output).ok()?;
+    if value
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(serde_json::Value::as_str)
+        != Some("permission_required")
+    {
+        return None;
+    }
+
+    value
+        .get("permission_request")
+        .cloned()
+        .and_then(|request| serde_json::from_value(request).ok())
 }
 
 pub async fn handle_chat(
@@ -141,7 +174,27 @@ pub async fn handle_chat(
                         output,
                     } => {
                         info!("tool_finish: {} - {}", tool, output);
+                        if let Some(request) = tool_permission_request_from_output(&output) {
+                            let permission_event = SseEvent::tool_permission_request(request).to_sse_event();
+                            if client_connected
+                                && tx
+                                    .send(Ok::<Event, std::convert::Infallible>(permission_event))
+                                    .await
+                                    .is_err()
+                            {
+                                warn!("SSE channel closed while sending permission request");
+                                client_connected = false;
+                            }
+                        }
                         SseEvent::tool_finish(tool_call_id, tool, output).to_sse_event()
+                    }
+                    gewu_core::types::AgentEvent::ToolPermissionRequest(request) => {
+                        info!("tool_permission_request: {} - {}", request.tool_name, request.requested_path.display());
+                        SseEvent::tool_permission_request(request).to_sse_event()
+                    }
+                    gewu_core::types::AgentEvent::ToolPermissionResolved { request_id, approved } => {
+                        info!("tool_permission_resolved: {} approved={}", request_id, approved);
+                        SseEvent::tool_permission_resolved(request_id, approved).to_sse_event()
                     }
                     gewu_core::types::AgentEvent::Finish { response } => {
                         info!("finish: {}", response);

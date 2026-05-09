@@ -4,9 +4,13 @@
 //! It uses the `ignore` crate to respect `.gitignore` files and the `grep` crate for
 //! efficient searching.
 
-use crate::fs_utils::{into_tool_error, resolve_read_path};
+use crate::fs_utils::{
+    PathPermissionDecision, classify_path_permission, configured_read_roots, into_tool_error,
+    permission_required_result,
+};
 use anyhow::Result;
 use async_trait::async_trait;
+use gewu_core::permission::PermissionAction;
 use gewu_core::traits::Tool;
 use gewu_core::types::{ToolContext, ToolResult};
 use grep::regex::RegexMatcher;
@@ -86,13 +90,31 @@ impl Tool for GrepTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: GrepArgs = serde_json::from_value(args).map_err(into_tool_error)?;
         let search_path_str = input.path.as_deref().unwrap_or(".");
 
-        let search_path =
-            resolve_read_path(&self.working_directory, search_path_str).map_err(into_tool_error)?;
+        let search_path = match classify_path_permission(
+            PermissionAction::Read,
+            &path_from_tool_input(&self.working_directory, search_path_str),
+            &configured_read_roots(&self.working_directory),
+            &ctx.permission_grants(),
+            "grep",
+            &ctx.session_id,
+            false,
+        )
+        .map_err(into_tool_error)?
+        {
+            PathPermissionDecision::Allowed { canonical_path } => canonical_path,
+            PathPermissionDecision::Requires(request) => {
+                return Ok(ToolResult::new(
+                    "grep",
+                    permission_required_result(request).to_string(),
+                ));
+            }
+            PathPermissionDecision::Denied { reason } => return Err(into_tool_error(anyhow::anyhow!(reason))),
+        };
 
         let result =
             tokio::task::spawn_blocking(move || -> Result<String, Box<dyn Error + Send + Sync>> {
@@ -170,6 +192,15 @@ impl Tool for GrepTool {
             .map_err(into_tool_error)??;
 
         Ok(ToolResult::new("grep", result))
+    }
+}
+
+fn path_from_tool_input(working_directory: &std::path::Path, input_path: &str) -> PathBuf {
+    let path = std::path::Path::new(input_path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_directory.join(path)
     }
 }
 

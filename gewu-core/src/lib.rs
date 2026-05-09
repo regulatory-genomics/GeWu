@@ -48,6 +48,7 @@
 pub mod agent;
 pub mod compaction;
 pub mod middleware;
+pub mod permission;
 pub mod traits;
 pub mod types;
 pub mod work_graph;

@@ -164,6 +164,17 @@ async fn run_runtime_agent(
                     };
                     println!("\n[Tool Finish: {}] Output: {}", tool, display_output);
                 }
+                AgentEvent::ToolPermissionRequest(request) => {
+                    println!(
+                        "\n[Permission Request: {}] {} ({})",
+                        request.tool_name,
+                        request.requested_path.display(),
+                        request.reason
+                    );
+                }
+                AgentEvent::ToolPermissionResolved { request_id, approved } => {
+                    println!("\n[Permission Resolved: {}] approved={}", request_id, approved);
+                }
                 AgentEvent::Finish { .. } => {
                     println!();
                 }

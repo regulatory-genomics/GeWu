@@ -18,12 +18,14 @@
 //! - [`GlobTool`] - Finds files using glob patterns, respects .gitignore
 
 use crate::fs_utils::{
-    glob_with_gitignore, into_tool_error, is_binary_file, is_read_allowed, mime_type, read_bytes,
-    read_text, resolve_read_path, resolve_write_path, write,
+    PathPermissionDecision, classify_path_permission, configured_read_roots, glob_with_gitignore,
+    into_tool_error, is_binary_file, is_read_allowed, mime_type, permission_required_result,
+    read_bytes, read_text, resolve_read_path, write,
 };
 use crate::replacers::smart_replace;
 use anyhow::Result;
 use async_trait::async_trait;
+use gewu_core::permission::PermissionAction;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use gewu_core::traits::Tool;
 use gewu_core::types::{FileAttachment, ToolContext, ToolResult};
@@ -116,12 +118,30 @@ impl Tool for ReadFileTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: ReadArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_read_path(&self.working_directory, &input.file_path)
-            .map_err(into_tool_error)?;
+        let file_path = match classify_path_permission(
+            PermissionAction::Read,
+            &path_from_tool_input(&self.working_directory, &input.file_path),
+            &configured_read_roots(&self.working_directory),
+            &ctx.permission_grants(),
+            "read_file",
+            &ctx.session_id,
+            false,
+        )
+        .map_err(into_tool_error)?
+        {
+            PathPermissionDecision::Allowed { canonical_path } => canonical_path,
+            PathPermissionDecision::Requires(request) => {
+                return Ok(ToolResult::new(
+                    "read_file",
+                    permission_required_result(request).to_string(),
+                ));
+            }
+            PathPermissionDecision::Denied { reason } => return Err(into_tool_error(anyhow::anyhow!(reason))),
+        };
 
         let metadata = tokio::fs::metadata(&file_path).await;
 
@@ -386,12 +406,30 @@ impl Tool for WriteFileTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: WriteArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_write_path(&self.working_directory, &input.file_path)
-            .map_err(into_tool_error)?;
+        let file_path = match classify_path_permission(
+            PermissionAction::Write,
+            &path_from_tool_input(&self.working_directory, &input.file_path),
+            &[self.working_directory.clone()],
+            &ctx.permission_grants(),
+            "write_file",
+            &ctx.session_id,
+            true,
+        )
+        .map_err(into_tool_error)?
+        {
+            PathPermissionDecision::Allowed { canonical_path } => canonical_path,
+            PathPermissionDecision::Requires(request) => {
+                return Ok(ToolResult::new(
+                    "write_file",
+                    permission_required_result(request).to_string(),
+                ));
+            }
+            PathPermissionDecision::Denied { reason } => return Err(into_tool_error(anyhow::anyhow!(reason))),
+        };
 
         write(&file_path, input.content.as_bytes())
             .await
@@ -420,12 +458,30 @@ impl Tool for EditFileTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: EditArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_write_path(&self.working_directory, &input.file_path)
-            .map_err(into_tool_error)?;
+        let file_path = match classify_path_permission(
+            PermissionAction::Write,
+            &path_from_tool_input(&self.working_directory, &input.file_path),
+            &[self.working_directory.clone()],
+            &ctx.permission_grants(),
+            "edit_file",
+            &ctx.session_id,
+            true,
+        )
+        .map_err(into_tool_error)?
+        {
+            PathPermissionDecision::Allowed { canonical_path } => canonical_path,
+            PathPermissionDecision::Requires(request) => {
+                return Ok(ToolResult::new(
+                    "edit_file",
+                    permission_required_result(request).to_string(),
+                ));
+            }
+            PathPermissionDecision::Denied { reason } => return Err(into_tool_error(anyhow::anyhow!(reason))),
+        };
 
         let content = read_text(&file_path).await.map_err(into_tool_error)?;
 
@@ -444,6 +500,15 @@ impl Tool for EditFileTool {
             "edit_file",
             format!("Successfully modified {}", file_path.to_string_lossy()),
         ))
+    }
+}
+
+fn path_from_tool_input(working_directory: &std::path::Path, input_path: &str) -> PathBuf {
+    let path = std::path::Path::new(input_path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_directory.join(path)
     }
 }
 

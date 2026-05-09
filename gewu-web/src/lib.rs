@@ -227,6 +227,10 @@ where
         .route("/api/agents", get(routes::sessions::handle_list_agents))
         .route("/api/skills", get(routes::skills::handle_list_skills))
         .route("/api/chat", post(routes::chat::handle_chat))
+        .route(
+            "/api/permissions/decide",
+            post(routes::permissions::handle_permission_decision),
+        )
         .route("/api/events", get(routes::events::handle_events))
         .route("/api/projects", get(routes::projects::handle_list_projects))
         .route(
