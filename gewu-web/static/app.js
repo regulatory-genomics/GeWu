@@ -1849,6 +1849,34 @@ function appendToDiv(div, role, text) {
     if (shouldFollow) scrollChatToBottom();
 }
 
+async function decidePermission(request, decision, card) {
+    const buttons = Array.from(card.querySelectorAll('button'));
+    buttons.forEach((button) => { button.disabled = true; });
+    try {
+        const resp = await fetch('/api/permissions/decide', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ request, decision, duration: request.default_duration || 'session' })
+        });
+        if (!resp.ok) {
+            const errorText = await resp.text();
+            throw new Error(errorText || `Permission decision failed (${resp.status})`);
+        }
+        const result = await resp.json();
+        card.classList.add(result.approved ? 'permission-approved' : 'permission-denied');
+        const status = card.querySelector('.permission-status');
+        if (status) {
+            status.textContent = result.approved
+                ? 'Approved for this session. Ask the agent to retry the action.'
+                : 'Denied. The agent will need to choose an allowed path.';
+        }
+        handleSSEEvent({ type: 'tool_permission_resolved', data: result });
+    } catch (e) {
+        buttons.forEach((button) => { button.disabled = false; });
+        showError('Permission decision failed: ' + e.message);
+    }
+}
+
 // SSE Handler
 function handleSSEEvent(event) {
     switch (event.type) {
@@ -1878,6 +1906,38 @@ function handleSSEEvent(event) {
                 if (toolCallEl) {
                     finishToolCall(toolCallEl, event.data.output);
                 }
+            }
+            break;
+        case 'tool_permission_request': {
+            const request = event.data.request;
+            const container = document.createElement('div');
+            container.className = 'message permission-request';
+            container.innerHTML = `
+                <div class="permission-header">Permission request from ${escapeHtml(request.tool_name)}</div>
+                <div class="permission-body">
+                    <div><strong>Action:</strong> ${escapeHtml(request.action)}</div>
+                    <div><strong>Path:</strong> ${escapeHtml(request.requested_path)}</div>
+                    <div><strong>Reason:</strong> ${escapeHtml(request.reason)}</div>
+                </div>
+                <div class="permission-actions">
+                    <button type="button" data-decision="approve">Approve for session</button>
+                    <button type="button" data-decision="deny">Deny</button>
+                </div>
+                <div class="permission-status"></div>
+            `;
+            container.querySelector('[data-decision="approve"]').addEventListener('click', () => {
+                decidePermission(request, 'approve', container);
+            });
+            container.querySelector('[data-decision="deny"]').addEventListener('click', () => {
+                decidePermission(request, 'deny', container);
+            });
+            chatContainer.appendChild(container);
+            scrollChatToBottom();
+            break;
+        }
+        case 'tool_permission_resolved':
+            if (currentAssistantDiv && event.data.approved) {
+                currentAssistantDiv.classList.add('permission-approved');
             }
             break;
         case 'finish':
