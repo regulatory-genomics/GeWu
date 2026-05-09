@@ -7,6 +7,9 @@
 #![allow(dead_code)]
 #![allow(clippy::collapsible_if)]
 use anyhow::{Context, Result};
+use gewu_core::permission::{
+    PermissionAction, PermissionGrant, PermissionScope, ToolPermissionRequest,
+};
 use mime_guess;
 use serde::{Serialize, de::DeserializeOwned};
 use std::path::{Component, Path, PathBuf};
@@ -118,6 +121,159 @@ pub fn is_read_allowed(root: impl AsRef<Path>, path: impl AsRef<Path>) -> bool {
     let roots = configured_read_roots(root);
     let normalized = normalize_path(path.as_ref());
     roots.iter().any(|r| normalized.starts_with(r))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PathPermissionDecision {
+    Allowed { canonical_path: PathBuf },
+    Requires(ToolPermissionRequest),
+    Denied { reason: String },
+}
+
+pub(crate) fn classify_path_permission(
+    action: PermissionAction,
+    requested_path: &Path,
+    static_roots: &[PathBuf],
+    session_grants: &[PermissionGrant],
+    tool_name: &str,
+    session_id: &str,
+    destructive: bool,
+) -> Result<PathPermissionDecision> {
+    let canonical_path = canonicalize_for_action(action.clone(), requested_path)?;
+
+    if is_hard_denied(&canonical_path) {
+        return Ok(PathPermissionDecision::Denied {
+            reason: format!("{} is blocked by GeWu hard-deny policy", canonical_path.display()),
+        });
+    }
+
+    if is_under_any_root(&canonical_path, static_roots) {
+        return Ok(PathPermissionDecision::Allowed { canonical_path });
+    }
+
+    if grant_allows(session_id, action.clone(), &canonical_path, session_grants) {
+        return Ok(PathPermissionDecision::Allowed { canonical_path });
+    }
+
+    let scope = if canonical_path.is_dir() {
+        PermissionScope::Directory {
+            path: canonical_path.clone(),
+        }
+    } else {
+        PermissionScope::File {
+            path: canonical_path.clone(),
+        }
+    };
+
+    Ok(PathPermissionDecision::Requires(ToolPermissionRequest::new(
+        session_id,
+        tool_name,
+        action,
+        canonical_path.clone(),
+        scope,
+        format!("{tool_name} requested {}", canonical_path.display()),
+        destructive,
+    )))
+}
+
+fn canonicalize_for_action(action: PermissionAction, requested_path: &Path) -> Result<PathBuf> {
+    match action {
+        PermissionAction::Write if !requested_path.exists() => {
+            let parent = requested_path.parent().ok_or_else(|| {
+                anyhow::anyhow!("Write path {} has no parent directory", requested_path.display())
+            })?;
+            let canonical_parent = parent.canonicalize().with_context(|| {
+                format!("Failed to canonicalize parent directory: {}", parent.display())
+            })?;
+            let file_name = requested_path.file_name().ok_or_else(|| {
+                anyhow::anyhow!("Write path {} has no file name", requested_path.display())
+            })?;
+            Ok(canonical_parent.join(file_name))
+        }
+        _ => requested_path
+            .canonicalize()
+            .with_context(|| format!("Failed to canonicalize path: {}", requested_path.display())),
+    }
+}
+
+fn is_hard_denied(path: &Path) -> bool {
+    if path == Path::new("/etc/shadow") || path == Path::new("/proc/kcore") || path == Path::new("/dev/mem") {
+        return true;
+    }
+    if let Some(home) = default_home_dir() {
+        let ssh_dir = home.join(".ssh");
+        if path.starts_with(&ssh_dir) {
+            let name = path.file_name().and_then(|part| part.to_str()).unwrap_or_default();
+            return matches!(name, "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519");
+        }
+    }
+    false
+}
+
+fn is_under_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| {
+        let normalized_root = if root.exists() {
+            root.canonicalize().unwrap_or_else(|_| normalize_path(root))
+        } else {
+            normalize_path(root)
+        };
+        path.starts_with(normalized_root)
+    })
+}
+
+fn grant_allows(
+    session_id: &str,
+    action: PermissionAction,
+    canonical_path: &Path,
+    session_grants: &[PermissionGrant],
+) -> bool {
+    session_grants.iter().any(|grant| {
+        grant.session_id == session_id
+            && grant.action == action
+            && match &grant.scope {
+                PermissionScope::File { path } => canonical_path == path,
+                PermissionScope::Directory { path } => canonical_path == path,
+                PermissionScope::DirectoryTree { path } => canonical_path.starts_with(path),
+            }
+    })
+}
+
+pub(crate) fn permission_required_result(request: ToolPermissionRequest) -> serde_json::Value {
+    serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": "permission_required",
+            "retryable": true,
+            "message": match request.action {
+                PermissionAction::Read => "Read access requires user approval.",
+                PermissionAction::Write => "Write access requires user approval.",
+                PermissionAction::Execute => "Execute access requires user approval.",
+            },
+            "suggested_fix": "Approve this path for the current session or choose a path under an allowed root."
+        },
+        "permission_request": request
+    })
+}
+
+#[cfg(test)]
+fn classify_path_permission_for_test(
+    action: PermissionAction,
+    requested_path: &Path,
+    static_roots: &[PathBuf],
+    session_grants: &[PermissionGrant],
+    tool_name: &str,
+    session_id: &str,
+    destructive: bool,
+) -> Result<PathPermissionDecision> {
+    classify_path_permission(
+        action,
+        requested_path,
+        static_roots,
+        session_grants,
+        tool_name,
+        session_id,
+        destructive,
+    )
 }
 
 /// Formats a read denial error message listing all allowed roots.
@@ -367,6 +523,9 @@ pub fn glob_with_gitignore(root: impl AsRef<Path>, pattern: &str) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gewu_core::permission::{
+        GrantDuration, PermissionAction, PermissionGrant, PermissionScope,
+    };
     use serde::{Deserialize, Serialize};
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
@@ -449,5 +608,84 @@ mod tests {
         let resolved = crate::fs_utils::resolve_read_path(project.path(), &allowed_file).unwrap();
 
         assert_eq!(resolved, crate::fs_utils::normalize_path(&allowed_file));
+    }
+
+    #[test]
+    fn outside_read_root_requires_file_scope_permission() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("sample.txt");
+        std::fs::write(&target, "hello").unwrap();
+
+        let decision = classify_path_permission_for_test(
+            PermissionAction::Read,
+            &target,
+            &[allowed.path().to_path_buf()],
+            &[],
+            "read_file",
+            "session-1",
+            false,
+        )
+        .unwrap();
+
+        match decision {
+            PathPermissionDecision::Requires(request) => {
+                assert_eq!(request.action, PermissionAction::Read);
+                assert_eq!(request.requested_path, target.canonicalize().unwrap());
+                assert_eq!(
+                    request.scope,
+                    PermissionScope::File {
+                        path: target.canonicalize().unwrap()
+                    }
+                );
+                assert!(!request.destructive);
+            }
+            other => panic!("expected permission request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_denied_path_never_prompts() {
+        let decision = classify_path_permission_for_test(
+            PermissionAction::Read,
+            std::path::Path::new("/etc/shadow"),
+            &[],
+            &[],
+            "read_file",
+            "session-1",
+            false,
+        )
+        .unwrap();
+
+        assert!(matches!(decision, PathPermissionDecision::Denied { .. }));
+    }
+
+    #[test]
+    fn approved_session_grant_allows_same_file() {
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("sample.txt");
+        std::fs::write(&target, "hello").unwrap();
+        let canonical = target.canonicalize().unwrap();
+        let grant = PermissionGrant {
+            session_id: "session-1".to_string(),
+            action: PermissionAction::Read,
+            scope: PermissionScope::File {
+                path: canonical.clone(),
+            },
+            duration: GrantDuration::Session,
+        };
+
+        let decision = classify_path_permission_for_test(
+            PermissionAction::Read,
+            &target,
+            &[],
+            &[grant],
+            "read_file",
+            "session-1",
+            false,
+        )
+        .unwrap();
+
+        assert!(matches!(decision, PathPermissionDecision::Allowed { .. }));
     }
 }
