@@ -35,6 +35,7 @@ pub mod observation;
 pub mod state;
 pub mod subscription;
 pub mod tools;
+pub mod workflow_emit;
 
 pub use manager::{CanvasError, CanvasManager, CanvasValidationIssue};
 pub use state::{
@@ -43,3 +44,4 @@ pub use state::{
     GenomeSelection, GenomeViewport, SampleSpec, TrackSpec, TrackType, build_genome_canvas_payload,
 };
 pub use tools::canvas_tools;
+pub use workflow_emit::WorkflowEmitTool;

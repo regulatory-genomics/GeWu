@@ -1,4 +1,4 @@
-//! Six `Tool` implementations exposing canvas operations to the agent.
+//! Canvas `Tool` implementations exposing canvas and tachyon workflow operations to the agent.
 //!
 //! All tools share an `Arc<CanvasManager>`. Session scoping comes from
 //! `ToolContext::session_id` at call time, so a single set of tool instances
@@ -33,8 +33,11 @@ use crate::state::{
     build_genome_canvas_payload,
 };
 
-/// Build the canonical six canvas tools, sharing a single manager.
+use crate::workflow_emit::WorkflowEmitTool;
+
+/// Build the canonical canvas tools, sharing a single manager.
 pub fn canvas_tools(manager: Arc<CanvasManager>) -> Vec<Arc<dyn Tool>> {
+    let workflow_url = std::env::var("GEWU_TACHYON_CANVAS_URL").unwrap_or_else(|_| "http://localhost:3210".to_string());
     vec![
         Arc::new(CanvasOpenTool {
             manager: manager.clone(),
@@ -55,6 +58,7 @@ pub fn canvas_tools(manager: Arc<CanvasManager>) -> Vec<Arc<dyn Tool>> {
             manager: manager.clone(),
         }),
         Arc::new(CanvasListTool { manager }),
+        Arc::new(WorkflowEmitTool::new(workflow_url)),
     ]
 }
 
