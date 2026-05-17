@@ -31,6 +31,7 @@
 //! No changes to `gewu_core::types::AgentEvent` are required.
 
 pub mod manager;
+pub mod invocation_poller;
 pub mod observation;
 pub mod state;
 pub mod subscription;
