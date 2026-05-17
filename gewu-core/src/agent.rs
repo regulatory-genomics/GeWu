@@ -44,6 +44,7 @@ use crate::compaction::{
     build_consolidation_text, save_consolidation_file,
 };
 use crate::middleware::TruncationService;
+use crate::observation::ObservationSource;
 use crate::permission::{
     PermissionDecision, PermissionDecisionKind, PermissionGrant, ToolPermissionRequest,
 };
@@ -86,6 +87,7 @@ pub struct Agent {
     session_id: String,
     tool_context_metadata: serde_json::Map<String, serde_json::Value>,
     permission_broker: Option<Arc<dyn PermissionBroker>>,
+    observation_source: Option<Arc<dyn ObservationSource>>,
 }
 
 pub struct AgentBuilder {
@@ -98,6 +100,7 @@ pub struct AgentBuilder {
     session_id: Option<String>,
     tool_context_metadata: serde_json::Map<String, serde_json::Value>,
     permission_broker: Option<Arc<dyn PermissionBroker>>,
+    observation_source: Option<Arc<dyn ObservationSource>>,
 }
 
 fn permission_request_from_output(output: &str) -> Option<ToolPermissionRequest> {
@@ -449,6 +452,7 @@ impl Default for AgentBuilder {
             session_id: None,
             tool_context_metadata: Default::default(),
             permission_broker: None,
+            observation_source: None,
         }
     }
 }
@@ -755,6 +759,17 @@ impl Agent {
                     }
                     call_index += 1;
                 }
+
+                if let Some(source) = &self.observation_source {
+                    for observation in source.poll(None).await {
+                        yield AgentEvent::Observation {
+                            source: observation.source,
+                            kind: observation.kind,
+                            payload: observation.payload,
+                            timestamp: observation.timestamp,
+                        };
+                    }
+                }
             }
         }
     }
@@ -943,6 +958,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn observation_source(mut self, source: Arc<dyn ObservationSource>) -> Self {
+        self.observation_source = Some(source);
+        self
+    }
+
     pub fn memory(mut self, memory: Box<dyn Memory>) -> Self {
         self.memory = Some(memory);
         self
@@ -963,6 +983,7 @@ impl AgentBuilder {
                 .unwrap_or_else(|| Uuid::new_v4().to_string()),
             tool_context_metadata: self.tool_context_metadata,
             permission_broker: self.permission_broker,
+            observation_source: self.observation_source,
         };
         Ok(agent)
     }
