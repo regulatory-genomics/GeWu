@@ -72,13 +72,13 @@ impl CanvasManager {
         title: Option<String>,
         initial_payload: Option<serde_json::Value>,
     ) -> Result<CanvasState, CanvasError> {
+        let canvas_id = normalize_canvas_id(canvas_id);
         let mut guard = self.inner.write().await;
         let session = guard.sessions.entry(session_id.to_string()).or_default();
 
         if let Some(id) = canvas_id.as_deref()
-            && session.contains_key(id)
+            && let Some(existing) = session.get(id)
         {
-            let existing = session.get(id).expect("contains_key returned true above");
             let mut candidate = existing.clone();
             candidate.visible = true;
             candidate.focused = true;
@@ -97,7 +97,10 @@ impl CanvasManager {
             }
             let existing = session
                 .get_mut(id)
-                .expect("contains_key returned true above");
+                .ok_or_else(|| CanvasError::NotFound {
+                    session_id: session_id.into(),
+                    canvas_id: id.to_string(),
+                })?;
             *existing = candidate;
             return Ok(existing.clone());
         }
@@ -164,10 +167,17 @@ impl CanvasManager {
                 canvas_id: canvas_id.into(),
             });
         }
+        let mut focused = None;
         for (id, state) in session.iter_mut() {
             state.focused = id == canvas_id;
+            if state.focused {
+                focused = Some(state.clone());
+            }
         }
-        Ok(session.get(canvas_id).expect("checked above").clone())
+        focused.ok_or_else(|| CanvasError::NotFound {
+            session_id: session_id.into(),
+            canvas_id: canvas_id.into(),
+        })
     }
 
     pub async fn set_state(
@@ -388,6 +398,17 @@ fn short_canvas_id() -> String {
     let raw = Uuid::new_v4().to_string();
     let suffix: String = raw.chars().filter(|c| *c != '-').take(8).collect();
     format!("c-{suffix}")
+}
+
+fn normalize_canvas_id(canvas_id: Option<String>) -> Option<String> {
+    canvas_id.and_then(|id| {
+        let id = id.trim();
+        if id.is_empty() {
+            None
+        } else {
+            Some(id.to_string())
+        }
+    })
 }
 
 #[cfg(test)]
