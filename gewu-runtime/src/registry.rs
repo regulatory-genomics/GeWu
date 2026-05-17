@@ -132,6 +132,10 @@ impl ToolFactory for BuiltinToolFactory {
             "register_tool",
             "write_specialist",
             "workflow_emit",
+            "canvas_open",
+            "canvas_list",
+            "canvas_get_state",
+            "canvas_set_state",
         ]
         .into_iter()
         .map(String::from)

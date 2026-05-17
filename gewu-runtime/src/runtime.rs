@@ -373,6 +373,26 @@ impl GeWuRuntime {
     /// Execute an inline specialist defined in a workflow node.
     /// Unlike execute_request, this doesn't look up the specialist in the registry —
     /// it uses the provided descriptor directly.
+
+    fn canvas_observation_source_for(
+        &self,
+        descriptor: &SpecialistDescriptor,
+    ) -> Option<Arc<dyn gewu_core::observation::ObservationSource>> {
+        let needs_canvas_observations = descriptor.id == "canvas-analyst"
+            || descriptor
+                .capabilities
+                .iter()
+                .any(|capability| capability == "workflow_emit");
+        if !needs_canvas_observations {
+            return None;
+        }
+        let url = std::env::var("GEWU_TACHYON_CANVAS_URL")
+            .unwrap_or_else(|_| "http://localhost:3210".to_string());
+        Some(Arc::new(
+            gewu_canvas::observation::TachyonObservationSource::new(&url),
+        ))
+    }
+
     pub async fn execute_inline_specialist(
         &self,
         descriptor: &SpecialistDescriptor,
@@ -416,13 +436,16 @@ impl GeWuRuntime {
             )
             .await?;
 
-        let mut agent = Agent::builder()
+        let mut agent_builder = Agent::builder()
             .llm(self.provider.clone())
             .with_tools(all_tools)
             .memory(Box::new(memory))
             .system_prompt(&system_prompt)
-            .session_id(session_id)
-            .build()?;
+            .session_id(session_id);
+        if let Some(source) = self.canvas_observation_source_for(&descriptor) {
+            agent_builder = agent_builder.observation_source(source);
+        }
+        let mut agent = agent_builder.build()?;
 
         let mut stream = Box::pin(agent.ask(prompt));
         let mut result_text = String::new();
@@ -535,14 +558,17 @@ impl GeWuRuntime {
             )
             .await?;
 
-        let agent = Agent::builder()
+        let mut agent_builder = Agent::builder()
             .llm(self.provider.clone())
             .with_tools(all_tools)
             .memory(Box::new(memory))
             .system_prompt(&system_prompt)
             .session_id(session_id.clone())
-            .tool_context_metadata(metadata_object_for_tool_context(&metadata_json))
-            .build()?;
+            .tool_context_metadata(metadata_object_for_tool_context(&metadata_json));
+        if let Some(source) = self.canvas_observation_source_for(&descriptor) {
+            agent_builder = agent_builder.observation_source(source);
+        }
+        let agent = agent_builder.build()?;
 
         Ok((agent, Arc::new(registry)))
     }
@@ -670,14 +696,17 @@ impl GeWuRuntime {
             session_id: request.session_id.clone(),
         };
 
-        let mut agent = Agent::builder()
+        let mut agent_builder = Agent::builder()
             .llm(self.provider.clone())
             .with_tools(all_tools)
             .memory(Box::new(memory))
             .system_prompt(&system_prompt)
             .session_id(request.session_id.clone())
-            .tool_context_metadata(trace_context.to_metadata_map())
-            .build()?;
+            .tool_context_metadata(trace_context.to_metadata_map());
+        if let Some(source) = self.canvas_observation_source_for(&descriptor) {
+            agent_builder = agent_builder.observation_source(source);
+        }
+        let mut agent = agent_builder.build()?;
 
         store
             .update_status(&request.task_id, &TaskStatus::Running, None)

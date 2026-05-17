@@ -2120,6 +2120,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
+ "axum 0.8.9",
  "chrono",
  "dirs 6.0.0",
  "futures",

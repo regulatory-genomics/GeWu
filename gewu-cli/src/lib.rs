@@ -10,8 +10,8 @@ use gewu_core::types::{AgentEvent, SpecialistExecutionRequest};
 use gewu_graph::Blackboard;
 use gewu_providers::OpenAIProvider;
 use gewu_runtime::{
-    PluginHost, PluginRegistry, RuntimeFactory, SpecialistExecutionEvent, WorkflowCompiler,
-    WorkflowRegistry,
+    InvocationExecutor, PluginHost, PluginRegistry, RuntimeFactory, SpecialistExecutionEvent,
+    WorkflowCompiler, WorkflowRegistry,
 };
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 use std::collections::HashMap;
@@ -19,6 +19,7 @@ use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -109,6 +110,22 @@ pub struct Cli {
     /// List available workflows and exit.
     #[arg(long)]
     pub list_workflows: bool,
+
+    /// Start the canvas-analyst polling loop for tachyon-canvas pending invocations.
+    #[arg(long)]
+    pub canvas_loop: bool,
+
+    /// tachyon-canvas server URL used by --canvas-loop and workflow.emit.
+    #[arg(
+        long,
+        default_value = "http://localhost:3210",
+        env = "GEWU_TACHYON_CANVAS_URL"
+    )]
+    pub canvas_url: String,
+
+    /// Poll interval in milliseconds for --canvas-loop.
+    #[arg(long, default_value_t = 2000, env = "GEWU_CANVAS_POLL_INTERVAL_MS")]
+    pub poll_interval_ms: u64,
 }
 
 async fn run_runtime_agent(
@@ -173,7 +190,10 @@ async fn run_runtime_agent(
                         request.reason
                     );
                 }
-                AgentEvent::ToolPermissionResolved { request_id, approved } => {
+                AgentEvent::ToolPermissionResolved {
+                    request_id,
+                    approved,
+                } => {
                     println!("\n[Permission Resolved: {request_id}] approved={approved}");
                 }
                 AgentEvent::Observation { source, kind, .. } => {
@@ -196,6 +216,38 @@ async fn run_runtime_agent(
         }
     }
     Ok(())
+}
+
+async fn run_canvas_loop(
+    runtime: &gewu_runtime::GeWuRuntime,
+    canvas_url: &str,
+    poll_interval_ms: u64,
+    workdir: &Path,
+) -> Result<()> {
+    unsafe {
+        std::env::set_var("GEWU_TACHYON_CANVAS_URL", canvas_url);
+    }
+    let executor = InvocationExecutor::new(canvas_url, poll_interval_ms);
+    info!("Starting canvas-analyst loop; polling {canvas_url}");
+    loop {
+        for invocation in executor.poll_once().await {
+            let prompt = executor.build_prompt(&invocation);
+            info!(
+                "Executing invocation {} for agent {}",
+                invocation.invocation_id, invocation.agent_id
+            );
+            run_runtime_agent(
+                runtime,
+                &invocation.agent_id,
+                &invocation.invocation_id,
+                &[],
+                &prompt,
+                workdir,
+            )
+            .await?;
+        }
+        tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+    }
 }
 
 fn resolve_manifest_dirs(config: &config::Config) -> Vec<PathBuf> {
@@ -581,6 +633,16 @@ where
         let input = parse_workflow_input(cli.workflow_input.as_deref())?;
         let registry = WorkflowRegistry::from_sources(&plugin_host, &workflow_dirs)?;
         return run_workflow(runtime, registry, workflow_id, input).await;
+    }
+
+    if cli.canvas_loop {
+        return run_canvas_loop(
+            &runtime,
+            &cli.canvas_url,
+            cli.poll_interval_ms,
+            &working_directory,
+        )
+        .await;
     }
 
     info!("Initialized agent: {}", cli.agent);

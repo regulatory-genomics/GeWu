@@ -7,6 +7,7 @@ pub mod execution_trace;
 pub mod factory;
 pub mod hooked_tool;
 pub mod hooks;
+pub mod invocation_loop;
 pub mod manifest;
 pub mod plugin_host;
 pub mod providers;
@@ -39,6 +40,7 @@ pub use composer::{
 pub use execution_trace::{NoopTraceSink, SqliteTraceSink, StartTraceRun, TraceContext, TraceSink};
 pub use factory::RuntimeFactory;
 pub use hooks::{HookRegistry, HttpHookProvider};
+pub use invocation_loop::InvocationExecutor;
 pub use manifest::loader::SpecialistManifestLoader;
 pub use manifest::runtime_plugin_loader::RuntimePluginManifestLoader;
 pub use manifest::schema::{PromptSource, SpecialistManifest};
