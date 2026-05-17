@@ -57,6 +57,22 @@ pub fn specialist_descriptors() -> Vec<SpecialistDescriptor> {
             skills: Vec::new(),
             system_prompt: include_str!("prompts/general.txt").into(),
         },
+        SpecialistDescriptor {
+            id: "canvas-analyst".into(),
+            description: "Bioinformatics analysis agent that drives tachyon-canvas workflows.".into(),
+            capabilities: vec![
+                "bash",
+                "read_file",
+                "write_file",
+                "workflow_emit",
+                "canvas_open",
+                "canvas_list",
+                "canvas_get_state",
+                "canvas_set_state",
+            ].into_iter().map(String::from).collect(),
+            skills: Vec::new(),
+            system_prompt: include_str!("prompts/canvas_analyst.txt").into(),
+        },
     ]
 }
 
@@ -73,6 +89,20 @@ pub fn list_available_agents() -> Vec<AgentConfig> {
 /// Look up a specialist descriptor by id.
 pub fn find_descriptor(name: &str) -> Option<SpecialistDescriptor> {
     specialist_descriptors().into_iter().find(|d| d.id == name)
+}
+
+
+struct ArcToolAdapter(Arc<dyn Tool>);
+
+#[async_trait::async_trait]
+impl Tool for ArcToolAdapter {
+    fn name(&self) -> &str { self.0.name() }
+    fn description(&self) -> &str { self.0.description() }
+    fn schema(&self) -> schemars::schema::RootSchema { self.0.schema() }
+    fn execution_policy(&self) -> gewu_core::types::ToolExecutionPolicy { self.0.execution_policy() }
+    fn start_metadata(&self, args: &str, ctx: &gewu_core::types::ToolContext) -> std::result::Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> { self.0.start_metadata(args, ctx) }
+    async fn init(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> { self.0.init().await }
+    async fn execute(&self, args: serde_json::Value, ctx: &gewu_core::types::ToolContext) -> std::result::Result<gewu_core::types::ToolResult, Box<dyn std::error::Error + Send + Sync>> { self.0.execute(args, ctx).await }
 }
 
 pub struct BuiltinToolFactory;
@@ -101,6 +131,7 @@ impl ToolFactory for BuiltinToolFactory {
             "memory_day_query",
             "register_tool",
             "write_specialist",
+            "workflow_emit",
         ]
         .into_iter()
         .map(String::from)
@@ -181,6 +212,26 @@ impl ToolFactory for BuiltinToolFactory {
                 crate::composer::default_specialists_dir(),
             ))]),
             "report_result" => Ok(vec![Box::new(ReportResultTool)]),
+            "workflow_emit" => {
+                let url = std::env::var("GEWU_TACHYON_CANVAS_URL")
+                    .unwrap_or_else(|_| "http://localhost:3210".to_string());
+                Ok(vec![Box::new(gewu_canvas::WorkflowEmitTool::new(url))])
+            }
+            "canvas_open" | "canvas_list" | "canvas_get_state" | "canvas_set_state" => {
+                let manager = Arc::new(gewu_canvas::CanvasManager::new());
+                let selected = gewu_canvas::canvas_tools(manager)
+                    .into_iter()
+                    .filter(|tool| match capability {
+                        "canvas_open" => tool.name() == "canvas.open" || tool.name() == "canvas.open_genome",
+                        "canvas_list" => tool.name() == "canvas.list",
+                        "canvas_get_state" => tool.name() == "canvas.get_state",
+                        "canvas_set_state" => tool.name() == "canvas.set_state",
+                        _ => false,
+                    })
+                    .map(|tool| Box::new(ArcToolAdapter(tool)) as Box<dyn Tool>)
+                    .collect();
+                Ok(selected)
+            }
             _ => Err(format!("Unknown capability: {capability}").into()),
         }
     }

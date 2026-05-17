@@ -9,6 +9,7 @@ gewu-core = { path = "../gewu-core" }
 gewu-graph = { path = "../gewu-graph" }
 gewu-resource-core = { path = "../gewu-resource-core" }
 gewu-tools = { path = "../gewu-tools" }
+gewu-canvas = { path = "../gewu-canvas" }
 gewu-storage = { path = "../gewu-storage" }
 anyhow = "1.0"
 async-trait = "0.1"

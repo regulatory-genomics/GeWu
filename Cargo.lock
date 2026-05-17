@@ -2123,6 +2123,7 @@ dependencies = [
  "chrono",
  "dirs 6.0.0",
  "futures",
+ "gewu-canvas",
  "gewu-core",
  "gewu-graph",
  "gewu-resource-core",
