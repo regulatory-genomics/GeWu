@@ -49,6 +49,7 @@
 //! ```
 
 pub mod agent;
+pub(crate) mod agent_normalization;
 pub mod compaction;
 pub mod middleware;
 pub mod observation;

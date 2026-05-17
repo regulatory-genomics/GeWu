@@ -37,6 +37,7 @@
 //!     .build()?;
 //! ```
 
+use crate::agent_normalization::normalize_assistant_output;
 use crate::compaction::{self, estimate_message_tokens, is_overflow};
 use crate::compaction::{
     ConsolidationInput, apply_consolidation_to_memory, build_consolidation_prompt,
@@ -63,33 +64,6 @@ use std::sync::Arc;
 use tokio::task::spawn_blocking;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-
-fn strip_tag_blocks(input: &str, tag: &str) -> String {
-    let start_tag = format!("<{tag}>");
-    let end_tag = format!("</{tag}>");
-    let mut output = input.to_string();
-
-    loop {
-        let lower = output.to_lowercase();
-        let Some(start) = lower.find(&start_tag) else {
-            break;
-        };
-        let Some(end_rel) = lower[start..].find(&end_tag) else {
-            break;
-        };
-        let end = start + end_rel + end_tag.len();
-        output.replace_range(start..end, "");
-    }
-
-    output
-}
-
-fn normalize_assistant_output(input: &str) -> String {
-    let cleaned = ["think", "analysis", "reasoning"]
-        .into_iter()
-        .fold(input.to_string(), |acc, tag| strip_tag_blocks(&acc, tag));
-    cleaned.trim().to_string()
-}
 
 fn is_max_output_stop(reason: Option<&str>) -> bool {
     let Some(reason) = reason else {
@@ -895,25 +869,6 @@ When constructing the summary, try to stick to this template:
             .await
             .map_err(|e| anyhow::anyhow!("Memory::replace failed: {e}"))?;
         Ok(true)
-    }
-}
-
-#[cfg(test)]
-mod normalization_tests {
-    use super::normalize_assistant_output;
-
-    #[test]
-    fn strips_think_analysis_and_reasoning_blocks() {
-        let raw = "<think>internal</think> {\"ok\":true} <analysis>drop</analysis> <reasoning>drop2</reasoning>";
-        let cleaned = normalize_assistant_output(raw);
-        assert_eq!(cleaned, "{\"ok\":true}");
-    }
-
-    #[test]
-    fn preserves_regular_text_when_no_tags_present() {
-        let raw = "plain response";
-        let cleaned = normalize_assistant_output(raw);
-        assert_eq!(cleaned, "plain response");
     }
 }
 
