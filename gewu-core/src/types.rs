@@ -236,6 +236,18 @@ pub enum AgentEvent {
     ToolPermissionRequest(ToolPermissionRequest),
     /// A previously requested tool permission has been approved or denied.
     ToolPermissionResolved { request_id: String, approved: bool },
+    /// An external observation delivered to the agent between tool calls.
+    /// The agent sees this in its next reasoning turn and decides whether to react.
+    Observation {
+        /// Source system (for example, "canvas", "workflow", or "system").
+        source: String,
+        /// Event type (for example, "data_ingested" or "selection_changed").
+        kind: String,
+        /// Event data as JSON.
+        payload: serde_json::Value,
+        /// ISO 8601 timestamp.
+        timestamp: String,
+    },
     /// The agent has finished with a final response.
     Finish { response: String },
     /// An error occurred during agent execution.

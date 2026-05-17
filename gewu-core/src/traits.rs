@@ -41,6 +41,7 @@
 //! }
 //! ```
 
+use crate::observation::ObservationEvent;
 use crate::types::{
     CapabilityDescriptor, ExperienceQuery, Message, ProviderEvent, RecalledExperience,
     SpecialistDescriptor, ToolContext, ToolExecutionPolicy, ToolResult,
@@ -53,6 +54,64 @@ use sqlx::SqlitePool;
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+
+/// Trigger that caused agent invocation.
+#[derive(Debug, Clone)]
+pub enum InvocationTrigger {
+    Explicit {
+        prompt: String,
+        selected_nodes: Vec<String>,
+    },
+    Subscription {
+        subscription_id: String,
+        triggering_event: ObservationEvent,
+        backlog: Vec<ObservationEvent>,
+    },
+}
+
+/// Assembled context for agent invocation.
+#[derive(Debug, Clone)]
+pub struct AgentContext {
+    pub trigger: InvocationTrigger,
+    pub selection: Vec<NodeSummary>,
+    pub neighbors: Vec<NodeSummary>,
+    pub lineage: Vec<LineageStep>,
+    pub recent_events: Vec<ObservationEvent>,
+    pub user_intent: Option<String>,
+    pub available_data: Vec<DataSummary>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeSummary {
+    pub id: String,
+    pub kind: String,
+    pub format: Option<String>,
+    pub summary: String,
+    pub uri: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LineageStep {
+    pub node_id: String,
+    pub step_id: Option<String>,
+    pub description: String,
+    pub depth: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct DataSummary {
+    pub id: String,
+    pub format: String,
+    pub uri: String,
+    pub description: String,
+}
+
+/// Assembles structured context for agent invocation.
+#[async_trait]
+pub trait ContextAssembler: Send + Sync {
+    async fn assemble(&self, trigger: InvocationTrigger) -> AgentContext;
+}
 
 /// Defines a tool that the agent can call during execution.
 ///

@@ -51,6 +51,7 @@
 pub mod agent;
 pub mod compaction;
 pub mod middleware;
+pub mod observation;
 pub mod permission;
 pub mod traits;
 pub mod types;
@@ -58,8 +59,9 @@ pub mod work_graph;
 
 pub use agent::Agent;
 pub use traits::{
-    AssemblyContext, Experiences, LlmProvider, Memory, Plugin, PluginPlatformContext, Tool,
-    ToolFactory, ToolProvider, ToolRegistry,
+    AgentContext, AssemblyContext, ContextAssembler, DataSummary, Experiences,
+    InvocationTrigger, LineageStep, LlmProvider, Memory, NodeSummary, Plugin,
+    PluginPlatformContext, Tool, ToolFactory, ToolProvider, ToolRegistry,
 };
 pub use types::{
     CapabilityDescriptor, Experience, ExperienceQuery, FileAttachment, Message,
