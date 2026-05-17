@@ -15,7 +15,7 @@ thiserror = "2.0"
 schemars = "0.8"
 uuid = { version = "1.0", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-native-tls"] }
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio-rustls", "migrate", "macros"] }
 qdrant-client = "1.16"
 embed_anything = { git = "https://github.com/StarlightSearch/EmbedAnything", rev = "273bf9da0317cd5740b66f6c69de9000fa76049e" }
 directories = "5.0"
