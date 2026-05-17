@@ -20,6 +20,36 @@ fn default_session() -> String {
     "default".to_string()
 }
 
+fn normalize_payload_aliases(kind: &str, payload: Value) -> Value {
+    let Value::Object(mut map) = payload else {
+        return payload;
+    };
+
+    if let Some(id) = map.get("id").cloned() {
+        let canonical = match kind {
+            "data_ingested" => Some("data_id"),
+            "step_executed" => Some("step_id"),
+            "artifact_produced" | "artifact_surfaced" | "artifact_hidden" => Some("artifact_id"),
+            "annotation_added" => Some("target_id"),
+            _ => None,
+        };
+        if let Some(key) = canonical {
+            map.entry(key.to_string()).or_insert(id);
+        }
+    }
+
+    if kind == "edge_declared" {
+        if let Some(from) = map.get("from").cloned() {
+            map.entry("from_id".to_string()).or_insert(from);
+        }
+        if let Some(to) = map.get("to").cloned() {
+            map.entry("to_id".to_string()).or_insert(to);
+        }
+    }
+
+    Value::Object(map)
+}
+
 pub struct WorkflowEmitTool {
     base_url: String,
     client: reqwest::Client,
@@ -67,7 +97,7 @@ impl Tool for WorkflowEmitTool {
             "kind": input.kind,
             "actor": "agent",
             "session_id": input.session_id,
-            "payload": input.payload,
+            "payload": normalize_payload_aliases(&input.kind, input.payload),
         });
         let url = format!("{}/api/workflow/events", self.base_url);
 
@@ -86,7 +116,8 @@ impl Tool for WorkflowEmitTool {
         if status.is_success() {
             Ok(ToolResult::new(
                 self.name(),
-                json!({ "ok": true, "data": { "status": status.as_u16(), "response": text } }).to_string(),
+                json!({ "ok": true, "data": { "status": status.as_u16(), "response": text } })
+                    .to_string(),
             ))
         } else {
             Ok(ToolResult::new(
