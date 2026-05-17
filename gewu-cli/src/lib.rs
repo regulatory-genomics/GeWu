@@ -176,6 +176,9 @@ async fn run_runtime_agent(
                 AgentEvent::ToolPermissionResolved { request_id, approved } => {
                     println!("\n[Permission Resolved: {request_id}] approved={approved}");
                 }
+                AgentEvent::Observation { source, kind, .. } => {
+                    println!("\n[Observation: {source}/{kind}]");
+                }
                 AgentEvent::Finish { .. } => {
                     println!();
                 }

@@ -181,7 +181,7 @@ impl Tool for TaskTool {
                             }
                         }
                     }
-                    AgentEvent::ToolPermissionRequest(_) | AgentEvent::ToolPermissionResolved { .. } => {}
+                    AgentEvent::ToolPermissionRequest(_) | AgentEvent::ToolPermissionResolved { .. } | AgentEvent::Observation { .. } => {}
                     AgentEvent::Error { error } => {
                         final_status = TaskStatus::Blocked;
                         block_reason = Some(error.clone());

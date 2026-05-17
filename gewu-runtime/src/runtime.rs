@@ -814,6 +814,22 @@ impl GeWuRuntime {
                         events.push(record);
                         yield SpecialistExecutionEvent::Agent(AgentEvent::ToolPermissionResolved { request_id, approved });
                     }
+                    AgentEvent::Observation { source, kind, payload, timestamp } => {
+                        let record = SpecialistAgentEventRecord {
+                            event_type: "observation".to_string(),
+                            tool_name: None,
+                            payload_json: serde_json::json!({
+                                "source": source.clone(),
+                                "kind": kind.clone(),
+                                "payload": payload.clone(),
+                                "timestamp": timestamp.clone(),
+                            }),
+                        };
+                        self.emit_agent_event_hook(&descriptor, &request, &record)
+                            .await;
+                        events.push(record);
+                        yield SpecialistExecutionEvent::Agent(AgentEvent::Observation { source, kind, payload, timestamp });
+                    }
                     AgentEvent::Error { error } => {
                         let record = SpecialistAgentEventRecord {
                             event_type: "error".to_string(),

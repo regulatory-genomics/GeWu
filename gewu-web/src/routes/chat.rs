@@ -196,6 +196,16 @@ pub async fn handle_chat(
                         info!("tool_permission_resolved: {} approved={}", request_id, approved);
                         SseEvent::tool_permission_resolved(request_id, approved).to_sse_event()
                     }
+                    gewu_core::types::AgentEvent::Observation { source, kind, payload, timestamp } => {
+                        info!("observation: {}/{}", source, kind);
+                        SseEvent::content_delta(serde_json::json!({
+                            "type": "observation",
+                            "source": source,
+                            "kind": kind,
+                            "payload": payload,
+                            "timestamp": timestamp,
+                        }).to_string()).to_sse_event()
+                    }
                     gewu_core::types::AgentEvent::Finish { response } => {
                         info!("finish: {}", response);
                         SseEvent::finish(response).to_sse_event()

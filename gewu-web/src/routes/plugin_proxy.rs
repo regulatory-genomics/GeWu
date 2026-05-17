@@ -62,13 +62,53 @@ pub async fn plugin_target_url(
 }
 
 fn validate_proxy_path(path: &str) -> Result<(), (StatusCode, String)> {
-    if path.contains("..") || path.contains('\\') {
+    let decoded = percent_decode_path(path).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "invalid plugin proxy path".to_string(),
+        )
+    })?;
+    if path_is_unsafe(path) || path_is_unsafe(&decoded) {
         return Err((
             StatusCode::BAD_REQUEST,
             "invalid plugin proxy path".to_string(),
         ));
     }
     Ok(())
+}
+
+fn path_is_unsafe(path: &str) -> bool {
+    path.contains("..") || path.contains('\\')
+}
+
+fn percent_decode_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return None;
+            }
+            let high = hex_value(bytes[index + 1])?;
+            let low = hex_value(bytes[index + 2])?;
+            output.push((high << 4) | low);
+            index += 3;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(output).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 async fn proxy_plugin_request(
@@ -120,5 +160,8 @@ mod tests {
         assert!(validate_proxy_path("api/browser/samples").is_ok());
         assert!(validate_proxy_path("../secret").is_err());
         assert!(validate_proxy_path("api\\secret").is_err());
+        assert!(validate_proxy_path("%2e%2e/secret").is_err());
+        assert!(validate_proxy_path("api/%2E%2E/secret").is_err());
+        assert!(validate_proxy_path("api/%5csecret").is_err());
     }
 }
