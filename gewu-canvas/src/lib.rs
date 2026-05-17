@@ -31,7 +31,9 @@
 //! No changes to `gewu_core::types::AgentEvent` are required.
 
 pub mod manager;
+pub mod observation;
 pub mod state;
+pub mod subscription;
 pub mod tools;
 
 pub use manager::{CanvasError, CanvasManager, CanvasValidationIssue};

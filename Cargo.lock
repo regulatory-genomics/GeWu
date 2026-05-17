@@ -1911,6 +1911,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "gewu-core",
+ "reqwest",
  "schemars",
  "serde",
  "serde_json",
