@@ -549,10 +549,18 @@ impl AppState {
         );
 
         let mut mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
-        mcp_tools.extend(self.canvas_tools.iter().filter(|tool| tool.name() != "workflow.emit").cloned());
-        let workspace_id = project.as_ref().map(|p| p.project_id.as_str()).unwrap_or("default");
-        let workspace_runtime = self.get_or_create_workspace_runtime(workspace_id).await?;
-        mcp_tools.push(Arc::new(crate::workspace::tool::InProcessWorkflowEmitTool::new(workspace_runtime)));
+        mcp_tools.extend(
+            self.canvas_tools
+                .iter()
+                .filter(|tool| tool.name() != "workflow.emit")
+                .cloned(),
+        );
+        let default_project = self.ensure_default_project().await?;
+        let workspace_id = workspace_id_for_project(project.as_ref(), &default_project);
+        let workspace_runtime = self.get_or_create_workspace_runtime(&workspace_id).await?;
+        mcp_tools.push(Arc::new(
+            crate::workspace::tool::InProcessWorkflowEmitTool::new(workspace_runtime),
+        ));
         let plugin_host = self.build_plugin_host_for_workdir(
             provider.clone(),
             pool.clone(),
@@ -774,8 +782,17 @@ impl AppState {
         ensure_default_project(&self.project_store).await
     }
 
-    pub async fn get_or_create_workspace_runtime(&self, workspace_id: &str) -> Result<Arc<WorkspaceRuntime>> {
-        if let Some(runtime) = self.workspace_runtimes.read().await.get(workspace_id).cloned() {
+    pub async fn get_or_create_workspace_runtime(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Arc<WorkspaceRuntime>> {
+        if let Some(runtime) = self
+            .workspace_runtimes
+            .read()
+            .await
+            .get(workspace_id)
+            .cloned()
+        {
             return Ok(runtime);
         }
 
@@ -788,8 +805,15 @@ impl AppState {
             }
         };
         let project_root = PathBuf::from(project.workdir.clone());
-        let storage_dir = project_root.join(".tachyon").join("workspaces").join(workspace_id);
-        let runtime = Arc::new(WorkspaceRuntime::open(workspace_id.to_string(), project_root, storage_dir)?);
+        let storage_dir = project_root
+            .join(".tachyon")
+            .join("workspaces")
+            .join(workspace_id);
+        let runtime = Arc::new(WorkspaceRuntime::open(
+            workspace_id.to_string(),
+            project_root,
+            storage_dir,
+        )?);
         self.workspace_runtimes
             .write()
             .await
@@ -943,6 +967,16 @@ impl AppState {
         session_id: &str,
         fallback_agent_type: &str,
     ) -> Result<(String, Arc<AgentHandle>)> {
+        self.ensure_agent_for_project(session_id, fallback_agent_type, None)
+            .await
+    }
+
+    pub async fn ensure_agent_for_project(
+        &self,
+        session_id: &str,
+        fallback_agent_type: &str,
+        project_id_hint: Option<&str>,
+    ) -> Result<(String, Arc<AgentHandle>)> {
         let session_id = self.resolve_session_id(session_id).await?;
 
         if let Some(handle) = self.get_agent(&session_id).await {
@@ -965,14 +999,12 @@ impl AppState {
         let record = match self.session_store.get(&session_id).await? {
             Some(record) => record,
             None => {
-                let project = if session_id == "default" {
-                    self.ensure_default_project().await?
-                } else {
-                    match self.project_store.get(&session_id).await? {
-                        Some(project) => project,
-                        None => self.ensure_default_project().await?,
-                    }
-                };
+                let project = resolve_project_for_new_session(
+                    &self.project_store,
+                    &session_id,
+                    project_id_hint,
+                )
+                .await?;
                 let created_at = unix_timestamp();
                 self.session_store
                     .insert(
@@ -1039,10 +1071,18 @@ impl AppState {
         );
 
         let mut mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
-        mcp_tools.extend(self.canvas_tools.iter().filter(|tool| tool.name() != "workflow.emit").cloned());
-        let workspace_id = project.as_ref().map(|p| p.project_id.as_str()).unwrap_or("default");
-        let workspace_runtime = self.get_or_create_workspace_runtime(workspace_id).await?;
-        mcp_tools.push(Arc::new(crate::workspace::tool::InProcessWorkflowEmitTool::new(workspace_runtime)));
+        mcp_tools.extend(
+            self.canvas_tools
+                .iter()
+                .filter(|tool| tool.name() != "workflow.emit")
+                .cloned(),
+        );
+        let default_project = self.ensure_default_project().await?;
+        let workspace_id = workspace_id_for_project(project.as_ref(), &default_project);
+        let workspace_runtime = self.get_or_create_workspace_runtime(&workspace_id).await?;
+        mcp_tools.push(Arc::new(
+            crate::workspace::tool::InProcessWorkflowEmitTool::new(workspace_runtime),
+        ));
         let plugin_host = self.build_plugin_host_for_workdir(
             provider.clone(),
             pool.clone(),
@@ -1266,6 +1306,40 @@ async fn ensure_default_project(project_store: &ProjectStore) -> Result<ProjectR
         .await
 }
 
+async fn resolve_project_for_new_session(
+    project_store: &ProjectStore,
+    session_id: &str,
+    project_id_hint: Option<&str>,
+) -> Result<ProjectRecord> {
+    if let Some(project_id) =
+        project_id_hint.filter(|value| !value.is_empty() && *value != "default")
+    {
+        return project_store
+            .get(project_id)
+            .await?
+            .with_context(|| format!("Project not found: {project_id}"));
+    }
+    if session_id == "default" {
+        return ensure_default_project(project_store).await;
+    }
+    match project_store.get(session_id).await? {
+        Some(project) => Ok(project),
+        None => ensure_default_project(project_store).await,
+    }
+}
+
+fn workspace_id_for_project(
+    project: Option<&ProjectRecord>,
+    default_project: &ProjectRecord,
+) -> String {
+    match project {
+        Some(project) if project.project_id != default_project.project_id => {
+            project.project_id.clone()
+        }
+        _ => "default".to_string(),
+    }
+}
+
 fn validate_project_workdir(workdir: &str) -> Result<String> {
     let path = PathBuf::from(workdir);
     if !path.is_absolute() {
@@ -1282,6 +1356,52 @@ fn validate_project_workdir(workdir: &str) -> Result<String> {
         .unwrap_or(path)
         .to_string_lossy()
         .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn test_project_store() -> Arc<ProjectStore> {
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        gewu_storage::run_migrations(&pool).await.unwrap();
+        Arc::new(ProjectStore::new(pool).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn default_workspace_hint_resolves_to_default_project() {
+        let store = test_project_store().await;
+        let default_project = ensure_default_project(&store).await.unwrap();
+
+        let resolved = resolve_project_for_new_session(&store, "fresh-session", Some("default"))
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.project_id, default_project.project_id);
+    }
+
+    #[tokio::test]
+    async fn default_project_uses_frontend_default_workspace_runtime_id() {
+        let store = test_project_store().await;
+        let default_project = ensure_default_project(&store).await.unwrap();
+        let other_project = store
+            .create("Other", "/tmp/gewu-web-other-project", unix_timestamp())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            workspace_id_for_project(Some(&default_project), &default_project),
+            "default"
+        );
+        assert_eq!(
+            workspace_id_for_project(Some(&other_project), &default_project),
+            other_project.project_id
+        );
+    }
 }
 
 fn directory_entry(path: PathBuf, is_root: bool) -> DirectoryEntry {

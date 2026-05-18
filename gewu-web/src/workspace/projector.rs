@@ -2,7 +2,7 @@ use crate::workspace::index::WorkflowIndex;
 use crate::workspace::types::{
     ArtifactPreview, GraphEdge, GraphNode, GraphPosition, WorkflowEvent, WorkflowEventKind,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -23,17 +23,23 @@ impl CanvasProjector {
         for event in events {
             match event.kind {
                 WorkflowEventKind::ArtifactSurfaced => {
-                    if let Some(artifact_id) = event.payload.get("artifact_id").and_then(Value::as_str) {
+                    if let Some(artifact_id) =
+                        event.payload.get("artifact_id").and_then(Value::as_str)
+                    {
                         let node_id = event
                             .payload
                             .get("canvas_node_id")
                             .and_then(Value::as_str)
                             .unwrap_or(artifact_id);
-                        projector.surface_map.insert(artifact_id.to_string(), node_id.to_string());
+                        projector
+                            .surface_map
+                            .insert(artifact_id.to_string(), node_id.to_string());
                     }
                 }
                 WorkflowEventKind::ArtifactHidden => {
-                    if let Some(artifact_id) = event.payload.get("artifact_id").and_then(Value::as_str) {
+                    if let Some(artifact_id) =
+                        event.payload.get("artifact_id").and_then(Value::as_str)
+                    {
                         projector.surface_map.remove(artifact_id);
                     }
                 }
@@ -76,7 +82,9 @@ impl CanvasProjector {
         let workflow_node = index.nodes.get(artifact_id);
         let node_type = workflow_node
             .and_then(|node| node.canvas_kind.clone())
-            .unwrap_or_else(|| infer_node_type(workflow_node.and_then(|node| node.format.as_deref())));
+            .unwrap_or_else(|| {
+                infer_node_type(workflow_node.and_then(|node| node.format.as_deref()))
+            });
         let data = build_node_data(artifact_id, workflow_node);
         let node = GraphNode {
             id: node_id.to_string(),
@@ -86,7 +94,9 @@ impl CanvasProjector {
         };
         self.surface_map
             .insert(artifact_id.to_string(), node_id.to_string());
-        vec![GraphMutation::AddNode(node)]
+        let mut mutations = vec![GraphMutation::AddNode(node)];
+        mutations.extend(self.project_index_edges_for_artifact(artifact_id, index));
+        mutations
     }
 
     fn project_edge_declared(&self, event: &WorkflowEvent) -> Vec<GraphMutation> {
@@ -101,13 +111,39 @@ impl CanvasProjector {
         let Some(target) = self.surface_map.get(to) else {
             return Vec::new();
         };
-        vec![GraphMutation::AddEdge(GraphEdge {
+        let relationship = event
+            .payload
+            .get("relationship")
+            .and_then(Value::as_str)
+            .unwrap_or("derived_from");
+        vec![self.edge_mutation(source, target, relationship)]
+    }
+
+    fn project_index_edges_for_artifact(
+        &self,
+        artifact_id: &str,
+        index: &WorkflowIndex,
+    ) -> Vec<GraphMutation> {
+        index
+            .edges
+            .iter()
+            .filter(|(from, to, _)| from == artifact_id || to == artifact_id)
+            .filter_map(|(from, to, relationship)| {
+                let source = self.surface_map.get(from)?;
+                let target = self.surface_map.get(to)?;
+                Some(self.edge_mutation(source, target, relationship))
+            })
+            .collect()
+    }
+
+    fn edge_mutation(&self, source: &str, target: &str, relationship: &str) -> GraphMutation {
+        GraphMutation::AddEdge(GraphEdge {
             id: format!("edge_{source}_{target}"),
-            source: source.clone(),
-            target: target.clone(),
+            source: source.to_string(),
+            target: target.to_string(),
             edge_type: Some("derived_from".to_string()),
-            data: Some(json!({"relationship": event.payload.get("relationship").and_then(Value::as_str).unwrap_or("derived_from")})),
-        })]
+            data: Some(json!({"relationship": relationship})),
+        })
     }
 
     fn project_artifact_hidden(&mut self, event: &WorkflowEvent) -> Vec<GraphMutation> {
@@ -132,15 +168,23 @@ fn infer_node_type(format: Option<&str>) -> String {
     }
 }
 
-fn build_node_data(artifact_id: &str, node: Option<&crate::workspace::index::WorkflowNode>) -> Value {
+fn build_node_data(
+    artifact_id: &str,
+    node: Option<&crate::workspace::index::WorkflowNode>,
+) -> Value {
     let label = node
         .and_then(|node| node.summary.clone())
         .unwrap_or_else(|| artifact_id.to_string());
     let mut data = json!({"label": label, "workflow_ref": artifact_id});
     if let Some(preview) = node.and_then(|node| node.preview.as_ref()) {
         match preview {
-            ArtifactPreview::Table { columns, rows, total_rows } => {
-                data["payload"] = json!({"columns": columns, "rows": rows, "total_rows": total_rows});
+            ArtifactPreview::Table {
+                columns,
+                rows,
+                total_rows,
+            } => {
+                data["payload"] =
+                    json!({"columns": columns, "rows": rows, "total_rows": total_rows});
             }
             ArtifactPreview::Text { content } => {
                 data["content"] = json!(content);
@@ -201,7 +245,46 @@ mod tests {
     fn edge_only_projects_when_both_artifacts_are_surfaced() {
         let index = WorkflowIndex::default();
         let mut projector = CanvasProjector::default();
-        let edge = event(WorkflowEventKind::EdgeDeclared, json!({"from_id":"a", "to_id":"b"}));
+        let edge = event(
+            WorkflowEventKind::EdgeDeclared,
+            json!({"from_id":"a", "to_id":"b"}),
+        );
         assert!(projector.project(&edge, &index).is_empty());
+    }
+
+    #[test]
+    fn edge_declared_before_surfaces_projects_when_second_endpoint_surfaces() {
+        let produced_a = event(
+            WorkflowEventKind::ArtifactProduced,
+            json!({"artifact_id": "a"}),
+        );
+        let produced_b = event(
+            WorkflowEventKind::ArtifactProduced,
+            json!({"artifact_id": "b"}),
+        );
+        let edge = event(
+            WorkflowEventKind::EdgeDeclared,
+            json!({"from_id": "a", "to_id": "b", "relationship": "derived_from"}),
+        );
+        let index = WorkflowIndex::rebuild(&[produced_a, produced_b, edge]);
+        let mut projector = CanvasProjector::default();
+
+        let first = event(
+            WorkflowEventKind::ArtifactSurfaced,
+            json!({"artifact_id":"a", "canvas_node_id":"node_a"}),
+        );
+        let first_mutations = projector.project(&first, &index);
+        assert_eq!(first_mutations.len(), 1);
+
+        let second = event(
+            WorkflowEventKind::ArtifactSurfaced,
+            json!({"artifact_id":"b", "canvas_node_id":"node_b"}),
+        );
+        let second_mutations = projector.project(&second, &index);
+
+        assert!(second_mutations.iter().any(|mutation| matches!(
+            mutation,
+            GraphMutation::AddEdge(edge) if edge.source == "node_a" && edge.target == "node_b"
+        )));
     }
 }

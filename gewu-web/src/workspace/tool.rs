@@ -69,13 +69,21 @@ impl Tool for InProcessWorkflowEmitTool {
         let mut event = WorkflowEvent {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
-            session_id: input.session_id.unwrap_or_else(|| ctx.session_id.clone()),
+            // The in-process web tool is workspace-bound by construction; the
+            // active agent session is authoritative. Ignore model-provided
+            // session_id so agents cannot write to the wrong canvas session.
+            session_id: ctx.session_id.clone(),
             actor: "agent".to_string(),
             kind: kind.clone(),
             payload: normalize_payload_aliases(&input.kind, input.payload),
         };
         normalize_event_defaults(&mut event, &ctx.session_id);
-        append_event_and_project(&self.runtime, event.clone()).await?;
+        if let Err(error) = append_event_and_project(&self.runtime, event.clone()).await {
+            return Ok(ToolResult::new(
+                self.name(),
+                json!({ "ok": false, "error": { "code": "invalid_event", "message": error.to_string() } }).to_string(),
+            ));
+        }
         Ok(ToolResult::new(
             self.name(),
             json!({"ok": true, "event_id": event.id, "event": event}).to_string(),
@@ -132,6 +140,7 @@ pub async fn append_event_and_project(
     runtime: &WorkspaceRuntime,
     event: WorkflowEvent,
 ) -> anyhow::Result<()> {
+    validate_workflow_event(&event)?;
     let mut store = runtime.workflow_store.lock().await;
     store.append(event.clone())?;
     drop(store);
@@ -158,6 +167,16 @@ pub async fn append_event_and_project(
     Ok(())
 }
 
+pub fn validate_workflow_event(event: &WorkflowEvent) -> anyhow::Result<()> {
+    if event.kind == WorkflowEventKind::ArtifactProduced {
+        if let Some(preview) = event.payload.get("preview") {
+            serde_json::from_value::<crate::workspace::ArtifactPreview>(preview.clone())
+                .map_err(|error| anyhow::anyhow!("invalid artifact_produced.preview: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn apply_mutations(graph: &mut SessionGraph, mutations: Vec<GraphMutation>) {
     for mutation in mutations {
         match mutation {
@@ -176,5 +195,73 @@ pub fn apply_mutations(graph: &mut SessionGraph, mutations: Vec<GraphMutation>) 
                     .retain(|edge| edge.source != node_id && edge.target != node_id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn workflow_event(kind: WorkflowEventKind, session_id: &str, payload: Value) -> WorkflowEvent {
+        WorkflowEvent {
+            id: "e1".to_string(),
+            timestamp: "t".to_string(),
+            session_id: session_id.to_string(),
+            actor: "agent".to_string(),
+            kind,
+            payload,
+        }
+    }
+
+    #[test]
+    fn validate_workflow_event_rejects_malformed_artifact_preview() {
+        let event = workflow_event(
+            WorkflowEventKind::ArtifactProduced,
+            "s1",
+            json!({
+                "artifact_id": "a1",
+                "preview": {"type": "table", "columns": ["sample"], "rows": [], "total_rows": 0}
+            }),
+        );
+
+        let error = validate_workflow_event(&event).unwrap_err();
+
+        assert!(error.to_string().contains("artifact_produced.preview"));
+        assert!(error.to_string().contains("kind"));
+    }
+
+    #[tokio::test]
+    async fn in_process_workflow_emit_uses_tool_context_session_id() {
+        let dir = tempdir().unwrap();
+        let runtime = Arc::new(
+            WorkspaceRuntime::open(
+                "default",
+                dir.path().to_path_buf(),
+                dir.path().join("store"),
+            )
+            .unwrap(),
+        );
+        let tool = InProcessWorkflowEmitTool::new(runtime.clone());
+        let ctx = ToolContext::new("ctx_session", "message-1");
+
+        let result = tool
+            .execute(
+                json!({
+                    "kind": "data_ingested",
+                    "session_id": "model_supplied_wrong_session",
+                    "payload": {"data_id": "samples", "summary": "samples.csv"}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&result.output).unwrap();
+
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["event"]["session_id"], "ctx_session");
+        let store = runtime.workflow_store.lock().await;
+        assert_eq!(store.all()[0].session_id, "ctx_session");
     }
 }

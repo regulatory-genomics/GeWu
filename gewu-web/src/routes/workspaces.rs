@@ -1,5 +1,7 @@
 use crate::state::AppState;
-use crate::workspace::tool::{append_event_and_project, normalize_event_defaults};
+use crate::workspace::tool::{
+    append_event_and_project, normalize_event_defaults, validate_workflow_event,
+};
 use crate::workspace::{GraphMutation, SessionGraph, WorkflowEvent};
 use axum::{
     Json,
@@ -61,12 +63,18 @@ pub async fn create_workspace(
     Json(req): Json<CreateWorkspaceRequest>,
 ) -> impl IntoResponse {
     match app.create_project(req.name, req.project_root).await {
-        Ok(project) => Json(json!({ "workspace": {
-            "id": project.project_id,
-            "name": project.name,
-            "project_root": project.workdir,
-        }})),
-        Err(err) => Json(json!({ "error": err.to_string() })),
+        Ok(project) => (
+            StatusCode::OK,
+            Json(json!({ "workspace": {
+                "id": project.project_id,
+                "name": project.name,
+                "project_root": project.workdir,
+            }})),
+        ),
+        Err(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "workspace creation failed" })),
+        ),
     }
 }
 
@@ -87,10 +95,10 @@ pub async fn get_graph(
                 json!({ "session_id": graph.session_id, "nodes": graph.nodes, "edges": graph.edges }),
             ),
         ),
-        Err(err) => (
+        Err(_) => (
             StatusCode::BAD_REQUEST,
             Json(
-                json!({ "session_id": session_id, "nodes": [], "edges": [], "error": err.to_string() }),
+                json!({ "session_id": session_id, "nodes": [], "edges": [], "error": "graph unavailable" }),
             ),
         ),
     }
@@ -110,41 +118,88 @@ pub async fn delete_graph(
                     StatusCode::OK,
                     Json(json!({"ok": true, "session_id": session_id})),
                 ),
-                Err(err) => (
+                Err(_) => (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({"ok": false, "error": err.to_string()})),
+                    Json(json!({"ok": false, "error": "graph unavailable"})),
                 ),
             }
         }
-        Err(err) => (
+        Err(_) => (
             StatusCode::BAD_REQUEST,
-            Json(json!({"ok": false, "error": err.to_string()})),
+            Json(json!({"ok": false, "error": "graph unavailable"})),
         ),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum WorkflowEventsRequest {
+    One(WorkflowEvent),
+    Many(Vec<WorkflowEvent>),
+}
+
+impl WorkflowEventsRequest {
+    fn into_events(self) -> Vec<WorkflowEvent> {
+        match self {
+            WorkflowEventsRequest::One(event) => vec![event],
+            WorkflowEventsRequest::Many(events) => events,
+        }
+    }
+}
+
+fn normalize_and_validate_events(
+    workspace_id: &str,
+    mut events: Vec<WorkflowEvent>,
+) -> Result<Vec<WorkflowEvent>, String> {
+    let mut normalized = Vec::with_capacity(events.len());
+    for mut event in events.drain(..) {
+        normalize_event_defaults(&mut event, workspace_id);
+        if let Err(error) = validate_workflow_event(&event) {
+            return Err(error.to_string());
+        }
+        normalized.push(event);
+    }
+    Ok(normalized)
 }
 
 pub async fn append_workflow_event(
     Path(workspace_id): Path<String>,
     State(app): State<Arc<AppState>>,
-    Json(mut event): Json<WorkflowEvent>,
+    Json(body): Json<WorkflowEventsRequest>,
 ) -> impl IntoResponse {
     let runtime = match app.get_or_create_workspace_runtime(&workspace_id).await {
         Ok(runtime) => runtime,
-        Err(err) => {
+        Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "ok": false, "error": err.to_string() })),
+                Json(json!({ "ok": false, "error": "workspace unavailable" })),
             );
         }
     };
-    normalize_event_defaults(&mut event, &workspace_id);
-    match append_event_and_project(&runtime, event.clone()).await {
-        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true, "event": event }))),
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "ok": false, "error": err.to_string() })),
-        ),
+    let events = match normalize_and_validate_events(&workspace_id, body.into_events()) {
+        Ok(events) => events,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": error })),
+            );
+        }
+    };
+    let mut appended = Vec::with_capacity(events.len());
+    for event in events {
+        if let Err(error) = append_event_and_project(&runtime, event.clone()).await {
+            tracing::warn!("workflow append failed: {error}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": "workflow append failed" })),
+            );
+        }
+        appended.push(event);
     }
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "events": appended })),
+    )
 }
 
 pub async fn get_workflow_events(
@@ -156,7 +211,7 @@ pub async fn get_workflow_events(
             let store = runtime.workflow_store.lock().await;
             Json(json!({ "events": store.all() }))
         }
-        Err(err) => Json(json!({ "events": [], "error": err.to_string() })),
+        Err(_) => Json(json!({ "events": [], "error": "workflow unavailable" })),
     }
 }
 
@@ -169,7 +224,9 @@ pub async fn get_lineage(
             let index = runtime.index().await;
             Json(json!({ "target": artifact_id, "lineage": index.lineage(&artifact_id) }))
         }
-        Err(err) => Json(json!({ "target": artifact_id, "lineage": [], "error": err.to_string() })),
+        Err(_) => {
+            Json(json!({ "target": artifact_id, "lineage": [], "error": "workflow unavailable" }))
+        }
     }
 }
 
@@ -198,11 +255,14 @@ pub async fn canvas_events(
                 },
             ),
         ),
-        Err(err) => Box::pin(futures::stream::once(async move {
-            Ok(Event::default()
-                .event("error")
-                .data(json!({"error": err.to_string()}).to_string()))
-        })),
+        Err(err) => {
+            tracing::warn!("canvas event stream unavailable: {err}");
+            Box::pin(futures::stream::once(async move {
+                Ok(Event::default()
+                    .event("error")
+                    .data(json!({"error": "workspace unavailable"}).to_string()))
+            }))
+        }
     };
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -257,6 +317,54 @@ mod tests {
     use crate::workspace::{GraphPosition, WorkflowEventKind};
     use serde_json::json;
     use tempfile::tempdir;
+
+    fn event(kind: WorkflowEventKind, payload: serde_json::Value) -> WorkflowEvent {
+        WorkflowEvent {
+            id: "".into(),
+            timestamp: "".into(),
+            session_id: "".into(),
+            actor: "".into(),
+            kind,
+            payload,
+        }
+    }
+
+    #[test]
+    fn normalize_and_validate_events_accepts_batch_payload() {
+        let events = normalize_and_validate_events(
+            "s1",
+            vec![
+                event(
+                    WorkflowEventKind::DataIngested,
+                    json!({"data_id": "samples"}),
+                ),
+                event(WorkflowEventKind::StepExecuted, json!({"step_id": "qc"})),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.session_id == "s1"));
+        assert!(events.iter().all(|event| event.actor == "agent"));
+    }
+
+    #[test]
+    fn normalize_and_validate_events_rejects_preview_with_type_alias() {
+        let error = normalize_and_validate_events(
+            "s1",
+            vec![event(
+                WorkflowEventKind::ArtifactProduced,
+                json!({
+                    "artifact_id": "bad_preview",
+                    "preview": {"type": "table", "columns": [], "rows": [], "total_rows": 0}
+                }),
+            )],
+        )
+        .unwrap_err();
+
+        assert!(error.contains("artifact_produced.preview"));
+        assert!(error.contains("kind"));
+    }
 
     #[tokio::test]
     async fn append_event_projects_surface_into_session_graph() {

@@ -533,7 +533,7 @@ impl GeWuRuntime {
             .into_iter()
             .map(|t| Arc::from(t) as Arc<dyn Tool>)
             .collect();
-        tools_arc.extend(additional_tools);
+        append_tools_overriding_existing(&mut tools_arc, additional_tools);
         tools_arc.extend(self.skill_tools(&descriptor));
 
         let tools_arc = self.wrap_tools_with_hooks(
@@ -631,7 +631,7 @@ impl GeWuRuntime {
             .into_iter()
             .map(|t| Arc::from(t) as Arc<dyn Tool>)
             .collect();
-        tools_arc.extend(additional_tools);
+        append_tools_overriding_existing(&mut tools_arc, additional_tools);
         tools_arc.extend(self.skill_tools(&descriptor));
 
         let tools_arc = self.wrap_tools_with_hooks(
@@ -1192,6 +1192,17 @@ fn metadata_object_for_tool_context(
     metadata_json: &Value,
 ) -> serde_json::Map<String, serde_json::Value> {
     metadata_json.as_object().cloned().unwrap_or_default()
+}
+
+fn append_tools_overriding_existing(
+    tools: &mut Vec<Arc<dyn Tool>>,
+    additional_tools: Vec<Arc<dyn Tool>>,
+) {
+    for tool in additional_tools {
+        let name = tool.name().to_string();
+        tools.retain(|existing| existing.name() != name);
+        tools.push(tool);
+    }
 }
 
 fn workspace_root_from_metadata(metadata_json: &Value) -> Option<String> {
@@ -1768,7 +1779,7 @@ mod task_result_tests {
     use futures::stream::BoxStream;
     use gewu_core::traits::{LlmProvider, Tool};
 
-    use gewu_core::types::{Message, ProviderEvent, SpecialistDescriptor};
+    use gewu_core::types::{Message, ProviderEvent, SpecialistDescriptor, ToolContext, ToolResult};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::error::Error;
     use std::sync::Arc;
@@ -1820,6 +1831,34 @@ mod task_result_tests {
     impl Drop for CwdRestore {
         fn drop(&mut self) {
             let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    struct ReplacementWorkflowEmitTool;
+
+    #[async_trait]
+    impl Tool for ReplacementWorkflowEmitTool {
+        fn name(&self) -> &str {
+            "workflow.emit"
+        }
+
+        fn description(&self) -> &str {
+            "replacement workflow emit"
+        }
+
+        fn schema(&self) -> schemars::schema::RootSchema {
+            schemars::schema::RootSchema::default()
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: &ToolContext,
+        ) -> std::result::Result<ToolResult, Box<dyn Error + Send + Sync>> {
+            Ok(ToolResult::new(
+                "workflow.emit",
+                serde_json::json!({"ok": true, "source": "replacement"}).to_string(),
+            ))
         }
     }
 
@@ -2207,5 +2246,48 @@ description: Validate genomic resource registration URIs and enforce UCF/ATAC co
             !prompt.contains("Reject filename-as-sample-id"),
             "Skill body content should NOT appear in prompt"
         );
+    }
+
+    #[tokio::test]
+    async fn additional_tool_overrides_builtin_capability_with_same_name() {
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        gewu_storage::run_migrations(&pool).await.unwrap();
+        let runtime = GeWuRuntime::builder()
+            .provider(Arc::new(StubLlm))
+            .pool(pool)
+            .register_builtin_capabilities()
+            .register_builtin_specialists()
+            .build()
+            .unwrap();
+
+        let (_agent, registry) = runtime
+            .build_specialist(
+                "canvas-analyst",
+                "session-override".to_string(),
+                vec![Arc::new(ReplacementWorkflowEmitTool)],
+            )
+            .await
+            .unwrap();
+
+        let tools = registry.list_tools();
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|tool| tool.as_str() == "workflow.emit")
+                .count(),
+            1
+        );
+        let output = registry
+            .execute(
+                "workflow.emit",
+                serde_json::json!({"kind": "data_ingested", "payload": {"data_id": "x"}}),
+                &ToolContext::new("session-override", "message-1"),
+            )
+            .await
+            .unwrap();
+        assert!(output.output.contains("\"source\":\"replacement\""));
     }
 }

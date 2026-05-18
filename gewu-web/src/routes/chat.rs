@@ -14,6 +14,8 @@ pub struct ChatRequest {
     pub message: String,
     pub session_id: String,
     #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
     pub agent_type: Option<String>,
 }
 
@@ -123,7 +125,7 @@ pub async fn handle_chat(
 
     let fallback_type = req.agent_type.as_deref().unwrap_or("general");
     let (session_id, agent_handle) = app
-        .ensure_agent(&req.session_id, fallback_type)
+        .ensure_agent_for_project(&req.session_id, fallback_type, req.workspace_id.as_deref())
         .await
         .map_err(|e| {
             warn!("ensure_agent failed for {}: {}", req.session_id, e);
