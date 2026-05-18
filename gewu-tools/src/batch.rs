@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 
 const DISALLOWED: &[&str] = &["batch", "invalid", "patch"];
 const MAX_TOOLS: usize = 25;
+const MAX_OUTPUT_CHARS_PER_TOOL: usize = 4_000;
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ToolCallInput {
@@ -50,7 +51,7 @@ impl Tool for BatchTool {
     async fn execute(
         &self,
         args: Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let batch_args: BatchArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
@@ -75,6 +76,7 @@ impl Tool for BatchTool {
             let params = call.parameters.clone();
             let registry = self.registry.clone();
             let allowed = allowed_tools.clone();
+            let ctx = ctx.clone();
 
             if tool_name.is_empty() {
                 let tool_name_clone = tool_name.clone();
@@ -82,7 +84,6 @@ impl Tool for BatchTool {
                 continue;
             }
 
-            let ctx = ToolContext::new("batch", "batch");
             join_set.spawn(async move {
                 let result = async {
                     if DISALLOWED.contains(&tool_name.as_str()) {
@@ -160,8 +161,10 @@ impl Tool for BatchTool {
 
         if !successes.is_empty() {
             output.push_str("Results:\n");
-            for (tool_name, _) in &successes {
+            for (tool_name, child_output) in &successes {
                 output.push_str(&format!("- {tool_name}: success\n"));
+                output.push_str("  output:\n");
+                output.push_str(&indent_child_output(&truncate_child_output(child_output)));
             }
         }
 
@@ -188,6 +191,40 @@ impl Tool for BatchTool {
     }
 }
 
+fn truncate_child_output(output: &str) -> String {
+    let total_chars = output.chars().count();
+    if total_chars <= MAX_OUTPUT_CHARS_PER_TOOL {
+        return output.to_string();
+    }
+
+    let truncated = output
+        .chars()
+        .take(MAX_OUTPUT_CHARS_PER_TOOL)
+        .collect::<String>();
+    format!(
+        "{truncated}\n[truncated: showing first {MAX_OUTPUT_CHARS_PER_TOOL} of {total_chars} chars]",
+    )
+}
+
+fn indent_child_output(output: &str) -> String {
+    if output.is_empty() {
+        return "    <empty>\n".to_string();
+    }
+
+    let mut indented = String::new();
+    for line in output.lines() {
+        indented.push_str("    ");
+        indented.push_str(line);
+        indented.push('\n');
+    }
+
+    if output.ends_with('\n') {
+        indented.push_str("    \n");
+    }
+
+    indented
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +234,7 @@ mod tests {
 
     struct TestRegistry {
         policies: BTreeMap<String, ToolExecutionPolicy>,
+        outputs: BTreeMap<String, String>,
         executions: AtomicUsize,
     }
 
@@ -209,7 +247,12 @@ mod tests {
             _ctx: &ToolContext,
         ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
             self.executions.fetch_add(1, Ordering::SeqCst);
-            Ok(ToolResult::new(name, "ok"))
+            let output = self
+                .outputs
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| "ok".to_string());
+            Ok(ToolResult::new(name, output))
         }
 
         fn list_tools(&self) -> Vec<String> {
@@ -228,6 +271,7 @@ mod tests {
                 "resource.register".to_string(),
                 ToolExecutionPolicy::Serial,
             )]),
+            outputs: BTreeMap::new(),
             executions: AtomicUsize::new(0),
         });
         let batch = BatchTool::new(registry.clone());
@@ -258,6 +302,7 @@ mod tests {
                 "resource.search".to_string(),
                 ToolExecutionPolicy::ParallelSafe,
             )]),
+            outputs: BTreeMap::new(),
             executions: AtomicUsize::new(0),
         });
         let batch = BatchTool::new(registry.clone());
@@ -277,5 +322,71 @@ mod tests {
 
         assert_eq!(registry.executions.load(Ordering::SeqCst), 1);
         assert!(result.output.contains("All 1 tools executed successfully"));
+    }
+
+    #[tokio::test]
+    async fn batch_includes_child_tool_outputs() {
+        let registry = Arc::new(TestRegistry {
+            policies: BTreeMap::from([(
+                "atlas_modules_get".to_string(),
+                ToolExecutionPolicy::ParallelSafe,
+            )]),
+            outputs: BTreeMap::from([(
+                "atlas_modules_get".to_string(),
+                r#"{"module_id":139,"semantic_label":"stage:12CS"}"#.to_string(),
+            )]),
+            executions: AtomicUsize::new(0),
+        });
+        let batch = BatchTool::new(registry.clone());
+
+        let result = batch
+            .execute(
+                serde_json::json!({
+                    "tool_calls": [{
+                        "tool": "atlas_modules_get",
+                        "parameters": {"id": 139}
+                    }]
+                }),
+                &ToolContext::new("s1", "m1"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(registry.executions.load(Ordering::SeqCst), 1);
+        assert!(result.output.contains("atlas_modules_get"));
+        assert!(result.output.contains("module_id"));
+        assert!(result.output.contains("stage:12CS"));
+    }
+
+    #[tokio::test]
+    async fn batch_truncates_large_child_outputs() {
+        let long_output = "x".repeat(8_100);
+        let registry = Arc::new(TestRegistry {
+            policies: BTreeMap::from([(
+                "atlas_modules_chromhmm".to_string(),
+                ToolExecutionPolicy::ParallelSafe,
+            )]),
+            outputs: BTreeMap::from([("atlas_modules_chromhmm".to_string(), long_output)]),
+            executions: AtomicUsize::new(0),
+        });
+        let batch = BatchTool::new(registry.clone());
+
+        let result = batch
+            .execute(
+                serde_json::json!({
+                    "tool_calls": [{
+                        "tool": "atlas_modules_chromhmm",
+                        "parameters": {"id": 139}
+                    }]
+                }),
+                &ToolContext::new("s1", "m1"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(registry.executions.load(Ordering::SeqCst), 1);
+        assert!(result.output.contains("atlas_modules_chromhmm"));
+        assert!(result.output.contains("truncated"));
+        assert!(result.output.len() < 8_500);
     }
 }

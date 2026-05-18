@@ -37,7 +37,8 @@ use crate::workflow_emit::WorkflowEmitTool;
 
 /// Build the canonical canvas tools, sharing a single manager.
 pub fn canvas_tools(manager: Arc<CanvasManager>) -> Vec<Arc<dyn Tool>> {
-    let workflow_url = std::env::var("GEWU_TACHYON_CANVAS_URL").unwrap_or_else(|_| "http://localhost:3210".to_string());
+    let workflow_url = std::env::var("GEWU_TACHYON_CANVAS_URL")
+        .unwrap_or_else(|_| "http://localhost:3210".to_string());
     vec![
         Arc::new(CanvasOpenTool {
             manager: manager.clone(),
@@ -198,7 +199,13 @@ impl Tool for CanvasOpenTool {
 }
 
 fn preview_canvas_state(args: &OpenArgs) -> Result<CanvasState, CanvasError> {
-    let id = args.canvas_id.clone().unwrap_or_else(|| "pending".into());
+    let id = args
+        .canvas_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or("pending")
+        .to_string();
     let mut state = CanvasState::new(id, args.kind);
     state.mode = args.mode.unwrap_or_default();
     state.title = args.title.clone().filter(|t| !t.is_empty());
@@ -687,6 +694,48 @@ mod tests {
                 .any(|issue| issue["path"] == path && issue["code"] == code),
             "expected issue {path}/{code}, got {details}"
         );
+    }
+
+    #[tokio::test]
+    async fn open_genome_blank_canvas_id_allocates_visible_canvas_id() {
+        let m = Arc::new(CanvasManager::new());
+        let open_genome = CanvasOpenGenomeTool { manager: m.clone() };
+
+        let result = open_genome
+            .execute(
+                json!({
+                    "assembly": "hg38",
+                    "region": "chr16:8885000-9079500",
+                    "gene_symbol": "SP7",
+                    "canvas_id": "",
+                    "samples": [
+                        { "id": "SP4-1_ATAC13", "label": "SP4-1_ATAC13", "assay": "atac" }
+                    ],
+                    "tracks": [
+                        {
+                            "id": "signal-atac-SP4-1_ATAC13",
+                            "type": "signal",
+                            "sample_id": "SP4-1_ATAC13",
+                            "assay": "atac",
+                            "source": "l1"
+                        }
+                    ]
+                }),
+                &ctx("s1"),
+            )
+            .await
+            .unwrap();
+
+        let opened: Value = serde_json::from_str(&result.output).unwrap();
+        let canvas_id = opened["canvas_id"].as_str().unwrap();
+        assert!(
+            !canvas_id.trim().is_empty(),
+            "canvas_id must be frontend-addressable"
+        );
+        assert_eq!(opened["event_payload"]["canvas_id"], canvas_id);
+        assert_eq!(opened["state"]["canvas_id"], canvas_id);
+        assert_eq!(opened["state"]["payload"]["tracks"][0]["source"], "l1");
+        assert!(m.get_state("s1", canvas_id).await.is_some());
     }
 
     #[tokio::test]

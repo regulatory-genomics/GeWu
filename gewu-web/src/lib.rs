@@ -23,6 +23,7 @@ pub mod plugin_suite;
 pub mod routes;
 pub mod sidecar;
 pub mod state;
+pub mod workspace;
 
 use auth::AuthMode;
 use fallback::{RuntimeFrontendAssets, RuntimeFrontendPlugin, RuntimeFrontendSidecar};
@@ -70,6 +71,12 @@ struct Cli {
     /// networks). Off by default.
     #[arg(long, default_value_t = false)]
     allow_insecure_bind: bool,
+
+    /// Directory containing the gewu-web SPA static assets (index.html,
+    /// app.js, vendor/...). Falls back to `GEWU_STATIC_DIR` env, then
+    /// `<exe_dir>/gewu-web/static`, then cwd-relative `gewu-web/static`.
+    #[arg(long = "static-dir", env = "GEWU_STATIC_DIR")]
+    static_dir: Option<String>,
 }
 
 pub async fn run_with_plugins<F>(register_plugins: F) -> Result<()>
@@ -79,6 +86,23 @@ where
     dotenvy::dotenv().ok();
 
     let cli = Cli::parse();
+
+    if let Some(dir) = cli.static_dir.as_deref() {
+        unsafe { std::env::set_var("GEWU_STATIC_DIR", dir) };
+    }
+    if std::env::var("GEWU_TACHYON_CANVAS_URL").is_err() {
+        let host = if cli.host.is_unspecified() {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        } else {
+            cli.host
+        };
+        unsafe {
+            std::env::set_var(
+                "GEWU_TACHYON_CANVAS_URL",
+                format!("http://{}:{}/api/workspaces/default", host, cli.port),
+            );
+        }
+    }
 
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
@@ -245,6 +269,32 @@ where
             "/api/projects/directories",
             get(routes::projects::handle_browse_directories),
         )
+        .route("/api/workspaces", get(routes::workspaces::list_workspaces))
+        .route("/api/workspaces", post(routes::workspaces::create_workspace))
+        .route(
+            "/api/workspaces/{workspace_id}/canvas/graph",
+            get(routes::workspaces::get_graph).delete(routes::workspaces::delete_graph),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/canvas/events",
+            get(routes::workspaces::canvas_events),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/workflow/events",
+            get(routes::workspaces::get_workflow_events).post(routes::workspaces::append_workflow_event),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/api/workflow/events",
+            get(routes::workspaces::get_workflow_events).post(routes::workspaces::append_workflow_event),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/workflow/lineage/{artifact_id}",
+            get(routes::workspaces::get_lineage),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/chat/send",
+            post(routes::workspaces::workspace_chat_send),
+        )
         .route("/api/runs", get(routes::runs::handle_list_runs))
         .route("/api/runs/{id}", get(routes::runs::handle_get_run))
         .route(
@@ -310,10 +360,8 @@ where
             auth_middleware::require_auth,
         ));
 
-    // Static file serving via ServeDir (handles path traversal correctly).
-    // Resolved relative to the project's gewu-web/static dir (current
-    // working directory at run time, matching previous behaviour).
-    let static_service = ServeDir::new("gewu-web/static")
+    let static_dir = fallback::resolve_static_dir();
+    let static_service = ServeDir::new(&static_dir)
         .append_index_html_on_directories(false)
         .precompressed_gzip();
 

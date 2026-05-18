@@ -45,4 +45,4 @@ pub use state::{
     GenomeSelection, GenomeViewport, SampleSpec, TrackSpec, TrackType, build_genome_canvas_payload,
 };
 pub use tools::canvas_tools;
-pub use workflow_emit::WorkflowEmitTool;
+pub use workflow_emit::{WorkflowEmitTool, WorkflowHttpEmitTool};

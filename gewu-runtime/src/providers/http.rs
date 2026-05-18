@@ -1,7 +1,7 @@
 //! HTTP tool provider — wraps a REST API endpoint as a tool.
 
 use gewu_core::traits::{AssemblyContext, Tool, ToolProvider};
-use gewu_core::types::{CapabilityDescriptor, ToolContext, ToolResult};
+use gewu_core::types::{CapabilityDescriptor, ToolContext, ToolExecutionPolicy, ToolResult};
 use schemars::schema::RootSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -147,6 +147,10 @@ impl Tool for HttpTool {
         serde_json::from_value(self.cap.input_schema.clone()).unwrap_or_default()
     }
 
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::ParallelSafe
+    }
+
     async fn execute(
         &self,
         args: Value,
@@ -243,5 +247,42 @@ tools:
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0].name, "memory_search");
         assert_eq!(caps[0].provider_kind, "http");
+    }
+
+    #[test]
+    fn runtime_plugin_http_tools_are_parallel_safe_for_batch() {
+        let manifest: RuntimePluginManifest = serde_yaml::from_str(
+            r#"
+id: macrophage-atlas
+kind: http
+base_url: http://127.0.0.1:3055
+tools:
+  - name: atlas_modules_get
+    description: Get module summary
+    endpoint: /api/modules/{id}
+    method: GET
+"#,
+        )
+        .unwrap();
+
+        let provider = HttpToolProvider::from_runtime_plugin(&manifest)
+            .unwrap()
+            .unwrap();
+        let cap = provider.capabilities().into_iter().next().unwrap();
+        let tool = HttpTool {
+            cap: HttpCapabilitySpec {
+                name: cap.name,
+                description: cap.description,
+                url: "http://127.0.0.1:3055/api/modules/{id}".to_string(),
+                method: "GET".to_string(),
+                headers: std::collections::HashMap::new(),
+                input_schema: cap.input_schema,
+            },
+        };
+
+        assert_eq!(
+            tool.execution_policy(),
+            gewu_core::types::ToolExecutionPolicy::ParallelSafe
+        );
     }
 }

@@ -22,6 +22,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::sidecar::TachyonBrowserConfig;
+use crate::workspace::WorkspaceRuntime;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct SessionInfo {
@@ -233,6 +234,7 @@ pub struct AppState {
     pub canvases: CanvasManager,
     pub canvas_tools: Arc<Vec<Arc<dyn Tool>>>,
     pub permission_grants: Arc<RwLock<HashMap<String, Vec<PermissionGrant>>>>,
+    pub workspace_runtimes: Arc<RwLock<HashMap<String, Arc<WorkspaceRuntime>>>>,
     pending_permissions: Arc<RwLock<HashMap<String, PendingPermissionRequest>>>,
     rebuild_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
@@ -437,6 +439,7 @@ impl AppState {
             canvases,
             canvas_tools,
             permission_grants: Arc::new(RwLock::new(HashMap::new())),
+            workspace_runtimes: Arc::new(RwLock::new(HashMap::new())),
             pending_permissions: Arc::new(RwLock::new(HashMap::new())),
             rebuild_locks: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -546,7 +549,10 @@ impl AppState {
         );
 
         let mut mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
-        mcp_tools.extend(self.canvas_tools.iter().cloned());
+        mcp_tools.extend(self.canvas_tools.iter().filter(|tool| tool.name() != "workflow.emit").cloned());
+        let workspace_id = project.as_ref().map(|p| p.project_id.as_str()).unwrap_or("default");
+        let workspace_runtime = self.get_or_create_workspace_runtime(workspace_id).await?;
+        mcp_tools.push(Arc::new(crate::workspace::tool::InProcessWorkflowEmitTool::new(workspace_runtime)));
         let plugin_host = self.build_plugin_host_for_workdir(
             provider.clone(),
             pool.clone(),
@@ -768,6 +774,29 @@ impl AppState {
         ensure_default_project(&self.project_store).await
     }
 
+    pub async fn get_or_create_workspace_runtime(&self, workspace_id: &str) -> Result<Arc<WorkspaceRuntime>> {
+        if let Some(runtime) = self.workspace_runtimes.read().await.get(workspace_id).cloned() {
+            return Ok(runtime);
+        }
+
+        let project = if workspace_id == "default" {
+            self.ensure_default_project().await?
+        } else {
+            match self.project_store.get(workspace_id).await? {
+                Some(project) => project,
+                None => self.ensure_default_project().await?,
+            }
+        };
+        let project_root = PathBuf::from(project.workdir.clone());
+        let storage_dir = project_root.join(".tachyon").join("workspaces").join(workspace_id);
+        let runtime = Arc::new(WorkspaceRuntime::open(workspace_id.to_string(), project_root, storage_dir)?);
+        self.workspace_runtimes
+            .write()
+            .await
+            .insert(workspace_id.to_string(), runtime.clone());
+        Ok(runtime)
+    }
+
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
         self.session_store.delete(session_id).await?;
         self.agents.write().await.remove(session_id);
@@ -933,11 +962,29 @@ impl AppState {
             return Ok((session_id, handle));
         }
 
-        let record = self
-            .session_store
-            .get(&session_id)
-            .await?
-            .context("Session not found")?;
+        let record = match self.session_store.get(&session_id).await? {
+            Some(record) => record,
+            None => {
+                let project = if session_id == "default" {
+                    self.ensure_default_project().await?
+                } else {
+                    match self.project_store.get(&session_id).await? {
+                        Some(project) => project,
+                        None => self.ensure_default_project().await?,
+                    }
+                };
+                let created_at = unix_timestamp();
+                self.session_store
+                    .insert(
+                        &session_id,
+                        Some(project.project_id.as_str()),
+                        Some(project.workdir.as_str()),
+                        fallback_agent_type,
+                        created_at,
+                    )
+                    .await?
+            }
+        };
 
         info!("rehydrating agent for persisted session {}", session_id);
 
@@ -992,7 +1039,10 @@ impl AppState {
         );
 
         let mut mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
-        mcp_tools.extend(self.canvas_tools.iter().cloned());
+        mcp_tools.extend(self.canvas_tools.iter().filter(|tool| tool.name() != "workflow.emit").cloned());
+        let workspace_id = project.as_ref().map(|p| p.project_id.as_str()).unwrap_or("default");
+        let workspace_runtime = self.get_or_create_workspace_runtime(workspace_id).await?;
+        mcp_tools.push(Arc::new(crate::workspace::tool::InProcessWorkflowEmitTool::new(workspace_runtime)));
         let plugin_host = self.build_plugin_host_for_workdir(
             provider.clone(),
             pool.clone(),

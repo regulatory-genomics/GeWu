@@ -39,9 +39,26 @@ impl RuntimeFrontendAssets {
     }
 }
 
-/// Resolved path to gewu-web/static/index.html.
+/// Resolve the static directory used for serving frontend assets.
+///
+/// Priority: `GEWU_STATIC_DIR` env → `<exe_dir>/gewu-web/static` → `gewu-web/static` (cwd).
+pub fn resolve_static_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("GEWU_STATIC_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let candidate = exe_dir.join("gewu-web").join("static");
+            if candidate.is_dir() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("gewu-web/static")
+}
+
 fn index_path() -> PathBuf {
-    Path::new("gewu-web").join("static").join("index.html")
+    resolve_static_dir().join("index.html")
 }
 
 pub async fn serve_index() -> Response {
@@ -68,9 +85,7 @@ fn escape_attr(value: &str) -> String {
 pub fn inject_runtime_assets(html: &str, assets: &RuntimeFrontendAssets) -> String {
     let runtime_json =
         serde_json::to_string(assets).unwrap_or_else(|_| "{\"plugins\":[]}".to_string());
-    let runtime_script = format!(
-        "<script>window.__GEWU_PLUGINS__ = {runtime_json};</script>"
-    );
+    let runtime_script = format!("<script>window.__GEWU_PLUGINS__ = {runtime_json};</script>");
     let mut out = inject_before_head_close(html, &runtime_script);
 
     for plugin in &assets.plugins {
@@ -237,6 +252,55 @@ mod tests {
         assert!(
             app_js.contains("window.canvasController.hydrate"),
             "app.js must call window.canvasController.hydrate for session hydration"
+        );
+    }
+
+    #[test]
+    fn resolve_static_dir_uses_env_var_when_set() {
+        let dir = std::env::temp_dir().join("gewu-static-dir-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var("GEWU_STATIC_DIR").ok();
+        unsafe { std::env::set_var("GEWU_STATIC_DIR", &dir) };
+
+        let resolved = resolve_static_dir();
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("GEWU_STATIC_DIR", v),
+                None => std::env::remove_var("GEWU_STATIC_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(resolved, dir);
+    }
+
+    #[test]
+    fn resolve_static_dir_falls_back_to_cwd_relative_when_no_env_or_exe_sibling() {
+        let prev_env = std::env::var("GEWU_STATIC_DIR").ok();
+        unsafe { std::env::remove_var("GEWU_STATIC_DIR") };
+
+        let resolved = resolve_static_dir();
+
+        unsafe {
+            if let Some(v) = prev_env {
+                std::env::set_var("GEWU_STATIC_DIR", v);
+            }
+        }
+
+        let exe_sibling = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("gewu-web").join("static")));
+        let cwd_relative = PathBuf::from("gewu-web/static");
+
+        let acceptable = match exe_sibling {
+            Some(ref p) if p.is_dir() => resolved == *p,
+            _ => resolved == cwd_relative,
+        };
+        assert!(
+            acceptable,
+            "resolve_static_dir returned {:?}; expected exe-sibling or cwd-relative fallback",
+            resolved
         );
     }
 }

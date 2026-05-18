@@ -9,3 +9,4 @@ pub mod runs;
 pub mod sessions;
 pub mod skills;
 pub mod work_graph;
+pub mod workspaces;

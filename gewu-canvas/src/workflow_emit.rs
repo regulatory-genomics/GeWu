@@ -50,12 +50,14 @@ fn normalize_payload_aliases(kind: &str, payload: Value) -> Value {
     Value::Object(map)
 }
 
-pub struct WorkflowEmitTool {
+pub struct WorkflowHttpEmitTool {
     base_url: String,
     client: reqwest::Client,
 }
 
-impl WorkflowEmitTool {
+pub type WorkflowEmitTool = WorkflowHttpEmitTool;
+
+impl WorkflowHttpEmitTool {
     pub fn new(base_url: String) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -65,7 +67,7 @@ impl WorkflowEmitTool {
 }
 
 #[async_trait]
-impl Tool for WorkflowEmitTool {
+impl Tool for WorkflowHttpEmitTool {
     fn name(&self) -> &str {
         "workflow.emit"
     }
