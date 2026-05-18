@@ -4,7 +4,10 @@ target/
 .idea/
 .vscode/
 .opencode/
+.claude/
+.tachyon/
 gewu-cli/target/
+gewu-web/static/vendor/
 docs/
 .gewu/
 .omc/
@@ -18,3 +21,4 @@ mempalace.yaml
 .playwright-mcp/
 .playwright-cli/
 .sisyphus/
+scripts/migrate_opencode_memory.py
