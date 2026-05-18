@@ -1,35 +1,50 @@
 use gewu_core::types::{
     AgentEvent, Capabilities, ContentPart, FileAttachment, FunctionCall, InputCapabilities,
-    Message, OutputCapabilities, ProviderEvent, ToolCall, ToolContext, ToolResult, TruncationResult,
+    Message, OutputCapabilities, ProviderEvent, ToolCall, ToolContext, ToolResult,
+    TruncationResult,
 };
 
 #[test]
 fn test_content_part_mime_type_text() {
-    let part = ContentPart::Text { text: "Hello".to_string() };
+    let part = ContentPart::Text {
+        text: "Hello".to_string(),
+    };
     assert_eq!(part.mime_type(), "text/plain");
 }
 
 #[test]
 fn test_content_part_mime_type_image() {
-    let part = ContentPart::Image { data: "abc".to_string(), mime_type: "image/png".to_string() };
+    let part = ContentPart::Image {
+        data: "abc".to_string(),
+        mime_type: "image/png".to_string(),
+    };
     assert_eq!(part.mime_type(), "image/png");
 }
 
 #[test]
 fn test_content_part_mime_type_audio() {
-    let part = ContentPart::Audio { data: "abc".to_string(), mime_type: "audio/mp3".to_string() };
+    let part = ContentPart::Audio {
+        data: "abc".to_string(),
+        mime_type: "audio/mp3".to_string(),
+    };
     assert_eq!(part.mime_type(), "audio/mp3");
 }
 
 #[test]
 fn test_content_part_mime_type_video() {
-    let part = ContentPart::Video { data: "abc".to_string(), mime_type: "video/mp4".to_string() };
+    let part = ContentPart::Video {
+        data: "abc".to_string(),
+        mime_type: "video/mp4".to_string(),
+    };
     assert_eq!(part.mime_type(), "video/mp4");
 }
 
 #[test]
 fn test_content_part_mime_type_file() {
-    let part = ContentPart::File { data: "abc".to_string(), mime_type: "application/pdf".to_string() };
+    let part = ContentPart::File {
+        data: "abc".to_string(),
+        mime_type: "application/pdf".to_string(),
+    };
     assert_eq!(part.mime_type(), "application/pdf");
 }
 
@@ -156,7 +171,9 @@ fn test_tool_call() {
 
 #[test]
 fn test_message_system() {
-    let msg = Message::System { content: "You are helpful".to_string() };
+    let msg = Message::System {
+        content: "You are helpful".to_string(),
+    };
 
     assert!(matches!(msg, Message::System { .. }));
 }
@@ -165,8 +182,13 @@ fn test_message_system() {
 fn test_message_user() {
     let msg = Message::User {
         content: vec![
-            ContentPart::Text { text: "Hello".to_string() },
-            ContentPart::Image { data: "base64".to_string(), mime_type: "image/png".to_string() },
+            ContentPart::Text {
+                text: "Hello".to_string(),
+            },
+            ContentPart::Image {
+                data: "base64".to_string(),
+                mime_type: "image/png".to_string(),
+            },
         ],
     };
 
@@ -184,7 +206,11 @@ fn test_message_assistant_with_content() {
         tool_calls: None,
     };
 
-    if let Message::Assistant { content, tool_calls } = msg {
+    if let Message::Assistant {
+        content,
+        tool_calls,
+    } = msg
+    {
         assert_eq!(content.unwrap(), "I can help");
         assert!(tool_calls.is_none());
     }
@@ -194,19 +220,21 @@ fn test_message_assistant_with_content() {
 fn test_message_assistant_with_tool_calls() {
     let msg = Message::Assistant {
         content: None,
-        tool_calls: Some(vec![
-            ToolCall {
-                id: "call_1".to_string(),
-                r#type: "function".to_string(),
-                function: FunctionCall {
-                    name: "bash".to_string(),
-                    arguments: "{\"cmd\":\"ls\"}".to_string(),
-                },
-            }
-        ]),
+        tool_calls: Some(vec![ToolCall {
+            id: "call_1".to_string(),
+            r#type: "function".to_string(),
+            function: FunctionCall {
+                name: "bash".to_string(),
+                arguments: "{\"cmd\":\"ls\"}".to_string(),
+            },
+        }]),
     };
 
-    if let Message::Assistant { content, tool_calls } = msg {
+    if let Message::Assistant {
+        content,
+        tool_calls,
+    } = msg
+    {
         assert!(content.is_none());
         let calls = tool_calls.unwrap();
         assert_eq!(calls.len(), 1);
@@ -220,10 +248,19 @@ fn test_message_tool() {
         tool_call_id: "call_123".to_string(),
         tool_name: Some("read_file".to_string()),
         content: "File contents".to_string(),
-        media: vec![ContentPart::Image { data: "img".to_string(), mime_type: "image/png".to_string() }],
+        media: vec![ContentPart::Image {
+            data: "img".to_string(),
+            mime_type: "image/png".to_string(),
+        }],
     };
 
-    if let Message::Tool { tool_call_id, tool_name, content, media } = msg {
+    if let Message::Tool {
+        tool_call_id,
+        tool_name,
+        content,
+        media,
+    } = msg
+    {
         assert_eq!(tool_call_id, "call_123");
         assert_eq!(tool_name.unwrap(), "read_file");
         assert_eq!(content, "File contents");
@@ -233,7 +270,9 @@ fn test_message_tool() {
 
 #[test]
 fn test_provider_event_content_delta() {
-    let event = ProviderEvent::ContentDelta { delta: "Hello".to_string() };
+    let event = ProviderEvent::ContentDelta {
+        delta: "Hello".to_string(),
+    };
 
     assert!(matches!(event, ProviderEvent::ContentDelta { .. }));
 }
@@ -253,7 +292,9 @@ fn test_provider_event_tool_call_start() {
 
 #[test]
 fn test_provider_event_finish() {
-    let event = ProviderEvent::Finish { reason: Some("stop".to_string()) };
+    let event = ProviderEvent::Finish {
+        reason: Some("stop".to_string()),
+    };
 
     if let ProviderEvent::Finish { reason } = event {
         assert_eq!(reason.unwrap(), "stop");
@@ -262,7 +303,9 @@ fn test_provider_event_finish() {
 
 #[test]
 fn test_provider_event_error() {
-    let event = ProviderEvent::Error { error: "Something went wrong".to_string() };
+    let event = ProviderEvent::Error {
+        error: "Something went wrong".to_string(),
+    };
 
     if let ProviderEvent::Error { error } = event {
         assert_eq!(error, "Something went wrong");
@@ -271,7 +314,9 @@ fn test_provider_event_error() {
 
 #[test]
 fn test_agent_event_content_delta() {
-    let event = AgentEvent::ContentDelta { delta: "Hello".to_string() };
+    let event = AgentEvent::ContentDelta {
+        delta: "Hello".to_string(),
+    };
 
     assert!(matches!(event, AgentEvent::ContentDelta { .. }));
 }
@@ -279,24 +324,41 @@ fn test_agent_event_content_delta() {
 #[test]
 fn test_agent_event_tool_start() {
     let event = AgentEvent::ToolStart {
+        tool_call_id: "call_1".to_string(),
         tool: "bash".to_string(),
         input: "{}".to_string(),
+        metadata: serde_json::Value::Null,
     };
 
-    if let AgentEvent::ToolStart { tool, input } = event {
+    if let AgentEvent::ToolStart {
+        tool,
+        input,
+        tool_call_id,
+        metadata,
+    } = event
+    {
+        assert_eq!(tool_call_id, "call_1");
         assert_eq!(tool, "bash");
         assert_eq!(input, "{}");
+        assert!(metadata.is_null());
     }
 }
 
 #[test]
 fn test_agent_event_tool_finish() {
     let event = AgentEvent::ToolFinish {
+        tool_call_id: "call_1".to_string(),
         tool: "bash".to_string(),
         output: "files...".to_string(),
     };
 
-    if let AgentEvent::ToolFinish { tool, output } = event {
+    if let AgentEvent::ToolFinish {
+        tool,
+        output,
+        tool_call_id,
+    } = event
+    {
+        assert_eq!(tool_call_id, "call_1");
         assert_eq!(tool, "bash");
         assert_eq!(output, "files...");
     }
@@ -304,7 +366,9 @@ fn test_agent_event_tool_finish() {
 
 #[test]
 fn test_agent_event_finish() {
-    let event = AgentEvent::Finish { response: "Done".to_string() };
+    let event = AgentEvent::Finish {
+        response: "Done".to_string(),
+    };
 
     if let AgentEvent::Finish { response } = event {
         assert_eq!(response, "Done");
@@ -313,7 +377,9 @@ fn test_agent_event_finish() {
 
 #[test]
 fn test_agent_event_error() {
-    let event = AgentEvent::Error { error: "Failed".to_string() };
+    let event = AgentEvent::Error {
+        error: "Failed".to_string(),
+    };
 
     if let AgentEvent::Error { error } = event {
         assert_eq!(error, "Failed");

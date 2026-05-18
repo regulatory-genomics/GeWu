@@ -64,6 +64,7 @@ impl GeWuRuntime {
             skill_dirs: Vec::new(),
             workflow_dirs: Vec::new(),
             resource_dirs: Vec::new(),
+            command_tool_dirs: Vec::new(),
             provider: None,
             pool: None,
         }
@@ -1262,6 +1263,7 @@ pub struct GeWuRuntimeBuilder {
     skill_dirs: Vec<PathBuf>,
     workflow_dirs: Vec<PathBuf>,
     resource_dirs: Vec<PathBuf>,
+    command_tool_dirs: Vec<PathBuf>,
     provider: Option<Arc<dyn LlmProvider>>,
     pool: Option<SqlitePool>,
 }
@@ -1338,6 +1340,11 @@ impl GeWuRuntimeBuilder {
         self
     }
 
+    pub fn with_command_tool_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.command_tool_dirs.push(dir.into());
+        self
+    }
+
     pub fn register_plugin(mut self, plugin: Box<dyn Plugin>) -> Self {
         let name = plugin.name().to_string();
         for factory in plugin.tool_factories() {
@@ -1391,26 +1398,30 @@ impl GeWuRuntimeBuilder {
             )));
         }
 
-        // Load command-backed tools from ~/.gewu/tools/
-        let tools_dir = CommandToolRegistry::default_dir();
-        match CommandToolRegistry::new(&tools_dir) {
-            Ok(cmd_registry) => {
-                let count = cmd_registry.definitions().len();
-                if count > 0 {
-                    tracing::info!(
-                        "Loaded {} command tool(s) from {}",
-                        count,
-                        tools_dir.display()
-                    );
-                    registry.register(Arc::new(cmd_registry.into_provider()));
+        // Load command-backed tools from ~/.gewu/tools/ plus any explicitly
+        // configured project-local tool directories.
+        let mut command_tool_dirs = vec![CommandToolRegistry::default_dir()];
+        command_tool_dirs.extend(self.command_tool_dirs);
+        for tools_dir in command_tool_dirs {
+            match CommandToolRegistry::new(&tools_dir) {
+                Ok(cmd_registry) => {
+                    let count = cmd_registry.definitions().len();
+                    if count > 0 {
+                        tracing::info!(
+                            "Loaded {} command tool(s) from {}",
+                            count,
+                            tools_dir.display()
+                        );
+                        registry.register(Arc::new(cmd_registry.into_provider()));
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to load command tools from {}: {}",
-                    tools_dir.display(),
-                    e
-                );
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load command tools from {}: {}",
+                        tools_dir.display(),
+                        e
+                    );
+                }
             }
         }
 
@@ -1900,7 +1911,7 @@ Global sentinel body.
                 .with_skill_dir(project_root.join(".gewu/skills"))
                 .build()
                 .unwrap();
-            std::env::set_current_dir(&original_cwd).unwrap();
+            let _ = std::env::set_current_dir(&original_cwd);
             runtime
         };
 
@@ -1961,7 +1972,7 @@ Global sentinel body.
                 .with_skill_dir(project_root.join(".gewu/skills"))
                 .build()
                 .unwrap();
-            std::env::set_current_dir(&original_cwd).unwrap();
+            let _ = std::env::set_current_dir(&original_cwd);
             runtime
         };
 
@@ -2045,7 +2056,7 @@ Global sentinel body.
                 .with_skill_dir(project_root.join(".gewu/skills"))
                 .build()
                 .unwrap();
-            std::env::set_current_dir(&original_cwd).unwrap();
+            let _ = std::env::set_current_dir(&original_cwd);
             runtime
         };
 
@@ -2159,7 +2170,7 @@ description: Validate genomic resource registration URIs and enforce UCF/ATAC co
                 .with_skill_dir(project_root.join(".gewu/skills"))
                 .build()
                 .unwrap();
-            std::env::set_current_dir(&original_cwd).unwrap();
+            let _ = std::env::set_current_dir(&original_cwd);
             runtime
         };
 

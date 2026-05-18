@@ -2,16 +2,21 @@ use crate::state::AppState;
 use crate::workspace::tool::{append_event_and_project, normalize_event_defaults};
 use crate::workspace::{GraphMutation, SessionGraph, WorkflowEvent};
 use axum::{
-    extract::{Path, Query, State},
-    response::{sse::{Event, Sse}, IntoResponse},
     Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{
+        IntoResponse,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
 use futures::Stream;
-use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio_stream::{wrappers::BroadcastStream, StreamExt};
+use std::time::Duration;
+use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
 #[derive(Debug, Deserialize)]
 pub struct CreateWorkspaceRequest {
@@ -76,8 +81,18 @@ pub async fn get_graph(
         .await
         .and_then(|rt| rt.graph_store.load(&session_id))
     {
-        Ok(graph) => Json(json!({ "session_id": graph.session_id, "nodes": graph.nodes, "edges": graph.edges })),
-        Err(err) => Json(json!({ "session_id": session_id, "nodes": [], "edges": [], "error": err.to_string() })),
+        Ok(graph) => (
+            StatusCode::OK,
+            Json(
+                json!({ "session_id": graph.session_id, "nodes": graph.nodes, "edges": graph.edges }),
+            ),
+        ),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({ "session_id": session_id, "nodes": [], "edges": [], "error": err.to_string() }),
+            ),
+        ),
     }
 }
 
@@ -91,11 +106,20 @@ pub async fn delete_graph(
         Ok(runtime) => {
             let graph = SessionGraph::empty(&session_id);
             match runtime.graph_store.save(&graph) {
-                Ok(()) => Json(json!({"ok": true, "session_id": session_id})),
-                Err(err) => Json(json!({"ok": false, "error": err.to_string()})),
+                Ok(()) => (
+                    StatusCode::OK,
+                    Json(json!({"ok": true, "session_id": session_id})),
+                ),
+                Err(err) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"ok": false, "error": err.to_string()})),
+                ),
             }
         }
-        Err(err) => Json(json!({"ok": false, "error": err.to_string()})),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": err.to_string()})),
+        ),
     }
 }
 
@@ -106,12 +130,20 @@ pub async fn append_workflow_event(
 ) -> impl IntoResponse {
     let runtime = match app.get_or_create_workspace_runtime(&workspace_id).await {
         Ok(runtime) => runtime,
-        Err(err) => return Json(json!({ "ok": false, "error": err.to_string() })),
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": err.to_string() })),
+            );
+        }
     };
     normalize_event_defaults(&mut event, &workspace_id);
     match append_event_and_project(&runtime, event.clone()).await {
-        Ok(()) => Json(json!({ "ok": true, "event": event })),
-        Err(err) => Json(json!({ "ok": false, "error": err.to_string() })),
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true, "event": event }))),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        ),
     }
 }
 
@@ -141,18 +173,30 @@ pub async fn get_lineage(
     }
 }
 
-type CanvasEventStream = Pin<Box<dyn Stream<Item = Result<Event, std::convert::Infallible>> + Send>>;
+type CanvasEventStream =
+    Pin<Box<dyn Stream<Item = Result<Event, std::convert::Infallible>> + Send>>;
 
 pub async fn canvas_events(
     Path(workspace_id): Path<String>,
+    Query(query): Query<GraphQuery>,
     State(app): State<Arc<AppState>>,
-) -> Result<Sse<CanvasEventStream>, std::convert::Infallible> {
+) -> Result<impl IntoResponse, std::convert::Infallible> {
+    let requested_session_id = query.session_id;
     let stream: CanvasEventStream = match app.get_or_create_workspace_runtime(&workspace_id).await {
         Ok(runtime) => Box::pin(
-            BroadcastStream::new(runtime.graph_events.subscribe()).filter_map(|item| match item {
-                Ok(mutation) => Some(Ok(mutation_to_event(mutation))),
-                Err(_) => None,
-            }),
+            BroadcastStream::new(runtime.graph_events.subscribe()).filter_map(
+                move |item| match item {
+                    Ok(session_mutation)
+                        if requested_session_id.as_ref().is_none_or(|session_id| {
+                            session_id == &session_mutation.session_id
+                        }) =>
+                    {
+                        Some(Ok(mutation_to_event(session_mutation.mutation)))
+                    }
+                    Ok(_) => None,
+                    Err(_) => None,
+                },
+            ),
         ),
         Err(err) => Box::pin(futures::stream::once(async move {
             Ok(Event::default()
@@ -160,7 +204,11 @@ pub async fn canvas_events(
                 .data(json!({"error": err.to_string()}).to_string()))
         })),
     };
-    Ok(Sse::new(stream))
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
 }
 
 fn mutation_to_event(mutation: GraphMutation) -> Event {
@@ -186,7 +234,11 @@ pub async fn workspace_chat_send(
     let message = if req.selected_nodes.is_empty() {
         req.content
     } else {
-        format!("{}\n\nCanvas selected nodes: {}", req.content, req.selected_nodes.join(", "))
+        format!(
+            "{}\n\nCanvas selected nodes: {}",
+            req.content,
+            req.selected_nodes.join(", ")
+        )
     };
     Json(json!({
         "session_id": session_id,
@@ -234,5 +286,16 @@ mod tests {
         let graph = runtime.graph_store.load("s1").unwrap();
         assert_eq!(graph.nodes.len(), 1);
         assert_eq!(graph.nodes[0].data["payload"]["columns"][0], "sample");
+        let mut rx = runtime.graph_events.subscribe();
+        append_event_and_project(&runtime, WorkflowEvent {
+            id: "e3".into(),
+            timestamp: "t".into(),
+            session_id: "s1".into(),
+            actor: "agent".into(),
+            kind: WorkflowEventKind::ArtifactSurfaced,
+            payload: json!({"artifact_id":"a1", "canvas_node_id":"node_a1_b", "position": GraphPosition { x: 2.0, y: 3.0 }}),
+        }).await.unwrap();
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.session_id, "s1");
     }
 }

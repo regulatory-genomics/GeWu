@@ -103,6 +103,10 @@ impl RuntimeFactory {
         }
 
         builder = builder.with_resource_dir(working_directory.join(".gewu/resources"));
+        let project_tools = working_directory.join(".gewu/tools");
+        if project_tools.is_dir() {
+            builder = builder.with_command_tool_dir(project_tools);
+        }
 
         let home_specialists = dirs::home_dir()
             .map(|h| h.join(".gewu").join("specialists"))

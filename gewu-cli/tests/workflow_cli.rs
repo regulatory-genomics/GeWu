@@ -106,6 +106,9 @@ fn minimal_cli(workflow_dir: &str) -> Cli {
         workflow_input: None,
         workflow_dirs: vec![workflow_dir.to_string()],
         list_workflows: false,
+        canvas_loop: false,
+        canvas_url: "http://localhost:3210".into(),
+        poll_interval_ms: 2000,
     }
 }
 

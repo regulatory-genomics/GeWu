@@ -7,7 +7,7 @@ pub mod types;
 
 pub use index::{WorkflowIndex, WorkflowNode};
 pub use projector::{CanvasProjector, GraphMutation};
-pub use runtime::WorkspaceRuntime;
+pub use runtime::{SessionGraphMutation, WorkspaceRuntime};
 pub use store::{SessionGraphStore, WorkflowEventStore};
 pub use types::{
     ArtifactPreview, GraphEdge, GraphNode, GraphPosition, SessionGraph, WorkflowEvent,

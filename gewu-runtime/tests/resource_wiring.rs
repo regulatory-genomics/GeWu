@@ -82,6 +82,21 @@ resources:
     .unwrap();
 }
 
+fn write_gene_resolver_tool(project_root: &std::path::Path) {
+    let tools_dir = project_root.join(".gewu/tools");
+    std::fs::create_dir_all(&tools_dir).unwrap();
+    std::fs::write(
+        tools_dir.join("gene.resolve_symbol.yaml"),
+        r#"
+name: gene.resolve_symbol
+description: Resolve a gene symbol to a locus.
+command: /bin/echo
+input_schema: { type: object }
+"#,
+    )
+    .unwrap();
+}
+
 #[tokio::test]
 async fn runtime_registers_resource_tools_when_catalog_exists() {
     let dir = tempfile::tempdir().unwrap();
@@ -217,6 +232,7 @@ async fn runtime_resource_register_available_for_explicit_empty_resource_dir() {
 #[tokio::test]
 async fn build_specialist_can_use_resources_and_gene_resolver_in_project_workdir() {
     let dir = tempfile::tempdir().unwrap();
+    write_gene_resolver_tool(dir.path());
     let pool = pool().await;
     let provider: Arc<dyn LlmProvider> = Arc::new(FinishLlm);
     let plugin_host = PluginHost::empty();

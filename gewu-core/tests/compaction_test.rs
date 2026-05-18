@@ -1,5 +1,40 @@
-use gewu_core::compaction::{estimate_tokens, estimate_message_tokens, is_overflow, prune};
-use gewu_core::types::{ContentPart, Message};
+use async_trait::async_trait;
+use futures::{StreamExt, stream::BoxStream};
+use gewu_core::agent::AgentBuilder;
+use gewu_core::compaction::{estimate_message_tokens, estimate_tokens, is_overflow, prune};
+use gewu_core::traits::{LlmProvider, Tool};
+use gewu_core::types::{AgentEvent, ContentPart, Message, ProviderEvent};
+use std::error::Error;
+use std::sync::{Arc, Mutex};
+
+struct MockLlm {
+    responses: Arc<Mutex<Vec<Message>>>,
+}
+
+#[async_trait]
+impl LlmProvider for MockLlm {
+    async fn stream_response<'a>(
+        &'a self,
+        _messages: &[Message],
+        _tools: &[Arc<dyn Tool>],
+    ) -> Result<
+        BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+        Box<dyn Error + Send + Sync>,
+    > {
+        let mut responses = self.responses.lock().unwrap();
+        let response = responses.remove(0);
+        let stream = async_stream::try_stream! {
+            if let Message::Assistant { content: Some(content), .. } = response {
+                yield ProviderEvent::ContentDelta { delta: content };
+            }
+        };
+        Ok(Box::pin(stream))
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+        Ok(vec!["mock".to_string()])
+    }
+}
 
 #[test]
 fn test_estimate_tokens_exact() {
@@ -41,14 +76,18 @@ fn test_is_overflow_zero_limit() {
 
 #[test]
 fn test_estimate_message_tokens_system() {
-    let msg = Message::System { content: "Hello".to_string() };
+    let msg = Message::System {
+        content: "Hello".to_string(),
+    };
     assert_eq!(estimate_message_tokens(&msg), 5 / 4);
 }
 
 #[test]
 fn test_estimate_message_tokens_user_text() {
     let msg = Message::User {
-        content: vec![ContentPart::Text { text: "Hello world".to_string() }],
+        content: vec![ContentPart::Text {
+            text: "Hello world".to_string(),
+        }],
     };
     assert_eq!(estimate_message_tokens(&msg), 11 / 4);
 }
@@ -57,8 +96,13 @@ fn test_estimate_message_tokens_user_text() {
 fn test_estimate_message_tokens_user_with_media() {
     let msg = Message::User {
         content: vec![
-            ContentPart::Text { text: "Hello".to_string() },
-            ContentPart::Image { data: "imagedata".to_string(), mime_type: "image/png".to_string() },
+            ContentPart::Text {
+                text: "Hello".to_string(),
+            },
+            ContentPart::Image {
+                data: "imagedata".to_string(),
+                mime_type: "image/png".to_string(),
+            },
         ],
     };
     let expected = estimate_tokens("Hello") + estimate_tokens("imagedata");
@@ -78,21 +122,22 @@ fn test_estimate_message_tokens_assistant() {
 fn test_estimate_message_tokens_assistant_with_tool_calls() {
     let msg = Message::Assistant {
         content: Some("Calling tool".to_string()),
-        tool_calls: Some(vec![
-            gewu_core::types::ToolCall {
-                id: "call_1".to_string(),
-                r#type: "function".to_string(),
-                function: gewu_core::types::FunctionCall {
-                    name: "get_weather".to_string(),
-                    arguments: "{\"city\":\"NYC\"}".to_string(),
-                },
-            }
-        ]),
+        tool_calls: Some(vec![gewu_core::types::ToolCall {
+            id: "call_1".to_string(),
+            r#type: "function".to_string(),
+            function: gewu_core::types::FunctionCall {
+                name: "get_weather".to_string(),
+                arguments: "{\"city\":\"NYC\"}".to_string(),
+            },
+        }]),
     };
     let text_tokens = estimate_tokens("Calling tool");
     let name_tokens = estimate_tokens("get_weather");
     let args_tokens = estimate_tokens("{\"city\":\"NYC\"}");
-    assert_eq!(estimate_message_tokens(&msg), text_tokens + name_tokens + args_tokens);
+    assert_eq!(
+        estimate_message_tokens(&msg),
+        text_tokens + name_tokens + args_tokens
+    );
 }
 
 #[test]
@@ -103,7 +148,10 @@ fn test_estimate_message_tokens_tool() {
         content: "File contents here".to_string(),
         media: vec![],
     };
-    assert_eq!(estimate_message_tokens(&msg), estimate_tokens("File contents here"));
+    assert_eq!(
+        estimate_message_tokens(&msg),
+        estimate_tokens("File contents here")
+    );
 }
 
 #[test]
@@ -115,9 +163,18 @@ fn test_prune_does_nothing_when_empty() {
 #[test]
 fn test_prune_does_nothing_when_under_threshold() {
     let mut messages = vec![
-        Message::System { content: "You are helpful".to_string() },
-        Message::User { content: vec![ContentPart::Text { text: "Hello".to_string() }] },
-        Message::Assistant { content: Some("Hi".to_string()), tool_calls: None },
+        Message::System {
+            content: "You are helpful".to_string(),
+        },
+        Message::User {
+            content: vec![ContentPart::Text {
+                text: "Hello".to_string(),
+            }],
+        },
+        Message::Assistant {
+            content: Some("Hi".to_string()),
+            tool_calls: None,
+        },
         Message::Tool {
             tool_call_id: "call_1".to_string(),
             tool_name: Some("tool".to_string()),
@@ -129,6 +186,18 @@ fn test_prune_does_nothing_when_under_threshold() {
     assert_eq!(saved, 0);
 }
 
+#[tokio::test]
+async fn test_agent_ask_compacts_when_history_exceeds_context_limit() {
+    let responses = vec![
+        Message::Assistant {
+            content: Some("Prior context summarized.".to_string()),
+            tool_calls: None,
+        },
+        Message::Assistant {
+            content: Some("I am ready.".to_string()),
+            tool_calls: None,
+        },
+    ];
     let llm = Arc::new(MockLlm {
         responses: Arc::new(Mutex::new(responses)),
     });
@@ -168,21 +237,38 @@ fn test_prune_does_nothing_when_under_threshold() {
     drop(stream); // Release borrow
 
     assert_eq!(response, "I am ready.");
+}
 
 #[test]
 fn test_prune_protects_recent_turns() {
     let mut messages = vec![
-        Message::System { content: "You are helpful".to_string() },
-        Message::User { content: vec![ContentPart::Text { text: "First".to_string() }] },
-        Message::Assistant { content: Some("Response 1".to_string()), tool_calls: None },
+        Message::System {
+            content: "You are helpful".to_string(),
+        },
+        Message::User {
+            content: vec![ContentPart::Text {
+                text: "First".to_string(),
+            }],
+        },
+        Message::Assistant {
+            content: Some("Response 1".to_string()),
+            tool_calls: None,
+        },
         Message::Tool {
             tool_call_id: "call_1".to_string(),
             tool_name: Some("tool1".to_string()),
             content: "Old output 1".to_string(),
             media: vec![],
         },
-        Message::User { content: vec![ContentPart::Text { text: "Second".to_string() }] },
-        Message::Assistant { content: Some("Response 2".to_string()), tool_calls: None },
+        Message::User {
+            content: vec![ContentPart::Text {
+                text: "Second".to_string(),
+            }],
+        },
+        Message::Assistant {
+            content: Some("Response 2".to_string()),
+            tool_calls: None,
+        },
         Message::Tool {
             tool_call_id: "call_2".to_string(),
             tool_name: Some("tool2".to_string()),
@@ -208,12 +294,18 @@ fn test_prune_protects_recent_turns() {
 #[test]
 fn test_prune_stops_at_summary() {
     let mut messages = vec![
-        Message::System { content: "You are helpful".to_string() },
+        Message::System {
+            content: "You are helpful".to_string(),
+        },
         Message::Assistant {
             content: Some("Summary: Previous conversation...".to_string()),
             tool_calls: None,
         },
-        Message::User { content: vec![ContentPart::Text { text: "Recent".to_string() }] },
+        Message::User {
+            content: vec![ContentPart::Text {
+                text: "Recent".to_string(),
+            }],
+        },
         Message::Tool {
             tool_call_id: "call_1".to_string(),
             tool_name: Some("tool".to_string()),

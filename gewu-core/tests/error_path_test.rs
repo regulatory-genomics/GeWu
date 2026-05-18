@@ -26,7 +26,10 @@ impl LlmProvider for MockLlmProvider {
         &'a self,
         messages: &[Message],
         _tools: &[Arc<dyn Tool>],
-    ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
+    ) -> Result<
+        BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+        Box<dyn Error + Send + Sync>,
+    > {
         let tool_response_count = messages
             .iter()
             .filter(|m| matches!(m, Message::Tool { .. }))
@@ -79,7 +82,11 @@ impl Tool for TestTool {
     fn schema(&self) -> schemars::schema::RootSchema {
         schemars::schema_for!(serde_json::Value)
     }
-    async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
+    async fn execute(
+        &self,
+        _args: Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
         Ok(ToolResult::new("test_tool", "output".to_string()))
     }
 }
@@ -149,7 +156,7 @@ impl Tool for PermissionTool {
 async fn test_tool_not_found_error() {
     let llm = MockLlmProvider {
         responses: Arc::new(Mutex::new(vec![])),
-        tool_behavior: "default",
+        tool_behavior: "not_found",
     };
 
     let agent = Agent::builder()
@@ -171,7 +178,10 @@ async fn test_tool_not_found_error() {
         }
     }
 
-    assert!(tool_found_error, "Should have received tool not found error in ToolFinish");
+    assert!(
+        tool_found_error,
+        "Should have received tool not found error in ToolFinish"
+    );
 }
 
 #[tokio::test]
@@ -212,7 +222,10 @@ async fn permission_broker_approves_and_retries_tool_in_same_turn() {
         }
     }
 
-    assert!(resolved, "permission broker should approve during the same turn");
+    assert!(
+        resolved,
+        "permission broker should approve during the same turn"
+    );
     assert!(retried_output, "tool should retry with the approved grant");
     assert!(
         !permission_error_output,
@@ -236,7 +249,10 @@ async fn test_agent_reset_clears_memory() {
             &'a self,
             _messages: &[Message],
             _tools: &[Arc<dyn Tool>],
-        ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
+        ) -> Result<
+            BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+            Box<dyn Error + Send + Sync>,
+        > {
             Err("Not implemented".into())
         }
 
@@ -251,7 +267,10 @@ async fn test_agent_reset_clears_memory() {
         .build()
         .unwrap();
 
-    agent.memory.add_message(Message::User { content: vec![] }).await;
+    agent
+        .memory
+        .add_message(Message::User { content: vec![] })
+        .await;
     assert_eq!(agent.memory.messages().len(), 1);
 
     agent.reset().await;
@@ -329,7 +348,10 @@ async fn test_agent_reset_restores_system_prompt() {
             &'a self,
             _messages: &[Message],
             _tools: &[Arc<dyn Tool>],
-        ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
+        ) -> Result<
+            BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+            Box<dyn Error + Send + Sync>,
+        > {
             Err("Not implemented".into())
         }
 

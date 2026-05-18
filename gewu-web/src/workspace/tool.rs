@@ -1,10 +1,13 @@
-use crate::workspace::{GraphMutation, SessionGraph, WorkflowEvent, WorkflowEventKind, WorkflowIndex, WorkspaceRuntime};
+use crate::workspace::{
+    GraphMutation, SessionGraph, SessionGraphMutation, WorkflowEvent, WorkflowEventKind,
+    WorkspaceRuntime,
+};
 use async_trait::async_trait;
 use gewu_core::traits::Tool;
 use gewu_core::types::{ToolContext, ToolResult};
-use schemars::{schema::RootSchema, schema_for, JsonSchema};
+use schemars::{JsonSchema, schema::RootSchema, schema_for};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -125,13 +128,18 @@ pub fn normalize_event_defaults(event: &mut WorkflowEvent, fallback_session_id: 
     }
 }
 
-pub async fn append_event_and_project(runtime: &WorkspaceRuntime, event: WorkflowEvent) -> anyhow::Result<()> {
+pub async fn append_event_and_project(
+    runtime: &WorkspaceRuntime,
+    event: WorkflowEvent,
+) -> anyhow::Result<()> {
     let mut store = runtime.workflow_store.lock().await;
     store.append(event.clone())?;
-    let index = WorkflowIndex::rebuild(store.all());
     drop(store);
 
+    let mut index = runtime.workflow_index.lock().await;
+    index.apply(&event);
     let mutations = runtime.projector.lock().await.project(&event, &index);
+    drop(index);
     if !mutations.is_empty() {
         let mut graph = runtime
             .graph_store
@@ -141,7 +149,10 @@ pub async fn append_event_and_project(runtime: &WorkspaceRuntime, event: Workflo
         apply_mutations(&mut graph, mutations);
         runtime.graph_store.save(&graph)?;
         for mutation in broadcast_mutations {
-            let _ = runtime.graph_events.send(mutation);
+            let _ = runtime.graph_events.send(SessionGraphMutation {
+                session_id: event.session_id.clone(),
+                mutation,
+            });
         }
     }
     Ok(())
@@ -160,7 +171,9 @@ pub fn apply_mutations(graph: &mut SessionGraph, mutations: Vec<GraphMutation>) 
             }
             GraphMutation::RemoveNode(node_id) => {
                 graph.nodes.retain(|node| node.id != node_id);
-                graph.edges.retain(|edge| edge.source != node_id && edge.target != node_id);
+                graph
+                    .edges
+                    .retain(|edge| edge.source != node_id && edge.target != node_id);
             }
         }
     }

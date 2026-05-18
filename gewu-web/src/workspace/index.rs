@@ -13,7 +13,7 @@ pub struct WorkflowNode {
     pub preview: Option<ArtifactPreview>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct WorkflowIndex {
     pub nodes: HashMap<String, WorkflowNode>,
     pub edges: Vec<(String, String, String)>,
@@ -45,7 +45,10 @@ impl WorkflowIndex {
                 WorkflowNode {
                     id: id.to_string(),
                     kind: "data".to_string(),
-                    uri: payload.get("uri").and_then(Value::as_str).map(str::to_string),
+                    uri: payload
+                        .get("uri")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     format: payload
                         .get("format")
                         .and_then(Value::as_str)
@@ -92,7 +95,10 @@ impl WorkflowIndex {
                 WorkflowNode {
                     id: id.to_string(),
                     kind: "artifact".to_string(),
-                    uri: payload.get("uri").and_then(Value::as_str).map(str::to_string),
+                    uri: payload
+                        .get("uri")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     format: payload
                         .get("format")
                         .and_then(Value::as_str)

@@ -140,7 +140,7 @@ pub async fn handle_chat(
     let app_for_cleanup = app.clone();
     let join_handle = tokio::spawn(async move {
         let mut agent = agent_handle.agent.lock().await;
-        info!("Agent locked, calling ask() with message: {}", message);
+        info!("Agent locked, calling ask() with redacted user message");
         let stream = agent.ask(&message);
         futures::pin_mut!(stream);
         let mut event_count = 0usize;
@@ -165,7 +165,7 @@ pub async fn handle_chat(
                         input,
                         metadata,
                     } => {
-                        info!("tool_start: {} - {}", tool, input);
+                        debug!(tool = %tool, input_bytes = input.len(), "tool_start");
                         SseEvent::tool_start(tool_call_id, tool, input, metadata).to_sse_event()
                     }
                     gewu_core::types::AgentEvent::ToolFinish {
@@ -173,9 +173,10 @@ pub async fn handle_chat(
                         tool,
                         output,
                     } => {
-                        info!("tool_finish: {} - {}", tool, output);
+                        debug!(tool = %tool, output_bytes = output.len(), "tool_finish");
                         if let Some(request) = tool_permission_request_from_output(&output) {
-                            let permission_event = SseEvent::tool_permission_request(request).to_sse_event();
+                            let permission_event =
+                                SseEvent::tool_permission_request(request).to_sse_event();
                             if client_connected
                                 && tx
                                     .send(Ok::<Event, std::convert::Infallible>(permission_event))
@@ -189,25 +190,44 @@ pub async fn handle_chat(
                         SseEvent::tool_finish(tool_call_id, tool, output).to_sse_event()
                     }
                     gewu_core::types::AgentEvent::ToolPermissionRequest(request) => {
-                        info!("tool_permission_request: {} - {}", request.tool_name, request.requested_path.display());
+                        info!(
+                            "tool_permission_request: {} - {}",
+                            request.tool_name,
+                            request.requested_path.display()
+                        );
                         SseEvent::tool_permission_request(request).to_sse_event()
                     }
-                    gewu_core::types::AgentEvent::ToolPermissionResolved { request_id, approved } => {
-                        info!("tool_permission_resolved: {} approved={}", request_id, approved);
+                    gewu_core::types::AgentEvent::ToolPermissionResolved {
+                        request_id,
+                        approved,
+                    } => {
+                        info!(
+                            "tool_permission_resolved: {} approved={}",
+                            request_id, approved
+                        );
                         SseEvent::tool_permission_resolved(request_id, approved).to_sse_event()
                     }
-                    gewu_core::types::AgentEvent::Observation { source, kind, payload, timestamp } => {
+                    gewu_core::types::AgentEvent::Observation {
+                        source,
+                        kind,
+                        payload,
+                        timestamp,
+                    } => {
                         info!("observation: {}/{}", source, kind);
-                        SseEvent::content_delta(serde_json::json!({
-                            "type": "observation",
-                            "source": source,
-                            "kind": kind,
-                            "payload": payload,
-                            "timestamp": timestamp,
-                        }).to_string()).to_sse_event()
+                        SseEvent::content_delta(
+                            serde_json::json!({
+                                "type": "observation",
+                                "source": source,
+                                "kind": kind,
+                                "payload": payload,
+                                "timestamp": timestamp,
+                            })
+                            .to_string(),
+                        )
+                        .to_sse_event()
                     }
                     gewu_core::types::AgentEvent::Finish { response } => {
-                        info!("finish: {}", response);
+                        info!(response_bytes = response.len(), "finish");
                         SseEvent::finish(response).to_sse_event()
                     }
                     gewu_core::types::AgentEvent::Error { error } => {

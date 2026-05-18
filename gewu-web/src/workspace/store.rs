@@ -1,5 +1,5 @@
 use crate::workspace::types::{SessionGraph, WorkflowEvent, WorkflowEventKind};
-use anyhow::{Context, Result};
+use anyhow::{Result, bail};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -19,9 +19,13 @@ impl WorkflowEventStore {
         if path.exists() {
             let content = fs::read_to_string(&path)?;
             for line in content.lines().filter(|line| !line.trim().is_empty()) {
-                let event: WorkflowEvent = serde_json::from_str(line)
-                    .with_context(|| format!("invalid workflow event JSONL line: {line}"))?;
-                events.push(event);
+                match serde_json::from_str::<WorkflowEvent>(line) {
+                    Ok(event) => events.push(event),
+                    Err(error) => eprintln!(
+                        "[workspace] skipping corrupt workflow JSONL line in {}: {error}",
+                        path.display()
+                    ),
+                }
             }
         }
         Ok(Self { path, events })
@@ -60,12 +64,17 @@ impl SessionGraphStore {
         Self { root: root.into() }
     }
 
-    fn graph_path(&self, session_id: &str) -> PathBuf {
-        self.root.join("sessions").join(session_id).join("graph.json")
+    fn graph_path(&self, session_id: &str) -> Result<PathBuf> {
+        validate_session_id(session_id)?;
+        Ok(self
+            .root
+            .join("sessions")
+            .join(session_id)
+            .join("graph.json"))
     }
 
     pub fn load(&self, session_id: &str) -> Result<SessionGraph> {
-        let path = self.graph_path(session_id);
+        let path = self.graph_path(session_id)?;
         if !path.exists() {
             return Ok(SessionGraph::empty(session_id));
         }
@@ -74,13 +83,24 @@ impl SessionGraphStore {
     }
 
     pub fn save(&self, graph: &SessionGraph) -> Result<()> {
-        let path = self.graph_path(&graph.session_id);
+        let path = self.graph_path(&graph.session_id)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::write(path, serde_json::to_string_pretty(graph)?)?;
         Ok(())
     }
+}
+
+fn validate_session_id(session_id: &str) -> Result<()> {
+    if session_id.is_empty()
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        bail!("invalid session_id: use only ASCII letters, numbers, '_' or '-'");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -121,6 +141,27 @@ mod tests {
     }
 
     #[test]
+    fn workflow_store_skips_corrupt_jsonl_lines() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("workflow.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}\nnot json\n{}\n",
+                serde_json::to_string(&event("e1", WorkflowEventKind::ArtifactProduced)).unwrap(),
+                serde_json::to_string(&event("e2", WorkflowEventKind::ArtifactSurfaced)).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let reloaded = WorkflowEventStore::open(&path).unwrap();
+
+        assert_eq!(reloaded.all().len(), 2);
+        assert_eq!(reloaded.all()[0].id, "e1");
+        assert_eq!(reloaded.all()[1].id, "e2");
+    }
+
+    #[test]
     fn session_graph_store_is_session_scoped() {
         let dir = tempdir().unwrap();
         let store = SessionGraphStore::new(dir.path());
@@ -135,5 +176,14 @@ mod tests {
 
         assert_eq!(store.load("s1").unwrap().nodes.len(), 1);
         assert_eq!(store.load("s2").unwrap().nodes.len(), 0);
+    }
+
+    #[test]
+    fn session_graph_store_rejects_path_traversal_session_ids() {
+        let dir = tempdir().unwrap();
+        let store = SessionGraphStore::new(dir.path());
+
+        assert!(store.load("../hack").is_err());
+        assert!(store.save(&SessionGraph::empty("nested/session")).is_err());
     }
 }

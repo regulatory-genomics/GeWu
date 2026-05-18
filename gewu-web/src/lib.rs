@@ -270,7 +270,10 @@ where
             get(routes::projects::handle_browse_directories),
         )
         .route("/api/workspaces", get(routes::workspaces::list_workspaces))
-        .route("/api/workspaces", post(routes::workspaces::create_workspace))
+        .route(
+            "/api/workspaces",
+            post(routes::workspaces::create_workspace),
+        )
         .route(
             "/api/workspaces/{workspace_id}/canvas/graph",
             get(routes::workspaces::get_graph).delete(routes::workspaces::delete_graph),
@@ -281,11 +284,8 @@ where
         )
         .route(
             "/api/workspaces/{workspace_id}/workflow/events",
-            get(routes::workspaces::get_workflow_events).post(routes::workspaces::append_workflow_event),
-        )
-        .route(
-            "/api/workspaces/{workspace_id}/api/workflow/events",
-            get(routes::workspaces::get_workflow_events).post(routes::workspaces::append_workflow_event),
+            get(routes::workspaces::get_workflow_events)
+                .post(routes::workspaces::append_workflow_event),
         )
         .route(
             "/api/workspaces/{workspace_id}/workflow/lineage/{artifact_id}",
