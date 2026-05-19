@@ -559,7 +559,10 @@ impl AppState {
         let workspace_id = workspace_id_for_project(project.as_ref(), &default_project);
         let workspace_runtime = self.get_or_create_workspace_runtime(&workspace_id).await?;
         mcp_tools.push(Arc::new(
-            crate::workspace::tool::InProcessWorkflowEmitTool::new(workspace_runtime),
+            crate::workspace::tool::InProcessWorkflowEmitTool::new(workspace_runtime.clone()),
+        ));
+        mcp_tools.push(Arc::new(
+            crate::workspace::code_execute::CodeExecuteTool::new(workspace_runtime),
         ));
         let plugin_host = self.build_plugin_host_for_workdir(
             provider.clone(),
@@ -1081,7 +1084,10 @@ impl AppState {
         let workspace_id = workspace_id_for_project(project.as_ref(), &default_project);
         let workspace_runtime = self.get_or_create_workspace_runtime(&workspace_id).await?;
         mcp_tools.push(Arc::new(
-            crate::workspace::tool::InProcessWorkflowEmitTool::new(workspace_runtime),
+            crate::workspace::tool::InProcessWorkflowEmitTool::new(workspace_runtime.clone()),
+        ));
+        mcp_tools.push(Arc::new(
+            crate::workspace::code_execute::CodeExecuteTool::new(workspace_runtime),
         ));
         let plugin_host = self.build_plugin_host_for_workdir(
             provider.clone(),

@@ -1,3 +1,4 @@
+use gewu_core::traits::Tool;
 use gewu_core::types::ToolContext;
 use gewu_web::workspace::code_execute::{CodeExecuteTool, PythonSandbox};
 use gewu_web::workspace::{WorkflowEventKind, WorkspaceRuntime};
@@ -89,4 +90,49 @@ async fn code_execute_tool_emits_canvas_events() {
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].kind, WorkflowEventKind::ArtifactProduced);
     assert_eq!(events[1].kind, WorkflowEventKind::ArtifactSurfaced);
+}
+
+#[tokio::test]
+async fn code_execute_tool_handles_object_columns_and_record_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(
+        WorkspaceRuntime::open("default", dir.path().to_path_buf(), dir.path().join("store"))
+            .unwrap(),
+    );
+    let tool = CodeExecuteTool::new(runtime.clone());
+    let ctx = ToolContext::new("test_session", "msg-2");
+
+    let result = tool
+        .execute(
+            json!({
+                "code": r#"
+result = {
+    "kind": "data_table",
+    "columns": [{"field": "gene", "header": "Gene"}, {"field": "score", "header": "Score"}],
+    "rows": [{"gene": "TP53", "score": 0.95}],
+}
+"#
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    let body: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["nodes_created"], 1);
+}
+
+#[test]
+fn code_execute_tool_name_is_stable_for_llm_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(
+        WorkspaceRuntime::open("default", dir.path().to_path_buf(), dir.path().join("store"))
+            .unwrap(),
+    );
+    let tool = CodeExecuteTool::new(runtime);
+
+    assert_eq!(tool.name(), "code_execute");
+    assert!(tool.description().contains("Set a JSON-serializable `result` variable"));
+    assert!(tool.description().contains("plotly"));
 }

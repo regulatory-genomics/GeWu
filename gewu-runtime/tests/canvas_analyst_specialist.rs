@@ -13,3 +13,17 @@ fn canvas_analyst_specialist_exists() {
     assert!(analyst.system_prompt.contains("bioinformatics"));
     assert!(analyst.system_prompt.contains("workflow.emit"));
 }
+
+#[test]
+fn canvas_analyst_prompt_prefers_code_execute_when_requested() {
+    let descriptors = specialist_descriptors();
+    let analyst = descriptors
+        .iter()
+        .find(|d| d.id == "canvas-analyst")
+        .expect("canvas-analyst specialist exists");
+
+    assert!(analyst.system_prompt.contains("code_execute"));
+    assert!(analyst
+        .system_prompt
+        .contains("When the user explicitly asks to use code_execute"));
+}

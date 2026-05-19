@@ -164,6 +164,9 @@ fn infer_node_type(format: Option<&str>) -> String {
         "png" | "jpg" | "jpeg" | "svg" => "markdown".to_string(),
         "plotly" | "plotly_json" => "plotly".to_string(),
         "bed" | "bigwig" | "ucf" => "genome_track".to_string(),
+        "heatmap" => "heatmap".to_string(),
+        "markdown" | "md" => "markdown".to_string(),
+        "data_table" | "table" | "tsv" | "csv" => "data_table".to_string(),
         _ => "data_table".to_string(),
     }
 }
@@ -327,5 +330,13 @@ mod tests {
             mutation,
             GraphMutation::AddEdge(edge) if edge.source == "node_a" && edge.target == "node_b"
         )));
+    }
+
+    #[test]
+    fn infer_node_type_handles_heatmap_and_markdown() {
+        assert_eq!(infer_node_type(Some("heatmap")), "heatmap");
+        assert_eq!(infer_node_type(Some("markdown")), "markdown");
+        assert_eq!(infer_node_type(Some("plotly")), "plotly");
+        assert_eq!(infer_node_type(Some("data_table")), "data_table");
     }
 }
