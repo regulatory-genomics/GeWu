@@ -296,6 +296,14 @@ where
             get(routes::workspaces::get_lineage),
         )
         .route(
+            "/api/workspaces/{workspace_id}/artifacts/{artifact_id}/raw",
+            get(routes::workspaces::get_artifact_raw),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/artifacts/{artifact_id}/upload",
+            post(routes::workspaces::upload_artifact),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/chat/send",
             post(routes::workspaces::workspace_chat_send),
         )

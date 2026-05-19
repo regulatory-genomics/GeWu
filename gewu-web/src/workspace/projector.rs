@@ -161,7 +161,8 @@ impl CanvasProjector {
 
 fn infer_node_type(format: Option<&str>) -> String {
     match format.unwrap_or_default() {
-        "png" | "jpg" | "jpeg" | "svg" => "markdown".to_string(),
+        "html" | "htm" => "html".to_string(),
+        "png" | "jpg" | "jpeg" | "svg" | "gif" | "webp" | "image" => "image".to_string(),
         "plotly" | "plotly_json" => "plotly".to_string(),
         "bed" | "bigwig" | "ucf" => "genome_track".to_string(),
         "heatmap" => "heatmap".to_string(),
@@ -194,20 +195,36 @@ fn build_node_data(
             ArtifactPreview::Plot { spec } => {
                 data["payload"] = spec.clone();
             }
+            ArtifactPreview::Html { uri, sandbox } => {
+                data["payload"] = json!({
+                    "url": uri,
+                    "sandbox": sandbox.clone().unwrap_or_else(|| "allow-scripts".to_string())
+                });
+            }
             ArtifactPreview::Image { uri, width, height } => {
-                data["payload"] = json!({"uri": uri, "width": width, "height": height});
+                data["payload"] = json!({"url": uri, "width": width, "height": height});
             }
         }
-    } else if node
-        .map(|node| {
-            node.canvas_kind
-                .clone()
-                .unwrap_or_else(|| infer_node_type(node.format.as_deref()))
-        })
-        .unwrap_or_else(|| "data_table".to_string())
-        == "data_table"
-    {
-        data["payload"] = json!({"columns": [], "rows": [], "summary": label});
+    } else {
+        let node_type = node
+            .map(|node| {
+                node.canvas_kind
+                    .clone()
+                    .unwrap_or_else(|| infer_node_type(node.format.as_deref()))
+            })
+            .unwrap_or_else(|| "data_table".to_string());
+        if node_type == "html" {
+            data["payload"] = json!({
+                "url": node.and_then(|node| node.uri.clone()).unwrap_or_default(),
+                "sandbox": "allow-scripts"
+            });
+        } else if node_type == "image" {
+            data["payload"] = json!({
+                "url": node.and_then(|node| node.uri.clone()).unwrap_or_default()
+            });
+        } else if node_type == "data_table" {
+            data["payload"] = json!({"columns": [], "rows": [], "summary": label});
+        }
     }
     data
 }
@@ -381,5 +398,71 @@ mod tests {
         assert_eq!(infer_node_type(Some("markdown")), "markdown");
         assert_eq!(infer_node_type(Some("plotly")), "plotly");
         assert_eq!(infer_node_type(Some("data_table")), "data_table");
+        assert_eq!(infer_node_type(Some("html")), "html");
+        assert_eq!(infer_node_type(Some("png")), "image");
+        assert_eq!(infer_node_type(Some("webp")), "image");
+    }
+
+    #[test]
+    fn surfaced_html_artifact_uses_uri_as_payload_url() {
+        let produced = event(
+            WorkflowEventKind::ArtifactProduced,
+            json!({
+                "artifact_id":"html1",
+                "summary":"Interactive HTML",
+                "format":"html",
+                "uri":"/api/workspaces/default/artifacts/html1/raw"
+            }),
+        );
+        let index = WorkflowIndex::rebuild(&[produced]);
+        let surfaced = event(
+            WorkflowEventKind::ArtifactSurfaced,
+            json!({"artifact_id":"html1", "canvas_node_id":"node_html1"}),
+        );
+        let mut projector = CanvasProjector::default();
+
+        let mutations = projector.project(&surfaced, &index);
+
+        let GraphMutation::AddNode(node) = &mutations[0] else {
+            panic!("expected node");
+        };
+        assert_eq!(node.node_type, "html");
+        assert_eq!(
+            node.data["payload"]["url"],
+            "/api/workspaces/default/artifacts/html1/raw"
+        );
+        assert_eq!(node.data["payload"]["sandbox"], "allow-scripts");
+    }
+
+    #[test]
+    fn surfaced_image_preview_uses_url_payload() {
+        let produced = event(
+            WorkflowEventKind::ArtifactProduced,
+            json!({
+                "artifact_id":"img1",
+                "summary":"Image",
+                "format":"png",
+                "preview":{"kind":"image", "uri":"/api/workspaces/default/artifacts/img1/raw", "width":800, "height":600}
+            }),
+        );
+        let index = WorkflowIndex::rebuild(&[produced]);
+        let surfaced = event(
+            WorkflowEventKind::ArtifactSurfaced,
+            json!({"artifact_id":"img1", "canvas_node_id":"node_img1"}),
+        );
+        let mut projector = CanvasProjector::default();
+
+        let mutations = projector.project(&surfaced, &index);
+
+        let GraphMutation::AddNode(node) = &mutations[0] else {
+            panic!("expected node");
+        };
+        assert_eq!(node.node_type, "image");
+        assert_eq!(
+            node.data["payload"]["url"],
+            "/api/workspaces/default/artifacts/img1/raw"
+        );
+        assert_eq!(node.data["payload"]["width"], 800);
+        assert_eq!(node.data["payload"]["height"], 600);
     }
 }

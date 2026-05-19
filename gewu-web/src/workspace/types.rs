@@ -91,6 +91,11 @@ pub enum ArtifactPreview {
     },
     Plot { spec: Value },
     Text { content: String },
+    Html {
+        uri: String,
+        #[serde(default)]
+        sandbox: Option<String>,
+    },
     Image { uri: String, width: u32, height: u32 },
 }
 
@@ -116,5 +121,17 @@ mod tests {
     fn workflow_event_kind_uses_snake_case_contract() {
         let kind = serde_json::to_value(WorkflowEventKind::ArtifactProduced).unwrap();
         assert_eq!(kind, json!("artifact_produced"));
+    }
+
+    #[test]
+    fn html_artifact_preview_serializes_with_uri_and_sandbox() {
+        let preview = ArtifactPreview::Html {
+            uri: "/api/workspaces/default/artifacts/html1/raw".to_string(),
+            sandbox: Some("allow-scripts".to_string()),
+        };
+        let value = serde_json::to_value(preview).unwrap();
+        assert_eq!(value["kind"], "html");
+        assert_eq!(value["uri"], "/api/workspaces/default/artifacts/html1/raw");
+        assert_eq!(value["sandbox"], "allow-scripts");
     }
 }

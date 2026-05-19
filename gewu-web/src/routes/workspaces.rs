@@ -5,8 +5,9 @@ use crate::workspace::tool::{
 use crate::workspace::{GraphMutation, SessionGraph, WorkflowEvent};
 use axum::{
     Json,
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{StatusCode, header, HeaderMap},
     response::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
@@ -15,6 +16,7 @@ use axum::{
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -230,6 +232,170 @@ pub async fn get_lineage(
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ArtifactMeta {
+    filename: String,
+    content_type: String,
+}
+
+fn artifact_dir(storage_dir: &FsPath, artifact_id: &str) -> PathBuf {
+    storage_dir.join("artifacts").join(artifact_id)
+}
+
+fn artifact_raw_path(storage_dir: &FsPath, artifact_id: &str) -> PathBuf {
+    artifact_dir(storage_dir, artifact_id).join("raw")
+}
+
+fn artifact_meta_path(storage_dir: &FsPath, artifact_id: &str) -> PathBuf {
+    artifact_dir(storage_dir, artifact_id).join("meta.json")
+}
+
+fn content_type_for_filename(filename: &str) -> &'static str {
+    match FsPath::new(filename)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "txt" | "md" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+pub async fn upload_artifact(
+    Path((workspace_id, artifact_id)): Path<(String, String)>,
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let runtime = match app.get_or_create_workspace_runtime(&workspace_id).await {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": "workspace unavailable" })),
+            );
+        }
+    };
+    let filename = headers
+        .get("X-Filename")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("artifact.bin");
+    let inferred_content_type = content_type_for_filename(filename);
+    let content_type = if inferred_content_type != "application/octet-stream" {
+        inferred_content_type
+    } else {
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| {
+                !value.is_empty() && !value.eq_ignore_ascii_case("application/octet-stream")
+            })
+            .unwrap_or(inferred_content_type)
+    };
+    let dir = artifact_dir(&runtime.storage_dir, &artifact_id);
+    let raw_path = artifact_raw_path(&runtime.storage_dir, &artifact_id);
+    let meta_path = artifact_meta_path(&runtime.storage_dir, &artifact_id);
+
+    if let Err(error) = tokio::fs::create_dir_all(&dir).await {
+        tracing::warn!("artifact upload directory unavailable: {error}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": "artifact upload failed" })),
+        );
+    }
+    if let Err(error) = tokio::fs::write(&raw_path, &body).await {
+        tracing::warn!("artifact upload write failed: {error}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": "artifact upload failed" })),
+        );
+    }
+    let meta = ArtifactMeta {
+        filename: filename.to_string(),
+        content_type: content_type.to_string(),
+    };
+    if let Err(error) = tokio::fs::write(
+        &meta_path,
+        serde_json::to_vec_pretty(&meta).unwrap_or_default(),
+    )
+    .await
+    {
+        tracing::warn!("artifact meta write failed: {error}");
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "ok": true,
+            "artifact_id": artifact_id,
+            "url": format!("/api/workspaces/{workspace_id}/artifacts/{artifact_id}/raw"),
+        })),
+    )
+}
+
+pub async fn get_artifact_raw(
+    Path((workspace_id, artifact_id)): Path<(String, String)>,
+    State(app): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let runtime = match app.get_or_create_workspace_runtime(&workspace_id).await {
+        Ok(runtime) => runtime,
+        Err(_) => return (StatusCode::BAD_REQUEST, "workspace unavailable").into_response(),
+    };
+    let raw_path = artifact_raw_path(&runtime.storage_dir, &artifact_id);
+    if !raw_path.exists() {
+        return (StatusCode::NOT_FOUND, "artifact not found").into_response();
+    }
+    let content_type = tokio::fs::read_to_string(artifact_meta_path(
+        &runtime.storage_dir,
+        &artifact_id,
+    ))
+    .await
+    .ok()
+    .and_then(|meta| serde_json::from_str::<ArtifactMeta>(&meta).ok())
+    .map(|meta| meta.content_type)
+    .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    match tokio::fs::read(&raw_path).await {
+        Ok(bytes) => {
+            let is_html = content_type.starts_with("text/html");
+            let mut response = (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, content_type)],
+                bytes,
+            )
+                .into_response();
+            if is_html {
+                // Allow same-origin iframe embedding for HTML artifacts
+                response.headers_mut().insert(
+                    header::X_FRAME_OPTIONS,
+                    "SAMEORIGIN".parse().unwrap(),
+                );
+                // Permissive CSP for user-provided HTML (plotly, D3, etc.)
+                response.headers_mut().insert(
+                    header::CONTENT_SECURITY_POLICY,
+                    "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:"
+                        .parse()
+                        .unwrap(),
+                );
+            }
+            response
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "artifact read failed",
+        )
+            .into_response(),
+    }
+}
+
 type CanvasEventStream =
     Pin<Box<dyn Stream<Item = Result<Event, std::convert::Infallible>> + Send>>;
 
@@ -314,9 +480,62 @@ pub async fn workspace_chat_send(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace::{GraphPosition, WorkflowEventKind};
+    use crate::state::{AppState, ServerConfig};
+    use crate::workspace::{GraphPosition, WorkflowEventKind, WorkspaceRuntime};
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{Method, Request, StatusCode},
+        routing::{get, post},
+    };
     use serde_json::json;
+    use std::sync::Arc;
     use tempfile::tempdir;
+    use tower::ServiceExt;
+
+    async fn test_app_with_runtime() -> Router {
+        let db_dir = tempdir().unwrap().keep();
+        let runtime_dir = tempdir().unwrap().keep();
+        let config = ServerConfig {
+            api_key: Some("test-key".to_string()),
+            endpoint: Some("http://127.0.0.1:9/v1".to_string()),
+            db_path: Some(db_dir.join("gewu.sqlite").to_string_lossy().to_string()),
+            ..ServerConfig::default()
+        };
+        let state = Arc::new(
+            AppState::new(
+                config,
+                crate::auth::AuthMode::None,
+                Vec::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .unwrap(),
+        );
+        let runtime = Arc::new(
+            WorkspaceRuntime::open(
+                "default",
+                runtime_dir.clone(),
+                runtime_dir.join(".tachyon"),
+            )
+            .unwrap(),
+        );
+        state
+            .workspace_runtimes
+            .write()
+            .await
+            .insert("default".to_string(), runtime);
+        Router::new()
+            .route(
+                "/api/workspaces/{workspace_id}/artifacts/{artifact_id}/upload",
+                post(upload_artifact),
+            )
+            .route(
+                "/api/workspaces/{workspace_id}/artifacts/{artifact_id}/raw",
+                get(get_artifact_raw),
+            )
+            .with_state(state)
+    }
 
     fn event(kind: WorkflowEventKind, payload: serde_json::Value) -> WorkflowEvent {
         WorkflowEvent {
@@ -406,5 +625,81 @@ mod tests {
         }).await.unwrap();
         let event = rx.try_recv().unwrap();
         assert_eq!(event.session_id, "s1");
+    }
+
+    #[tokio::test]
+    async fn artifact_upload_and_raw_round_trip_for_html() {
+        let app = test_app_with_runtime().await;
+        let html = b"<html><body><h1>Hi</h1></body></html>";
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/workspaces/default/artifacts/html1/upload")
+                    .header("content-type", "text/html")
+                    .header("X-Filename", "plot.html")
+                    .body(Body::from(html.as_slice().to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspaces/default/artifacts/html1/raw")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), html);
+    }
+
+    #[tokio::test]
+    async fn artifact_upload_and_raw_round_trip_for_png() {
+        let app = test_app_with_runtime().await;
+        let png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/workspaces/default/artifacts/img1/upload")
+                    .header("content-type", "application/octet-stream")
+                    .header("X-Filename", "plot.png")
+                    .body(Body::from(png.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspaces/default/artifacts/img1/raw")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "image/png"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), png.as_slice());
     }
 }
