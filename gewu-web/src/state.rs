@@ -21,6 +21,7 @@ use tokio::task::AbortHandle;
 use tracing::info;
 use uuid::Uuid;
 
+use crate::routes::mailbox::MailboxBuffer;
 use crate::sidecar::TachyonBrowserConfig;
 use crate::workspace::WorkspaceRuntime;
 
@@ -235,6 +236,7 @@ pub struct AppState {
     pub canvas_tools: Arc<Vec<Arc<dyn Tool>>>,
     pub permission_grants: Arc<RwLock<HashMap<String, Vec<PermissionGrant>>>>,
     pub workspace_runtimes: Arc<RwLock<HashMap<String, Arc<WorkspaceRuntime>>>>,
+    pub mailboxes: Arc<Mutex<HashMap<String, Arc<Mutex<MailboxBuffer>>>>>,
     pending_permissions: Arc<RwLock<HashMap<String, PendingPermissionRequest>>>,
     rebuild_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
@@ -440,9 +442,21 @@ impl AppState {
             canvas_tools,
             permission_grants: Arc::new(RwLock::new(HashMap::new())),
             workspace_runtimes: Arc::new(RwLock::new(HashMap::new())),
+            mailboxes: Arc::new(Mutex::new(HashMap::new())),
             pending_permissions: Arc::new(RwLock::new(HashMap::new())),
             rebuild_locks: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    pub async fn get_or_create_mailbox(
+        &self,
+        workspace_id: &str,
+    ) -> Arc<Mutex<MailboxBuffer>> {
+        let mut mailboxes = self.mailboxes.lock().await;
+        mailboxes
+            .entry(workspace_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(MailboxBuffer::default())))
+            .clone()
     }
 
     pub async fn add_permission_grant(&self, grant: PermissionGrant) -> Result<()> {

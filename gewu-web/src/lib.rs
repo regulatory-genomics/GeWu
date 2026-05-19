@@ -288,6 +288,10 @@ where
                 .post(routes::workspaces::append_workflow_event),
         )
         .route(
+            "/api/workspaces/{workspace_id}/mailbox",
+            get(routes::mailbox::poll_mailbox).post(routes::mailbox::post_mailbox),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/workflow/lineage/{artifact_id}",
             get(routes::workspaces::get_lineage),
         )

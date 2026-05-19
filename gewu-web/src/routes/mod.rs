@@ -2,6 +2,7 @@ pub mod canvas;
 pub mod chat;
 pub mod events;
 pub mod login;
+pub mod mailbox;
 pub mod permissions;
 pub mod plugin_proxy;
 pub mod projects;
