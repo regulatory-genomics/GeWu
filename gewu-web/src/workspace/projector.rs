@@ -196,6 +196,16 @@ fn build_node_data(
                 data["payload"] = json!({"uri": uri, "width": width, "height": height});
             }
         }
+    } else if node
+        .map(|node| {
+            node.canvas_kind
+                .clone()
+                .unwrap_or_else(|| infer_node_type(node.format.as_deref()))
+        })
+        .unwrap_or_else(|| "data_table".to_string())
+        == "data_table"
+    {
+        data["payload"] = json!({"columns": [], "rows": [], "summary": label});
     }
     data
 }
@@ -239,6 +249,37 @@ mod tests {
         assert_eq!(node.id, "node_qc");
         assert_eq!(node.node_type, "data_table");
         assert_eq!(node.data["payload"]["columns"][0], "sample");
+    }
+
+    #[test]
+    fn surfaced_summary_only_artifact_gets_empty_table_payload() {
+        let produced = event(
+            WorkflowEventKind::ArtifactProduced,
+            json!({
+                "artifact_id":"demo_result",
+                "summary":"Demo analysis artifact for canvas story",
+                "format":"text"
+            }),
+        );
+        let index = WorkflowIndex::rebuild(&[produced]);
+        let surfaced = event(
+            WorkflowEventKind::ArtifactSurfaced,
+            json!({"artifact_id":"demo_result", "canvas_node_id":"node_demo_result"}),
+        );
+        let mut projector = CanvasProjector::default();
+
+        let mutations = projector.project(&surfaced, &index);
+
+        let GraphMutation::AddNode(node) = &mutations[0] else {
+            panic!("expected node");
+        };
+        assert_eq!(node.node_type, "data_table");
+        assert_eq!(
+            node.data["payload"]["summary"],
+            "Demo analysis artifact for canvas story"
+        );
+        assert_eq!(node.data["payload"]["columns"], json!([]));
+        assert_eq!(node.data["payload"]["rows"], json!([]));
     }
 
     #[test]
