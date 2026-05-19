@@ -8,6 +8,8 @@ use schemars::{JsonSchema, schema::RootSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::process::Stdio;
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
@@ -40,7 +42,7 @@ impl PythonSandbox {
             .await
             .context("python sandbox semaphore closed")?;
         let wrapper = Self::wrapper_code(code)?;
-        let child = Command::new("micromamba")
+        let child = Command::new(micromamba_command())
             .args(["run", "-n", "py311", "python3", "-c", &wrapper])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -142,6 +144,26 @@ except Exception as e:
 impl Default for PythonSandbox {
     fn default() -> Self {
         Self::new(60)
+    }
+}
+
+fn micromamba_command() -> OsString {
+    let explicit = PathBuf::from("/home/gilberthan/.local/bin/micromamba");
+    if explicit.exists() {
+        explicit.into_os_string()
+    } else {
+        std::ffi::OsString::from("micromamba")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefers_home_local_bin_micromamba_when_resolving_sandbox_binary() {
+        let command = micromamba_command();
+        assert_eq!(command.to_string_lossy(), "/home/gilberthan/.local/bin/micromamba");
     }
 }
 
