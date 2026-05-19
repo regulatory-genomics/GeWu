@@ -186,8 +186,7 @@ fn build_node_data(
                 rows,
                 total_rows,
             } => {
-                data["payload"] =
-                    json!({"columns": columns, "rows": rows, "total_rows": total_rows});
+                data["payload"] = table_payload(columns, rows, *total_rows);
             }
             ArtifactPreview::Text { content } => {
                 data["content"] = json!(content);
@@ -211,6 +210,48 @@ fn build_node_data(
         data["payload"] = json!({"columns": [], "rows": [], "summary": label});
     }
     data
+}
+
+fn table_payload(columns: &[String], rows: &[Vec<Value>], total_rows: usize) -> Value {
+    let column_defs: Vec<Value> = columns
+        .iter()
+        .map(|column| {
+            json!({
+                "key": column,
+                "label": column,
+                "type": infer_column_type(rows, column_index(columns, column)),
+                "sortable": true,
+                "filterable": true,
+            })
+        })
+        .collect();
+    let records: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let mut object = serde_json::Map::new();
+            for (idx, column) in columns.iter().enumerate() {
+                object.insert(column.clone(), row.get(idx).cloned().unwrap_or(Value::Null));
+            }
+            Value::Object(object)
+        })
+        .collect();
+    json!({"columns": column_defs, "rows": records, "total_rows": total_rows})
+}
+
+fn column_index(columns: &[String], column: &str) -> usize {
+    columns.iter().position(|item| item == column).unwrap_or(0)
+}
+
+fn infer_column_type(rows: &[Vec<Value>], idx: usize) -> &'static str {
+    if rows
+        .iter()
+        .filter_map(|row| row.get(idx))
+        .any(|value| value.is_number())
+    {
+        "number"
+    } else {
+        "string"
+    }
 }
 
 #[cfg(test)]
@@ -251,7 +292,9 @@ mod tests {
         };
         assert_eq!(node.id, "node_qc");
         assert_eq!(node.node_type, "data_table");
-        assert_eq!(node.data["payload"]["columns"][0], "sample");
+        assert_eq!(node.data["payload"]["columns"][0]["key"], "sample");
+        assert_eq!(node.data["payload"]["columns"][0]["label"], "sample");
+        assert_eq!(node.data["payload"]["rows"][0]["sample"], "SM30-1");
     }
 
     #[test]
