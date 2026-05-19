@@ -121,6 +121,13 @@ result = {
     let body: serde_json::Value = serde_json::from_str(&result.output).unwrap();
     assert_eq!(body["ok"], true);
     assert_eq!(body["nodes_created"], 1);
+
+    let store = runtime.workflow_store.lock().await;
+    let events = store.all();
+    let preview = &events[0].payload["preview"];
+    assert_eq!(preview["kind"], "table");
+    assert_eq!(preview["columns"], json!(["Gene", "Score"]));
+    assert_eq!(preview["rows"], json!([["TP53", 0.95]]));
 }
 
 #[test]

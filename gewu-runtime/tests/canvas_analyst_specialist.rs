@@ -27,3 +27,18 @@ fn canvas_analyst_prompt_prefers_code_execute_when_requested() {
         .system_prompt
         .contains("When the user explicitly asks to use code_execute"));
 }
+
+#[test]
+fn canvas_analyst_prompt_treats_code_execute_as_workflow_recording() {
+    let descriptors = specialist_descriptors();
+    let analyst = descriptors
+        .iter()
+        .find(|d| d.id == "canvas-analyst")
+        .expect("canvas-analyst specialist exists");
+
+    assert!(analyst.system_prompt.contains("code_execute counts as workflow recording"));
+    assert!(
+        !analyst.system_prompt.contains("Never skip workflow.emit"),
+        "prompt must not contradict explicit code_execute requests"
+    );
+}

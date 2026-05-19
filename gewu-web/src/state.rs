@@ -1367,6 +1367,7 @@ fn validate_project_workdir(workdir: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gewu_core::traits::ToolRegistry;
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn test_project_store() -> Arc<ProjectStore> {
@@ -1407,6 +1408,36 @@ mod tests {
             workspace_id_for_project(Some(&other_project), &default_project),
             other_project.project_id
         );
+    }
+
+    #[tokio::test]
+    async fn canvas_analyst_sessions_expose_code_execute_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ServerConfig {
+            api_key: Some("test-key".to_string()),
+            endpoint: Some("http://127.0.0.1:9/v1".to_string()),
+            db_path: Some(dir.path().join("gewu.sqlite").to_string_lossy().to_string()),
+            ..ServerConfig::default()
+        };
+        let app = AppState::new(
+            config,
+            crate::auth::AuthMode::None,
+            Vec::new(),
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+
+        let session = app
+            .create_session("canvas-analyst".to_string(), None)
+            .await
+            .unwrap();
+        let handle = app.get_agent(&session.id).await.unwrap();
+        let agent = handle.agent.lock().await;
+        let tools = agent.list_tools();
+
+        assert!(tools.contains(&"code_execute".to_string()), "{tools:?}");
+        assert!(tools.contains(&"workflow.emit".to_string()), "{tools:?}");
     }
 }
 

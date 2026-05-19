@@ -8,9 +8,12 @@ use schemars::{JsonSchema, schema::RootSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
+
+static PYTHON_SANDBOX_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PythonResult {
@@ -31,6 +34,11 @@ impl PythonSandbox {
     }
 
     pub async fn execute(&self, code: &str) -> Result<PythonResult> {
+        let _permit = PYTHON_SANDBOX_SEMAPHORE
+            .get_or_init(|| Semaphore::new(1))
+            .acquire()
+            .await
+            .context("python sandbox semaphore closed")?;
         let wrapper = Self::wrapper_code(code)?;
         let child = Command::new("micromamba")
             .args(["run", "-n", "py311", "python3", "-c", &wrapper])
@@ -326,7 +334,8 @@ fn preview_for(item: &Value) -> Value {
         "plotly" | "heatmap" => json!({"kind": "plot", "spec": plot_spec(item)}),
         _ => {
             let columns = table_columns(item);
-            let rows = table_rows(item, &columns);
+            let column_keys = table_column_keys(item);
+            let rows = table_rows(item, &column_keys);
             json!({"kind": "table", "columns": columns, "rows": rows, "total_rows": table_total_rows(item)})
         }
     }
@@ -380,11 +389,32 @@ fn table_columns(item: &Value) -> Value {
     json!(normalized)
 }
 
-fn table_rows(item: &Value, columns: &Value) -> Value {
+fn table_column_keys(item: &Value) -> Value {
+    let Some(columns) = item.get("columns").and_then(Value::as_array) else {
+        return json!([]);
+    };
+    let normalized: Vec<String> = columns
+        .iter()
+        .map(|column| {
+            if let Some(field) = column.get("field").and_then(Value::as_str) {
+                field.to_string()
+            } else if let Some(header) = column.get("header").and_then(Value::as_str) {
+                header.to_string()
+            } else if let Some(name) = column.as_str() {
+                name.to_string()
+            } else {
+                column.to_string()
+            }
+        })
+        .collect();
+    json!(normalized)
+}
+
+fn table_rows(item: &Value, column_keys: &Value) -> Value {
     let Some(row_values) = item.get("rows").and_then(Value::as_array) else {
         return json!([]);
     };
-    let col_names: Vec<String> = columns
+    let col_names: Vec<String> = column_keys
         .as_array()
         .map(|cols| {
             cols.iter()
