@@ -393,7 +393,8 @@ mod tests {
         }).await.unwrap();
         let graph = runtime.graph_store.load("s1").unwrap();
         assert_eq!(graph.nodes.len(), 1);
-        assert_eq!(graph.nodes[0].data["payload"]["columns"][0], "sample");
+        assert_eq!(graph.nodes[0].data["payload"]["columns"][0]["key"], "sample");
+        assert_eq!(graph.nodes[0].data["payload"]["rows"][0]["sample"], "SM30");
         let mut rx = runtime.graph_events.subscribe();
         append_event_and_project(&runtime, WorkflowEvent {
             id: "e3".into(),
