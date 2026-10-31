@@ -63,6 +63,12 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                     }
                     println!();
                 }
+                AgentEvent::Cancelled { reason } => {
+                    if reasoning_started {
+                        print!("{}", RESET);
+                    }
+                    eprintln!("\n[cancelled] {}", reason);
+                }
                 AgentEvent::Error { error } => {
                     if reasoning_started {
                         print!("{}", RESET);

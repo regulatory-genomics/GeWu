@@ -139,18 +139,20 @@ async fn test_agent_loop() {
     while let Some(event) = stream.next().await {
         match event.unwrap() {
             AgentEvent::ToolFinish {
+                call_id,
                 tool,
                 title,
                 output,
                 metadata,
-            } => tool_finish = Some((tool, title, output, metadata)),
+            } => tool_finish = Some((call_id, tool, title, output, metadata)),
             AgentEvent::ContentDelta { delta } => result.push_str(&delta),
             AgentEvent::Finish { response } => result = response,
             _ => {}
         }
     }
 
-    let (tool, title, output, metadata) = tool_finish.unwrap();
+    let (call_id, tool, title, output, metadata) = tool_finish.unwrap();
+    assert_eq!(call_id, "call_1");
     assert_eq!(tool, "mock_tool");
     assert_eq!(title, "Mock Result Title");
     assert_eq!(output, "Tool output");
@@ -198,17 +200,18 @@ async fn test_apply_patch_metadata_through_agent_loop() {
 
     while let Some(event) = stream.next().await {
         if let AgentEvent::ToolFinish {
+            call_id,
             tool,
             title,
             output,
             metadata,
         } = event.unwrap()
         {
-            finish = Some((tool, title, output, metadata));
+            finish = Some((call_id, tool, title, output, metadata));
         }
     }
 
-    let (tool, title, output, metadata) = finish.expect("missing ToolFinish");
+    let (_call_id, tool, title, output, metadata) = finish.expect("missing ToolFinish");
     assert_eq!(tool, "apply_patch");
     assert_eq!(title, "apply_patch");
     assert!(output.contains("A created.txt"));

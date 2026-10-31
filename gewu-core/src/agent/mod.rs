@@ -92,6 +92,40 @@ pub struct Agent {
     /// Optional request log; when set, every LLM request is recorded by the
     /// provider's `stream_response` (see [`crate::traits::RequestLog`]).
     log: Option<RequestLog>,
+    /// Shared with every tool context of the active run.
+    run_abort: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Per-run budgets. `Default` keeps the historical behaviour.
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    /// Overrides the agent's `max_turns` for this run.
+    pub max_turns: Option<usize>,
+    /// Hard cap on tool executions in one run.
+    pub max_tool_calls: Option<usize>,
+    /// Wall-clock budget for the whole run.
+    pub deadline: Option<std::time::Duration>,
+}
+
+/// A handle that can cancel a run while its stream is being consumed.
+///
+/// `Agent::run_with` borrows the agent mutably, so the owner needs this handle
+/// rather than `&Agent` to stop a run from another task.
+///
+/// Semantics: the handle cancels the run that is currently streaming. A cancel
+/// with no active run has no effect — the next run clears the flag when it
+/// starts, so a stale Stop cannot poison a later request.
+#[derive(Clone)]
+pub struct CancelHandle(Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelHandle {
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Builder for constructing `Agent` instances.
@@ -159,6 +193,11 @@ impl Agent {
         AgentBuilder::default()
     }
 
+    /// Handle that stops the current or next run.
+    pub fn cancel_handle(&self) -> CancelHandle {
+        CancelHandle(self.run_abort.clone())
+    }
+
     /// Resets the agent to its initial state.
     ///
     /// Clears all conversation history and re-adds the system prompt if one was configured.
@@ -201,7 +240,27 @@ impl Agent {
         &'a mut self,
         user_message: &'a str,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
+        self.run_with(user_message, RunOptions::default())
+    }
+
+    /// Runs one turn with explicit budgets and cancellation.
+    ///
+    /// The stream ends after exactly one terminal event: [`AgentEvent::Finish`]
+    /// (success), [`AgentEvent::Cancelled`] (owner stopped it), or
+    /// [`AgentEvent::Error`] (turn budget exhausted or the run failed).
+    pub fn run_with<'a>(
+        &'a mut self,
+        user_message: &'a str,
+        options: RunOptions,
+    ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
         async_stream::try_stream! {
+            self.run_abort.store(false, std::sync::atomic::Ordering::SeqCst);
+            let abort = self.run_abort.clone();
+            let run_id = Uuid::new_v4().to_string();
+            let max_turns = options.max_turns.or(self.max_turns);
+            let max_tool_calls = options.max_tool_calls;
+            let deadline = options.deadline.map(|limit| std::time::Instant::now() + limit);
+
             if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
                 self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
             }
@@ -209,15 +268,25 @@ impl Agent {
             self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await;
 
             let mut turn = 0;
+            let mut tool_calls_made = 0usize;
             let mut doom_loop = DoomLoopDetector::new(3);
             let mut message_id = Uuid::new_v4().to_string();
 
             loop {
+                if abort.load(std::sync::atomic::Ordering::SeqCst) {
+                    yield AgentEvent::Cancelled { reason: "cancelled by owner".to_string() };
+                    break;
+                }
+                if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+                    yield AgentEvent::Error { error: "Run deadline exceeded.".to_string() };
+                    break;
+                }
+
                 if self.compact_if_needed().await? {
                     info!("History compacted.");
                 }
 
-                if let Some(max) = self.max_turns {
+                if let Some(max) = max_turns {
                     if turn >= max {
                         yield AgentEvent::Error { error: "Max turns reached without final answer.".to_string() };
                         break;
@@ -239,10 +308,21 @@ impl Agent {
                     .map_err(|e| anyhow::anyhow!(e))?;
 
                 while let Some(event_result) = stream.next().await {
+                    if abort.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
                     let event = event_result.map_err(|e| anyhow::anyhow!(e))?;
                     if let Some(agent_event) = aggregator.process_event(event) {
                         yield agent_event;
                     }
+                }
+
+                if abort.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Do not record a partial assistant turn: the provider may
+                    // still be mid-stream, and a truncated tool call would leave
+                    // history that cannot be answered.
+                    yield AgentEvent::Cancelled { reason: "cancelled while streaming".to_string() };
+                    break;
                 }
 
                 let (content, tool_calls) = aggregator.take_parts();
@@ -259,10 +339,16 @@ impl Agent {
 
                 info!("Agent requested {} tool calls", tool_calls.len());
 
+                let mut cancelled = false;
                 for call in tool_calls {
                     let tool_name = call.function.name.clone();
                     let args = call.function.arguments.clone();
                     let call_id = call.id.clone();
+
+                    if abort.load(std::sync::atomic::Ordering::SeqCst) {
+                        cancelled = true;
+                        break;
+                    }
 
                     if let Some(error) = doom_loop.check(&tool_name, &args) {
                         yield AgentEvent::Error { error };
@@ -270,14 +356,56 @@ impl Agent {
                     }
                     doom_loop.record(tool_name.clone(), args.clone());
 
+                    if let Some(max) = max_tool_calls {
+                        if tool_calls_made >= max {
+                            yield AgentEvent::Error {
+                                error: format!("Tool call budget of {max} exhausted."),
+                            };
+                            return;
+                        }
+                    }
+                    tool_calls_made += 1;
+
                     if tool_name.is_empty() {
-                        yield AgentEvent::Error { error: "Tool name is empty, skipping execution".to_string() };
+                        // Still answer the call: history must stay protocol-valid.
+                        yield AgentEvent::Error {
+                            error: "Tool name is empty, skipping execution".to_string(),
+                        };
+                        let output = "Error: tool name is empty".to_string();
+                        yield AgentEvent::ToolStart {
+                            call_id: call_id.clone(),
+                            tool: tool_name.clone(),
+                            input: args.clone(),
+                        };
+                        yield AgentEvent::ToolFinish {
+                            call_id: call_id.clone(),
+                            tool: tool_name.clone(),
+                            title: String::new(),
+                            output: output.clone(),
+                            metadata: Default::default(),
+                        };
+                        self.memory.add_message(Message::Tool {
+                            tool_call_id: call_id,
+                            tool_name: Some(tool_name.clone()),
+                            content: output,
+                            media: Vec::new(),
+                        }).await;
                         continue;
                     }
 
-                    yield AgentEvent::ToolStart { tool: tool_name.clone(), input: args.clone() };
+                    yield AgentEvent::ToolStart {
+                        call_id: call_id.clone(),
+                        tool: tool_name.clone(),
+                        input: args.clone(),
+                    };
 
-                    let ctx = ToolContext::new(&self.session_id, &message_id);
+                    let ctx = ToolContext::with_call(
+                        &self.session_id,
+                        &run_id,
+                        &message_id,
+                        &call_id,
+                        abort.clone(),
+                    );
                     message_id = Uuid::new_v4().to_string();
 
                     let tool = self.tools.iter().find(|t| t.name() == tool_name);
@@ -285,9 +413,13 @@ impl Agent {
                     let result = if let Some(t) = tool {
                         match execute_tool_call(t.clone(), call, ctx, &self.truncation).await {
                             Ok(result) => result,
+                            // A malformed argument payload is a tool outcome, not
+                            // a reason to skip the Tool message: the provider
+                            // rejects a run whose tool calls have no answers.
                             Err(e) => {
-                                yield AgentEvent::Error { error: e.to_string() };
-                                continue;
+                                let output = format!("Error: {}", e);
+                                yield AgentEvent::Error { error: output.clone() };
+                                ToolResult::new(tool_name.clone(), output)
                             }
                         }
                     } else {
@@ -298,6 +430,7 @@ impl Agent {
                     };
 
                     yield AgentEvent::ToolFinish {
+                        call_id: call_id.clone(),
                         tool: tool_name.clone(),
                         title: result.title.clone(),
                         output: result.output.clone(),
@@ -311,6 +444,11 @@ impl Agent {
                         content: result.output,
                         media: media_parts,
                     }).await;
+                }
+
+                if cancelled {
+                    yield AgentEvent::Cancelled { reason: "cancelled between tool calls".to_string() };
+                    break;
                 }
             }
         }
@@ -435,6 +573,7 @@ impl AgentBuilder {
             session_id: Uuid::new_v4().to_string(),
             experiences: self.experiences,
             log: self.log,
+            run_abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         Ok(agent)
     }

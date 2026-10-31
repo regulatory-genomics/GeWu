@@ -54,7 +54,7 @@ pub mod middleware;
 pub mod traits;
 pub mod types;
 
-pub use agent::Agent;
+pub use agent::{Agent, CancelHandle, RunOptions};
 pub use compaction::{estimate_tokens, is_overflow, prune};
 pub use middleware::TruncationService;
 pub use traits::{Experiences, LlmProvider, Memory, Tool, ToolRegistry};
