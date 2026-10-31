@@ -229,7 +229,7 @@ impl SessionModel {
                 }
                 Some(idx)
             }
-            AgentEvent::ToolStart { tool, input } => {
+            AgentEvent::ToolStart { tool, input, .. } => {
                 self.end_thought();
                 self.blocks.push(Block::Tool {
                     tool: tool.clone(),
@@ -270,6 +270,10 @@ impl SessionModel {
                 Some(self.blocks.len() - 1)
             }
             AgentEvent::Finish { response: _ } => {
+                self.end_thought();
+                None
+            }
+            AgentEvent::Cancelled { .. } => {
                 self.end_thought();
                 None
             }
@@ -807,10 +811,12 @@ mod tests {
     fn tool_start_then_finish_fills_output() {
         let mut m = model();
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: String::new(),
             tool: "bash".into(),
             input: r#"{"command":"ls"}"#.into(),
         });
         let _ = m.apply_event(&AgentEvent::ToolFinish {
+            call_id: String::new(),
             tool: "bash".into(),
             title: String::new(),
             output: "file.rs".into(),
@@ -1064,6 +1070,7 @@ mod tests {
         // output must land in the original block, not in a duplicate.
         let mut m = model();
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: String::new(),
             tool: "bash".into(),
             input: r#"{"command":"ls"}"#.into(),
         });
@@ -1071,6 +1078,7 @@ mod tests {
             text: "focus on tests".into(),
         });
         let affected = m.apply_event(&AgentEvent::ToolFinish {
+            call_id: String::new(),
             tool: "bash".into(),
             title: String::new(),
             output: "file.rs".into(),
@@ -1099,6 +1107,7 @@ mod tests {
         let mut m = model();
         for _ in 0..2 {
             let _ = m.apply_event(&AgentEvent::ToolStart {
+                call_id: String::new(),
                 tool: "bash".into(),
                 input: "{}".into(),
             });
@@ -1106,6 +1115,7 @@ mod tests {
         let _ = m.apply_event(&AgentEvent::Steered { text: "go".into() });
         assert_eq!(
             m.apply_event(&AgentEvent::ToolFinish {
+                call_id: String::new(),
                 tool: "bash".into(),
                 title: String::new(),
                 output: "first".into(),
@@ -1115,6 +1125,7 @@ mod tests {
         );
         assert_eq!(
             m.apply_event(&AgentEvent::ToolFinish {
+                call_id: String::new(),
                 tool: "bash".into(),
                 title: String::new(),
                 output: "second".into(),
@@ -1145,10 +1156,12 @@ mod tests {
             .join("\n");
         assert!(output.len() > 400);
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: String::new(),
             tool: "bash".into(),
             input: r#"{"command":"seq 60"}"#.into(),
         });
         let _ = m.apply_event(&AgentEvent::ToolFinish {
+            call_id: String::new(),
             tool: "bash".into(),
             title: String::new(),
             output: output.clone(),
@@ -1172,10 +1185,12 @@ mod tests {
             delta: "let me check".into(),
         });
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: String::new(),
             tool: "bash".into(),
             input: "{}".into(),
         });
         let _ = m.apply_event(&AgentEvent::ToolFinish {
+            call_id: String::new(),
             tool: "bash".into(),
             title: String::new(),
             output: "ok".into(),
@@ -1280,6 +1295,7 @@ mod tests {
         m.apply_event(&AgentEvent::ReasoningDelta { delta: "hm".into() });
 
         m.apply_event(&AgentEvent::ToolStart {
+            call_id: String::new(),
             tool: "bash".into(),
             input: "{}".into(),
         });
@@ -1304,6 +1320,7 @@ mod tests {
         assert_eq!(m.take_collapsed(), None);
         assert_eq!(
             m.apply_event(&AgentEvent::ToolStart {
+                call_id: String::new(),
                 tool: "bash".into(),
                 input: "{}".into(),
             }),
@@ -1312,6 +1329,7 @@ mod tests {
         assert_eq!(m.take_collapsed(), Some(1));
         // Taken once: the next event without a collapse reports nothing.
         m.apply_event(&AgentEvent::ToolFinish {
+            call_id: String::new(),
             tool: "bash".into(),
             title: String::new(),
             output: "ok".into(),
@@ -1375,6 +1393,7 @@ mod tests {
         // ToolStart appends block 1; its ToolFinish fills it.
         assert_eq!(
             m.apply_event(&AgentEvent::ToolStart {
+                call_id: String::new(),
                 tool: "bash".into(),
                 input: "{}".into(),
             }),
@@ -1382,6 +1401,7 @@ mod tests {
         );
         assert_eq!(
             m.apply_event(&AgentEvent::ToolFinish {
+                call_id: String::new(),
                 tool: "bash".into(),
                 title: String::new(),
                 output: "ok".into(),
@@ -1403,6 +1423,7 @@ mod tests {
         // A second ToolStart appends into the same run (block 2).
         assert_eq!(
             m.apply_event(&AgentEvent::ToolStart {
+                call_id: String::new(),
                 tool: "grep".into(),
                 input: "{}".into(),
             }),
@@ -1693,6 +1714,7 @@ mod tests {
     fn tool_progress_updates_the_open_tool_block_in_place() {
         let mut m = model();
         m.apply_event(&AgentEvent::ToolStart {
+            call_id: String::new(),
             tool: "task".into(),
             input: r#"{"description":"explore","prompt":"p"}"#.into(),
         });
@@ -1741,6 +1763,7 @@ mod tests {
     fn tool_finish_clears_the_status_and_progress_after_finish_is_ignored() {
         let mut m = model();
         m.apply_event(&AgentEvent::ToolStart {
+            call_id: String::new(),
             tool: "task".into(),
             input: "{}".into(),
         });
@@ -1750,6 +1773,7 @@ mod tests {
         });
         assert_eq!(
             m.apply_event(&AgentEvent::ToolFinish {
+                call_id: String::new(),
                 tool: "task".into(),
                 title: String::new(),
                 output: "done".into(),
@@ -1781,6 +1805,7 @@ mod tests {
         let mut m = model();
         for _ in 0..2 {
             m.apply_event(&AgentEvent::ToolStart {
+                call_id: String::new(),
                 tool: "task".into(),
                 input: "{}".into(),
             });

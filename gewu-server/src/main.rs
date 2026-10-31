@@ -79,7 +79,7 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                                 spinner_frame = 0;
                             }
                         }
-                        AgentEvent::ToolStart { tool, input } => {
+                        AgentEvent::ToolStart { tool, input, .. } => {
                             stop_spinner(&mut spinner_active, is_tty)?;
                             if tool == "bash"
                                 && let Some(command) = extract_bash_command(&input)
@@ -98,6 +98,10 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                         AgentEvent::Finish { response: _ } => {
                             stop_spinner(&mut spinner_active, is_tty)?;
                             println!();
+                        }
+                        AgentEvent::Cancelled { .. } => {
+                            stop_spinner(&mut spinner_active, is_tty)?;
+                            println!("\nCancelled.");
                         }
                         AgentEvent::Usage { .. } => {}
                         AgentEvent::Compacted { summary } => {
