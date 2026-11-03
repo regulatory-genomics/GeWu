@@ -143,6 +143,39 @@ fn is_private_v4(v4: Ipv4Addr) -> bool {
         || (octets[0] == 100 && (64..=127).contains(&octets[1]))
 }
 
+/// Remove blocks whose text the model never needs: inline scripts alone made a
+/// nature.com article 272 KB of JavaScript.
+fn strip_block(html: &str, tag: &str) -> String {
+    let pattern = format!(r"(?is)<{tag}\b[^>]*>.*?</{tag}\s*>");
+    match regex::Regex::new(&pattern) {
+        Ok(re) => re.replace_all(html, "").into_owned(),
+        Err(_) => html.to_string(),
+    }
+}
+
+/// Strip scripts, styles and other non-content elements, then prefer the
+/// document's own `<article>` or `<main>` when it has one.
+fn clean_html(html: &str) -> String {
+    let mut cleaned = html.to_string();
+    for tag in ["script", "style", "noscript", "svg", "template", "iframe"] {
+        cleaned = strip_block(&cleaned, tag);
+    }
+    if let Ok(comments) = regex::Regex::new(r"(?s)<!--.*?-->") {
+        cleaned = comments.replace_all(&cleaned, "").into_owned();
+    }
+    for tag in ["article", "main"] {
+        let Ok(re) = regex::Regex::new(&format!(r"(?is)<{tag}\b[^>]*>(.*?)</{tag}\s*>")) else {
+            continue;
+        };
+        if let Some(inner) = re.captures(&cleaned).and_then(|caps| caps.get(1)) {
+            if inner.as_str().len() > 500 {
+                return inner.as_str().to_string();
+            }
+        }
+    }
+    cleaned
+}
+
 #[async_trait]
 impl Tool for WebFetchTool {
     fn name(&self) -> &str {
@@ -172,7 +205,10 @@ impl Tool for WebFetchTool {
 
         let output = match input.format.as_str() {
             "html" => body,
-            _ => html2md::parse_html(&body),
+            _ => {
+                let cleaned = clean_html(&body);
+                html2md::parse_html(&cleaned)
+            }
         };
 
         Ok(ToolResult::new("webfetch", output))
@@ -499,11 +535,34 @@ mod tests {
             .await
             .expect("fetch");
 
+        println!(
+            "fetched {} chars, starts with: {:?}",
+            result.output.len(),
+            &result.output[..result.output.len().min(300)]
+        );
         assert!(
             result.output.len() > 500,
             "expected an article body, got {} chars: {}",
             result.output.len(),
             &result.output[..result.output.len().min(200)]
         );
+        assert!(
+            result.output.contains("DeepSeek") || result.output.contains("title"),
+            "the article body must be present"
+        );
+    }
+
+    #[test]
+    fn scripts_and_styles_never_reach_the_markdown() {
+        let html = r#"<html><head><style>.x{}</style></head><body>
+            <script>var leaked = "secret";</script>
+            <article><h1>Real title</h1><p>Real body.</p></article>
+            </body></html>"#;
+
+        let cleaned = clean_html(html);
+
+        assert!(cleaned.contains("Real title"));
+        assert!(!cleaned.contains("leaked"));
+        assert!(!cleaned.contains(".x{}"));
     }
 }
