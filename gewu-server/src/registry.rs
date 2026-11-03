@@ -8,7 +8,7 @@ use gewu_tools::task::AgentFactory;
 use gewu_tools::{
     ApplyPatchTool, BashTool, BatchTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool,
     ListTool, ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoItem, TodoReadTool, TodoWriteTool,
-    WebFetchTool, WebSearchTool, WriteFileTool,
+    WebFetchPolicy, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -85,6 +85,7 @@ struct SqliteAgentFactory {
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
     skills: Vec<SkillInfo>,
+    web_fetch: Arc<WebFetchPolicy>,
 }
 
 #[async_trait]
@@ -103,6 +104,7 @@ impl AgentFactory for SqliteAgentFactory {
             Vec::new(),
             None,
             self.skills.clone(),
+            self.web_fetch.clone(),
         )
         .await
         .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
@@ -111,11 +113,17 @@ impl AgentFactory for SqliteAgentFactory {
 }
 
 /// Builds the task tool wired to the CLI registry.
-fn task_tool(provider: Arc<dyn LlmProvider>, pool: SqlitePool, skills: Vec<SkillInfo>) -> TaskTool {
+fn task_tool(
+    provider: Arc<dyn LlmProvider>,
+    pool: SqlitePool,
+    skills: Vec<SkillInfo>,
+    web_fetch: Arc<WebFetchPolicy>,
+) -> TaskTool {
     let factory = Arc::new(SqliteAgentFactory {
         provider,
         pool,
         skills,
+        web_fetch,
     });
     let agents = list_available_agents()
         .into_iter()
@@ -131,12 +139,18 @@ fn build_tool_registry_and_list(
     working_directory: std::path::PathBuf,
     additional_tools: Vec<Arc<dyn Tool>>,
     skills: Vec<SkillInfo>,
+    web_fetch: Arc<WebFetchPolicy>,
 ) -> Result<(Arc<dyn ToolRegistry>, Vec<Arc<dyn Tool>>)> {
     let mut tools: Vec<Box<dyn Tool>> = match name {
         "build" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone())),
+                Box::new(task_tool(
+                    provider.clone(),
+                    pool.clone(),
+                    skills.clone(),
+                    web_fetch.clone(),
+                )),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -159,7 +173,7 @@ fn build_tool_registry_and_list(
                 Box::new(GrepTool {
                     working_directory: working_directory.clone(),
                 }),
-                Box::new(WebFetchTool),
+                Box::new(WebFetchTool::with_shared_policy(web_fetch.clone())),
                 Box::new(ListTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -184,7 +198,7 @@ fn build_tool_registry_and_list(
                 Box::new(GrepTool {
                     working_directory: working_directory.clone(),
                 }),
-                Box::new(WebFetchTool),
+                Box::new(WebFetchTool::with_shared_policy(web_fetch.clone())),
                 Box::new(ListTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -195,7 +209,12 @@ fn build_tool_registry_and_list(
         "general" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone())),
+                Box::new(task_tool(
+                    provider.clone(),
+                    pool.clone(),
+                    skills.clone(),
+                    web_fetch.clone(),
+                )),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -218,7 +237,7 @@ fn build_tool_registry_and_list(
                 Box::new(GrepTool {
                     working_directory: working_directory.clone(),
                 }),
-                Box::new(WebFetchTool),
+                Box::new(WebFetchTool::with_shared_policy(web_fetch.clone())),
                 Box::new(ListTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -272,6 +291,7 @@ pub async fn create_agent(
     additional_tools: Vec<Arc<dyn Tool>>,
     log: Option<RequestLog>,
     skills: Vec<SkillInfo>,
+    web_fetch: Arc<WebFetchPolicy>,
 ) -> Result<(Agent, Arc<dyn ToolRegistry>)> {
     let working_directory = std::env::current_dir()?;
 
@@ -284,6 +304,7 @@ pub async fn create_agent(
         working_directory,
         additional_tools,
         skills.clone(),
+        web_fetch,
     )?;
 
     let batch_tool: Arc<dyn Tool> = Arc::new(BatchTool::new(registry.clone()));
@@ -318,6 +339,10 @@ pub async fn create_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn permissive() -> Arc<WebFetchPolicy> {
+        Arc::new(WebFetchPolicy::default())
+    }
     use futures::stream::BoxStream;
     use gewu_core::types::{Message, ProviderEvent};
     use std::error::Error;
@@ -389,6 +414,7 @@ mod tests {
                 directory.path().to_path_buf(),
                 Vec::new(),
                 Vec::new(),
+                permissive(),
             )
             .unwrap();
             assert!(tools.iter().any(|tool| tool.name() == "apply_patch"));
@@ -401,6 +427,7 @@ mod tests {
             directory.path().to_path_buf(),
             Vec::new(),
             Vec::new(),
+            permissive(),
         )
         .unwrap();
         assert!(!tools.iter().any(|tool| tool.name() == "apply_patch"));
@@ -420,6 +447,7 @@ mod tests {
             Vec::new(),
             Some(log),
             Vec::new(),
+            permissive(),
         )
         .await
         .expect("create_agent should accept a request log");
@@ -449,6 +477,7 @@ mod tests {
             Vec::new(),
             None,
             skills,
+            permissive(),
         )
         .await
         .expect("create_agent should register the skill tool");
@@ -469,6 +498,7 @@ mod tests {
             directory.path().to_path_buf(),
             vec![Arc::new(NamedTool("apply_patch"))],
             Vec::new(),
+            permissive(),
         );
         assert!(reserved.err().unwrap().to_string().contains("reserved"));
 
@@ -479,6 +509,7 @@ mod tests {
             directory.path().to_path_buf(),
             vec![Arc::new(NamedTool("batch"))],
             Vec::new(),
+            permissive(),
         );
         assert!(batch.err().unwrap().to_string().contains("reserved"));
 
@@ -489,6 +520,7 @@ mod tests {
             directory.path().to_path_buf(),
             vec![Arc::new(NamedTool("websearch"))],
             Vec::new(),
+            permissive(),
         );
         assert!(
             duplicate

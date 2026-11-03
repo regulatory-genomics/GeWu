@@ -61,6 +61,8 @@ pub struct Bootstrap {
     pub pool: SqlitePool,
     pub mcp_tools: Vec<Arc<dyn gewu_core::traits::Tool>>,
     pub skills: Vec<gewu_tools::SkillInfo>,
+    /// Destination policy shared by every `webfetch` instance this process builds.
+    pub web_fetch: Arc<gewu_tools::WebFetchPolicy>,
     pub log_writer: Option<RequestLog>,
     pub model: String,
     pub provider_name: String,
@@ -226,11 +228,23 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
         found
     };
 
+    let web_fetch = Arc::new(
+        file_config
+            .web_fetch
+            .as_ref()
+            .map(|config| config.policy())
+            .unwrap_or_default(),
+    );
+    if web_fetch.block_private_networks {
+        info!("webfetch: private networks are blocked");
+    }
+
     Ok(Bootstrap {
         provider,
         pool,
         mcp_tools,
         skills,
+        web_fetch,
         log_writer,
         model,
         provider_name,

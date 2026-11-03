@@ -16,8 +16,33 @@ pub struct Config {
     /// Optional directories to scan for skills (files named `SKILL.md`).
     #[serde(default)]
     pub skills: Option<Vec<String>>,
+    /// Destination policy for the `webfetch` tool.
+    #[serde(rename = "webFetch", default)]
+    pub web_fetch: Option<WebFetchConfig>,
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
+}
+
+/// `webFetch` section of the config file.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebFetchConfig {
+    /// Refuse destinations that resolve to a private address and do not follow
+    /// redirects. Off by default.
+    #[serde(default)]
+    pub block_private_networks: bool,
+    /// Host suffixes that may be fetched. Empty means "no host allowlist".
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+}
+
+impl WebFetchConfig {
+    pub fn policy(&self) -> gewu_tools::web_fetch::WebFetchPolicy {
+        gewu_tools::web_fetch::WebFetchPolicy {
+            block_private_networks: self.block_private_networks,
+            allowed_hosts: self.allowed_hosts.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -126,5 +151,23 @@ mod tests {
     fn skills_is_optional() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert!(config.skills.is_none());
+    }
+
+    #[test]
+    fn parses_the_web_fetch_policy() {
+        let config: Config = serde_json::from_str(
+            r#"{"webFetch": {"blockPrivateNetworks": true, "allowedHosts": ["pubmed.ncbi.nlm.nih.gov"]}}"#,
+        )
+        .unwrap();
+
+        let policy = config.web_fetch.expect("webFetch").policy();
+        assert!(policy.block_private_networks);
+        assert_eq!(policy.allowed_hosts, vec!["pubmed.ncbi.nlm.nih.gov"]);
+    }
+
+    #[test]
+    fn web_fetch_is_permissive_when_omitted() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.web_fetch.is_none());
     }
 }

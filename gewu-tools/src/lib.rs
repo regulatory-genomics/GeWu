@@ -80,4 +80,4 @@ pub use search::{CodeSearchTool, WebSearchTool};
 pub use skill::{SkillInfo, SkillTool};
 pub use task::{AgentFactory, TaskTool};
 pub use todo::{TodoItem, TodoReadTool, TodoWriteTool};
-pub use web_fetch::WebFetchTool;
+pub use web_fetch::{WebFetchPolicy, WebFetchTool};

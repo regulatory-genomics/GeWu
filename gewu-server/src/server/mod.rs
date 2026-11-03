@@ -177,6 +177,7 @@ impl ServerState {
             self.bootstrap.mcp_tools.clone(),
             self.bootstrap.log_writer.clone(),
             self.bootstrap.skills.clone(),
+            self.bootstrap.web_fetch.clone(),
         )
         .await?;
         info!("Created session {} (agent: {})", session_id, agent_name);
@@ -1085,6 +1086,7 @@ mod tests {
                     .unwrap(),
                 mcp_tools: Vec::new(),
                 skills: Vec::new(),
+                web_fetch: Arc::new(gewu_tools::WebFetchPolicy::default()),
                 log_writer: None,
                 model: "test-model".to_string(),
                 provider_name: "test".to_string(),
@@ -1215,6 +1217,7 @@ mod tests {
                 pool,
                 mcp_tools: Vec::new(),
                 skills: Vec::new(),
+                web_fetch: Arc::new(gewu_tools::WebFetchPolicy::default()),
                 log_writer: None,
                 model: "test-model".to_string(),
                 provider_name: "test".to_string(),
