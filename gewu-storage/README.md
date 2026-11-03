@@ -33,3 +33,9 @@ let agent = Agent::builder()
     // ...
     .build()?;
 ```
+
+### Session history queries
+
+Standalone helpers work directly on the pool: `list_sessions` (newest first),
+`load_session` (one session's messages), and `delete_session` (remove a
+session's stored messages, returning the number of rows removed).

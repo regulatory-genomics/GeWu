@@ -300,6 +300,7 @@ impl OpenAIProvider {
                         .map(|tc| {
                             ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
                                 id: tc.id.clone(),
+                                tool_type: "function".to_string(),
                                 function: OpenAIFunctionCall {
                                     name: tc.function.name.clone(),
                                     arguments: tc.function.arguments.clone(),
@@ -1599,5 +1600,40 @@ mod tests {
 
         let result = provider.stream_response(&messages, &[], None).await;
         assert!(result.is_err(), "send should fail against 127.0.0.1:1");
+    }
+
+    #[test]
+    fn openai_assistant_tool_calls_serialize_with_function_type() {
+        // Regression: the OpenAI API (strict servers such as vLLM) requires
+        // `"type": "function"` on each entry of assistant message tool_calls.
+        let provider = OpenAIProvider::new("test-key", "gpt-4o");
+        let messages = vec![Message::Assistant {
+            content: None,
+            tool_calls: Some(vec![CoreToolCall {
+                id: "call_1".to_string(),
+                r#type: "function".to_string(),
+                function: CoreFunctionCall {
+                    name: "list".to_string(),
+                    arguments: "{\"path\":\"/\"}".to_string(),
+                },
+            }]),
+        }];
+
+        let request = provider.build(&messages, &[]).expect("build success");
+        let tool_call = &request["messages"][0]["tool_calls"][0];
+        assert_eq!(tool_call["type"], "function");
+        assert_eq!(tool_call["id"], "call_1");
+        assert_eq!(tool_call["function"]["name"], "list");
+    }
+
+    #[test]
+    fn anthropic_config_strips_trailing_v1_from_base_url() {
+        // Regression: the client appends `/v1/messages` itself, so a base URL
+        // that already ends in `/v1` must not produce a doubled prefix.
+        let config = crate::anthropic::AnthropicConfig::new("test-key", "https://host/v1/");
+        assert_eq!(config.base_url, "https://host");
+
+        let config = crate::anthropic::AnthropicConfig::new("test-key", "https://host");
+        assert_eq!(config.base_url, "https://host");
     }
 }

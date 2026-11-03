@@ -29,7 +29,7 @@
 //! - `gewu-providers` - LLM provider implementations (OpenAI)
 //! - `gewu-tools` - Built-in tools (bash, file operations, grep, search, MCP)
 //! - `gewu-storage` - Storage backends (SQLite memory)
-//! - `gewu-cli` - Command-line interface application
+//! - `gewu-server` - Command-line interface application
 //!
 //! # Example
 //!

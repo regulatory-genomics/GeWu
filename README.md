@@ -12,7 +12,11 @@ GeWu (格物) is a comprehensive framework for building and deploying AI agents.
 | **`gewu-providers`** | LLM provider implementations supporting OpenAI-compatible APIs and Anthropic Claude. Features streaming responses, tool/function calling, and multi-modal content handling. |
 | **`gewu-storage`** | Persistent memory implementation using SQLite via `sqlx`. Enables multi-session support where conversations persist across process restarts. |
 | **`gewu-tools`** | Collection of built-in tools for filesystem operations, bash execution, web fetching, code search, and MCP (Model Context Protocol) integration. |
-| **`gewu-cli`** | Command-line interface for interacting with GeWu agents. Supports build, explore, and general agent profiles with configurable tools and permissions. |
+| **`gewu-server`** | Command-line interface for interacting with GeWu agents. Supports build, explore, and general agent profiles with configurable tools and permissions. Also runs as a server (`gewu-server serve`) exposing agents over WebSocket and TCP so other programs can send prompts and receive streamed agent events. |
+| **`gewu-protocol`** | Wire protocol shared by the server and its clients: request parsing/serialization (`ClientRequest`) and server reply types (`ServerMessage`). |
+| **`gewu-client`** | Async Rust client library for the GeWu server: streaming asks (`Client::ask`), `interrupt`, session listing/loading, tool/agent introspection, and the UI-agnostic conversation model (`SessionModel`) shared by the TUI and GUI. |
+| **`gewu-tui`** | Full-screen terminal chat UI built on `gewu-client`: streaming transcript, `$ <command>` tool-call display, scrollback, and session resume. |
+| **`gewu-gui`** | Desktop client for the GeWu server, built with egui/eframe. Streaming markdown transcript, collapsible tool cards, interrupt, and a sidebar for resuming persisted sessions. Shares its conversation model and `Client` library with the TUI. |
 | **`gewu-graph`** | Stateful graph execution library for building complex workflow orchestration with conditional routing, parallel execution, and nested subgraphs. |
 | **`gewu-rag`** | RAG (Retrieval Augmented Generation) system with document processing (PDF, text), embedding generation, and vector storage integration (Qdrant). |
 | **`gewu-experience`** | Experience memory system with Qdrant vector embeddings for semantic recall of past problem-solving experiences. Includes experience store and recall tools. |
@@ -22,7 +26,7 @@ GeWu (格物) is a comprehensive framework for building and deploying AI agents.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                         gewu-cli                            │
+│                         gewu-server                           │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -90,16 +94,51 @@ The CLI provides pre-configured agent types optimized for different use cases:
 ### Running the CLI
 
 ```bash
-cargo run -p gewu-cli -- run --help
+cargo run -p gewu-server -- run --help
 ```
 
 Run an agent or inspect persisted memory:
 
 ```bash
-cargo run -p gewu-cli -- run "Hello"
-cargo run -p gewu-cli -- view
-cargo run -p gewu-cli -- view <SESSION_ID>
+cargo run -p gewu-server -- run "Hello"
+cargo run -p gewu-server -- view
+cargo run -p gewu-server -- view <SESSION_ID>
 ```
+
+Run an agent as a server other programs can connect to (WebSocket on port
+8420, newline-delimited JSON TCP on port 8421 — see `gewu-server/README.md`
+for the wire protocol):
+
+```bash
+cargo run -p gewu-server -- serve
+```
+
+Connect from the terminal with the `gewu-tui` TUI:
+
+```bash
+cargo run -p gewu-tui                    # full-screen chat TUI
+cargo run -p gewu-tui -- --session-id <ID>   # resume a conversation
+```
+
+Or use the `gewu-gui` desktop window (session history sidebar, markdown,
+collapsible tool cards):
+
+```bash
+cargo run -p gewu-gui
+cargo run -p gewu-gui -- --session-id <ID>
+```
+
+Or embed it as a library from Rust:
+
+```rust
+use gewu_client::Client;
+
+let client = Client::tcp("127.0.0.1", 8421).await?;
+let response = client.ask("Hello").send().await?.final_response().await?;
+```
+
+(See `gewu-client/README.md` for the library and `gewu-tui/README.md` for the
+terminal UI.)
 
 ### Configuration
 

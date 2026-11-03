@@ -49,10 +49,16 @@ impl AnthropicConfig {
     ///
     /// * `api_key` - Your Anthropic API key.
     /// * `base_url` - The base URL of the API (e.g., <https://api.anthropic.com>).
+    ///
+    /// A trailing `/v1` is stripped so that endpoints configured either with
+    /// (`https://host/v1`) or without (`https://host`) the version prefix both
+    /// work, since this client appends `/v1/messages` itself.
     pub fn new(api_key: &str, base_url: &str) -> Self {
+        let base_url = base_url.trim_end_matches('/');
+        let base_url = base_url.strip_suffix("/v1").unwrap_or(base_url);
         Self {
             api_key: api_key.to_string(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: base_url.to_string(),
             beta: None,
         }
     }

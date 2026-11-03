@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// Represents a function call within a tool call.
 ///
 /// Contains the name of the function to invoke and its arguments as a JSON string.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionCall {
     /// The name of the function to call.
     pub name: String,
@@ -34,7 +34,7 @@ pub struct FunctionCall {
 /// Tool calls are how the agent requests execution of tools like bash, file operations, etc.
 /// Each tool call has a unique ID (assigned by the LLM provider), a type (always "function"),
 /// and the actual function to call with its arguments.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// A unique identifier for this tool call, assigned by the LLM provider.
     /// This ID is used to match tool responses with tool call requests.
@@ -50,7 +50,7 @@ pub struct ToolCall {
 /// ContentPart represents the actual content within a message. It can be plain text,
 /// or media types like images, audio, video, or generic files. Media types include
 /// both the data (typically base64-encoded) and the MIME type.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ContentPart {
     /// Plain text content.
@@ -152,7 +152,7 @@ pub enum ProviderEvent {
 /// AgentEvent represents the high-level events that the agent runtime
 /// produces as it processes a request. These events are consumed by
 /// the CLI or other frontends to display progress and results.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// A delta of reasoning content from the model.
@@ -201,7 +201,7 @@ pub enum AgentEvent {
 /// - **Assistant**: Response from the agent. May contain text content and/or tool calls.
 /// - **Tool**: Result from executing a tool. Includes the tool call ID to link it
 ///   to the corresponding tool call in the assistant message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
     /// A system message, typically used to set agent behavior/instructions.

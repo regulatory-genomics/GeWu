@@ -391,7 +391,14 @@ pub enum ChatCompletionMessageToolCalls {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionMessageToolCall {
     pub id: String,
+    /// The OpenAI API requires `"type": "function"` on every tool call.
+    #[serde(rename = "type", default = "default_tool_call_type")]
+    pub tool_type: String,
     pub function: FunctionCall,
+}
+
+fn default_tool_call_type() -> String {
+    "function".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
