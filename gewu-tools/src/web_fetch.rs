@@ -166,12 +166,39 @@ impl Tool for WebFetchTool {
         let url_text = normalize_url(&input.url);
         let url = reqwest::Url::parse(&url_text)
             .map_err(|error| format!("webfetch: {url_text} is not a URL ({error})"))?;
+        let body = self
+            .fetch_following(url, self.policy.block_private_networks)
+            .await?;
+
+        let output = match input.format.as_str() {
+            "html" => body,
+            _ => html2md::parse_html(&body),
+        };
+
+        Ok(ToolResult::new("webfetch", output))
+    }
+}
+
+/// Redirects are followed one hop at a time so each destination can be
+/// validated. More hops than this is treated as a loop.
+const MAX_REDIRECTS: usize = 5;
+
+impl WebFetchTool {
+    /// Check one URL and, when private networks are blocked, resolve it and
+    /// return the address to pin the connection to.
+    async fn check(
+        &self,
+        url: &reqwest::Url,
+        enforce_private: bool,
+    ) -> Result<(String, Option<SocketAddr>), Box<dyn Error + Send + Sync>> {
         if !matches!(url.scheme(), "http" | "https") {
-            return Err(format!("webfetch refused: scheme {} is not http or https", url.scheme()).into());
+            return Err(
+                format!("webfetch refused: scheme {} is not http or https", url.scheme()).into(),
+            );
         }
         let host = url
             .host_str()
-            .ok_or_else(|| format!("webfetch refused: {url_text} has no host"))?
+            .ok_or_else(|| format!("webfetch refused: {url} has no host"))?
             .to_ascii_lowercase();
         if !self.policy.permits_host(&host) {
             return Err(format!(
@@ -179,66 +206,88 @@ impl Tool for WebFetchTool {
             )
             .into());
         }
+        if !enforce_private {
+            return Ok((host, None));
+        }
 
-        let mut builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .user_agent("opencode-cli/0.1.0");
+        let port = url.port_or_known_default().unwrap_or(443);
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|error| format!("webfetch refused: cannot resolve {host}: {error}"))?
+            .collect();
+        if addrs.is_empty() {
+            return Err(format!("webfetch refused: {host} did not resolve").into());
+        }
+        if let Some(private) = addrs.iter().find(|addr| !is_public_ip(addr.ip())) {
+            return Err(format!(
+                "webfetch refused: {host} resolves to {}, which is a private address",
+                private.ip()
+            )
+            .into());
+        }
+        Ok((host, Some(addrs[0])))
+    }
 
-        if self.policy.block_private_networks {
-            let port = url.port_or_known_default().unwrap_or(443);
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
-                .await
-                .map_err(|error| format!("webfetch refused: cannot resolve {host}: {error}"))?
-                .collect();
-            if addrs.is_empty() {
-                return Err(format!("webfetch refused: {host} did not resolve").into());
-            }
-            if let Some(private) = addrs.iter().find(|addr| !is_public_ip(addr.ip())) {
-                return Err(format!(
-                    "webfetch refused: {host} resolves to {}, which is a private address",
-                    private.ip()
-                )
-                .into());
-            }
-            // Pin the connection to the address that was checked, and never
-            // follow a redirect: a redirect target is not re-checked.
-            builder = builder
-                .resolve(&host, addrs[0])
+    /// Fetch `start`, following redirects and re-validating every hop.
+    ///
+    /// Cookies are shared across hops through one jar, so an identity-provider
+    /// round trip (nature.com) can complete. When `enforce_private` is set, the
+    /// connection is pinned to the address that was checked on that hop.
+    async fn fetch_following(
+        &self,
+        start: reqwest::Url,
+        enforce_private: bool,
+    ) -> Result<String, Box<dyn Error + Send + Sync>> {
+        let jar = Arc::new(reqwest::cookie::Jar::default());
+        let start_display = start.to_string();
+        let mut current = start;
+
+        for hop in 0..=MAX_REDIRECTS {
+            let (host, pinned) = self.check(&current, enforce_private).await?;
+
+            let mut builder = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .user_agent("opencode-cli/0.1.0")
+                .cookie_provider(jar.clone())
                 .redirect(reqwest::redirect::Policy::none());
-        }
-
-        let client = builder.build().map_err(into_tool_error)?;
-
-        let response = client.get(url.as_str()).send().await.map_err(into_tool_error)?;
-        let status = response.status();
-
-        if self.policy.block_private_networks && status.is_redirection() {
-            return Ok(ToolResult::new(
-                "webfetch",
-                format!(
-                    "Request redirected with status {status}; redirects are not followed while private networks are blocked."
-                ),
-            ));
-        }
-
-        if !status.is_success() {
-            return Ok(ToolResult::new(
-                "webfetch",
-                format!("Request failed with status: {}", status),
-            ));
-        }
-
-        let html = response.text().await.map_err(into_tool_error)?;
-
-        let output = match input.format.as_str() {
-            "html" => html,
-            _ => {
-                let markdown = html2md::parse_html(&html);
-                markdown
+            if let Some(addr) = pinned {
+                builder = builder.resolve(&host, addr);
             }
-        };
+            let client = builder.build().map_err(into_tool_error)?;
 
-        Ok(ToolResult::new("webfetch", output))
+            let response = client
+                .get(current.clone())
+                .send()
+                .await
+                .map_err(into_tool_error)?;
+            let status = response.status();
+
+            if status.is_redirection() {
+                if hop == MAX_REDIRECTS {
+                    return Err(format!(
+                        "webfetch: more than {MAX_REDIRECTS} redirects starting at {start_display}"
+                    )
+                    .into());
+                }
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or("webfetch: redirect without a Location header")?;
+                current = current.join(location).map_err(|error| {
+                    format!("webfetch: bad redirect target {location}: {error}")
+                })?;
+                continue;
+            }
+
+            if !status.is_success() {
+                return Ok(format!("Request failed with status: {status}"));
+            }
+
+            return response.text().await.map_err(into_tool_error);
+        }
+
+        Err(format!("webfetch: too many redirects starting at {start_display}").into())
     }
 }
 
@@ -355,5 +404,106 @@ mod tests {
                 "{ip} must be treated as public"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn redirects_are_followed_with_a_shared_cookie_jar() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+
+        let _idp = server
+            .mock("GET", "/idp")
+            .with_status(302)
+            .with_header("location", "/article")
+            .with_header("set-cookie", "session=1; Path=/")
+            .create_async()
+            .await;
+        let _article = server
+            .mock("GET", "/article")
+            .match_header("cookie", "session=1")
+            .with_status(200)
+            .with_header("content-type", "text/html")
+            .with_body("<html><body><h1>Article</h1></body></html>")
+            .create_async()
+            .await;
+
+        let tool = WebFetchTool::default();
+        let start = reqwest::Url::parse(&format!("{base}/idp")).expect("url");
+        let body = tool.fetch_following(start, false).await.expect("follow");
+
+        assert!(
+            body.contains("Article"),
+            "the cookie from the first hop must reach the second: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_loop_is_bounded() {
+        let mut server = mockito::Server::new_async().await;
+        let _looping = server
+            .mock("GET", "/loop")
+            .with_status(302)
+            .with_header("location", "/loop")
+            .create_async()
+            .await;
+
+        let tool = WebFetchTool::default();
+        let start = reqwest::Url::parse(&format!("{}/loop", server.url())).expect("url");
+        let error = tool
+            .fetch_following(start, false)
+            .await
+            .err()
+            .expect("a loop must stop");
+
+        assert!(error.to_string().contains("redirect"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_private_address_is_checked_on_the_next_hop() {
+        let mut server = mockito::Server::new_async().await;
+        let _hop = server
+            .mock("GET", "/to-loopback")
+            .with_status(302)
+            .with_header("location", "http://127.0.0.1:8406/api/health")
+            .create_async()
+            .await;
+
+        let tool = WebFetchTool::new(WebFetchPolicy {
+            block_private_networks: true,
+            allowed_hosts: Vec::new(),
+        });
+        let start = reqwest::Url::parse(&format!("{}/to-loopback", server.url())).expect("url");
+        let error = tool
+            .fetch_following(start, true)
+            .await
+            .err()
+            .expect("the first hop is already private");
+
+        assert!(error.to_string().contains("private address"), "{error}");
+    }
+
+    #[tokio::test]
+    #[ignore = "hits the public internet"]
+    async fn live_nature_article_is_followed() {
+        let tool = WebFetchTool::new(WebFetchPolicy {
+            block_private_networks: true,
+            allowed_hosts: Vec::new(),
+        });
+        let ctx = ToolContext::new("test", "msg");
+
+        let result = tool
+            .execute(
+                serde_json::json!({"url": "https://www.nature.com/articles/s41586-025-09422-z"}),
+                &ctx,
+            )
+            .await
+            .expect("fetch");
+
+        assert!(
+            result.output.len() > 500,
+            "expected an article body, got {} chars: {}",
+            result.output.len(),
+            &result.output[..result.output.len().min(200)]
+        );
     }
 }
