@@ -185,6 +185,10 @@ fn list_skill_files(dir: &Path) -> Vec<PathBuf> {
 
 pub struct SkillTool {
     skills: Vec<SkillInfo>,
+    /// Built once so the tool's own description lists what can be loaded. A
+    /// model choosing tools never sees the prompt's skills section otherwise.
+    description: String,
+    schema: RootSchema,
 }
 
 #[derive(Deserialize)]
@@ -192,12 +196,19 @@ struct SkillArgs {
     name: String,
 }
 
-fn schema() -> RootSchema {
+fn schema(names: &[&str]) -> RootSchema {
+    let name = if names.is_empty() {
+        serde_json::json!({"type": "string", "description": "Skill name"})
+    } else {
+        serde_json::json!({
+            "type": "string",
+            "enum": names,
+            "description": "Skill name from the available skills list"
+        })
+    };
     serde_json::from_value(serde_json::json!({
         "type": "object",
-        "properties": {
-            "name": { "type": "string", "description": "The name of the skill from available_skills" }
-        },
+        "properties": { "name": name },
         "required": ["name"]
     }))
     .unwrap()
@@ -205,7 +216,31 @@ fn schema() -> RootSchema {
 
 impl SkillTool {
     pub fn new(skills: Vec<SkillInfo>) -> Self {
-        Self { skills }
+        let mut names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
+        names.sort_unstable();
+        let mut description = String::from(
+            "Load a specialized skill when the task matches one of the available skills. \
+             The output injects the skill's instructions and its companion files into this conversation.\n\n\
+             Available skills:\n",
+        );
+        let mut listed = 0;
+        for skill in &skills {
+            let Some(summary) = skill.description.as_deref().filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            description.push_str(&format!("- {}: {}\n", skill.name, summary.trim()));
+            listed += 1;
+        }
+        if listed == 0 {
+            description.push_str("- (no described skills are available)\n");
+        }
+        let schema = schema(&names);
+        Self {
+            skills,
+            description,
+            schema,
+        }
     }
 }
 
@@ -216,11 +251,11 @@ impl Tool for SkillTool {
     }
 
     fn description(&self) -> &str {
-        include_str!("prompts/skill.txt")
+        &self.description
     }
 
     fn schema(&self) -> RootSchema {
-        schema()
+        self.schema.clone()
     }
 
     async fn execute(
@@ -428,6 +463,41 @@ mod tests {
         assert!(section.contains("<name>alpha</name>"));
         assert!(section.contains("Does &lt;things&gt;"));
         assert!(section.contains("<location>"));
+    }
+
+    #[test]
+    fn the_tool_description_lists_available_skills() {
+        let dir = tempdir().unwrap();
+        let a = write_skill(
+            dir.path(),
+            "alpha",
+            "name: alpha\ndescription: Handles alpha tasks",
+            "body",
+        );
+        let b = write_skill(dir.path(), "beta", "name: beta", "body");
+        let skills = vec![
+            SkillInfo {
+                name: "alpha".into(),
+                description: Some("Handles alpha tasks".into()),
+                location: a,
+                content: String::new(),
+            },
+            SkillInfo {
+                name: "beta".into(),
+                description: None,
+                location: b,
+                content: String::new(),
+            },
+        ];
+        let tool = SkillTool::new(skills);
+        assert!(tool.description().contains("alpha"));
+        assert!(tool.description().contains("Handles alpha tasks"));
+        assert!(!tool.description().contains("- beta"));
+
+        let schema = serde_json::to_value(tool.schema()).unwrap();
+        let names = schema["properties"]["name"]["enum"].as_array().unwrap();
+        assert!(names.contains(&serde_json::json!("alpha")));
+        assert!(names.contains(&serde_json::json!("beta")));
     }
 
     #[test]
