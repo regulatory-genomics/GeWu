@@ -151,7 +151,10 @@ impl Stream for ChatCompletionStream {
 
 struct SseStream<S> {
     stream: Pin<Box<S>>,
-    buffer: String,
+    /// Raw bytes, not a String: a TCP chunk can split a multi-byte UTF-8
+    /// character. Decoding per chunk silently dropped that chunk and produced
+    /// "expected ident" JSON errors mid-answer; we only decode complete lines.
+    buffer: Vec<u8>,
 }
 
 impl<S> SseStream<S>
@@ -161,7 +164,7 @@ where
     fn new(stream: S) -> Self {
         Self {
             stream: Box::pin(stream),
-            buffer: String::new(),
+            buffer: Vec::new(),
         }
     }
 }
@@ -174,16 +177,15 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            if let Some(pos) = self.buffer.find('\n') {
-                let line = self.buffer[..pos].to_string();
-                self.buffer = self.buffer[pos + 1..].to_string();
-                
+            if let Some(pos) = self.buffer.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = self.buffer.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]);
                 let line = line.trim();
                 if line.is_empty() || line.starts_with(':') {
                     continue;
                 }
-                
-                if let Some(data) = line.strip_prefix("data: ") {
+                if let Some(data) = line.strip_prefix("data:") {
+                    let data = data.trim_start();
                     if data == "[DONE]" {
                         return Poll::Ready(None);
                     }
@@ -196,9 +198,7 @@ where
             
             match self.stream.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
-                    if let Ok(s) = std::str::from_utf8(&bytes) {
-                        self.buffer.push_str(s);
-                    }
+                    self.buffer.extend_from_slice(&bytes);
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Some(Err(OpenAIError::Http(e))));
@@ -584,4 +584,33 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+}
+
+#[cfg(test)]
+mod sse_tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures::executor::block_on;
+    use futures::stream;
+    use futures::StreamExt;
+
+    #[test]
+    fn a_utf8_character_split_across_chunks_is_not_dropped() {
+        let payload = "data: {\"id\":\"chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"免疫抑制\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+        let split = payload.find('免').expect("needle") + 1; // inside the 3-byte character
+        let bytes = payload.as_bytes();
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from(bytes[..split].to_vec())),
+            Ok(Bytes::from(bytes[split..].to_vec())),
+        ];
+        let mut stream = SseStream::new(stream::iter(chunks));
+        let chunk = block_on(stream.next())
+            .expect("one chunk")
+            .expect("valid chunk");
+        assert_eq!(
+            chunk.choices[0].delta.content.as_deref(),
+            Some("免疫抑制")
+        );
+        assert!(block_on(stream.next()).is_none());
+    }
 }
