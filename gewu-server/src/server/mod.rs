@@ -725,6 +725,7 @@ mod tests {
     use super::*;
     use gewu_core::types::{ContentPart, ToolContext, ToolResult};
     use std::error::Error;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // -- Test doubles -------------------------------------------------------
 
@@ -733,6 +734,11 @@ mod tests {
         /// Artificial delay before yielding events (makes asks observably
         /// long-running for interrupt tests).
         delay_ms: u64,
+        /// Interior-mutable count of `send` calls (`send` takes `&self`).
+        /// The agent prepends a system prompt to the message history, so
+        /// `messages.len()` cannot identify the conversation turn; count
+        /// provider calls instead.
+        calls: AtomicUsize,
     }
 
     #[derive(Clone, Copy, PartialEq)]
@@ -748,12 +754,14 @@ mod tests {
             Arc::new(Self {
                 behavior: LlmBehavior::Plain,
                 delay_ms: 0,
+                calls: AtomicUsize::new(0),
             })
         }
         fn tool_call() -> Arc<Self> {
             Arc::new(Self {
                 behavior: LlmBehavior::ToolCall,
                 delay_ms: 0,
+                calls: AtomicUsize::new(0),
             })
         }
         /// Tool-calling LLM that sleeps before responding: long enough for
@@ -762,6 +770,7 @@ mod tests {
             Arc::new(Self {
                 behavior: LlmBehavior::ToolCall,
                 delay_ms: 500,
+                calls: AtomicUsize::new(0),
             })
         }
     }
@@ -786,10 +795,10 @@ mod tests {
             >,
             Box<dyn Error + Send + Sync>,
         > {
-            let turn = request["turn"].as_u64().unwrap_or(0);
             if self.delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
             }
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             let events: Vec<gewu_core::types::ProviderEvent> = match self.behavior {
                 LlmBehavior::Plain => vec![
                     gewu_core::types::ProviderEvent::ContentDelta {
@@ -799,7 +808,7 @@ mod tests {
                         reason: Some("stop".to_string()),
                     },
                 ],
-                LlmBehavior::ToolCall if turn <= 1 => vec![
+                LlmBehavior::ToolCall if call == 1 => vec![
                     gewu_core::types::ProviderEvent::ToolCallStart {
                         id: "call-1".to_string(),
                         name: "echo".to_string(),
@@ -1374,8 +1383,10 @@ mod tests {
 
     #[tokio::test]
     async fn connection_rejects_second_ask_while_running() {
-        // A tool-calling agent keeps the ask busy across two LLM turns.
-        let state = server_state_with(TestLlm::tool_call());
+        // A slow tool-calling agent keeps the ask busy across two LLM turns,
+        // long enough for the second ask to arrive while the first is still
+        // running (a zero-delay ask can finish before it is even read).
+        let state = server_state_with(TestLlm::slow_tool_call());
         let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
 
         in_tx
@@ -1393,25 +1404,38 @@ mod tests {
             .send(r#"{"id": 2, "op": "ask", "prompt": "again"}"#.to_string())
             .await
             .unwrap();
-        let err = recv_json(&mut out_rx).await;
-        assert_eq!(err["type"], "error");
-        assert!(
-            err["error"]
-                .as_str()
-                .unwrap()
-                .contains("already in progress")
-        );
+        // The rejection error is emitted by the connection loop while the
+        // running ask streams events into the same channel from another
+        // task, so drain messages until the error shows up. A `result`
+        // first would mean the second ask was accepted, i.e. not rejected.
+        let mut rejected = false;
+        loop {
+            let msg = recv_json(&mut out_rx).await;
+            match msg["type"].as_str() {
+                Some("error") => {
+                    assert!(
+                        msg["error"]
+                            .as_str()
+                            .unwrap()
+                            .contains("already in progress"),
+                        "unexpected error: {}",
+                        msg["error"]
+                    );
+                    rejected = true;
+                    break;
+                }
+                Some("result") => panic!("second ask should be rejected while the first is running"),
+                _ => continue,
+            }
+        }
+        assert!(rejected);
 
         // Let the first ask finish.
-        let mut saw_result = false;
-        for _ in 0..10 {
-            let msg = recv_json(&mut out_rx).await;
-            if msg["type"] == "result" {
-                saw_result = true;
+        loop {
+            if recv_json(&mut out_rx).await["type"] == "result" {
                 break;
             }
         }
-        assert!(saw_result, "first ask should complete");
 
         drop(in_tx);
         handle.await.unwrap().unwrap();

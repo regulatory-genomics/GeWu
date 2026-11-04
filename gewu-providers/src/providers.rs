@@ -1636,4 +1636,43 @@ mod tests {
         let config = crate::anthropic::AnthropicConfig::new("test-key", "https://host");
         assert_eq!(config.base_url, "https://host");
     }
+
+    #[tokio::test]
+    async fn openai_parse_stream_yields_reasoning_deltas_for_glm_field() {
+        // Regression: GLM-style gateways stream thinking under
+        // `delta.reasoning`; the parser must emit ReasoningDelta events for
+        // them instead of silently dropping the whole reasoning phase.
+        let sse = concat!(
+            "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"Step\"}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" one\"}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Answer\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let body: std::collections::VecDeque<Result<bytes::Bytes, reqwest::Error>> =
+            std::collections::VecDeque::from(vec![Ok(bytes::Bytes::from(sse))]);
+        let wire = futures::stream::iter(body);
+        let stream = OpenAIProvider::new("test-key", "glm-flash")
+            .parse_stream(ChatCompletionStream::new(wire));
+
+        let events: Vec<_> = stream
+            .map(|e| e.expect("event should parse"))
+            .collect()
+            .await;
+        let reasoning: String = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::ReasoningDelta { delta } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        let content: String = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::ContentDelta { delta } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, "Step one");
+        assert_eq!(content, "Answer");
+    }
 }

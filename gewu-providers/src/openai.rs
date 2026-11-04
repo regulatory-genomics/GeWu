@@ -130,7 +130,7 @@ pub struct ChatCompletionStream {
 }
 
 impl ChatCompletionStream {
-    fn new<S>(stream: S) -> Self
+    pub(crate) fn new<S>(stream: S) -> Self
     where
         S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     {
@@ -151,9 +151,8 @@ impl Stream for ChatCompletionStream {
 
 struct SseStream<S> {
     stream: Pin<Box<S>>,
-    /// Raw bytes, not a String: a TCP chunk can split a multi-byte UTF-8
-    /// character. Decoding per chunk silently dropped that chunk and produced
-    /// "expected ident" JSON errors mid-answer; we only decode complete lines.
+    /// Unparsed bytes from the wire. Kept as raw bytes (not a `String`) so a
+    /// chunk boundary splitting a multi-byte UTF-8 character never loses data.
     buffer: Vec<u8>,
 }
 
@@ -177,15 +176,18 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            if let Some(pos) = self.buffer.iter().position(|byte| *byte == b'\n') {
-                let line: Vec<u8> = self.buffer.drain(..=pos).collect();
-                let line = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]);
+            if let Some(pos) = self.buffer.iter().position(|&b| b == b'\n') {
+                // Decode only complete lines, so a multi-byte character split
+                // across chunk boundaries is decoded once the line is whole.
+                let line = String::from_utf8_lossy(&self.buffer[..pos]).into_owned();
+                self.buffer.drain(..=pos);
+
                 let line = line.trim();
                 if line.is_empty() || line.starts_with(':') {
                     continue;
                 }
-                if let Some(data) = line.strip_prefix("data:") {
-                    let data = data.trim_start();
+
+                if let Some(data) = line.strip_prefix("data: ") {
                     if data == "[DONE]" {
                         return Poll::Ready(None);
                     }
@@ -195,7 +197,7 @@ where
                     }
                 }
             }
-            
+
             match self.stream.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
                     self.buffer.extend_from_slice(&bytes);
@@ -554,7 +556,15 @@ pub struct ChatDelta {
     pub role: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
-    #[serde(rename = "reasoning_content", skip_serializing_if = "Option::is_none")]
+    // Reasoning models stream their thinking under different field names:
+    // GLM (and some other gateways) use "reasoning", DeepSeek-style APIs use
+    // "reasoning_content". Accept both on deserialize; serialize as
+    // "reasoning_content" to preserve the existing wire behavior.
+    #[serde(
+        rename = "reasoning_content",
+        alias = "reasoning",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
@@ -587,30 +597,79 @@ pub struct Usage {
 }
 
 #[cfg(test)]
-mod sse_tests {
+mod tests {
     use super::*;
-    use bytes::Bytes;
-    use futures::executor::block_on;
-    use futures::stream;
     use futures::StreamExt;
 
+    /// A stream of canned body chunks, typed as the SSE source expects.
+    fn body_stream(chunks: Vec<Bytes>) -> impl Stream<Item = Result<Bytes, reqwest::Error>> {
+        futures::stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>())
+    }
+
     #[test]
-    fn a_utf8_character_split_across_chunks_is_not_dropped() {
-        let payload = "data: {\"id\":\"chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"免疫抑制\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
-        let split = payload.find('免').expect("needle") + 1; // inside the 3-byte character
-        let bytes = payload.as_bytes();
-        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
-            Ok(Bytes::from(bytes[..split].to_vec())),
-            Ok(Bytes::from(bytes[split..].to_vec())),
-        ];
-        let mut stream = SseStream::new(stream::iter(chunks));
-        let chunk = block_on(stream.next())
-            .expect("one chunk")
-            .expect("valid chunk");
-        assert_eq!(
-            chunk.choices[0].delta.content.as_deref(),
-            Some("免疫抑制")
+    fn chat_delta_parses_glm_reasoning_field() {
+        // GLM-style gateways stream thinking under "reasoning".
+        let delta: ChatDelta = serde_json::from_str(r#"{"reasoning":"thinking..."}"#).unwrap();
+        assert_eq!(delta.reasoning_content.as_deref(), Some("thinking..."));
+    }
+
+    #[test]
+    fn chat_delta_parses_deepseek_reasoning_content_field() {
+        // DeepSeek-style APIs use "reasoning_content"; must keep working.
+        let delta: ChatDelta =
+            serde_json::from_str(r#"{"reasoning_content":"thinking..."}"#).unwrap();
+        assert_eq!(delta.reasoning_content.as_deref(), Some("thinking..."));
+    }
+
+    #[tokio::test]
+    async fn sse_stream_reassembles_utf8_split_across_chunks() {
+        // A multi-byte character ("好" = 3 bytes) split across two network
+        // chunks must not be dropped.
+        let full = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": "1",
+                "choices": [{"index": 0, "delta": {"content": "你好"}}]
+            })
         );
-        assert!(block_on(stream.next()).is_none());
+        let split_at = full.find("好").unwrap() + 1; // mid-character cut
+        let bytes = full.as_bytes();
+        let chunks = vec![
+            Bytes::copy_from_slice(&bytes[..split_at]),
+            Bytes::copy_from_slice(&bytes[split_at..]),
+        ];
+
+        let mut stream = ChatCompletionStream::new(body_stream(chunks));
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            events.push(ev.expect("chunk should parse"));
+        }
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].choices[0].delta.content.as_deref(),
+            Some("你好")
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_stream_parses_glm_reasoning_chunks() {
+        // Regression: GLM streams thinking as "delta":{"reasoning":...};
+        // chunks must parse (not be silently ignored).
+        let sse = concat!(
+            "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"The\"}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" user\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut stream = ChatCompletionStream::new(body_stream(vec![Bytes::from_static(
+            sse.as_bytes(),
+        )]));
+        let mut reasoning = String::new();
+        while let Some(ev) = stream.next().await {
+            let chunk = ev.expect("chunk should parse");
+            if let Some(r) = &chunk.choices[0].delta.reasoning_content {
+                reasoning.push_str(r);
+            }
+        }
+        assert_eq!(reasoning, "The user");
     }
 }

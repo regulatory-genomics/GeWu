@@ -2,10 +2,10 @@
 
 Async Rust client library for a GeWu server (`gewu-server serve`). It also
 contains the UI-agnostic conversation model shared by the terminal UI
-(`gewu-tui`) and the desktop UI (`gewu-gui`).
+(`gewu-tui`) and the web UI (`gewu-gui`).
 
 For the terminal front-end, see [`gewu-tui`](../gewu-tui/README.md); for the
-desktop one, see [`gewu-gui`](../gewu-gui/README.md).
+browser one, see [`gewu-gui`](../gewu-gui/README.md).
 
 ## Library usage
 

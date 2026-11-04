@@ -132,5 +132,6 @@ gewu-tui
   tui_view.rs  ratatui rendering
 ```
 
-Conversation state lives in `gewu-client::session` and is shared with the
-desktop UI, so both front-ends render events and replay history identically.
+Conversation state lives in `gewu-client::session` and is shared with the web
+GUI ([`gewu-gui`](../gewu-gui/README.md)), so both front-ends render events
+and replay history identically.

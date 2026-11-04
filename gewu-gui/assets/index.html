@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#07090c">
+  <title>GeWu · 格物</title>
+  <link rel="preload" href="/fonts/inter-var.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/fonts/jetbrains-mono-400.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div id="app" class="app">
+    <div id="offline" class="banner hidden" role="status" aria-live="polite">
+      <span id="offline-text">Disconnected</span>
+      <button id="retry" class="banner-action" type="button">Retry now</button>
+    </div>
+
+    <header class="topbar">
+      <div class="brand" title="GeWu agent">
+        <span class="brand-mark">格物</span>
+        <span class="brand-name">GEWU</span>
+        <span class="uplink"><span class="uplink-label">uplink</span><span id="upstream" class="upstream" title="Upstream server"></span></span>
+      </div>
+      <div class="tab-bar">
+        <nav id="tabs" class="tabs" aria-label="Conversation tabs"></nav>
+        <button id="new-tab" class="icon-button" type="button" title="New session" aria-label="New session">+</button>
+      </div>
+      <div class="topbar-actions">
+        <button id="interrupt" class="icon-button stop hidden" type="button" title="Interrupt (Esc)" aria-label="Interrupt">■</button>
+      </div>
+    </header>
+
+    <main id="transcript" class="transcript" aria-live="polite"></main>
+
+    <footer class="footer">
+      <div id="status" class="status" aria-live="polite"></div>
+      <form id="composer" class="composer">
+        <span class="prompt-glyph" aria-hidden="true">›</span>
+        <textarea
+          id="prompt"
+          class="prompt"
+          rows="1"
+          placeholder="Message gewu…"
+          autocomplete="off"
+          autocapitalize="sentences"
+          spellcheck="true"
+          aria-label="Message"></textarea>
+        <button id="send" class="send" type="submit">Send <kbd>⏎</kbd></button>
+      </form>
+    </footer>
+  </div>
+
+  <div id="toasts" class="toasts" aria-live="assertive"></div>
+
+  <div id="login" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="login-title">
+    <form id="login-form" class="login-card">
+      <h1 id="login-title"><span class="brand-mark">格物</span> <span class="brand-name">GEWU</span></h1>
+      <p class="login-copy">This GUI requires an access token. Ask whoever started <code>gewu-gui</code> for it.</p>
+      <label class="login-label" for="token">access token</label>
+      <input id="token" class="login-input" type="password" autocomplete="current-password" required>
+      <p id="login-error" class="login-error hidden"></p>
+      <button class="login-submit" type="submit">Connect</button>
+    </form>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

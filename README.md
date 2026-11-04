@@ -16,7 +16,7 @@ GeWu (格物) is a comprehensive framework for building and deploying AI agents.
 | **`gewu-protocol`** | Wire protocol shared by the server and its clients: request parsing/serialization (`ClientRequest`) and server reply types (`ServerMessage`). |
 | **`gewu-client`** | Async Rust client library for the GeWu server: streaming asks (`Client::ask`), `interrupt`, session listing/loading, tool/agent introspection, and the UI-agnostic conversation model (`SessionModel`) shared by the TUI and GUI. |
 | **`gewu-tui`** | Full-screen terminal chat UI built on `gewu-client`: streaming transcript, `$ <command>` tool-call display, scrollback, and session resume. |
-| **`gewu-gui`** | Desktop client for the GeWu server, built with egui/eframe. Streaming markdown transcript, collapsible tool cards, interrupt, and a sidebar for resuming persisted sessions. Shares its conversation model and `Client` library with the TUI. |
+| **`gewu-gui`** | Browser-based chat UI served by a small axum proxy: Rust-rendered HTML/Markdown, streaming transcript, tabs, tool groups, context usage, and session resume over one HTTP/WebSocket port. Supports remote browsers with an optional access token. |
 | **`gewu-graph`** | Stateful graph execution library for building complex workflow orchestration with conditional routing, parallel execution, and nested subgraphs. |
 | **`gewu-rag`** | RAG (Retrieval Augmented Generation) system with document processing (PDF, text), embedding generation, and vector storage integration (Qdrant). |
 | **`gewu-experience`** | Experience memory system with Qdrant vector embeddings for semantic recall of past problem-solving experiences. Includes experience store and recall tools. |
@@ -120,12 +120,13 @@ cargo run -p gewu-tui                    # full-screen chat TUI
 cargo run -p gewu-tui -- --session-id <ID>   # resume a conversation
 ```
 
-Or use the `gewu-gui` desktop window (session history sidebar, markdown,
-collapsible tool cards):
+Or from a browser with the `gewu-gui` web UI (open
+<http://127.0.0.1:8430>):
 
 ```bash
-cargo run -p gewu-gui
-cargo run -p gewu-gui -- --session-id <ID>
+cargo run -p gewu-gui                              # local GUI
+cargo run -p gewu-gui -- --open                    # open a browser too
+cargo run -p gewu-gui -- --host 0.0.0.0 --token "$(openssl rand -hex 16)"  # remote, token-protected
 ```
 
 Or embed it as a library from Rust:
@@ -137,8 +138,8 @@ let client = Client::tcp("127.0.0.1", 8421).await?;
 let response = client.ask("Hello").send().await?.final_response().await?;
 ```
 
-(See `gewu-client/README.md` for the library and `gewu-tui/README.md` for the
-terminal UI.)
+(See `gewu-client/README.md` for the library, `gewu-tui/README.md` for the
+terminal UI, and `gewu-gui/README.md` for the web UI.)
 
 ### Configuration
 

@@ -103,8 +103,8 @@ conversation. One `ask` runs at a time per connection; `interrupt` aborts it.
 #### Rust client
 
 The `gewu-client` library implements this protocol, with the `gewu-tui`
-terminal UI (`cargo run -p gewu-tui`) and `gewu-gui` desktop window as
-front-ends:
+terminal UI (`cargo run -p gewu-tui`) and the `gewu-gui` browser UI
+(`cargo run -p gewu-gui`) as front-ends:
 
 ```rust
 use gewu_client::Client;
