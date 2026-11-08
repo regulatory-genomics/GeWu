@@ -13,7 +13,7 @@ pub mod tool;
 
 pub use constants::{END, START};
 pub use state_graph::{
-    CompiledGraph, GraphError, GraphSend, NodeResult, StateGraph, StreamMode, StreamOutput,
-    StreamWriter,
+    CompiledGraph, GraphError, GraphSend, NodeError, NodeResult, StateGraph, StreamMode,
+    StreamOutput, StreamWriter,
 };
 pub use tool::GraphTool;

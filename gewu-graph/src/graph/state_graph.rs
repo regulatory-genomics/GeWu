@@ -36,6 +36,15 @@ pub enum GraphError {
     /// Returned when execution exceeds the configured number of supersteps.
     #[error("Execution step limit ({0}) exceeded")]
     StepLimitExceeded(usize),
+
+    /// A node returned a structured failure. Downstream nodes did not run.
+    #[error("Node `{node}` failed ({code}): {message}")]
+    NodeFailed {
+        node: String,
+        code: String,
+        message: String,
+        retryable: bool,
+    },
 }
 
 /// A tuple struct representing a message to be sent to another node.
@@ -46,6 +55,30 @@ pub enum GraphError {
 /// other operations.
 #[derive(Clone, Debug)]
 pub struct GraphSend<S: State>(pub String, pub S);
+
+/// A structured node failure.
+///
+/// Carries a machine-readable code so a caller can decide whether to retry,
+/// and never conflates a failed step with a successful empty result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeError {
+    /// Stable error code, for example `BACKEND_UNAVAILABLE`.
+    pub code: String,
+    /// Human-readable explanation.
+    pub message: String,
+    /// Whether repeating the same input could succeed.
+    pub retryable: bool,
+}
+
+impl NodeError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>, retryable: bool) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            retryable,
+        }
+    }
+}
 
 /// The result returned by a node's handler function.
 ///
@@ -65,6 +98,13 @@ pub enum NodeResult<S: State> {
     /// Emit custom data to any registered stream consumers.
     /// The state remains unchanged and execution continues along edges.
     Custom(serde_json::Value),
+
+    /// The node failed.
+    ///
+    /// Successful peers in the same superstep keep their emitted events, but
+    /// nothing downstream of the failure is scheduled and the graph returns
+    /// [`GraphError::NodeFailed`].
+    Fail(NodeError),
 }
 
 impl<S: State> NodeResult<S> {
@@ -121,6 +161,15 @@ pub enum StreamOutput<S: State> {
         /// The result from the node (typically default/empty).
         result: S::Partial,
     },
+    /// Marks a node's structured failure.
+    TaskFailed {
+        /// Unique identifier for this task instance.
+        id: String,
+        /// Name of the node that failed.
+        name: String,
+        /// Typed failure returned by the node.
+        error: NodeError,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -168,6 +217,11 @@ enum ExecutionEvent<S: State> {
         id: String,
         name: String,
         result: S::Partial,
+    },
+    TaskFailed {
+        id: String,
+        name: String,
+        error: NodeError,
     },
 }
 
@@ -594,6 +648,7 @@ impl<S: State + 'static> CompiledGraph<S> {
             let mut updates = Vec::new();
             let mut branches = Vec::new();
             let mut completed = Vec::new();
+            let mut failures: Vec<(String, NodeError)> = Vec::new();
 
             for outcome in outcomes {
                 let task = outcome.task;
@@ -657,7 +712,26 @@ impl<S: State + 'static> CompiledGraph<S> {
                             sends: None,
                         });
                     }
+                    TaskResult::Node(NodeResult::Fail(error)) => {
+                        emit(ExecutionEvent::TaskFailed {
+                            id: task.id.clone(),
+                            name: task.node.clone(),
+                            error: error.clone(),
+                        });
+                        failures.push((task.node, error));
+                    }
                 }
+            }
+
+            // Peers that already finished in this superstep keep their events,
+            // but a failed node never schedules its downstream.
+            if let Some((node, error)) = failures.into_iter().next() {
+                return Err(GraphError::NodeFailed {
+                    node,
+                    code: error.code,
+                    message: error.message,
+                    retryable: error.retryable,
+                });
             }
 
             current_state = current_state.merge_many(updates);
@@ -804,6 +878,11 @@ impl<S: State + 'static> CompiledGraph<S> {
                         if modes.contains(&StreamMode::Tasks) =>
                     {
                         yield Ok(StreamOutput::TaskEnd { id, name, result });
+                    }
+                    Ok(ExecutionEvent::TaskFailed { id, name, error })
+                        if modes.contains(&StreamMode::Tasks) =>
+                    {
+                        yield Ok(StreamOutput::TaskFailed { id, name, error });
                     }
                     Ok(_) => {}
                     Err(error) => yield Err(error),

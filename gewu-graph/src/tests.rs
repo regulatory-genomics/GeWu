@@ -1,9 +1,14 @@
 #[cfg(test)]
 mod tests {
-    use crate::graph::{END, GraphSend, NodeResult, START, StateGraph, StreamMode, StreamOutput};
+    use crate::graph::{
+        END, GraphError, GraphSend, NodeError, NodeResult, START, StateGraph, StreamMode,
+        StreamOutput,
+    };
     use crate::state::State;
     use futures::StreamExt;
     use serde::{Deserialize, Serialize};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     struct TestState {
@@ -1511,6 +1516,7 @@ mod tests {
                 StreamOutput::Custom { node, data } => customs.push((node, data)),
                 StreamOutput::TaskStart { id, name } => task_starts.push((id, name)),
                 StreamOutput::TaskEnd { id, name, .. } => task_ends.push((id, name)),
+                StreamOutput::TaskFailed { .. } => {}
             }
         }
 
@@ -1738,5 +1744,125 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.messages, vec!["first", "second", "third"]);
+    }
+
+    // ========================================
+    // Phase 5: Structured node failures
+    // ========================================
+
+    fn failure(code: &str) -> NodeResult<TestState> {
+        NodeResult::Fail(NodeError::new(
+            code,
+            "backend is not available",
+            false,
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_node_failure_is_typed_and_skips_downstream() {
+        let mut graph = StateGraph::<TestState>::new();
+        let downstream_calls = Arc::new(AtomicUsize::new(0));
+
+        graph.add_node("broken", |_| async {
+            failure("BACKEND_UNAVAILABLE")
+        });
+        let calls = downstream_calls.clone();
+        graph.add_node("downstream", move |_| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                partial(Some(1), None)
+            }
+        });
+        graph.set_entry_point("broken");
+        graph.add_edge("broken", "downstream");
+        graph.add_edge("downstream", END);
+
+        let error = graph
+            .compile()
+            .ainvoke(TestState::default())
+            .await
+            .unwrap_err();
+
+        match error {
+            GraphError::NodeFailed {
+                node,
+                code,
+                message,
+                retryable,
+            } => {
+                assert_eq!(node, "broken");
+                assert_eq!(code, "BACKEND_UNAVAILABLE");
+                assert_eq!(message, "backend is not available");
+                assert!(!retryable);
+            }
+            other => panic!("expected NodeFailed, got {other:?}"),
+        }
+        assert_eq!(downstream_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_failure_keeps_successful_peers_and_skips_waiting_join() {
+        let mut graph = StateGraph::<TestState>::new();
+        let left_calls = Arc::new(AtomicUsize::new(0));
+        let join_calls = Arc::new(AtomicUsize::new(0));
+
+        graph.add_node("start", |_| async {
+            NodeResult::Send(vec![
+                GraphSend("left".to_string(), TestState::default()),
+                GraphSend("bad".to_string(), TestState::default()),
+            ])
+        });
+        let left = left_calls.clone();
+        graph.add_node("left", move |_| {
+            let left = left.clone();
+            async move {
+                left.fetch_add(1, Ordering::SeqCst);
+                partial(Some(10), None)
+            }
+        });
+        graph.add_node("bad", |_| async { failure("MISSING_INPUT") });
+        let join = join_calls.clone();
+        graph.add_node("join", move |_| {
+            let join = join.clone();
+            async move {
+                join.fetch_add(1, Ordering::SeqCst);
+                partial(None, None)
+            }
+        });
+        graph.set_entry_point("start");
+        graph.add_waiting_edge(["left", "bad"], "join");
+        graph.add_edge("join", END);
+
+        let compiled = graph.compile();
+        let mut stream = Box::pin(
+            compiled.stream_with_modes(TestState::default(), vec![StreamMode::Tasks]),
+        );
+        let mut started = Vec::new();
+        let mut finished = Vec::new();
+        let mut failed = Vec::new();
+        let mut final_error = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(StreamOutput::TaskStart { name, .. }) => started.push(name),
+                Ok(StreamOutput::TaskEnd { name, .. }) => finished.push(name),
+                Ok(StreamOutput::TaskFailed { name, error, .. }) => {
+                    failed.push((name, error.code))
+                }
+                Ok(_) => {}
+                Err(error) => final_error = Some(error),
+            }
+        }
+
+        // The peer that succeeded still ran and reported completion...
+        assert_eq!(left_calls.load(Ordering::SeqCst), 1);
+        assert!(finished.contains(&"left".to_string()));
+        // ...the failure stays typed, the waiting join never runs...
+        assert_eq!(failed, vec![("bad".to_string(), "MISSING_INPUT".to_string())]);
+        assert!(!started.contains(&"join".to_string()));
+        assert_eq!(join_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            matches!(final_error, Some(GraphError::NodeFailed { ref node, .. }) if node == "bad")
+        );
     }
 }

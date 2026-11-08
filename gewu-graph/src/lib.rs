@@ -73,6 +73,7 @@
 //! - `Partial(partial_state)` - Update the state with partial values
 //! - `Send(targets)` - Send state to other nodes for parallel processing
 //! - `Custom(json_value)` - Emit custom data in streams without affecting state
+//! - `Fail(NodeError)` - Stop the graph with a typed failure; nothing downstream runs
 
 pub mod channels;
 pub mod graph;
@@ -85,7 +86,7 @@ pub use channels::{
     NamedBarrierChannel, TopicChannel,
 };
 pub use graph::{
-    CompiledGraph, GraphError, GraphSend, GraphTool, NodeResult, StateGraph, StreamMode,
+    CompiledGraph, GraphError, GraphSend, GraphTool, NodeError, NodeResult, StateGraph, StreamMode,
     StreamOutput, StreamWriter,
 };
 pub use state::{Append, LastValue, Reducer, State, Sum};
