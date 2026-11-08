@@ -271,6 +271,10 @@ pub struct CreateChatCompletionRequest {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Ask reasoning-capable models to think less (`low`) or more (`high`).
+    /// Omitted for models and gateways that do not understand it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

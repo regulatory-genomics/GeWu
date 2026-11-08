@@ -132,6 +132,8 @@ pub struct OpenAIProvider {
     client: OpenAIClient,
     model: String,
     capabilities: Capabilities,
+    /// Forwarded verbatim when set; `None` leaves the gateway's default.
+    reasoning_effort: Option<String>,
 }
 
 impl OpenAIProvider {
@@ -148,6 +150,7 @@ impl OpenAIProvider {
             client: OpenAIClient::with_config(config),
             model: model.to_string(),
             capabilities,
+            reasoning_effort: None,
         }
     }
 
@@ -168,7 +171,20 @@ impl OpenAIProvider {
             client: OpenAIClient::with_config(config),
             model: model.to_string(),
             capabilities,
+            reasoning_effort: None,
         }
+    }
+
+    /// Sets the `reasoning_effort` field sent with every completion request.
+    ///
+    /// Only gateways that support the field should receive it; other models
+    /// ignore unknown request fields, but this stays opt-in to avoid changing
+    /// wire behaviour for existing deployments.
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
+        self
     }
 
     /// Determines capabilities based on model name.
@@ -420,6 +436,7 @@ impl OpenAIProvider {
             stream: None,
             max_tokens: None,
             temperature: None,
+            reasoning_effort: self.reasoning_effort.clone(),
         })
     }
 }
@@ -1508,6 +1525,32 @@ mod tests {
         assert_eq!(wire_tools.len(), 1);
         assert_eq!(wire_tools[0]["type"], "function");
         assert_eq!(wire_tools[0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn openai_reasoning_effort_is_opt_in_on_the_wire() {
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        let tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let default = OpenAIProvider::new("test-key", "gpt-4o")
+            .build(&messages, &tools)
+            .expect("build success");
+        assert!(default.get("reasoning_effort").is_none());
+
+        let low = OpenAIProvider::new("test-key", "glm-flash")
+            .with_reasoning_effort(Some(" LOW ".to_string()))
+            .build(&messages, &tools)
+            .expect("build success");
+        assert_eq!(low["reasoning_effort"], "low");
+
+        let blank = OpenAIProvider::new("test-key", "glm-flash")
+            .with_reasoning_effort(Some("   ".to_string()))
+            .build(&messages, &tools)
+            .expect("build success");
+        assert!(blank.get("reasoning_effort").is_none());
     }
 
     #[test]
