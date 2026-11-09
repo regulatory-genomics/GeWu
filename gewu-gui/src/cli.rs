@@ -33,6 +33,11 @@ pub struct Cli {
     #[arg(long, env = "GEWU_GUI_TOKEN")]
     pub token: Option<String>,
 
+    /// Token for the upstream gewu server, when it runs with --token
+    /// (also GEWU_SERVE_TOKEN)
+    #[arg(long, env = "GEWU_SERVE_TOKEN")]
+    pub server_token: Option<String>,
+
     /// Allow binding a non-loopback host without a token. Dangerous: the
     /// agent can run shell commands on this machine.
     #[arg(long)]
@@ -77,12 +82,18 @@ impl Endpoint {
         Ok(Self::Tcp { host, port })
     }
 
-    /// Connect a client to this endpoint.
-    pub async fn connect(&self) -> gewu_client::Result<Client> {
+    /// Connect a client to this endpoint, authenticating with `token` when
+    /// the upstream server runs with `--token`.
+    pub async fn connect_with_token(&self, token: Option<&str>) -> gewu_client::Result<Client> {
         match self {
-            Self::Websocket(url) => Client::websocket(url).await,
-            Self::Tcp { host, port } => Client::tcp(host, *port).await,
+            Self::Websocket(url) => Client::websocket_with_token(url, token).await,
+            Self::Tcp { host, port } => Client::tcp_with_token(host, *port, token).await,
         }
+    }
+
+    /// Connect a client to this endpoint without a token.
+    pub async fn connect(&self) -> gewu_client::Result<Client> {
+        self.connect_with_token(None).await
     }
 
     /// Human-readable form for logs and the browser configuration endpoint.
@@ -129,6 +140,7 @@ mod tests {
         assert_eq!(cli.port, 8430);
         assert_eq!(cli.server, "ws://127.0.0.1:8420");
         assert_eq!(cli.token, None);
+        assert_eq!(cli.server_token, None);
         assert!(!cli.allow_anonymous);
         assert!(!cli.open);
     }
@@ -145,6 +157,8 @@ mod tests {
             "tcp://example.org:8421",
             "--token",
             "secret",
+            "--server-token",
+            "upstream-secret",
             "--allow-anonymous",
             "--open",
         ])
@@ -153,6 +167,7 @@ mod tests {
         assert_eq!(cli.port, 9000);
         assert_eq!(cli.server, "tcp://example.org:8421");
         assert_eq!(cli.token.as_deref(), Some("secret"));
+        assert_eq!(cli.server_token.as_deref(), Some("upstream-secret"));
         assert!(cli.allow_anonymous);
         assert!(cli.open);
     }
@@ -168,6 +183,7 @@ mod tests {
         };
         assert!(has_env("server"));
         assert!(has_env("token"));
+        assert!(has_env("server_token"));
     }
 
     #[test]
@@ -191,7 +207,7 @@ mod tests {
                 port: 8421
             }
         );
-        // A bare host:port is treated as TCP, matching gewu-tui's default.
+        // A bare host:port is treated as TCP.
         assert_eq!(
             Endpoint::parse("127.0.0.1:8421").unwrap(),
             Endpoint::Tcp {

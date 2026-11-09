@@ -10,6 +10,7 @@ gewu-protocol = { path = "../gewu-protocol" }
 gewu-tools = { path = "../gewu-tools" }
 gewu-storage = { path = "../gewu-storage" }
 anyhow = "1.0"
+base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -25,6 +26,7 @@ dirs = "6.0.0"
 futures = "0.3.32"
 schemars = "0.8"
 atty = "0.2"
+ignore = "0.4"
 tokio-tungstenite = "0.28"
 
 [dev-dependencies]

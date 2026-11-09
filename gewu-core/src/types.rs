@@ -9,6 +9,7 @@
 //! - [`Capabilities`] - Model capabilities for input/output modalities
 //! - [`ToolResult`] - Structured result from tool execution
 //! - [`ToolContext`] - Execution context passed to tools
+//! - [`PathEnforcement`] - File-path confinement level for tools
 //! - [`FileAttachment`] - File attachment in tool results
 //! - [`TruncationResult`] - Result of output truncation
 
@@ -55,6 +56,10 @@ pub struct ToolCall {
 pub enum ContentPart {
     /// Plain text content.
     Text { text: String },
+    /// Model-facing instruction scaffolding (for example, mode reminders)
+    /// appended to user messages. Sent to providers as plain text, but
+    /// hidden from chat UIs, which should not render it as user content.
+    Reminder { text: String },
     /// An image with base64-encoded data and MIME type (e.g., "image/png").
     Image { data: String, mime_type: String },
     /// An audio file with base64-encoded data and MIME type (e.g., "audio/mp3").
@@ -72,7 +77,7 @@ impl ContentPart {
     /// specific MIME type of that media.
     pub fn mime_type(&self) -> String {
         match self {
-            ContentPart::Text { .. } => "text/plain".to_string(),
+            ContentPart::Text { .. } | ContentPart::Reminder { .. } => "text/plain".to_string(),
             ContentPart::Image { mime_type, .. } => mime_type.clone(),
             ContentPart::Audio { mime_type, .. } => mime_type.clone(),
             ContentPart::Video { mime_type, .. } => mime_type.clone(),
@@ -124,6 +129,54 @@ pub struct OutputCapabilities {
     pub pdf: bool,
 }
 
+/// Provider-reported token accounting for one LLM request.
+///
+/// Every field is provider-reported (`0` when the provider does not report
+/// that figure); hit rate is computed against the totals, not per turn.
+/// Input token fields follow the Anthropic breakdown; OpenAI's
+/// `prompt_tokens_details.cached_tokens` maps to `cached_tokens`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    /// Uncached prompt tokens processed at full price.
+    pub input_tokens: u64,
+    /// Prompt tokens served from the provider cache (cache hits).
+    pub cached_tokens: u64,
+    /// Prompt tokens written to the provider cache this request.
+    pub cache_write_tokens: u64,
+    /// Output (completion) tokens.
+    pub output_tokens: u64,
+    /// Output tokens the model spent thinking (`reasoning_tokens` in
+    /// OpenAI-style breakdowns). Subtracted from nothing: it is reported
+    /// for latency diagnostics, not billing. `0` when the provider does
+    /// not report it.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Adds the other tally into this one (session accumulation).
+    pub fn add(&mut self, other: &TokenUsage) {
+        self.input_tokens += other.input_tokens;
+        self.cached_tokens += other.cached_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+    }
+
+    /// Total prompt tokens this request (or session) processed:
+    /// uncached + cached + newly-written.
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input_tokens + self.cached_tokens + self.cache_write_tokens
+    }
+
+    /// Fraction of prompt tokens served from cache, as a percentage.
+    /// `None` when no prompt tokens were processed at all.
+    pub fn cache_hit_rate_percent(&self) -> Option<u64> {
+        let total = self.prompt_tokens();
+        (total > 0).then(|| self.cached_tokens * 100 / total)
+    }
+}
+
 /// Events emitted by the LLM provider during streaming responses.
 ///
 /// ProviderEvent represents the raw events that come from the LLM provider
@@ -132,6 +185,8 @@ pub struct OutputCapabilities {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderEvent {
+    /// Native reasoning state required to replay this assistant response.
+    ReasoningReplay { replay: ReasoningReplay },
     /// A delta of reasoning content (e.g., chain-of-thought) from the model.
     ReasoningDelta { delta: String },
     /// A delta of content (text response) from the model.
@@ -143,6 +198,9 @@ pub enum ProviderEvent {
     ToolCallDelta { id: String, delta: String },
     /// The provider has finished generating the response.
     Finish { reason: Option<String> },
+    /// Provider-reported token usage for the completed request. Emitted
+    /// once per LLM request (after the last usage figure is known).
+    Usage { usage: TokenUsage },
     /// An error occurred during streaming.
     Error { error: String },
 }
@@ -187,6 +245,30 @@ pub enum AgentEvent {
     ///
     /// Effects already applied stay applied; nothing further is dispatched.
     Cancelled { reason: String },
+    /// A context-usage snapshot, emitted at each turn boundary so frontends
+    /// can update the usage gauge mid-ask.
+    Usage {
+        /// Estimated tokens in the conversation history (the same estimate
+        /// compaction acts on).
+        used_tokens: u64,
+        /// The agent's context window in tokens.
+        context_limit: u64,
+        /// Provider-reported token accounting accumulated across the whole
+        /// session (every LLM request, including compaction requests).
+        /// `None` when the provider reported no usage yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<TokenUsage>,
+    },
+    /// A transient status message for frontends (e.g. LLM retry backoff).
+    ///
+    /// Not part of the transcript: frontends render it in their busy
+    /// indicator and replace or clear it with the next event.
+    Status { message: String },
+    /// A compaction checkpoint was durably stored; recent context stays internal.
+    Compacted {
+        #[serde(default)]
+        summary: String,
+    },
     /// An error occurred during agent execution.
     Error { error: String },
 }
@@ -204,6 +286,9 @@ pub enum AgentEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
+    /// Durable context boundary. Earlier messages remain in the transcript,
+    /// but only this checkpoint and subsequent messages reach the model.
+    Compaction { summary: String, recent: String },
     /// A system message, typically used to set agent behavior/instructions.
     System {
         /// The content of the system message.
@@ -218,6 +303,10 @@ pub enum Message {
     Assistant {
         /// The text content of the assistant's response, if any.
         content: Option<String>,
+        /// Reasoning (chain-of-thought) text streamed before the answer, if any.
+        reasoning: Option<String>,
+        /// Provider-native replay state; opaque values are never displayed.
+        replay: Option<ReasoningReplay>,
         /// Tool calls requested by the assistant, if any.
         tool_calls: Option<Vec<ToolCall>>,
     },
@@ -234,6 +323,17 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         media: Vec<ContentPart>,
     },
+}
+
+/// Replay state belongs to exactly one endpoint and model. Anthropic stores
+/// its ordered native assistant blocks, including thinking signatures. OpenAI
+/// Responses stores output items, including encrypted reasoning and call IDs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningReplay {
+    pub origin: String,
+    pub model: String,
+    pub field: Option<String>,
+    pub blocks: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -269,6 +369,26 @@ impl ToolResult {
     }
 }
 
+/// How strictly file-touching tools confine paths to the working directory.
+///
+/// The level is server configuration (config key `sandbox`), travels to tools
+/// on [`ToolContext`], and defaults to [`PathEnforcement::None`] — paths are
+/// used as provided with no containment checks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PathEnforcement {
+    /// No checks: relative paths are joined to the working directory and
+    /// absolute paths are used as-is.
+    #[default]
+    None,
+    /// Lexical containment: `.`/`..` are normalized and paths that resolve
+    /// outside the working directory are rejected. Symlinks are followed.
+    Contain,
+    /// Containment plus canonicalization and symlink-component rejection;
+    /// resolved paths must land inside the real (canonicalized) root.
+    Strict,
+}
+
 #[derive(Clone, Debug)]
 pub struct ToolContext {
     pub session_id: String,
@@ -281,6 +401,8 @@ pub struct ToolContext {
     /// that polls it stops work instead of finishing into a dead run.
     pub abort: Arc<std::sync::atomic::AtomicBool>,
     pub metadata: std::collections::HashMap<String, serde_json::Value>,
+    /// File-path confinement level for this execution.
+    pub enforcement: PathEnforcement,
 }
 
 impl ToolContext {
@@ -294,6 +416,7 @@ impl ToolContext {
             call_id: String::new(),
             abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metadata: Default::default(),
+            enforcement: PathEnforcement::default(),
         }
     }
 
@@ -312,7 +435,14 @@ impl ToolContext {
             call_id: call_id.into(),
             abort,
             metadata: Default::default(),
+            enforcement: PathEnforcement::default(),
         }
+    }
+
+    /// Returns the context with a different path-enforcement level.
+    pub fn with_enforcement(mut self, enforcement: PathEnforcement) -> Self {
+        self.enforcement = enforcement;
+        self
     }
 
     pub fn is_aborted(&self) -> bool {
@@ -359,4 +489,23 @@ pub struct ExperienceQuery {
 pub struct RecalledExperience {
     pub experience: Experience,
     pub similarity_score: f32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reminder parts persist in stored history, so they must round-trip
+    /// through the internally-tagged JSON representation with their own
+    /// type tag (distinct from plain text).
+    #[test]
+    fn reminder_part_round_trips_with_distinct_type_tag() {
+        let part = ContentPart::Reminder {
+            text: "<system-reminder>Plan mode is active.</system-reminder>".to_string(),
+        };
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(json["type"], "reminder");
+        let back: ContentPart = serde_json::from_value(json).unwrap();
+        assert_eq!(back, part);
+    }
 }

@@ -3,6 +3,26 @@ use serde_json::Value;
 
 // JSON-RPC 2.0 Base Types
 
+/// Deserializes a JSON-RPC id that may be a number, a numeric string (some
+/// servers emit string ids), or null — so string-id responses are correlated
+/// instead of silently dropped.
+fn flexible_id<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value: Option<Value> = Option::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => Ok(n.as_u64()),
+        Some(Value::String(s)) => s
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| D::Error::custom(format!("non-numeric id string: {s}"))),
+        Some(other) => Err(D::Error::custom(format!("unsupported id value: {other}"))),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
@@ -19,6 +39,7 @@ pub struct JsonRpcResponse {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
+    #[serde(default, deserialize_with = "flexible_id")]
     pub id: Option<u64>,
 }
 

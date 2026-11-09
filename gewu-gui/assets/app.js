@@ -8,7 +8,8 @@
   "use strict";
 
   const TOKEN_KEY = "gewu-gui-token";
-  const MAX_RECONNECT_MS = 8000;
+  const SIDEBAR_KEY = "gewu-gui-sidebar";
+  const MAX_RECONNECT_MS = 60000;
 
   const el = {
     app: document.getElementById("app"),
@@ -28,7 +29,9 @@
     loginForm: document.getElementById("login-form"),
     loginError: document.getElementById("login-error"),
     token: document.getElementById("token"),
-    upstream: document.getElementById("upstream"),
+    sidebar: document.getElementById("sidebar"),
+    sidebarToggle: document.getElementById("sidebar-toggle"),
+    filePreview: document.getElementById("file-preview"),
   };
 
   const state = {
@@ -42,6 +45,8 @@
     busy: false,
     attempt: 0,
     reconnectTimer: null,
+    countdownTimer: null,
+    reconnectAt: 0,
     refreshTimer: null,
     lastToast: { text: "", at: 0 },
   };
@@ -71,6 +76,35 @@
     }
   }
 
+  // -- sidebar ------------------------------------------------------------
+
+  // Open by default, except on narrow screens where it covers the transcript.
+  function loadSidebarOpen() {
+    try {
+      const saved = localStorage.getItem(SIDEBAR_KEY);
+      if (saved === "open") return true;
+      if (saved === "closed") return false;
+    } catch {
+      // Fall through to the default.
+    }
+    return !window.matchMedia("(max-width: 800px)").matches;
+  }
+
+  function setSidebarOpen(open, remember) {
+    el.app.classList.toggle("sidebar-collapsed", !open);
+    el.sidebarToggle.setAttribute("aria-expanded", String(open));
+    if (!remember) return;
+    try {
+      localStorage.setItem(SIDEBAR_KEY, open ? "open" : "closed");
+    } catch {
+      // The state still applies to this page.
+    }
+  }
+
+  function toggleSidebar() {
+    setSidebarOpen(el.app.classList.contains("sidebar-collapsed"), true);
+  }
+
   // -- connection ---------------------------------------------------------
 
   async function boot() {
@@ -78,8 +112,6 @@
       const response = await fetch("/api/config", { cache: "no-store" });
       const config = await response.json();
       state.authRequired = Boolean(config.auth_required);
-      el.upstream.textContent = config.server || "";
-      el.upstream.title = config.server ? `Upstream ${config.server}` : "";
     } catch (error) {
       toast(`Could not reach gewu-gui: ${error.message}`);
     }
@@ -99,8 +131,7 @@
     ) {
       return;
     }
-    clearTimeout(state.reconnectTimer);
-    state.reconnectTimer = null;
+    clearReconnect();
 
     const scheme = location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${scheme}//${location.host}/ws`;
@@ -150,13 +181,31 @@
     });
   }
 
+  // Cancel a pending reconnect and stop the countdown.
+  function clearReconnect() {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+    clearInterval(state.countdownTimer);
+    state.countdownTimer = null;
+  }
+
+  // Render the remaining whole seconds from the fixed deadline, so the label
+  // stays correct even when background tabs throttle timers.
+  function renderCountdown() {
+    const seconds = Math.max(0, Math.ceil((state.reconnectAt - Date.now()) / 1000));
+    el.offlineText.textContent = `Disconnected — reconnecting in ${seconds}s…`;
+  }
+
   function scheduleReconnect() {
     if (state.reconnectTimer) return;
     const delay = Math.min(MAX_RECONNECT_MS, 500 * 2 ** state.attempt);
     state.attempt += 1;
-    el.offlineText.textContent = `Disconnected — reconnecting in ${Math.ceil(delay / 1000)}s…`;
+    state.reconnectAt = Date.now() + delay;
+    renderCountdown();
+    // Tick faster than once a second so whole-second values never skip.
+    state.countdownTimer = setInterval(renderCountdown, 250);
     state.reconnectTimer = setTimeout(() => {
-      state.reconnectTimer = null;
+      clearReconnect();
       connect();
     }, delay);
   }
@@ -164,6 +213,7 @@
   function setOffline(offline) {
     el.offline.classList.toggle("hidden", !offline);
     if (!offline) {
+      clearReconnect();
       el.offlineText.textContent = "Disconnected";
     }
   }
@@ -188,6 +238,7 @@
         renderTabs(message.tabs, message.active);
         setTranscript(message.transcript, true);
         setStatus(message.status);
+        el.sidebar.innerHTML = message.sidebar || "";
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
         break;
       case "tabs":
@@ -198,8 +249,17 @@
       case "transcript":
         setTranscript(message.html, false);
         break;
-      case "text_delta":
-        appendDelta(message.block, message.delta);
+      case "tool_card":
+        replaceToolCard(message.first, message.html);
+        break;
+      case "tool_card_start":
+        startToolCard(message.first, message.html, message.assistant);
+        break;
+      case "block_append":
+        appendBlock(message.index, message.html);
+        break;
+      case "streaming_body":
+        updateStreamingBody(message.index, message.html);
         break;
       case "status":
         setStatus(message.html);
@@ -210,6 +270,26 @@
         } else {
           toast(message.message);
         }
+        break;
+      case "notice":
+        toast(message.message);
+        break;
+      case "file_tree":
+        const tree = document.getElementById("file-tree");
+        if (tree) tree.outerHTML = message.html;
+        break;
+      case "tools": {
+        const panel = document.getElementById("sidebar-tools");
+        if (panel) panel.innerHTML = message.html;
+        break;
+      }
+      case "file_preview":
+        el.filePreview.innerHTML = message.html;
+        el.filePreview.classList.remove("hidden");
+        break;
+      case "close_preview":
+        el.filePreview.classList.add("hidden");
+        el.filePreview.textContent = "";
         break;
       default:
         break;
@@ -293,21 +373,103 @@
     if (shouldScroll) scrollToBottom();
   }
 
-  function appendDelta(block, delta) {
-    const node = el.transcript.querySelector(
-      `.streaming-text[data-block="${block}"]`,
+  // Replace one streaming block's rendered Markdown body in place: keeping
+  // the `.block` node avoids re-triggering its entry animation or moving the
+  // scroll position.
+  function updateStreamingBody(index, html) {
+    const block = el.transcript.querySelector(
+      `.block[data-block="${Number(index)}"]`,
     );
-    if (!node) {
+    if (!block) {
+      requestRefresh();
+      return;
+    }
+    const body = fromHtml(html);
+    if (!body) {
       requestRefresh();
       return;
     }
     const shouldScroll = nearBottom();
-    node.textContent += delta;
+    block.replaceChildren(body);
     if (shouldScroll) scrollToBottom();
   }
 
   function setStatus(html) {
     el.status.innerHTML = html;
+  }
+
+  // Swap one card's contents in place: keeping the `.tool-card` node avoids
+  // re-triggering its entry animation or moving the scroll position.
+  function replaceToolCard(first, html) {
+    const card = el.transcript.querySelector(
+      `.tool-card[data-card="${Number(first)}"]`,
+    );
+    if (!card) {
+      requestRefresh();
+      return;
+    }
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    const fresh = template.content.firstElementChild;
+    if (!fresh) {
+      requestRefresh();
+      return;
+    }
+    card.replaceChildren(...fresh.childNodes);
+  }
+
+  // Append one rendered block (user message, streaming assistant block,
+  // error note) at the end of the transcript.
+  function appendBlock(index, html) {
+    // A block that is already there means the DOM has drifted.
+    if (el.transcript.querySelector(`.block[data-block="${Number(index)}"]`)) {
+      requestRefresh();
+      return;
+    }
+    const node = fromHtml(html);
+    if (!node) {
+      requestRefresh();
+      return;
+    }
+    const shouldScroll = nearBottom();
+    el.transcript.querySelector(".empty")?.remove();
+    el.transcript.appendChild(node);
+    if (shouldScroll) scrollToBottom();
+  }
+
+  // Start of a new tool run: convert the preceding assistant block out of
+  // its streaming form, then append the card at the end of the transcript.
+  function startToolCard(first, html, assistant) {
+    if (assistant) {
+      const [index, bodyHtml] = assistant;
+      const block = el.transcript.querySelector(
+        `.block[data-block="${Number(index)}"]`,
+      );
+      const body = fromHtml(bodyHtml);
+      if (!block || !body) {
+        requestRefresh();
+        return;
+      }
+      // Swap only the body: keeping the `.block` node avoids re-triggering
+      // its entry animation.
+      block.replaceChildren(body);
+    }
+    const card = fromHtml(html);
+    if (!card) {
+      requestRefresh();
+      return;
+    }
+    const shouldScroll = nearBottom();
+    el.transcript.querySelector(".empty")?.remove();
+    el.transcript.appendChild(card);
+    if (shouldScroll) scrollToBottom();
+  }
+
+  // Parse trusted server-rendered HTML into the first element.
+  function fromHtml(html) {
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    return template.content.firstElementChild;
   }
 
   // The streaming block can be missing if a delta raced a tab switch.
@@ -370,9 +532,34 @@
   });
 
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && state.busy && el.login.classList.contains("hidden")) {
+    if (event.key === "Escape" && !el.filePreview.classList.contains("hidden")) {
+      send({ op: "close_preview" });
+    } else if (event.key === "Escape" && state.busy && el.login.classList.contains("hidden")) {
       send({ op: "interrupt", tab: state.active });
+    } else if (
+      (event.ctrlKey || event.metaKey) &&
+      !event.altKey &&
+      !event.shiftKey &&
+      event.key.toLowerCase() === "b" &&
+      el.login.classList.contains("hidden")
+    ) {
+      event.preventDefault();
+      toggleSidebar();
     }
+  });
+
+  el.sidebarToggle.addEventListener("click", toggleSidebar);
+  el.status.addEventListener("mousedown", (event) => {
+    if (event.target.closest("[data-mode]")) event.preventDefault();
+  });
+  el.status.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-mode]");
+    if (button && !state.busy) send({ op: "switch_agent", tab: state.active, agent: button.dataset.mode });
+    if (!event.target.closest("[data-model-picker]")) el.prompt.focus();
+  });
+  el.status.addEventListener("change", (event) => {
+    const picker = event.target.closest("[data-model-picker]");
+    if (picker && !state.busy) send({ op: "switch_model", tab: Number(picker.dataset.tab), model: picker.value });
   });
 
   el.newTab.addEventListener("click", () => send({ op: "open_tab" }));
@@ -382,8 +569,7 @@
   });
 
   el.retry.addEventListener("click", () => {
-    clearTimeout(state.reconnectTimer);
-    state.reconnectTimer = null;
+    clearReconnect();
     connect();
   });
 
@@ -402,6 +588,31 @@
   });
 
   el.transcript.addEventListener("click", (event) => {
+    const revert = event.target.closest("[data-revert-block]");
+    if (revert) {
+      closeMessageMenus();
+      if (!state.busy && window.confirm("Revert chat from this message? File changes will NOT be undone.")) {
+        send({ op: "revert_chat", tab: state.active, block: Number(revert.dataset.revertBlock), undo: false });
+      }
+      return;
+    }
+    const message = event.target.closest(".block.user");
+    if (message && !event.target.closest("a, input, textarea, .message-menu") && !window.getSelection()?.toString()) {
+      const trigger = message.querySelector(".message-menu-trigger");
+      if (trigger && (!event.target.closest("button") || event.target === trigger)) {
+        const open = trigger.getAttribute("aria-expanded") !== "true";
+        closeMessageMenus();
+        if (open) {
+          trigger.setAttribute("aria-expanded", "true");
+          const menu = message.querySelector(".message-menu");
+          menu.hidden = false;
+          const item = menu.querySelector("button");
+          item.disabled = state.busy;
+          item.focus();
+        }
+        return;
+      }
+    }
     const button = event.target.closest("[data-action]");
     if (!button) return;
     const tab = Number(button.dataset.tab);
@@ -411,7 +622,123 @@
       send({ op: "toggle_tool", tab, block });
     } else if (button.dataset.action === "toggle_group") {
       send({ op: "toggle_group", tab, block });
+    } else if (button.dataset.action === "toggle_thought") {
+      send({ op: "toggle_thought", tab, block });
     }
+  });
+
+  function closeMessageMenus(restoreFocus = false) {
+    for (const trigger of el.transcript.querySelectorAll('.message-menu-trigger[aria-expanded="true"]')) {
+      trigger.setAttribute("aria-expanded", "false");
+      const menu = document.getElementById(trigger.getAttribute("aria-controls"));
+      if (menu) menu.hidden = true;
+      if (restoreFocus) trigger.focus();
+    }
+  }
+
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest(".block.user")) closeMessageMenus();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && el.transcript.querySelector('.message-menu-trigger[aria-expanded="true"]')) {
+      closeMessageMenus(true);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+  }, true);
+
+  el.sidebar.addEventListener("click", (event) => {
+    const sidebarTab = event.target.closest("[data-sidebar-tab]");
+    if (sidebarTab) {
+      setSidebarTab(sidebarTab.dataset.sidebarTab);
+      return;
+    }
+    const dir = event.target.closest("[data-path].tree-dir");
+    if (dir) { send({ op: "toggle_dir", path: dir.dataset.path }); return; }
+    const file = event.target.closest("[data-path].tree-file");
+    if (file) { send({ op: "read_file", path: file.dataset.path }); return; }
+    if (event.target.closest("[data-tree-upload]")) {
+      el.fileUpload.click();
+      return;
+    }
+    if (event.target.closest("[data-tree-refresh]")) { send({ op: "refresh_tree" }); }
+  });
+
+  // -- file upload ---------------------------------------------------------
+
+  // Uploads always land in the working-directory root; the server sanitizes
+  // names and enforces the size cap.
+  const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+
+  function bytesToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    const chunk = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunk) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + chunk));
+    }
+    return btoa(binary);
+  }
+
+  async function uploadFiles(fileList) {
+    const files = [...fileList].filter((file) => file.size <= MAX_UPLOAD_BYTES);
+    const skipped = fileList.length - files.length;
+    if (skipped > 0) {
+      toast(`Skipped ${skipped} file(s) over the 50 MB upload limit`);
+    }
+    if (!files.length) return;
+    const payloads = await Promise.all(
+      files.map(async (file) => ({
+        name: file.name,
+        content_base64: bytesToBase64(await file.arrayBuffer()),
+      })),
+    );
+    send({ op: "upload_files", files: payloads });
+  }
+
+  el.fileUpload = document.getElementById("file-upload");
+  el.fileUpload.addEventListener("change", () => {
+    if (el.fileUpload.files.length) uploadFiles(el.fileUpload.files);
+    el.fileUpload.value = "";
+  });
+
+  const fileTreeHost = document.getElementById("app");
+  fileTreeHost.addEventListener("dragover", (event) => {
+    if (!event.dataTransfer?.types?.includes("Files")) return;
+    event.preventDefault();
+    fileTreeHost.classList.add("drag-over");
+  });
+  fileTreeHost.addEventListener("dragleave", (event) => {
+    if (event.target === fileTreeHost) fileTreeHost.classList.remove("drag-over");
+  });
+  fileTreeHost.addEventListener("drop", (event) => {
+    fileTreeHost.classList.remove("drag-over");
+    if (!event.dataTransfer?.files?.length) return;
+    event.preventDefault();
+    if (!state.ready) {
+      toast("Still loading the session; try again in a moment");
+      return;
+    }
+    uploadFiles(event.dataTransfer.files);
+  });
+
+  function setSidebarTab(name) {
+    const tabs = el.sidebar.querySelectorAll("[data-sidebar-tab]");
+    const panels = el.sidebar.querySelectorAll(".sidebar-panel");
+    for (const tab of tabs) {
+      const active = tab.dataset.sidebarTab === name;
+      tab.classList.toggle("active", active);
+      tab.setAttribute("aria-selected", String(active));
+    }
+    for (const panel of panels) {
+      const active = panel.id === `sidebar-${name}`;
+      panel.classList.toggle("active", active);
+      panel.hidden = !active;
+    }
+  }
+
+  el.filePreview.addEventListener("click", (event) => {
+    if (event.target.closest("[data-preview-close]")) send({ op: "close_preview" });
   });
 
   // -- login --------------------------------------------------------------
@@ -456,5 +783,6 @@
     }, 5000);
   }
 
+  setSidebarOpen(loadSidebarOpen(), false);
   boot();
 })();

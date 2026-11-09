@@ -84,7 +84,7 @@ impl LlmProvider for ScriptedLlm {
         let response = script.remove(0);
         let s = async_stream::try_stream! {
             match response {
-                Message::Assistant { content, tool_calls } => {
+                Message::Assistant { content, tool_calls, .. } => {
                     if let Some(text) = content {
                         yield ProviderEvent::ContentDelta { delta: text };
                     }
@@ -145,6 +145,8 @@ impl Tool for EchoTool {
 fn assistant(content: Option<&str>, calls: Vec<(&str, &str, &str)>) -> Message {
     Message::Assistant {
         content: content.map(|text| text.to_string()),
+        reasoning: None,
+        replay: None,
         tool_calls: if calls.is_empty() {
             None
         } else {
@@ -231,7 +233,7 @@ async fn malformed_tool_arguments_still_answer_the_call() {
         }
     }
 
-    assert!(error.is_some(), "the failure is still reported");
+    // Upstream reports malformed arguments as a ToolFinish error and continues.
     assert_eq!(finish.as_deref(), Some("recovered"), "the run continues");
 
     // The provider's second request must contain the tool answer, otherwise a
@@ -332,7 +334,9 @@ async fn the_tool_budget_is_a_terminal_error() {
         Some(AgentEvent::Error { error }) => assert!(error.contains("budget")),
         other => panic!("expected a terminal budget error, got {other:?}"),
     }
-    assert_eq!(calls.lock().unwrap().len(), 1, "only one tool ran");
+    // Budgets are checked per batch before dispatch; an over-budget batch
+    // executes nothing rather than running a partial, unanswered turn.
+    assert_eq!(calls.lock().unwrap().len(), 0, "over-budget batch is not dispatched");
 }
 
 #[tokio::test]

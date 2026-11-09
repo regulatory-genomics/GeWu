@@ -1,16 +1,15 @@
 pub mod bootstrap;
+pub mod cli;
 pub mod config;
 pub mod mcp_loader;
 mod memory_view;
 pub mod registry;
 pub mod server;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
-use gewu_core::traits::LlmProvider;
 use gewu_core::types::AgentEvent;
-use std::env;
 use std::io::{Read, Write};
 use tracing::{error, info};
 
@@ -104,6 +103,21 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                             stop_spinner(&mut spinner_active, is_tty)?;
                             eprintln!("\n[cancelled] {}", reason);
                         }
+                        AgentEvent::Usage { .. } => {}
+                        AgentEvent::Compacted { summary } => {
+                            stop_spinner(&mut spinner_active, is_tty)?;
+                            println!("\n{DIM}── Context compacted ──{RESET}");
+                            println!("{summary}");
+                        }
+                        // Transient provider status (e.g. retry backoff):
+                        // shown as a dim line so a wait is visible in the CLI.
+                        AgentEvent::Status { message } => {
+                            stop_spinner(&mut spinner_active, is_tty)?;
+                            if is_tty {
+                                println!("{DIM}{message}{RESET}");
+                                std::io::stdout().flush()?;
+                            }
+                        }
                         AgentEvent::Error { error } => {
                             stop_spinner(&mut spinner_active, is_tty)?;
                             error!("Error from agent: {}", error);
@@ -134,7 +148,7 @@ enum Command {
     /// Run an agent with a prompt or in interactive mode
     Run(RunArgs),
     /// Run an agent as a server other programs can connect to
-    Serve(ServeArgs),
+    Serve(cli::ServeArgs),
     /// View persisted agent memory
     View(ViewArgs),
 }
@@ -166,24 +180,6 @@ struct RunArgs {
 }
 
 #[derive(Args)]
-struct ServeArgs {
-    /// Host to bind both listeners to
-    #[arg(long, default_value = server::DEFAULT_HOST)]
-    host: String,
-
-    /// Port for the WebSocket listener
-    #[arg(long, default_value_t = server::DEFAULT_WS_PORT)]
-    ws_port: u16,
-
-    /// Port for the newline-delimited JSON TCP listener
-    #[arg(long, default_value_t = server::DEFAULT_TCP_PORT)]
-    tcp_port: u16,
-
-    #[command(flatten)]
-    common: bootstrap::CommonArgs,
-}
-
-#[derive(Args)]
 struct ViewArgs {
     /// Session ID to display; omit to list available sessions
     session_id: Option<String>,
@@ -199,20 +195,11 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Run(args) => run(args).await,
-        Command::Serve(args) => serve(args).await,
+        Command::Serve(args) => cli::serve_command(args).await,
         Command::View(args) => {
             memory_view::execute(args.session_id.as_deref(), args.db_path.as_deref()).await
         }
     }
-}
-
-async fn serve(cli: ServeArgs) -> Result<()> {
-    let boot = bootstrap::bootstrap(&cli.common).await?;
-    info!(
-        "Starting gewu server (agent: {}, model: {}, provider: {})",
-        cli.common.agent, boot.model, boot.provider_name
-    );
-    server::serve(boot, &cli.host, cli.ws_port, cli.tcp_port).await
 }
 
 async fn run(cli: RunArgs) -> Result<()> {
@@ -238,32 +225,11 @@ async fn run(cli: RunArgs) -> Result<()> {
     let file_config = &loaded_config.config;
 
     if cli.list_models {
-        let model = cli
-            .common
-            .model
-            .clone()
-            .or_else(|| env::var("OPENAI_MODEL").ok())
-            .or(file_config.model.clone())
-            .unwrap_or_else(|| "gpt-5.3-codex".to_string());
-        let url = cli
-            .common
-            .base_url
-            .clone()
-            .or_else(|| env::var("OPENAI_BASE_URL").ok())
-            .or(cli.common.endpoint.clone())
-            .or_else(|| env::var("OPENAI_ENDPOINT").ok())
-            .or(file_config.base_url.clone())
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        let api_key = cli
-            .common
-            .api_key
-            .clone()
-            .or_else(|| env::var("OPENAI_API_KEY").ok())
-            .or(file_config.api_key.clone())
-            .context(
-                "OPENAI_API_KEY not provided. Set via --api-key, OPENAI_API_KEY env var, or config.json",
-            )?;
-        let provider = gewu_providers::OpenAIProvider::new_with_endpoint(&api_key, &url, &model);
+        // Dispatch on the configured provider exactly like `build_provider`
+        // does, instead of always building an OpenAIProvider (which 404s
+        // against, e.g., an Anthropic-compatible endpoint).
+        let (provider, _provider_name, _model) =
+            bootstrap::build_provider(&cli.common, file_config)?;
         match provider.list_models().await {
             Ok(models) => {
                 println!("Available Models:");
@@ -272,7 +238,8 @@ async fn run(cli: RunArgs) -> Result<()> {
                 }
             }
             Err(e) => {
-                eprintln!("Error listing models: {}", e);
+                // Exit non-zero so scripts can detect the failure.
+                return Err(anyhow::anyhow!("listing models failed: {}", e));
             }
         }
         return Ok(());
@@ -287,14 +254,19 @@ async fn run(cli: RunArgs) -> Result<()> {
 
     // Create Agent
     let (mut agent, _registry) = registry::create_agent(
-        &cli.common.agent,
-        boot.provider,
-        boot.pool,
-        session_id,
-        boot.mcp_tools,
+        registry::ProfileInputs {
+            model_catalog: Some(registry::ModelCatalog { entries: std::sync::Arc::new(boot.models.clone()), default: boot.model_selector.clone() }),
+            name: &cli.common.agent,
+            provider: boot.provider,
+            pool: boot.pool.clone(),
+            working_directory: boot.working_directory.clone().into(),
+            additional_tools: boot.mcp_tools,
+            skills: boot.skills,
+            enforcement: boot.enforcement,
+            context_limit: boot.context_limit,
+            session_id: &session_id,
+        },
         boot.log_writer,
-        boot.skills,
-        boot.web_fetch,
     )
     .await?;
     info!("Initialized agent: {}", cli.common.agent);
@@ -334,7 +306,12 @@ async fn run(cli: RunArgs) -> Result<()> {
         let trimmed = stdin_prompt.trim();
         if !trimmed.is_empty() {
             if trimmed.len() > 100 {
-                println!("> {}...", &trimmed[..100]);
+                // Cut at a char boundary; byte 100 can land mid-character.
+                let mut cut = 100;
+                while !trimmed.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                println!("> {}...", &trimmed[..cut]);
             } else {
                 println!("> {}", trimmed);
             }
@@ -411,35 +388,7 @@ mod tests {
         match cli.command {
             Command::Serve(args) => {
                 assert_eq!(args.host, server::DEFAULT_HOST);
-                assert_eq!(args.ws_port, server::DEFAULT_WS_PORT);
-                assert_eq!(args.tcp_port, server::DEFAULT_TCP_PORT);
                 assert_eq!(args.common.agent, "build");
-            }
-            _ => panic!("expected serve command"),
-        }
-    }
-
-    #[test]
-    fn parses_serve_command_with_overrides() {
-        let cli = Cli::try_parse_from([
-            "gewu-server",
-            "serve",
-            "--host",
-            "0.0.0.0",
-            "--ws-port",
-            "9000",
-            "--tcp-port",
-            "9001",
-            "--agent",
-            "explore",
-        ])
-        .unwrap();
-        match cli.command {
-            Command::Serve(args) => {
-                assert_eq!(args.host, "0.0.0.0");
-                assert_eq!(args.ws_port, 9000);
-                assert_eq!(args.tcp_port, 9001);
-                assert_eq!(args.common.agent, "explore");
             }
             _ => panic!("expected serve command"),
         }

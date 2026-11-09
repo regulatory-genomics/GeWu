@@ -1,7 +1,8 @@
 [workspace]
-members = ["gewu-server",
+members = ["gewu",
+    "gewu-server",
     "gewu-core",
-    "gewu-client", "gewu-tui", "gewu-protocol", "gewu-providers", "gewu-storage",
+    "gewu-client", "gewu-gui", "gewu-protocol", "gewu-providers", "gewu-storage",
     "gewu-tools",
     "gewu-graph",
     "gewu-runtime",

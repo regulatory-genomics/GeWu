@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 #![allow(clippy::collapsible_if)]
 use anyhow::{Context, Result};
+use gewu_core::types::PathEnforcement;
 use mime_guess;
 use serde::{Serialize, de::DeserializeOwned};
 use std::io::ErrorKind;
@@ -14,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use tokio::fs;
 
 pub fn into_tool_error(e: impl Into<anyhow::Error>) -> Box<dyn std::error::Error + Send + Sync> {
-    Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.into()))
+    Box::new(std::io::Error::other(e.into()))
 }
 
 pub fn parse_empty_args(tool_name: &str, required_params: &[(&str, &str)]) -> String {
@@ -187,6 +188,41 @@ pub async fn resolve_safe_write_path(
     anyhow::bail!("Unable to resolve a safe parent for {:?}", path)
 }
 
+/// Joins a user path to the root with no containment checks. Relative paths
+/// are joined; absolute paths replace the root entirely. The result is
+/// normalized lexically (`.`/`..` resolved).
+pub fn resolve_unchecked(root: impl AsRef<Path>, user_path: impl AsRef<Path>) -> PathBuf {
+    normalize_path(&root.as_ref().join(user_path))
+}
+
+/// Resolves a path that is read or must already exist, honoring the
+/// configured [`PathEnforcement`] level.
+pub async fn resolve_read_path(
+    root: impl AsRef<Path>,
+    user_path: impl AsRef<Path>,
+    enforcement: PathEnforcement,
+) -> Result<PathBuf> {
+    match enforcement {
+        PathEnforcement::None => Ok(resolve_unchecked(root, user_path)),
+        PathEnforcement::Contain => resolve_safe_path(root, user_path),
+        PathEnforcement::Strict => resolve_safe_existing_path(root, user_path).await,
+    }
+}
+
+/// Resolves a path that may be created or overwritten, honoring the
+/// configured [`PathEnforcement`] level.
+pub async fn resolve_write_path(
+    root: impl AsRef<Path>,
+    user_path: impl AsRef<Path>,
+    enforcement: PathEnforcement,
+) -> Result<PathBuf> {
+    match enforcement {
+        PathEnforcement::None => Ok(resolve_unchecked(root, user_path)),
+        PathEnforcement::Contain => resolve_safe_path(root, user_path),
+        PathEnforcement::Strict => resolve_safe_write_path(root, user_path).await,
+    }
+}
+
 /// Checks if a path exists.
 pub async fn exists(path: impl AsRef<Path>) -> bool {
     fs::metadata(path).await.is_ok()
@@ -261,15 +297,13 @@ pub async fn is_binary_file(path: impl AsRef<Path>, file_size: u64) -> Result<bo
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase());
 
-    // Binary extensions list (same as legacy)
-    match ext.as_deref() {
-        Some(
-            ".zip" | ".tar" | ".gz" | ".exe" | ".dll" | ".so" | ".class" | ".jar" | ".war" | ".7z"
-            | ".doc" | ".docx" | ".xls" | ".xlsx" | ".ppt" | ".pptx" | ".odt" | ".ods" | ".odp"
-            | ".bin" | ".dat" | ".obj" | ".o" | ".a" | ".lib" | ".wasm" | ".pyc" | ".pyo",
-        ) => return Ok(true),
-        _ => {}
-    }
+    // Binary extensions list (same as legacy). `Path::extension()` yields the
+    // name WITHOUT the leading dot, so the patterns must not include one.
+    if let Some(
+            "zip" | "tar" | "gz" | "exe" | "dll" | "so" | "class" | "jar" | "war" | "7z"
+            | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp"
+            | "bin" | "dat" | "obj" | "o" | "a" | "lib" | "wasm" | "pyc" | "pyo",
+        ) = ext.as_deref() { return Ok(true) }
 
     if file_size == 0 {
         return Ok(false);
@@ -285,11 +319,11 @@ pub async fn is_binary_file(path: impl AsRef<Path>, file_size: u64) -> Result<bo
     }
 
     let mut non_printable_count = 0;
-    for i in 0..result {
-        if bytes[i] == 0 {
+    for &byte in &bytes[..result] {
+        if byte == 0 {
             return Ok(true);
         }
-        if bytes[i] < 9 || (bytes[i] > 13 && bytes[i] < 32) {
+        if byte < 9 || (byte > 13 && byte < 32) {
             non_printable_count += 1;
         }
     }
@@ -321,42 +355,84 @@ pub fn glob(pattern: &str) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// Finds files matching a glob pattern, respecting .gitignore files.
-pub fn glob_with_gitignore(root: impl AsRef<Path>, pattern: &str) -> Result<Vec<PathBuf>> {
+/// Result of a workspace glob walk: matched files with their modification
+/// times, plus whether the walk was cut short by the entry limit.
+pub struct GlobMatches {
+    /// Matched files sorted by modification time, most recent first.
+    pub entries: Vec<(PathBuf, std::time::SystemTime)>,
+    /// True when the walk stopped early because `limit` entries had matched.
+    pub truncated: bool,
+}
+
+/// Finds files matching a glob pattern under `root`, respecting `.gitignore`
+/// files. `.git` directories are always excluded (matching ripgrep's
+/// `--glob=!**/.git/**`). When `hidden` is false, dot-files are skipped.
+///
+/// Matches are sorted by modification time (most recent first) so callers can
+/// surface recently-changed files; ties fall back to lexical path order for
+/// determinism. The walk stops after `limit` matches.
+pub fn glob_with_gitignore(
+    root: impl AsRef<Path>,
+    pattern: &str,
+    hidden: bool,
+    limit: usize,
+) -> Result<GlobMatches> {
     let root = root.as_ref();
     let walker = ignore::WalkBuilder::new(root)
-        .hidden(false) // Allow hidden files unless in .gitignore
+        .hidden(!hidden)
         .git_ignore(true)
+        .filter_entry(|entry| entry.file_name() != ".git")
         .build();
 
     let glob_pattern = glob::Pattern::new(pattern)
         .with_context(|| format!("Invalid glob pattern: {}", pattern))?;
 
-    let mut matches = Vec::new();
+    let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    let mut truncated = false;
 
     for result in walker {
         match result {
             Ok(entry) => {
                 let path = entry.path();
-                if path.is_file() {
-                    // Compute path relative to root to match against the pattern
-                    if let Ok(relative_path) = path.strip_prefix(root) {
-                        // glob::Pattern matches against the string representation
-                        //We need to handle the case where the pattern assumes the root is the current directory
-                        if glob_pattern.matches_path(relative_path) {
-                            matches.push(path.to_path_buf());
-                        }
-                    }
+                if !path.is_file() {
+                    continue;
+                }
+                // Match against the root-relative path so patterns like
+                // `src/**/*.ts` behave as if root were the search directory.
+                let relative = match path.strip_prefix(root) {
+                    Ok(rel) => rel,
+                    Err(_) => continue,
+                };
+                if !glob_pattern.matches_path(relative) {
+                    continue;
+                }
+                let modified = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                entries.push((path.to_path_buf(), modified));
+                if entries.len() > limit {
+                    truncated = true;
+                    break;
                 }
             }
             Err(_err) => {
-                // We might want to log this but for now just ignore/continue
-                // eprintln!("Error walking directory: {}", err);
+                // Ignore walk errors (permission denied, vanished files, ...)
+                // and keep going, matching ripgrep's default tolerance.
             }
         }
     }
 
-    Ok(matches)
+    // If the walk overflowed we may hold limit + 1 entries; trim first so the
+    // sort cannot waste effort on the surplus entry.
+    entries.truncate(limit);
+    entries.sort_by(|a, b| {
+        b.1.cmp(&a.1) // newest first
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    Ok(GlobMatches { entries, truncated })
 }
 
 #[cfg(test)]
@@ -428,13 +504,19 @@ mod tests {
         // Absolute paths outside root should be rejected
         let root = Path::new("/home/user/project");
         let result = resolve_safe_path(root, "/etc/passwd");
-        assert!(result.is_err(), "Absolute path /etc/passwd should be rejected");
+        assert!(
+            result.is_err(),
+            "Absolute path /etc/passwd should be rejected"
+        );
 
         let result = resolve_safe_path(root, "/var/log");
         assert!(result.is_err(), "Absolute path /var/log should be rejected");
 
         let result = resolve_safe_path(root, "/home/user/../root");
-        assert!(result.is_err(), "Path with parent traversal should be rejected");
+        assert!(
+            result.is_err(),
+            "Path with parent traversal should be rejected"
+        );
     }
 
     #[test]
@@ -442,10 +524,16 @@ mod tests {
         // Absolute paths inside root should be accepted
         let root = Path::new("/home/user/project");
         let result = resolve_safe_path(root, "/home/user/project/src/main.rs");
-        assert!(result.is_ok(), "Absolute path inside root should be accepted");
+        assert!(
+            result.is_ok(),
+            "Absolute path inside root should be accepted"
+        );
 
         let result = resolve_safe_path(root, "/home/user/project/./src");
-        assert!(result.is_ok(), "Absolute path with current dir should be accepted");
+        assert!(
+            result.is_ok(),
+            "Absolute path with current dir should be accepted"
+        );
     }
 
     #[test]
@@ -500,5 +588,62 @@ mod tests {
         // Relative path should work
         let result = resolve_safe_path(root, "home");
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn enforcement_levels_control_containment() -> Result<()> {
+        let dir = tempdir()?;
+        let outside = tempdir()?;
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, "secret").await?;
+
+        // None: paths resolve as given, even outside the root.
+        let resolved = resolve_read_path(dir.path(), &outside_file, PathEnforcement::None).await?;
+        assert_eq!(resolved, fs::canonicalize(&outside_file).await?);
+        assert_eq!(
+            resolve_unchecked(dir.path(), "../sibling.txt"),
+            dir.path().parent().unwrap().join("sibling.txt")
+        );
+        let written = resolve_write_path(dir.path(), "../new.txt", PathEnforcement::None).await?;
+        assert_eq!(
+            written,
+            dir.path().parent().unwrap().join("new.txt")
+        );
+
+        // Contain: outside absolutes and traversal rejected.
+        assert!(
+            resolve_read_path(dir.path(), &outside_file, PathEnforcement::Contain)
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_write_path(dir.path(), "../escape.txt", PathEnforcement::Contain)
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_read_path(dir.path(), &outside_file, PathEnforcement::Strict)
+                .await
+                .is_err()
+        );
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(outside.path(), &link)?;
+            // Contain is lexical only: it follows a symlink out of the root.
+            assert!(
+                resolve_read_path(dir.path(), "link/secret.txt", PathEnforcement::Contain)
+                    .await
+                    .is_ok()
+            );
+            // Strict rejects the symlinked component.
+            assert!(
+                resolve_read_path(dir.path(), "link/secret.txt", PathEnforcement::Strict)
+                    .await
+                    .is_err()
+            );
+        }
+        Ok(())
     }
 }

@@ -50,6 +50,227 @@ use gewu_core::types::Message;
 use sqlx::{Row, sqlite::SqlitePool};
 use tracing::{error, info};
 
+async fn ensure_reverts(pool: &SqlitePool) -> Result<()> {
+    sqlx::query("CREATE TABLE IF NOT EXISTS chat_reverts (session_id TEXT PRIMARY KEY, messages TEXT NOT NULL)").execute(pool).await?;
+    // Reminders became durable after chat_reverts existed; add the column
+    // best-effort so older databases keep working.
+    let _ = sqlx::query("ALTER TABLE chat_reverts ADD COLUMN reminder_state TEXT").execute(pool).await;
+    Ok(())
+}
+
+async fn ensure_reminders(pool: &SqlitePool) -> Result<()> {
+    sqlx::query("CREATE TABLE IF NOT EXISTS session_reminders (session_id TEXT PRIMARY KEY, state TEXT NOT NULL)").execute(pool).await?;
+    Ok(())
+}
+
+/// The durable per-session reminder state, or `None` when the session has
+/// never persisted one.
+pub async fn get_reminder_opt(pool: &SqlitePool, session_id: &str) -> Result<Option<gewu_core::agent::Reminder>> {
+    ensure_reminders(pool).await?;
+    let state: Option<String> = sqlx::query_scalar("SELECT state FROM session_reminders WHERE session_id = ?")
+        .bind(session_id).fetch_optional(pool).await?;
+    Ok(state.and_then(|text| serde_json::from_str(&text).ok()))
+}
+
+/// Persist the per-session reminder state (upsert).
+pub async fn set_reminder(pool: &SqlitePool, session_id: &str, reminder: &gewu_core::agent::Reminder) -> Result<()> {
+    ensure_reminders(pool).await?;
+    sqlx::query("INSERT INTO session_reminders (session_id, state) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET state = excluded.state")
+        .bind(session_id).bind(serde_json::to_string(reminder)?).execute(pool).await?;
+    Ok(())
+}
+
+/// Marks sessions created by the `task` tool so the session list can hide
+/// them: a subagent transcript is real data (task resume needs it) but is
+/// not a top-level conversation.
+async fn ensure_subagents(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS subagent_sessions (\
+            session_id TEXT PRIMARY KEY, \
+            parent_session_id TEXT NOT NULL, \
+            description TEXT NOT NULL DEFAULT '', \
+            created_at INTEGER DEFAULT (unixepoch())\
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Record `session_id` as a subagent spawned by `parent_session_id`.
+///
+/// Idempotent: resuming a task id keeps its original parent row.
+pub async fn record_subagent_session(
+    pool: &SqlitePool,
+    session_id: &str,
+    parent_session_id: &str,
+    description: &str,
+) -> Result<()> {
+    ensure_subagents(pool).await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO subagent_sessions(session_id, parent_session_id, description) \
+         VALUES (?, ?, ?)",
+    )
+    .bind(session_id)
+    .bind(parent_session_id)
+    .bind(description)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Number of subagent ancestors of a session: 0 for a top-level conversation,
+/// 1 for a direct subagent. Used to cap nested subagent spawning. Cycle-capped
+/// defensively; a well-formed table never loops.
+pub async fn subagent_depth(pool: &SqlitePool, session_id: &str) -> Result<usize> {
+    ensure_subagents(pool).await?;
+    let mut depth = 0;
+    let mut current = session_id.to_string();
+    while depth < 64 {
+        let parent: Option<String> =
+            sqlx::query_scalar("SELECT parent_session_id FROM subagent_sessions WHERE session_id = ?")
+                .bind(&current)
+                .fetch_optional(pool)
+                .await?;
+        let Some(parent) = parent else { break };
+        current = parent;
+        depth += 1;
+    }
+    Ok(depth)
+}
+
+/// Every transitive subagent session of `session_id`, order not guaranteed.
+async fn subagent_descendants(pool: &SqlitePool, session_id: &str) -> Result<Vec<String>> {
+    ensure_subagents(pool).await?;
+    let mut all = Vec::new();
+    let mut frontier = vec![session_id.to_string()];
+    while let Some(id) = frontier.pop() {
+        let children: Vec<(String,)> =
+            sqlx::query_as("SELECT session_id FROM subagent_sessions WHERE parent_session_id = ?")
+                .bind(&id)
+                .fetch_all(pool)
+                .await?;
+        for (child,) in children {
+            if child != session_id && !all.contains(&child) {
+                frontier.push(child.clone());
+                all.push(child);
+            }
+        }
+    }
+    Ok(all)
+}
+
+#[cfg(test)]
+mod revert_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn revert_restore_and_commit_are_persistent() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        let mut memory = SqliteMemory::new(pool.clone(), "chat".into()).await.unwrap();
+        for text in ["first", "second"] {
+            memory.add_message(Message::User { content: vec![gewu_core::types::ContentPart::Text { text: text.into() }] }).await;
+        }
+        let original = memory.messages().to_vec();
+        let reminder = gewu_core::agent::Reminder::switch("FULL", Some("SPARSE".into()));
+        assert!(revert_chat(&pool, "chat", Some(9), false, Some(&reminder)).await.is_err());
+        let (reverted, restored) = revert_chat(&pool, "chat", None, false, Some(&reminder)).await.unwrap();
+        assert_eq!(reverted, original[..1]);
+        assert!(restored.is_none(), "forward reverts never restore a reminder");
+        assert_eq!(SqliteMemory::new(pool.clone(), "chat".into()).await.unwrap().messages().len(), 1);
+        let (restored_messages, restored_reminder) = revert_chat(&pool, "chat", None, true, None).await.unwrap();
+        assert_eq!(restored_messages, original);
+        assert_eq!(restored_reminder.as_ref().unwrap().texts(), reminder.texts());
+        assert!(revert_chat(&pool, "chat", None, true, None).await.is_err());
+        revert_chat(&pool, "chat", Some(0), false, Some(&reminder)).await.unwrap();
+        commit_chat_revert(&pool, "chat").await.unwrap();
+        assert!(revert_chat(&pool, "chat", None, true, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn reminder_state_round_trips_through_sql() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        assert!(get_reminder_opt(&pool, "sess").await.unwrap().is_none());
+        let reminder = gewu_core::agent::Reminder::switch("FULL", None);
+        set_reminder(&pool, "sess", &reminder).await.unwrap();
+        let stored = get_reminder_opt(&pool, "sess").await.unwrap().unwrap();
+        assert_eq!(stored.texts(), reminder.texts());
+        // Upsert replaces the state.
+        let updated = gewu_core::agent::Reminder::continue_at("FULL", Some("SPARSE".into()), 7);
+        set_reminder(&pool, "sess", &updated).await.unwrap();
+        let stored = get_reminder_opt(&pool, "sess").await.unwrap().unwrap();
+        assert_eq!(stored.texts(), updated.texts());
+    }
+}
+
+pub async fn commit_chat_revert(pool: &SqlitePool, session_id: &str) -> Result<()> {
+    ensure_reverts(pool).await?;
+    sqlx::query("DELETE FROM chat_reverts WHERE session_id = ?").bind(session_id).execute(pool).await?;
+    Ok(())
+}
+
+/// Revert to the zero-based user turn, or restore the last staged revert.
+/// Only conversation rows are touched, never workspace files.
+///
+/// The reminder state is snapshotted alongside the messages and returned
+/// restored on undo; on a forward revert the caller recomputes it from the
+/// retained history and persists it separately.
+pub async fn revert_chat(pool: &SqlitePool, session_id: &str, turn: Option<usize>, undo: bool, reminder: Option<&gewu_core::agent::Reminder>) -> Result<(Vec<Message>, Option<gewu_core::agent::Reminder>)> {
+    ensure_reverts(pool).await?;
+    let mut tx = pool.begin().await?;
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT content FROM memory_messages WHERE session_id = ? ORDER BY id").bind(session_id).fetch_all(&mut *tx).await?;
+    let current: Vec<Message> = rows.iter().map(|(text,)| serde_json::from_str(text)).collect::<std::result::Result<_, _>>()?;
+    let (next, restored_reminder) = if undo {
+        let saved: Option<(String, Option<String>)> = sqlx::query_as("SELECT messages, reminder_state FROM chat_reverts WHERE session_id = ?").bind(session_id).fetch_optional(&mut *tx).await?;
+        let (saved_messages, saved_reminder) = saved.ok_or_else(|| anyhow::anyhow!("no chat revert to undo"))?;
+        let next: Vec<Message> = serde_json::from_str(&saved_messages)?;
+        let restored = saved_reminder.and_then(|text| serde_json::from_str(&text).ok());
+        (next, restored)
+    } else {
+        let users: Vec<usize> = current.iter().enumerate().filter_map(|(i,m)| matches!(m, Message::User { .. }).then_some(i)).collect();
+        let target = turn.unwrap_or_else(|| users.len().saturating_sub(1));
+        let boundary = *users.get(target).ok_or_else(|| anyhow::anyhow!("user turn not found"))?;
+        sqlx::query("INSERT INTO chat_reverts(session_id, messages, reminder_state) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET messages = excluded.messages, reminder_state = excluded.reminder_state")
+            .bind(session_id).bind(serde_json::to_string(&current)?).bind(reminder.map(serde_json::to_string).transpose()?).execute(&mut *tx).await?;
+        (current[..boundary].to_vec(), None)
+    };
+    sqlx::query("DELETE FROM memory_messages WHERE session_id = ?").bind(session_id).execute(&mut *tx).await?;
+    for message in &next {
+        sqlx::query("INSERT INTO memory_messages(session_id, content) VALUES (?, ?)").bind(session_id).bind(serde_json::to_string(message)?).execute(&mut *tx).await?;
+    }
+    if undo { sqlx::query("DELETE FROM chat_reverts WHERE session_id = ?").bind(session_id).execute(&mut *tx).await?; }
+    tx.commit().await?;
+    Ok((next, restored_reminder))
+}
+
+/// Session profile metadata is separate from message history (legacy sessions
+/// without a row continue to use Build).
+pub async fn session_agent(pool: &SqlitePool, session_id: &str) -> Result<String> {
+    sqlx::query("CREATE TABLE IF NOT EXISTS session_agents (session_id TEXT PRIMARY KEY, agent TEXT NOT NULL)").execute(pool).await?;
+    let value: Option<String> = sqlx::query_scalar("SELECT agent FROM session_agents WHERE session_id = ?").bind(session_id).fetch_optional(pool).await?;
+    Ok(value.unwrap_or_else(|| "build".into()))
+}
+
+pub async fn set_session_agent(pool: &SqlitePool, session_id: &str, agent: &str) -> Result<()> {
+    session_agent(pool, session_id).await?;
+    sqlx::query("INSERT INTO session_agents(session_id, agent) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET agent = excluded.agent").bind(session_id).bind(agent).execute(pool).await?;
+    Ok(())
+}
+
+/// Session model metadata: the `endpoint/model` selector the conversation
+/// runs on. `None` for legacy sessions (they use the server default).
+pub async fn session_model(pool: &SqlitePool, session_id: &str) -> Result<Option<String>> {
+    sqlx::query("CREATE TABLE IF NOT EXISTS session_models (session_id TEXT PRIMARY KEY, model TEXT NOT NULL)").execute(pool).await?;
+    let value: Option<String> = sqlx::query_scalar("SELECT model FROM session_models WHERE session_id = ?").bind(session_id).fetch_optional(pool).await?;
+    Ok(value)
+}
+
+pub async fn set_session_model(pool: &SqlitePool, session_id: &str, model: &str) -> Result<()> {
+    session_model(pool, session_id).await?;
+    sqlx::query("INSERT INTO session_models(session_id, model) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET model = excluded.model").bind(session_id).bind(model).execute(pool).await?;
+    Ok(())
+}
+
 /// One stored message together with its database identity.
 #[derive(Debug, Clone)]
 pub struct StoredMessage {
@@ -78,20 +299,27 @@ async fn memory_table_exists(pool: &SqlitePool) -> Result<bool> {
 /// List persisted conversation sessions, newest first.
 ///
 /// Sessions are derived from the `memory_messages` table, so a session exists
-/// once it has at least one stored message.
+/// once it has at least one stored message. Subagent sessions recorded via
+/// [`record_subagent_session`] are excluded: they belong to their parent
+/// conversation, not the session list.
 pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<gewu_protocol::SessionSummary>> {
+    session_agent(pool, "").await?;
+    ensure_subagents(pool).await?;
     if !memory_table_exists(pool).await? {
         return Ok(Vec::new());
     }
     let rows = sqlx::query(
         r#"
         SELECT
-            session_id,
+            memory_messages.session_id,
+            COALESCE((SELECT agent FROM session_agents WHERE session_agents.session_id = memory_messages.session_id), 'build') AS agent,
             COUNT(*) AS message_count,
-            datetime(MAX(created_at), 'unixepoch', 'localtime') AS updated_at
+            datetime(MAX(memory_messages.created_at), 'unixepoch', 'localtime') AS updated_at
         FROM memory_messages
-        GROUP BY session_id
-        ORDER BY MAX(created_at) DESC, session_id ASC
+        LEFT JOIN subagent_sessions ON subagent_sessions.session_id = memory_messages.session_id
+        WHERE subagent_sessions.session_id IS NULL
+        GROUP BY memory_messages.session_id
+        ORDER BY MAX(memory_messages.created_at) DESC, memory_messages.session_id ASC
         "#,
     )
     .fetch_all(pool)
@@ -101,6 +329,7 @@ pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<gewu_protocol::Sessi
     rows.into_iter()
         .map(|row| {
             Ok(gewu_protocol::SessionSummary {
+                agent: row.try_get("agent")?,
                 session_id: row.try_get("session_id")?,
                 message_count: row.try_get("message_count")?,
                 updated_at: row
@@ -111,20 +340,41 @@ pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<gewu_protocol::Sessi
         .collect()
 }
 
-/// Delete every stored message of one session.
+/// Delete every stored message of one session, including the transcripts of
+/// any subagent sessions spawned from it (directly or transitively), plus
+/// their subagent marker rows.
 ///
-/// Returns the number of removed rows (0 for an unknown session). A fresh
-/// database without the memory table simply has nothing to delete.
+/// Returns the number of removed message rows (0 for an unknown session). A
+/// fresh database without the memory table simply has nothing to delete.
 pub async fn delete_session(pool: &SqlitePool, session_id: &str) -> Result<u64> {
     if !memory_table_exists(pool).await? {
         return Ok(0);
     }
-    let result = sqlx::query("DELETE FROM memory_messages WHERE session_id = ?")
+    ensure_subagents(pool).await?;
+    let descendants = subagent_descendants(pool, session_id).await?;
+    let mut removed = sqlx::query("DELETE FROM memory_messages WHERE session_id = ?")
         .bind(session_id)
         .execute(pool)
         .await
-        .with_context(|| format!("Failed to delete session '{}'", session_id))?;
-    Ok(result.rows_affected())
+        .with_context(|| format!("Failed to delete session '{}'", session_id))?
+        .rows_affected();
+    for id in &descendants {
+        removed += sqlx::query("DELETE FROM memory_messages WHERE session_id = ?")
+            .bind(id)
+            .execute(pool)
+            .await?
+            .rows_affected();
+    }
+    // Drop every marker related to the deleted subtree: the subtree's own
+    // rows, and the session's marker if it was itself someone's subagent.
+    for id in std::iter::once(session_id).chain(descendants.iter().map(String::as_str)) {
+        sqlx::query("DELETE FROM subagent_sessions WHERE session_id = ? OR parent_session_id = ?")
+            .bind(id)
+            .bind(id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(removed)
 }
 
 /// Load every message stored for one session, oldest first.
@@ -257,6 +507,17 @@ impl SqliteMemory {
 
 #[async_trait]
 impl Memory for SqliteMemory {
+    async fn append_compaction(&mut self, summary: String, recent: String) -> anyhow::Result<()> {
+        let message = Message::Compaction { summary, recent };
+        let content = serde_json::to_string(&message)?;
+        sqlx::query("INSERT INTO memory_messages (session_id, content) VALUES (?, ?)")
+            .bind(&self.session_id)
+            .bind(content)
+            .execute(&self.pool)
+            .await?;
+        self.messages.push(message);
+        Ok(())
+    }
     fn messages(&self) -> &[Message] {
         &self.messages
     }
@@ -314,8 +575,7 @@ impl Memory for SqliteMemory {
 
     /// Replaces all messages with a new set.
     ///
-    /// This is used by the agent's compaction logic to replace the
-    /// full conversation history with a summarized version. The operation
+    /// Used for explicit history edits, not compaction. The operation
     /// is transactional:
     ///
     /// 1. Deletes all existing messages for this session
@@ -384,6 +644,65 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     #[tokio::test]
+    async fn session_model_round_trips() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        assert_eq!(session_model(&pool, "s1").await?, None);
+        set_session_model(&pool, "s1", "west/coding").await?;
+        assert_eq!(session_model(&pool, "s1").await?.as_deref(), Some("west/coding"));
+        set_session_model(&pool, "s1", "east/m2").await?;
+        assert_eq!(session_model(&pool, "s1").await?.as_deref(), Some("east/m2"));
+        assert_eq!(session_model(&pool, "other").await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revert_and_undo_restore_compaction_context() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        let mut memory = SqliteMemory::new(pool.clone(), "boundaries".into()).await?;
+        let user = |text: &str| Message::User { content: vec![ContentPart::Text { text: text.into() }] };
+        memory.add_message(user("first")).await;
+        memory.add_message(user("second")).await;
+        memory.append_compaction("summary".into(), "tail".into()).await?;
+        memory.add_message(user("third")).await;
+        let original = memory.messages().to_vec();
+        let original_context = gewu_core::compaction::active_context(&original).to_messages();
+        let (retained, _) = revert_chat(&pool, "boundaries", Some(1), false, None).await?;
+        assert_eq!(retained, vec![user("first")]);
+        let loaded = SqliteMemory::new(pool.clone(), "boundaries".into()).await?;
+        assert_eq!(gewu_core::compaction::active_context(loaded.messages()).to_messages(), retained);
+        let (restored, _) = revert_chat(&pool, "boundaries", None, true, None).await?;
+        assert_eq!(restored, original);
+        let loaded = SqliteMemory::new(pool.clone(), "boundaries".into()).await?;
+        assert_eq!(gewu_core::compaction::active_context(loaded.messages()).to_messages(), original_context);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compaction_preserves_original_rows_and_reloads_context() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        let mut memory = SqliteMemory::new(pool.clone(), "compact".into()).await?;
+        let original = Message::Tool { tool_call_id: "call".into(), tool_name: None,
+            content: "original".repeat(10_000), media: vec![] };
+        memory.add_message(original.clone()).await;
+        let original_id: i64 = sqlx::query_scalar("SELECT id FROM memory_messages WHERE session_id = 'compact'")
+            .fetch_one(&pool).await?;
+        memory.append_compaction("first".into(), "recent".into()).await?;
+        memory.append_compaction("latest".into(), "tail".into()).await?;
+        let loaded = SqliteMemory::new(pool.clone(), "compact".into()).await?;
+        assert_eq!(loaded.messages().len(), 3);
+        assert_eq!(loaded.messages()[0], original);
+        let retained_id: i64 = sqlx::query_scalar("SELECT MIN(id) FROM memory_messages WHERE session_id = 'compact'")
+            .fetch_one(&pool).await?;
+        assert_eq!(original_id, retained_id);
+        assert_eq!(gewu_core::compaction::active_context(loaded.messages()).to_messages(),
+            vec![gewu_core::compaction::build_checkpoint_message("latest", "tail")]);
+        pool.close().await;
+        assert!(memory.append_compaction("failed".into(), "".into()).await.is_err());
+        assert_eq!(memory.messages().len(), 3, "failed persistence cannot activate a boundary");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_persistence() -> Result<()> {
         let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
 
@@ -418,6 +737,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persists_assistant_reasoning() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        let session_id = "test_reasoning".to_string();
+
+        let mut mem = SqliteMemory::new(pool.clone(), session_id.clone()).await?;
+        mem.add_message(Message::Assistant {
+            content: Some("answer".to_string()),
+            reasoning: Some("step by step".to_string()),
+            replay: Some(gewu_core::types::ReasoningReplay {
+                origin: "anthropic:https://api.anthropic.com".into(),
+                model: "claude-test".into(),
+                field: None,
+                blocks: vec![serde_json::json!({"type":"thinking","thinking":"step by step","signature":"sig"})],
+            }),
+            tool_calls: None,
+        })
+        .await;
+        mem.add_message(Message::Assistant {
+            content: Some("plain".to_string()),
+            reasoning: None,
+            replay: None,
+            tool_calls: None,
+        })
+        .await;
+
+        let reloaded = SqliteMemory::new(pool, session_id).await?;
+        assert_eq!(reloaded.messages().len(), 2);
+        match &reloaded.messages()[0] {
+            Message::Assistant {
+                content,
+                reasoning,
+                replay,
+                tool_calls,
+            } => {
+                assert_eq!(content.as_deref(), Some("answer"));
+                assert_eq!(reasoning.as_deref(), Some("step by step"));
+                assert_eq!(replay.as_ref().unwrap().blocks[0]["signature"], "sig");
+                assert!(tool_calls.is_none());
+            }
+            _ => panic!("Wrong type"),
+        }
+        match &reloaded.messages()[1] {
+            Message::Assistant { reasoning, .. } => assert!(reasoning.is_none()),
+            _ => panic!("Wrong type"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn lists_and_loads_sessions() -> Result<()> {
         let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
         sqlx::query(
@@ -440,6 +808,8 @@ mod tests {
         };
         let assistant = Message::Assistant {
             content: Some("second".to_string()),
+            reasoning: None,
+            replay: None,
             tool_calls: None,
         };
         for (session, message, at) in [
@@ -535,6 +905,63 @@ mod tests {
         let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
         assert!(list_sessions(&pool).await?.is_empty());
         assert!(load_session(&pool, "anything").await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subagent_sessions_are_hidden_from_the_list_but_still_loadable() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        let user = Message::User {
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
+        };
+        for session in ["main", "task-a", "task-b"] {
+            SqliteMemory::new(pool.clone(), session.into()).await.unwrap();
+            sqlx::query("INSERT INTO memory_messages (session_id, content) VALUES (?, ?)")
+                .bind(session)
+                .bind(serde_json::to_string(&user)?)
+                .execute(&pool)
+                .await?;
+        }
+        record_subagent_session(&pool, "task-a", "main", "explore").await?;
+        record_subagent_session(&pool, "task-b", "main", "explore").await?;
+        // Recording again (task resume) keeps the original parent row.
+        record_subagent_session(&pool, "task-a", "other", "explore").await?;
+
+        let listed: Vec<String> = list_sessions(&pool).await?.into_iter().map(|s| s.session_id).collect();
+        assert_eq!(listed, vec!["main"]);
+
+        // Subagent transcripts remain reachable for task resume.
+        assert_eq!(load_session(&pool, "task-a").await?.len(), 1);
+        assert_eq!(subagent_depth(&pool, "main").await?, 0);
+        assert_eq!(subagent_depth(&pool, "task-a").await?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_a_session_cascades_to_its_subagents() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        let user = Message::User {
+            content: vec![ContentPart::Text {
+                text: "doomed".to_string(),
+            }],
+        };
+        for session in ["root", "child", "grandchild", "unrelated"] {
+            SqliteMemory::new(pool.clone(), session.into()).await.unwrap();
+            sqlx::query("INSERT INTO memory_messages (session_id, content) VALUES (?, ?)")
+                .bind(session)
+                .bind(serde_json::to_string(&user)?)
+                .execute(&pool)
+                .await?;
+        }
+        record_subagent_session(&pool, "child", "root", "explore").await?;
+        record_subagent_session(&pool, "grandchild", "child", "explore").await?;
+
+        assert_eq!(delete_session(&pool, "root").await?, 3);
+        let remaining: Vec<String> = list_sessions(&pool).await?.into_iter().map(|s| s.session_id).collect();
+        assert_eq!(remaining, vec!["unrelated"]);
+        assert!(load_session(&pool, "grandchild").await?.is_empty());
         Ok(())
     }
 }

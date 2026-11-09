@@ -169,7 +169,7 @@ mod tests {
         let mut graph = StateGraph::<TestState>::new();
 
         let set_messages =
-            |state: TestState| async move { partial(None, Some(vec!["msg1".to_string()])) };
+            |_state: TestState| async move { partial(None, Some(vec!["msg1".to_string()])) };
 
         let increment = |state: TestState| async move { partial(Some(state.count + 1), None) };
 
@@ -199,7 +199,7 @@ mod tests {
         let node_a = |state: TestState| async move { partial(Some(state.count + 10), None) };
 
         let node_b =
-            |state: TestState| async move { partial(None, Some(vec!["from_b".to_string()])) };
+            |_state: TestState| async move { partial(None, Some(vec!["from_b".to_string()])) };
 
         graph.add_node("a", node_a);
         graph.add_node("b", node_b);
@@ -1476,7 +1476,7 @@ mod tests {
 
         let step1 = |state: TestState| async move { partial(Some(state.count + 10), None) };
 
-        let step2 = |state: TestState| async move { custom(serde_json::json!({"step2": "done"})) };
+        let step2 = |_state: TestState| async move { custom(serde_json::json!({"step2": "done"})) };
 
         let step3 = |state: TestState| async move { partial(Some(state.count + 1), None) };
 

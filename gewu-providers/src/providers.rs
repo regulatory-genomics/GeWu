@@ -20,33 +20,35 @@
 //! - [`AnthropicProvider`] - Anthropic Claude provider implementation
 //! - [`ResponseParser`] - Trait for parsing streaming responses
 
+use crate::anthropic::{
+    AnthropicChunk, AnthropicConfig, AnthropicError, AnthropicMessage, AnthropicStream,
+    AnthropicTool, AssistantMessage as AnthropicAssistantMessage, Client as AnthropicClient,
+    ContentBlock, ContentBlockDeltaChunk, ContentBlockStart, ContentBlockStartChunk, ContentDelta,
+    CreateMessageRequest, MessageStartChunk, SourceBlock, UserMessage,
+};
 use crate::openai::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionMessageToolCalls,
-    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
+    AssistantMessage as OpenAIAssistantMessage, ChatCompletionMessageToolCall,
+    ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCalls,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartFile,
+    ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
     ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionTools, ChatCompletionStream, ChatCompletionTool,
-    CreateChatCompletionRequest, FunctionCall as OpenAIFunctionCall,
-    FunctionObjectArgs, ImageUrl, OpenAIConfig, AssistantMessage as OpenAIAssistantMessage,
-    ChatCompletionRequestMessageContentPartText, FileData,
-    ChatCompletionRequestMessageContentPartFile, OpenAIClient,
-};
-use crate::anthropic::{
-    AnthropicChunk, AnthropicConfig, AnthropicMessage, AnthropicStream, AnthropicTool,
-    ContentBlock, ContentBlockDeltaChunk, ContentBlockStart,
-    ContentBlockStartChunk, ContentDelta, CreateMessageRequest,
-    MessageStartChunk, UserMessage,
-    AssistantMessage as AnthropicAssistantMessage, Client as AnthropicClient,
+    ChatCompletionStream, ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequest,
+    FileData, FunctionCall as OpenAIFunctionCall, FunctionObjectArgs, ImageUrl, OpenAIClient,
+    OpenAIConfig, OpenAIError,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{Capabilities, ContentPart, Message, ProviderEvent};
+use gewu_core::traits::{LlmProvider, StatusSink, Tool};
+use gewu_core::types::{
+    Capabilities, ContentPart, Message, ProviderEvent, TokenUsage, ReasoningReplay,
+};
 use serde_json::Value;
 use std::error::Error;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
 
 static MULTIMODAL_CAP: Capabilities = Capabilities {
     input: gewu_core::types::InputCapabilities {
@@ -128,15 +130,40 @@ pub trait ResponseParser: Send + Sync {
 ///     "gpt-4"
 /// );
 /// ```
-pub struct OpenAIProvider {
+pub struct ChatCompletionsProvider {
+    reasoning_effort: Option<String>,
+    max_tokens: Option<u32>,
+    base_url: String,
+    reasoning_field: Option<String>,
     client: OpenAIClient,
     model: String,
     capabilities: Capabilities,
-    /// Forwarded verbatim when set; `None` leaves the gateway's default.
-    reasoning_effort: Option<String>,
+    retry_backoff: Duration,
+    /// Upper bound on a single retry wait; longer `Retry-After` hints are
+    /// clamped down to this.
+    retry_max_wait: Duration,
+    /// Sink for transient status messages (retry backoff), registered by
+    /// the agent layer so frontends can show progress during waits.
+    status_sink: Mutex<Option<StatusSink>>,
 }
 
+// Internal shorthand retained for the protocol adapter's existing tests.
+type OpenAIProvider = ChatCompletionsProvider;
+
 impl OpenAIProvider {
+    pub fn with_reasoning_effort(mut self, effort: &str) -> Self {
+        self.reasoning_effort = Some(effort.to_owned());
+        self
+    }
+    pub fn with_max_tokens(mut self, limit: Option<u32>) -> Self {
+        self.max_tokens = limit;
+        self
+    }
+    pub(crate) fn for_service(api_key: &str, base_url: &str, model: &str, policy: crate::services::ChatPolicy) -> Self {
+        let mut provider = Self::new_with_endpoint(api_key, base_url, model);
+        provider.reasoning_field = Some(policy.reasoning_field.to_string());
+        provider
+    }
     /// Creates a new provider for the official OpenAI API.
     ///
     /// # Arguments
@@ -147,10 +174,16 @@ impl OpenAIProvider {
         let config = OpenAIConfig::new(api_key, "https://api.openai.com/v1");
         let capabilities = Self::default_capabilities_for_model(model);
         Self {
+            max_tokens: None,
+            reasoning_effort: None,
+            base_url: "https://api.openai.com/v1".to_string(),
+            reasoning_field: None,
             client: OpenAIClient::with_config(config),
             model: model.to_string(),
             capabilities,
-            reasoning_effort: None,
+            retry_backoff: crate::http::RETRY_BACKOFF,
+            retry_max_wait: crate::http::MAX_RETRY_WAIT,
+            status_sink: Mutex::new(None),
         }
     }
 
@@ -168,23 +201,40 @@ impl OpenAIProvider {
         let config = OpenAIConfig::new(api_key, base_url);
         let capabilities = Self::default_capabilities_for_model(model);
         Self {
+            max_tokens: None,
+            reasoning_effort: None,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            reasoning_field: None,
             client: OpenAIClient::with_config(config),
             model: model.to_string(),
             capabilities,
-            reasoning_effort: None,
+            retry_backoff: crate::http::RETRY_BACKOFF,
+            retry_max_wait: crate::http::MAX_RETRY_WAIT,
+            status_sink: Mutex::new(None),
         }
     }
 
-    /// Sets the `reasoning_effort` field sent with every completion request.
-    ///
-    /// Only gateways that support the field should receive it; other models
-    /// ignore unknown request fields, but this stays opt-in to avoid changing
-    /// wire behaviour for existing deployments.
-    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
-        self.reasoning_effort = effort
-            .map(|value| value.trim().to_ascii_lowercase())
-            .filter(|value| !value.is_empty());
+    /// Overrides the base delay between retries of a failed request setup
+    /// (each retry waits four times longer than the previous one).
+    pub fn with_retry_backoff(mut self, backoff: Duration) -> Self {
+        self.retry_backoff = backoff;
         self
+    }
+
+    /// Overrides the upper bound on a single retry wait; a provider's
+    /// `Retry-After` hint longer than this is clamped down to it.
+    pub fn with_retry_max_wait(mut self, max_wait: Duration) -> Self {
+        self.retry_max_wait = max_wait;
+        self
+    }
+
+    /// Snapshot of the registered status sink, if any. Taken before the
+    /// retry loop so no lock guard is held across an await point.
+    fn status_sink_snapshot(&self) -> Option<StatusSink> {
+        self.status_sink
+            .lock()
+            .expect("status sink lock poisoned")
+            .clone()
     }
 
     /// Determines capabilities based on model name.
@@ -218,19 +268,21 @@ impl OpenAIProvider {
         part: &ContentPart,
     ) -> Option<ChatCompletionRequestUserMessageContentPart> {
         match part {
-            ContentPart::Text { text } => Some(ChatCompletionRequestUserMessageContentPart::Text(
-                ChatCompletionRequestMessageContentPartText {
-                    content_type: "text".to_string(),
-                    text: text.clone(),
-                },
-            )),
+            ContentPart::Text { text } | ContentPart::Reminder { text } => Some(
+                ChatCompletionRequestUserMessageContentPart::Text(
+                    ChatCompletionRequestMessageContentPartText {
+                        content_type: "text".to_string(),
+                        text: text.clone(),
+                    },
+                ),
+            ),
             ContentPart::Image { data, mime_type } => {
                 let url = format!("data:{};base64,{}", mime_type, data);
                 Some(ChatCompletionRequestUserMessageContentPart::ImageUrl(
                     ChatCompletionRequestMessageContentPartImage {
                         content_type: "image_url".to_string(),
                         image_url: ImageUrl {
-                            url: url.into(),
+                            url,
                             detail: None,
                         },
                     },
@@ -261,7 +313,9 @@ impl OpenAIProvider {
                             content_type: "file".to_string(),
                             file: FileData {
                                 filename: Some("document.pdf".to_string()),
-                                file_data: Some(data.clone()),
+                                // The API expects a full data URI here, not raw
+                                // base64 (matches the image_url branch above).
+                                file_data: Some(format!("data:{};base64,{}", mime_type, data)),
                                 file_id: None,
                             },
                         },
@@ -288,6 +342,8 @@ impl OpenAIProvider {
         msg: &Message,
     ) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn Error + Send + Sync>> {
         match msg {
+            Message::Compaction { summary, recent } => self.convert_message(
+                &gewu_core::compaction::build_checkpoint_message(summary, recent)),
             Message::System { content } => {
                 let m = ChatCompletionRequestSystemMessageArgs::default()
                     .content(content.clone())
@@ -308,81 +364,122 @@ impl OpenAIProvider {
             }
             Message::Assistant {
                 content,
+                reasoning,
+                replay,
                 tool_calls,
             } => {
+                let origin = format!("chat:{}", self.base_url);
+                let compatible = replay.as_ref().filter(|r| r.origin == origin && r.model == self.model);
+                let mut reasoning_fields = std::collections::BTreeMap::new();
+                let field = self.reasoning_field.as_deref()
+                    .or_else(|| compatible.and_then(|r| r.field.as_deref()))
+                    .unwrap_or("reasoning_content");
+                if ["role", "content", "refusal", "tool_calls"].contains(&field) {
+                    return Err("invalid reasoning field in stored replay state".into());
+                }
+                if let Some(text) = reasoning.as_ref().filter(|_| compatible.is_some()) {
+                    reasoning_fields.insert(field.to_string(), text.clone());
+                }
+                let content = if compatible.is_none() {
+                    [reasoning.as_deref(), content.as_deref()].into_iter().flatten()
+                        .filter(|text| !text.is_empty()).collect::<Vec<_>>().join("\n\n")
+                } else { content.clone().unwrap_or_default() };
                 let openai_calls = tool_calls.clone().map(|calls| {
                     calls
                         .iter()
                         .map(|tc| {
-                            ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
-                                id: tc.id.clone(),
-                                tool_type: "function".to_string(),
-                                function: OpenAIFunctionCall {
-                                    name: tc.function.name.clone(),
-                                    arguments: tc.function.arguments.clone(),
+                            ChatCompletionMessageToolCalls::Function(
+                                ChatCompletionMessageToolCall {
+                                    id: tc.id.clone(),
+                                    tool_type: "function".to_string(),
+                                    function: OpenAIFunctionCall {
+                                        name: tc.function.name.clone(),
+                                        // An empty arguments string is rejected
+                                        // by the API; normalize to an empty
+                                        // object.
+                                        arguments: if tc.function.arguments.trim().is_empty() {
+                                            "{}".to_string()
+                                        } else {
+                                            tc.function.arguments.clone()
+                                        },
+                                    },
                                 },
-                            })
+                            )
                         })
                         .collect()
                 });
 
                 Ok(vec![ChatCompletionRequestMessage::Assistant(
                     OpenAIAssistantMessage {
-                        content: content.clone(),
+                        reasoning: reasoning_fields,
+                        content: (!content.is_empty()).then_some(content),
                         tool_calls: openai_calls,
                     },
                 )])
             }
             Message::Tool {
                 tool_call_id,
-                tool_name,
+                tool_name: _,
                 content,
-                media,
+                media: _,
             } => {
+                // Media is NOT appended here: a user message between tool
+                // messages breaks the `assistant(tool_calls) → tool` contiguity
+                // that strict backends require. `build_typed` defers media to
+                // after the run of tool messages.
                 let m = ChatCompletionRequestToolMessageArgs::default()
                     .tool_call_id(tool_call_id.clone())
                     .content(content.clone())
                     .build()
                     .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-                let mut messages = vec![ChatCompletionRequestMessage::Tool(m)];
+                Ok(vec![ChatCompletionRequestMessage::Tool(m)])
+            }
+        }
+    }
 
-                if !media.is_empty() {
-                    let mut parts: Vec<ChatCompletionRequestUserMessageContentPart> = Vec::new();
-                    let label = match tool_name {
-                        Some(name) => format!("Tool '{}' returned additional media:", name),
-                        None => "Tool returned additional media:".to_string(),
-                    };
+    /// Emits deferred tool-result media as user message(s).
+    ///
+    /// Called once the run of tool messages ends so the produced user
+    /// messages never interleave between two `tool` messages.
+    fn flush_pending_media(
+        &self,
+        messages: &mut Vec<ChatCompletionRequestMessage>,
+        pending: &mut Vec<(Option<String>, Vec<ContentPart>)>,
+    ) {
+        for (tool_name, media) in pending.drain(..) {
+            let mut parts: Vec<ChatCompletionRequestUserMessageContentPart> = Vec::new();
+            let label = match tool_name {
+                Some(name) => format!("Tool '{}' returned additional media:", name),
+                None => "Tool returned additional media:".to_string(),
+            };
+            parts.push(ChatCompletionRequestUserMessageContentPart::Text(
+                ChatCompletionRequestMessageContentPartText {
+                    content_type: "text".to_string(),
+                    text: label,
+                },
+            ));
+            for part in media {
+                if let Some(converted) = self.convert_content_part(&part) {
+                    parts.push(converted);
+                } else {
+                    let unsupported_label = format!(
+                        "[Unsupported media type: {} - this model does not support {} input]",
+                        part.mime_type(),
+                        part.mime_type()
+                    );
                     parts.push(ChatCompletionRequestUserMessageContentPart::Text(
                         ChatCompletionRequestMessageContentPartText {
                             content_type: "text".to_string(),
-                            text: label,
+                            text: unsupported_label,
                         },
                     ));
-                    for part in media {
-                        if let Some(converted) = self.convert_content_part(part) {
-                            parts.push(converted);
-                        } else {
-                            let unsupported_label = format!(
-                                "[Unsupported media type: {} - this model does not support {} input]",
-                                part.mime_type(),
-                                part.mime_type()
-                            );
-                            parts.push(ChatCompletionRequestUserMessageContentPart::Text(
-                                ChatCompletionRequestMessageContentPartText {
-                                    content_type: "text".to_string(),
-                                    text: unsupported_label,
-                                },
-                            ));
-                        }
-                    }
-                    let extra = ChatCompletionRequestUserMessageArgs::default()
-                        .content(parts)
-                        .build()
-                        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-                    messages.push(ChatCompletionRequestMessage::User(extra));
                 }
-
-                Ok(messages)
+            }
+            if let Ok(extra) = ChatCompletionRequestUserMessageArgs::default()
+                .content(parts)
+                .build()
+            {
+                messages.push(ChatCompletionRequestMessage::User(extra));
             }
         }
     }
@@ -422,21 +519,50 @@ impl OpenAIProvider {
         tools: &[Arc<dyn Tool>],
     ) -> Result<CreateChatCompletionRequest, Box<dyn Error + Send + Sync>> {
         let mut openai_messages: Vec<ChatCompletionRequestMessage> = Vec::new();
+        // Media attached to tool results is deferred until the run of tool
+        // messages ends; a user message between two `tool` messages breaks
+        // the `assistant(tool_calls) → tool` contiguity strict backends
+        // require.
+        let mut pending_media: Vec<(Option<String>, Vec<ContentPart>)> = Vec::new();
         for msg in messages {
-            let mut converted = self.convert_message(msg)?;
-            openai_messages.append(&mut converted);
+            if matches!(msg, Message::Tool { .. }) {
+                let mut converted = self.convert_message(msg)?;
+                openai_messages.append(&mut converted);
+                if let Message::Tool { tool_name, media, .. } = msg
+                    && !media.is_empty() {
+                        pending_media.push((tool_name.clone(), media.clone()));
+                    }
+            } else {
+                self.flush_pending_media(&mut openai_messages, &mut pending_media);
+                let mut converted = self.convert_message(msg)?;
+                openai_messages.append(&mut converted);
+            }
         }
+        self.flush_pending_media(&mut openai_messages, &mut pending_media);
 
         let openai_tools = self.convert_tools(tools)?;
 
         Ok(CreateChatCompletionRequest {
+            reasoning_effort: self.reasoning_effort.clone(),
             model: self.model.clone(),
             messages: openai_messages,
-            tools: if openai_tools.is_empty() { None } else { Some(openai_tools) },
-            stream: None,
-            max_tokens: None,
+            tools: if openai_tools.is_empty() {
+                None
+            } else {
+                Some(openai_tools)
+            },
+            // This provider always streams (`create_stream` sets it on the
+            // wire); logging the request without `stream: true` would make
+            // the request log misrepresent what is sent.
+            stream: Some(true),
+            // Usage (and its cache figures) ride on the final chunk only
+            // when requested; `create_stream` sets the same value on the
+            // wire request.
+            stream_options: Some(crate::openai::StreamOptions {
+                include_usage: Some(true),
+            }),
+            max_tokens: self.max_tokens,
             temperature: None,
-            reasoning_effort: self.reasoning_effort.clone(),
         })
     }
 }
@@ -488,34 +614,30 @@ impl ToolCallAggregator {
 
         let state = &mut self.states[index];
 
-        if let Some(id) = &chunk.id {
-            if !id.is_empty() {
+        if let Some(id) = &chunk.id
+            && !id.is_empty() {
                 state.id = Some(id.clone());
             }
-        }
 
         if let Some(function) = &chunk.function {
-            if let Some(name) = &function.name {
-                if !name.is_empty() {
+            if let Some(name) = &function.name
+                && !name.is_empty() {
                     state.name = Some(name.clone());
                 }
-            }
 
-            if let Some(args) = &function.arguments {
-                if !args.is_empty() && !state.finalized {
+            if let Some(args) = &function.arguments
+                && !args.is_empty() && !state.finalized {
                     state.argument_buffer.push_str(args);
                     Self::update_finalized_flag(state);
-                    if state.started {
-                        if let Some(id) = state.id.clone() {
+                    if state.started
+                        && let Some(id) = state.id.clone() {
                             Self::emit_pending_arguments(state, &id, &mut events);
                         }
-                    }
                 }
-            }
         }
 
-        if !state.started {
-            if let (Some(id), Some(name)) = (state.id.clone(), state.name.clone()) {
+        if !state.started
+            && let (Some(id), Some(name)) = (state.id.clone(), state.name.clone()) {
                 events.push(ProviderEvent::ToolCallStart {
                     id: id.clone(),
                     name,
@@ -524,7 +646,6 @@ impl ToolCallAggregator {
 
                 Self::emit_pending_arguments(state, &id, &mut events);
             }
-        }
 
         events
     }
@@ -569,26 +690,70 @@ impl ResponseParser for OpenAIProvider {
         &self,
         stream: ChatCompletionStream,
     ) -> BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>> {
+        let field = self.reasoning_field.clone();
+        let origin = format!("chat:{}", self.base_url);
+        let model = self.model.clone();
         let s = async_stream::try_stream! {
             let mut tool_aggregator = ToolCallAggregator::default();
 
             let mut stream = stream;
+            yield ProviderEvent::ReasoningReplay { replay: ReasoningReplay {
+                origin: origin.clone(), model: model.clone(), field: field.clone(), blocks: vec![],
+            }};
             while let Some(result) = stream.next().await {
                 let response = result.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+                // The final chunk (requested via `stream_options.include_usage`)
+                // carries the whole-request usage with an empty `choices`.
+                if let Some(usage) = &response.usage
+                    && (!response.choices.is_empty() || usage.prompt_tokens > 0 || usage.total_tokens > 0)
+                {
+                    // `cached_tokens` is a subset of `prompt_tokens`;
+                    // the rest was processed uncached. Gateways without
+                    // the details object report no cache hits.
+                    let cached = usage
+                        .prompt_tokens_details
+                        .as_ref()
+                        .and_then(|d| d.cached_tokens)
+                        .unwrap_or(0) as u64;
+                    let reasoning = usage
+                        .completion_tokens_details
+                        .as_ref()
+                        .and_then(|d| d.reasoning_tokens)
+                        .unwrap_or(0) as u64;
+                    yield ProviderEvent::Usage {
+                        usage: TokenUsage {
+                            input_tokens: (usage.prompt_tokens as u64).saturating_sub(cached),
+                            cached_tokens: cached,
+                            // OpenAI's automatic prefix cache reports no
+                            // separate write figure.
+                            cache_write_tokens: 0,
+                            output_tokens: usage.completion_tokens as u64,
+                            reasoning_tokens: reasoning,
+                        },
+                    };
+                }
                 if let Some(choice) = response.choices.first() {
                     let delta = &choice.delta;
 
-                    if let Some(reasoning) = &delta.reasoning_content {
-                        if !reasoning.is_empty() {
-                            yield ProviderEvent::ReasoningDelta { delta: reasoning.clone() };
+                    let reasoning = field.as_deref().and_then(|name| {
+                        if name == "reasoning_content" { delta.reasoning_content.as_deref() }
+                        else { delta.extra.get(name).and_then(Value::as_str) }
+                    }).map(|text| (field.as_deref().unwrap(), text))
+                    .or_else(|| delta.reasoning_content.as_deref().map(|text| ("reasoning_content", text)))
+                    .or_else(|| ["reasoning", "reasoning_text"].into_iter().find_map(|name|
+                        delta.extra.get(name).and_then(Value::as_str).map(|text| (name, text))));
+                    if let Some((name, reasoning)) = reasoning
+                        && !reasoning.is_empty() {
+                            yield ProviderEvent::ReasoningReplay { replay: ReasoningReplay {
+                                origin: origin.clone(), model: model.clone(), field: Some(name.to_string()), blocks: vec![],
+                            }};
+                            yield ProviderEvent::ReasoningDelta { delta: reasoning.to_string() };
                         }
-                    }
 
-                    if let Some(content) = &delta.content {
-                        if !content.is_empty() {
+                    if let Some(content) = &delta.content
+                        && !content.is_empty() {
                             yield ProviderEvent::ContentDelta { delta: content.clone() };
                         }
-                    }
 
                     if let Some(tool_calls) = &delta.tool_calls {
                         for tool_call in tool_calls {
@@ -600,7 +765,11 @@ impl ResponseParser for OpenAIProvider {
 
                     if let Some(reason) = &choice.finish_reason {
                         yield ProviderEvent::Finish {
-                            reason: Some(format!("{:?}", reason)),
+                            // `finish_reason` is a plain String; Debug-
+                            // formatting it would wrap the value in literal
+                            // quotes and break the consumer's match on
+                            // "max_tokens"/"length".
+                            reason: Some(reason.clone()),
                         };
                     }
                 }
@@ -629,19 +798,43 @@ impl LlmProvider for OpenAIProvider {
         BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
         Box<dyn Error + Send + Sync>,
     > {
-        let request: CreateChatCompletionRequest = serde_json::from_value(request)
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-
-        let stream = self
-            .client
-            .chat()
-            .create_stream(request)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        // Retry the request-setup phase on transport-level failures (connect
+        // errors, read timeouts on a stalled connection). The wire request is
+        // re-parsed per attempt because `create_stream` consumes it; parse
+        // failures are permanent and never retried.
+        let status_sink = self.status_sink_snapshot();
+        let stream = crate::http::with_retries_capped(
+            self.retry_backoff,
+            self.retry_max_wait,
+            || {
+                let request = request.clone();
+                async move {
+                    let request: CreateChatCompletionRequest = serde_json::from_value(request)
+                        .map_err(|e| OpenAIError::Build(e.to_string()))?;
+                    self.client.chat().create_stream(request).await
+                }
+            },
+            |e| match e {
+                // Transport-level failures retry with the backoff sequence.
+                OpenAIError::Http(_) => crate::http::RetryDecision::Yes { after: None },
+                // Rate limits honor the provider's suggested wait, capped.
+                OpenAIError::RateLimit { retry_after, .. } => {
+                    crate::http::RetryDecision::Yes { after: *retry_after }
+                }
+                _ => crate::http::RetryDecision::No,
+            },
+            status_sink.as_ref(),
+        )
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         let parsed_stream = self.parse_stream(stream);
 
         Ok(parsed_stream)
+    }
+
+    fn set_status_sink(&self, sink: Option<StatusSink>) {
+        *self.status_sink.lock().expect("status sink lock poisoned") = sink;
     }
 
     async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
@@ -676,14 +869,44 @@ impl LlmProvider for OpenAIProvider {
 /// let provider = AnthropicProvider::new("api-key", "claude-3-7-sonnet")
 ///     .with_extended_thinking();
 /// ```
+/// Output budget for the Anthropic provider when the config does not pick
+/// one. Reasoning models (e.g. MiniMax M3) spend thinking tokens from this
+/// budget, so a small value can end a turn with no text at all — MiniMax's
+/// own API docs note that too small a `max_tokens` yields
+/// `stop_reason: "max_tokens"` with no text output. Newer reasoning models
+/// therefore get a much larger default than the legacy 8192.
+const ANTHROPIC_LEGACY_MAX_TOKENS: u32 = 8192;
+const ANTHROPIC_REASONING_MODEL_MAX_TOKENS: u32 = 32768;
+
 pub struct AnthropicProvider {
+    reasoning_effort: Option<String>,
     client: AnthropicClient,
     model: String,
     #[allow(dead_code)]
     capabilities: Capabilities,
+    retry_backoff: Duration,
+    /// Upper bound on a single retry wait; longer `Retry-After` hints are
+    /// clamped down to this.
+    retry_max_wait: Duration,
+    /// Output token budget sent as `max_tokens` on every request.
+    max_tokens: u32,
+    /// Sink for transient status messages (retry backoff), registered by
+    /// the agent layer so frontends can show progress during waits.
+    status_sink: Mutex<Option<StatusSink>>,
 }
 
 impl AnthropicProvider {
+    /// Per-model output budget: reasoning models think from the same budget
+    /// and need far more than the legacy 8192.
+    fn default_max_tokens_for_model(model: &str) -> u32 {
+        let model_lower = model.to_lowercase();
+        if model_lower.contains("minimax") {
+            ANTHROPIC_REASONING_MODEL_MAX_TOKENS
+        } else {
+            ANTHROPIC_LEGACY_MAX_TOKENS
+        }
+    }
+
     /// Creates a new provider for the official Anthropic API.
     ///
     /// # Arguments
@@ -697,6 +920,11 @@ impl AnthropicProvider {
             client: AnthropicClient::with_config(config),
             model: model.to_string(),
             capabilities,
+            retry_backoff: crate::http::RETRY_BACKOFF,
+            retry_max_wait: crate::http::MAX_RETRY_WAIT,
+            max_tokens: Self::default_max_tokens_for_model(model),
+            reasoning_effort: None,
+            status_sink: Mutex::new(None),
         }
     }
 
@@ -717,7 +945,54 @@ impl AnthropicProvider {
             client: AnthropicClient::with_config(config),
             model: model.to_string(),
             capabilities,
+            retry_backoff: crate::http::RETRY_BACKOFF,
+            retry_max_wait: crate::http::MAX_RETRY_WAIT,
+            max_tokens: Self::default_max_tokens_for_model(model),
+            reasoning_effort: None,
+            status_sink: Mutex::new(None),
         }
+    }
+
+    /// Overrides the base delay between retries of a failed request setup
+    /// (each retry waits four times longer than the previous one).
+    pub fn with_retry_backoff(mut self, backoff: Duration) -> Self {
+        self.retry_backoff = backoff;
+        self
+    }
+
+    /// Overrides the upper bound on a single retry wait; a provider's
+    /// `Retry-After` hint longer than this is clamped down to it.
+    pub fn with_retry_max_wait(mut self, max_wait: Duration) -> Self {
+        self.retry_max_wait = max_wait;
+        self
+    }
+
+    /// Snapshot of the registered status sink, if any. Taken before the
+    /// retry loop so no lock guard is held across an await point.
+    fn status_sink_snapshot(&self) -> Option<StatusSink> {
+        self.status_sink
+            .lock()
+            .expect("status sink lock poisoned")
+            .clone()
+    }
+
+    /// Overrides the output token budget sent as `max_tokens`.
+    ///
+    /// Reasoning models spend thinking tokens from this budget; raise it when
+    /// turns come back empty or truncated (`stop_reason: "max_tokens"`).
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    pub fn with_reasoning_effort(mut self, effort: &str) -> Self {
+        self.reasoning_effort = Some(effort.to_owned());
+        self
+    }
+
+    /// The output token budget sent as `max_tokens` on every request.
+    pub fn max_tokens(&self) -> u32 {
+        self.max_tokens
     }
 
     /// Enables extended thinking for supported models.
@@ -755,23 +1030,37 @@ impl AnthropicProvider {
 
     fn convert_content_part(&self, part: &ContentPart) -> Option<ContentBlock> {
         match part {
-            ContentPart::Text { text } => Some(ContentBlock::Text {
-                text: text.clone(),
+            ContentPart::Text { text } | ContentPart::Reminder { text } => {
+                Some(ContentBlock::Text { text: text.clone() })
+            }
+            ContentPart::Image { data, mime_type } => Some(ContentBlock::Image {
+                source: SourceBlock {
+                    source_type: "base64".to_string(),
+                    media_type: mime_type.clone(),
+                    data: data.clone(),
+                },
             }),
-            ContentPart::Image { data, mime_type } => Some(ContentBlock::Text {
-                text: format!("[Image: {}](data:{};base64,{})", mime_type, mime_type, data),
+            ContentPart::Audio { mime_type, .. } => Some(ContentBlock::Text {
+                text: format!("[Audio file: {} - not supported by this model]", mime_type),
             }),
-            ContentPart::Audio { data, mime_type } => Some(ContentBlock::Text {
-                text: format!("[Audio: {}](data:{};base64,{})", mime_type, mime_type, data),
+            ContentPart::Video { mime_type, .. } => Some(ContentBlock::Text {
+                text: format!("[Video file: {} - not supported by this model]", mime_type),
             }),
-            ContentPart::Video { data, mime_type } => Some(ContentBlock::Text {
-                text: format!("[Video: {}](data:{};base64,{})", mime_type, mime_type, data),
-            }),
-            ContentPart::File { data, mime_type } => {
-                Some(ContentBlock::Text {
-                    text: format!("[File: {}](data:{};base64,{})", mime_type, mime_type, data),
+            ContentPart::File { data, mime_type } if mime_type == "application/pdf" => {
+                Some(ContentBlock::Document {
+                    source: SourceBlock {
+                        source_type: "base64".to_string(),
+                        media_type: mime_type.clone(),
+                        data: data.clone(),
+                    },
                 })
             }
+            ContentPart::File { mime_type, .. } if mime_type != "application/pdf" => {
+                Some(ContentBlock::Text {
+                    text: format!("[File: {} - not supported by this model]", mime_type),
+                })
+            }
+            ContentPart::File { .. } => None,
         }
     }
 
@@ -780,29 +1069,60 @@ impl AnthropicProvider {
         msg: &Message,
     ) -> Result<Vec<AnthropicMessage>, Box<dyn Error + Send + Sync>> {
         match msg {
+            Message::Compaction { summary, recent } => self.convert_message(
+                &gewu_core::compaction::build_checkpoint_message(summary, recent)),
             Message::System { content: _ } => Ok(vec![]),
             Message::User { content } => {
                 let blocks: Vec<ContentBlock> = content
                     .iter()
                     .filter_map(|p| self.convert_content_part(p))
                     .collect();
-                Ok(vec![AnthropicMessage::User(UserMessage { content: blocks })])
+                Ok(vec![AnthropicMessage::User(UserMessage {
+                    content: blocks,
+                })])
             }
             Message::Assistant {
                 content,
+                reasoning,
+                replay,
                 tool_calls,
             } => {
+                let origin = format!("anthropic:{}", self.client.config.base_url.trim_end_matches('/'));
+                if let Some(replay) = replay.as_ref().filter(|r| r.origin == origin && r.model == self.model) {
+                    let blocks: Vec<ContentBlock> = replay.blocks.iter().cloned()
+                        .map(serde_json::from_value).collect::<Result<_, _>>()?;
+                    for block in &blocks {
+                        if let ContentBlock::Thinking { signature, .. } = block
+                            && signature.is_empty() {
+                                return Err("cannot replay incomplete Anthropic thinking: missing signature".into());
+                            }
+                    }
+                    return Ok(vec![AnthropicMessage::Assistant(AnthropicAssistantMessage { content: Some(blocks) })]);
+                }
                 let mut blocks: Vec<ContentBlock> = Vec::new();
-                if let Some(text) = content {
-                    if !text.is_empty() {
+                if let Some(text) = reasoning.as_ref().filter(|text| !text.is_empty()) {
+                    blocks.push(ContentBlock::Text { text: text.clone() });
+                }
+                if let Some(text) = content
+                    && !text.is_empty() {
                         blocks.push(ContentBlock::Text { text: text.clone() });
                     }
-                }
                 if let Some(calls) = tool_calls {
                     for call in calls {
-                        let input: Value = serde_json::from_str(&call.function.arguments).map_err(|e| {
-                            format!("Invalid arguments for Anthropic tool call '{}': {}", call.function.name, e)
-                        })?;
+                        // An empty arguments string (e.g. a no-argument tool
+                        // call whose fragments never arrived) must become an
+                        // empty JSON object; `from_str("")` is a hard error.
+                        let args = call.function.arguments.trim();
+                        let input: Value = if args.is_empty() {
+                            Value::Object(Default::default())
+                        } else {
+                            serde_json::from_str(args).map_err(|e| {
+                                format!(
+                                    "Invalid arguments for Anthropic tool call '{}': {}",
+                                    call.function.name, e
+                                )
+                            })?
+                        };
                         blocks.push(ContentBlock::ToolUse {
                             id: call.id.clone(),
                             name: call.function.name.clone(),
@@ -813,9 +1133,11 @@ impl AnthropicProvider {
                 if blocks.is_empty() {
                     Ok(vec![])
                 } else {
-                    Ok(vec![AnthropicMessage::Assistant(AnthropicAssistantMessage {
-                        content: Some(blocks),
-                    })])
+                    Ok(vec![AnthropicMessage::Assistant(
+                        AnthropicAssistantMessage {
+                            content: Some(blocks),
+                        },
+                    )])
                 }
             }
             Message::Tool {
@@ -835,7 +1157,9 @@ impl AnthropicProvider {
                         blocks.push(block);
                     }
                 }
-                Ok(vec![AnthropicMessage::User(UserMessage { content: blocks })])
+                Ok(vec![AnthropicMessage::User(UserMessage {
+                    content: blocks,
+                })])
             }
         }
     }
@@ -882,6 +1206,7 @@ impl AnthropicProvider {
         let anthropic_tools = self.convert_tools(tools)?;
 
         Ok(CreateMessageRequest {
+            output_config: self.reasoning_effort.as_ref().map(|effort| serde_json::json!({"effort": effort})),
             model: self.model.clone(),
             messages: anthropic_messages,
             system: if system_prompt.is_empty() {
@@ -895,7 +1220,7 @@ impl AnthropicProvider {
                 Some(anthropic_tools)
             },
             stream: true,
-            max_tokens: Some(8192),
+            max_tokens: Some(self.max_tokens),
         })
     }
 }
@@ -915,7 +1240,7 @@ impl AnthropicToolCallAggregator {
         }
 
         match &chunk.content_block {
-            ContentBlockStart::ToolUse { id, name } => {
+            ContentBlockStart::ToolUse { id, name, input } => {
                 let state = &mut self.states[idx];
                 state.id = Some(id.clone());
                 state.name = Some(name.clone());
@@ -924,6 +1249,23 @@ impl AnthropicToolCallAggregator {
                     id: id.clone(),
                     name: name.clone(),
                 });
+                // Anthropic delivers the complete `input` object on the start
+                // block for some calls (notably no-argument tools) and sends
+                // no `input_json_delta` fragments afterwards. Seed the buffer
+                // so the arguments reach the agent instead of ending up empty.
+                if let Some(input) = input
+                    && input.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+                        state.argument_buffer = input.to_string();
+                        let new_len = state.argument_buffer.len();
+                        let delta = state.argument_buffer[state.sent_len..new_len].to_string();
+                        state.sent_len = new_len;
+                        if !delta.is_empty() {
+                            events.push(ProviderEvent::ToolCallDelta {
+                                id: id.clone(),
+                                delta,
+                            });
+                        }
+                    }
             }
             ContentBlockStart::Thinking { thinking, .. } => {
                 if !thinking.is_empty() {
@@ -932,6 +1274,7 @@ impl AnthropicToolCallAggregator {
                     });
                 }
             }
+            ContentBlockStart::RedactedThinking { .. } => {}
             ContentBlockStart::Text { .. } => {}
         }
 
@@ -943,13 +1286,16 @@ impl AnthropicToolCallAggregator {
         let idx = index as usize;
 
         if idx >= self.states.len() {
-            return events;
+            // A delta without a preceding start block can still carry
+            // reasoning text; create the state so it is not dropped.
+            // (InputJsonDelta below is still guarded by `started`.)
+            self.states.resize_with(idx + 1, ToolCallState::default);
         }
 
         let state = &mut self.states[idx];
 
         match &chunk.delta {
-            ContentDelta::InputJsonDelta { partial_json } => {
+            ContentDelta::InputJson { partial_json } => {
                 if !state.started {
                     return events;
                 }
@@ -960,22 +1306,20 @@ impl AnthropicToolCallAggregator {
                         let delta = state.argument_buffer[state.sent_len..new_len].to_string();
                         state.sent_len = new_len;
                         if !delta.is_empty() {
-                            events.push(ProviderEvent::ToolCallDelta {
-                                id,
-                                delta,
-                            });
+                            events.push(ProviderEvent::ToolCallDelta { id, delta });
                         }
                     }
                 }
             }
-            ContentDelta::ThinkingDelta { thinking } => {
+            ContentDelta::Thinking { thinking } => {
                 if !thinking.is_empty() {
                     events.push(ProviderEvent::ReasoningDelta {
                         delta: thinking.clone(),
                     });
                 }
             }
-            ContentDelta::TextDelta { .. } => {}
+            ContentDelta::Text { .. } => {}
+            ContentDelta::Signature { .. } => {}
         }
 
         events
@@ -986,48 +1330,149 @@ impl AnthropicProvider {
     fn parse_stream(
         &self,
         stream: AnthropicStream,
-    ) -> futures::stream::BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>> {
+    ) -> futures::stream::BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>
+    {
+        let origin = format!("anthropic:{}", self.client.config.base_url.trim_end_matches('/'));
+        let model = self.model.clone();
         let s = async_stream::try_stream! {
             let mut tool_aggregator = AnthropicToolCallAggregator::default();
+            let mut blocks = std::collections::BTreeMap::<u32, Value>::new();
+            let mut arguments = std::collections::BTreeMap::<u32, String>::new();
+            let mut has_reasoning = false;
             let mut stream = stream;
+
+            // Cache figures may be zeroed on `message_start` by proxies
+            // (LiteLLM/OpenRouter report real numbers only in the final
+            // `message_delta`), so each field keeps the latest non-zero
+            // value across both events.
+            let mut usage = TokenUsage::default();
 
             while let Some(result) = stream.next().await {
                 let chunk = result.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
                 match chunk {
-                    AnthropicChunk::MessageStart(MessageStartChunk { .. }) => {}
+                    AnthropicChunk::MessageStart(MessageStartChunk { _message }) => {
+                        if let Some(message_usage) = _message.usage {
+                            if message_usage.input_tokens > 0 {
+                                usage.input_tokens = message_usage.input_tokens;
+                            }
+                            if message_usage.cache_read_input_tokens > 0 {
+                                usage.cached_tokens = message_usage.cache_read_input_tokens;
+                            }
+                            if message_usage.cache_creation_input_tokens > 0 {
+                                usage.cache_write_tokens = message_usage.cache_creation_input_tokens;
+                            }
+                            if message_usage.output_tokens > 0 {
+                                usage.output_tokens = message_usage.output_tokens;
+                            }
+                        }
+                    }
                     AnthropicChunk::ContentBlockStart(chunk) => {
+                        let block = match &chunk.content_block {
+                            ContentBlockStart::Thinking { thinking, signature } => {
+                                has_reasoning = true;
+                                serde_json::json!({"type":"thinking", "thinking":thinking, "signature":signature})
+                            }
+                            ContentBlockStart::RedactedThinking { data } => {
+                                has_reasoning = true;
+                                serde_json::json!({"type":"redacted_thinking", "data":data})
+                            }
+                            ContentBlockStart::Text { _text } => {
+                                if !_text.is_empty() {
+                                    yield ProviderEvent::ContentDelta { delta: _text.clone() };
+                                }
+                                serde_json::json!({"type":"text", "text":_text})
+                            }
+                            ContentBlockStart::ToolUse { id, name, input } =>
+                                serde_json::json!({"type":"tool_use", "id":id, "name":name, "input":input.clone().unwrap_or_else(|| serde_json::json!({}))}),
+                        };
+                        blocks.insert(chunk.index, block);
                         for event in tool_aggregator.process_chunk(&chunk, chunk.index) {
                             yield event;
                         }
                     }
                     AnthropicChunk::ContentBlockDelta(chunk) => {
+                        if let Some(block) = blocks.get_mut(&chunk.index) {
+                            let (field, delta) = match &chunk.delta {
+                                ContentDelta::Text { text } => ("text", text.as_str()),
+                                ContentDelta::Thinking { thinking } => ("thinking", thinking.as_str()),
+                                ContentDelta::Signature { signature } => ("signature", signature.as_str()),
+                                ContentDelta::InputJson { partial_json } => {
+                                    arguments.entry(chunk.index).or_default().push_str(partial_json);
+                                    ("", "")
+                                }
+                            };
+                            if !field.is_empty() {
+                                let mut text = block[field].as_str().unwrap_or("").to_string();
+                                text.push_str(delta);
+                                block[field] = Value::String(text);
+                            }
+                        }
                         for event in tool_aggregator.process_delta(&chunk, chunk.index) {
                             yield event;
                         }
                         match &chunk.delta {
-                            ContentDelta::TextDelta { text } => {
+                            ContentDelta::Text { text } => {
                                 if !text.is_empty() {
                                     yield ProviderEvent::ContentDelta { delta: text.clone() };
                                 }
                             }
-                            ContentDelta::ThinkingDelta { thinking } => {
-                                if !thinking.is_empty() {
-                                    yield ProviderEvent::ReasoningDelta { delta: thinking.clone() };
-                                }
-                            }
-                            ContentDelta::InputJsonDelta { .. } => {}
+                            // ThinkingDelta is already emitted by the
+                            // aggregator above; emitting it here too would
+                            // duplicate every reasoning token in the stream.
+                            ContentDelta::Thinking { .. } => {}
+                            ContentDelta::InputJson { .. } => {}
+                            ContentDelta::Signature { .. } => {}
                         }
                     }
                     AnthropicChunk::ContentBlockStop(_) => {}
                     AnthropicChunk::MessageDelta(chunk) => {
+                        // `message_delta.usage` is the cumulative figure;
+                        // merge it over the `message_start` values (latest
+                        // non-zero per field, see above).
+                        let message_usage = &chunk._usage;
+                        if message_usage.input_tokens > 0 {
+                            usage.input_tokens = message_usage.input_tokens;
+                        }
+                        if message_usage.cache_read_input_tokens > 0 {
+                            usage.cached_tokens = message_usage.cache_read_input_tokens;
+                        }
+                        if message_usage.cache_creation_input_tokens > 0 {
+                            usage.cache_write_tokens = message_usage.cache_creation_input_tokens;
+                        }
+                        if message_usage.output_tokens > 0 {
+                            usage.output_tokens = message_usage.output_tokens;
+                        }
                         if let Some(reason) = chunk.delta.stop_reason {
+                            if has_reasoning {
+                                for (index, json) in &arguments {
+                                    if let Some(block) = blocks.get_mut(index) {
+                                        block["input"] = serde_json::from_str(json)?;
+                                    }
+                                }
+                                yield ProviderEvent::ReasoningReplay { replay: ReasoningReplay {
+                                    origin: origin.clone(), model: model.clone(), field: None,
+                                    blocks: blocks.values().cloned().collect(),
+                                }};
+                            }
+                            // Emit once, with the terminal cumulative
+                            // figures: some flows (server tools) deliver
+                            // several cumulative `message_delta` events, and
+                            // emitting each would double-count downstream.
+                            if usage.prompt_tokens() > 0 || usage.output_tokens > 0 {
+                                yield ProviderEvent::Usage { usage };
+                            }
                             yield ProviderEvent::Finish { reason: Some(reason) };
                         }
                     }
                     AnthropicChunk::MessageStop => {}
                     AnthropicChunk::Error(e) => {
                         yield ProviderEvent::Error { error: e.error.message };
+                        // An `error` event is terminal per the Anthropic
+                        // streaming spec: the server sends nothing else and
+                        // keeps the connection open. Continuing to poll would
+                        // hang the turn forever.
+                        return;
                     }
                 }
             }
@@ -1055,19 +1500,42 @@ impl LlmProvider for AnthropicProvider {
         futures::stream::BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
         Box<dyn Error + Send + Sync>,
     > {
-        let request: CreateMessageRequest = serde_json::from_value(request)
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-
-        let stream = self
-            .client
-            .messages()
-            .create_stream(request)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        // Retry the request-setup phase on transport-level failures; see the
+        // OpenAI `send` for rationale. Parse failures are permanent and never
+        // retried.
+        let status_sink = self.status_sink_snapshot();
+        let stream = crate::http::with_retries_capped(
+            self.retry_backoff,
+            self.retry_max_wait,
+            || {
+                let request = request.clone();
+                async move {
+                    let request: CreateMessageRequest = serde_json::from_value(request)
+                        .map_err(|e| AnthropicError::Api(format!("build error: {e}")))?;
+                    self.client.messages().create_stream(request).await
+                }
+            },
+            |e| match e {
+                // Transport-level failures retry with the backoff sequence.
+                AnthropicError::Http(_) => crate::http::RetryDecision::Yes { after: None },
+                // Rate limits honor the provider's suggested wait, capped.
+                AnthropicError::RateLimit { retry_after, .. } => {
+                    crate::http::RetryDecision::Yes { after: *retry_after }
+                }
+                _ => crate::http::RetryDecision::No,
+            },
+            status_sink.as_ref(),
+        )
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         let parsed_stream = self.parse_stream(stream);
 
         Ok(parsed_stream)
+    }
+
+    fn set_status_sink(&self, sink: Option<StatusSink>) {
+        *self.status_sink.lock().expect("status sink lock poisoned") = sink;
     }
 
     async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
@@ -1082,11 +1550,106 @@ impl LlmProvider for AnthropicProvider {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn chat_reasoning_replays_detected_field_and_respects_origin() {
+        let body = concat!(
+            "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_text\":\"consider \"}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_text\":\"tools\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let addr = serve_canned(vec![http_response("HTTP/1.1 200 OK", &[("Content-Type", "text/event-stream")], body)]).await;
+        let provider = OpenAIProvider::new_with_endpoint("key", &format!("http://{addr}/v1"), "reasoner");
+        let mut stream = provider.stream_response(&[], &[], None).await.unwrap();
+        let mut text = String::new();
+        let mut replay = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                ProviderEvent::ReasoningDelta { delta } => text.push_str(&delta),
+                ProviderEvent::ReasoningReplay { replay: state } => replay = Some(state),
+                _ => {}
+            }
+        }
+        let message = Message::Assistant { content: None, reasoning: Some(text), replay, tool_calls: Some(vec![gewu_core::types::ToolCall {
+            id: "call-1".into(), r#type: "function".into(),
+            function: gewu_core::types::FunctionCall { name: "read".into(), arguments: "{}".into() },
+        }]) };
+        let restored: Message = serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+        let wire = serde_json::to_value(provider.convert_message(&restored).unwrap()).unwrap();
+        assert_eq!(wire[0]["reasoning_text"], "consider tools");
+        let request = provider.build(&[restored.clone(), Message::Tool {
+            tool_call_id: "call-1".into(), tool_name: Some("read".into()), content: "result".into(), media: vec![],
+        }, Message::User { content: vec![ContentPart::Text { text: "continue".into() }] }], &[]).unwrap();
+        assert_eq!(request["messages"][0]["reasoning_text"], "consider tools");
+        assert_eq!(request["messages"][1]["role"], "tool");
+        assert_eq!(request["messages"][2]["role"], "user");
+        let other = OpenAIProvider::new("key", "other-model");
+        let wire = serde_json::to_value(other.convert_message(&restored).unwrap()).unwrap();
+        assert!(wire[0].get("reasoning_text").is_none());
+        let required = crate::GlmProvider::new("key", "other-model");
+        let wire = required.build(std::slice::from_ref(&restored), &[]).unwrap();
+        assert!(wire["messages"][0].get("reasoning").is_none());
+        drop(stream);
+        let custom = crate::DeepSeekProvider::new_with_endpoint("key", &provider.base_url, "reasoner");
+        let wire = custom.build(std::slice::from_ref(&restored), &[]).unwrap();
+        assert_eq!(wire["messages"][0]["reasoning_content"], "consider tools");
+        let plain = Message::Assistant { content: Some("plain".into()), reasoning: None, replay: None, tool_calls: None };
+        let wire = custom.build(&[plain], &[]).unwrap();
+        assert!(wire["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[tokio::test]
+    async fn anthropic_replays_ordered_signed_and_redacted_blocks() {
+        let events = [
+            serde_json::json!({"type":"content_block_start", "index":0,"content_block":{"type":"thinking","thinking":"consider", "signature":""}}),
+            serde_json::json!({"type":"content_block_delta", "index":0,"delta":{"type":"signature_delta","signature":"sig-"}}),
+            serde_json::json!({"type":"content_block_delta", "index":0,"delta":{"type":"signature_delta","signature":"123"}}),
+            serde_json::json!({"type":"content_block_start", "index":1,"content_block":{"type":"redacted_thinking","data":"opaque"}}),
+            serde_json::json!({"type":"content_block_start", "index":2,"content_block":{"type":"text","text":"checking"}}),
+            serde_json::json!({"type":"content_block_start", "index":3,"content_block":{"type":"tool_use","id":"call-1","name":"read","input":{}}}),
+            serde_json::json!({"type":"content_block_delta", "index":3,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a\"}"}}),
+            serde_json::json!({"type":"content_block_start", "index":4,"content_block":{"type":"thinking","thinking":"again", "signature":"second-signature"}}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":10}}),
+        ];
+        let body = events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect::<String>();
+        let addr = serve_canned(vec![http_response("HTTP/1.1 200 OK", &[("Content-Type", "text/event-stream")], &body)]).await;
+        let provider = AnthropicProvider::new_with_endpoint("key", &format!("http://{addr}"), "claude-test");
+        let mut stream = provider.stream_response(&[], &[], None).await.unwrap();
+        let mut replay = None;
+        while let Some(event) = stream.next().await {
+            if let ProviderEvent::ReasoningReplay { replay: state } = event.unwrap() { replay = Some(state); }
+        }
+        let message = Message::Assistant { content: Some("checking".into()), reasoning: Some("consider".into()), replay, tool_calls: None };
+        let restored: Message = serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+        let wire = serde_json::to_value(provider.convert_message(&restored).unwrap()).unwrap();
+        let blocks = &wire[0]["content"];
+        assert_eq!(blocks[0]["signature"], "sig-123");
+        assert_eq!(blocks[1]["type"], "redacted_thinking");
+        assert_eq!(blocks[1]["data"], "opaque");
+        assert_eq!(blocks[2]["text"], "checking");
+        assert_eq!(blocks[3]["input"]["path"], "a");
+        assert_eq!(blocks[4]["thinking"], "again");
+        assert_eq!(blocks[4]["signature"], "second-signature");
+        let request = provider.build(&[restored.clone(), Message::Tool {
+            tool_call_id: "call-1".into(), tool_name: Some("read".into()), content: "result".into(), media: vec![],
+        }], &[]).unwrap();
+        assert_eq!(request["messages"][0]["content"][0]["signature"], "sig-123");
+        assert_eq!(request["messages"][1]["content"][0]["tool_use_id"], "call-1");
+        let mut incomplete = restored.clone();
+        if let Message::Assistant { replay: Some(state), .. } = &mut incomplete {
+            state.blocks[0]["signature"] = serde_json::json!("");
+        }
+        assert!(provider.convert_message(&incomplete).is_err());
+        let other = AnthropicProvider::new("key", "other");
+        let wire = serde_json::to_value(other.convert_message(&restored).unwrap()).unwrap();
+        assert_eq!(wire[0]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(wire[0]["content"][0]["type"], "text");
+        assert_eq!(wire[0]["content"][0]["text"], "consider");
+    }
     use super::*;
     use crate::openai::FunctionCallStream;
     use async_trait::async_trait;
     use gewu_core::types::{FunctionCall as CoreFunctionCall, ToolCall as CoreToolCall};
-    use gewu_core::{ToolContext, ToolResult, Tool};
+    use gewu_core::{Tool, ToolContext, ToolResult};
     use schemars::schema::RootSchema;
     use serde_json::Value;
 
@@ -1109,8 +1672,74 @@ mod tests {
         assert!(provider.build(&[], &[]).is_ok());
     }
 
+    /// Reasoning models think from the `max_tokens` budget, so the default
+    /// must be large enough for them to emit text after thinking; legacy
+    /// models keep the conservative 8192.
     #[test]
-    fn convert_message_emits_media_followup() {
+    fn anthropic_default_max_tokens_is_model_aware() {
+        let reasoning = AnthropicProvider::new("test-key", "MiniMax-M3.1-flash");
+        assert_eq!(reasoning.max_tokens, 32768);
+
+        let legacy = AnthropicProvider::new("test-key", "claude-3-5-sonnet");
+        assert_eq!(legacy.max_tokens, 8192);
+    }
+
+    #[test]
+    fn anthropic_max_tokens_is_configurable() {
+        let provider =
+            AnthropicProvider::new("test-key", "MiniMax-M3.1-flash").with_max_tokens(65_536);
+        let request = provider
+            .build_typed(
+                &[Message::User {
+                    content: vec![ContentPart::Text {
+                        text: "hi".to_string(),
+                    }],
+                }],
+                &[],
+            )
+            .expect("request builds");
+        assert_eq!(request.max_tokens, Some(65_536));
+    }
+
+    /// Reminder parts are model-facing scaffolding: both providers must
+    /// carry them on the wire as plain text so the model still sees them.
+    #[test]
+    fn reminder_parts_reach_providers_as_text() {
+        let reminder_text = "<system-reminder>Plan mode is active.</system-reminder>";
+        let messages = [Message::User {
+            content: vec![
+                ContentPart::Text {
+                    text: "prompt".to_string(),
+                },
+                ContentPart::Reminder {
+                    text: reminder_text.to_string(),
+                },
+            ],
+        }];
+
+        let openai = OpenAIProvider::new("test-key", "gpt-4")
+            .build_typed(&messages, &[])
+            .expect("openai request builds");
+        let wire = serde_json::to_string(&openai).unwrap();
+        assert!(wire.contains(reminder_text), "OpenAI wire lost the reminder");
+
+        let anthropic = AnthropicProvider::new("test-key", "claude-3-5-sonnet")
+            .build_typed(&messages, &[])
+            .expect("anthropic request builds");
+        let AnthropicMessage::User(UserMessage { content }) = &anthropic.messages[0] else {
+            panic!("expected a user message");
+        };
+        assert!(content.iter().any(
+            |block| matches!(block, ContentBlock::Text { text } if text == reminder_text)
+        ));
+    }
+
+    #[test]
+    fn convert_message_defers_media_followup() {
+        // Regression: a user message between two tool messages breaks the
+        // `assistant(tool_calls) → tool` contiguity strict backends require,
+        // so convert_message must emit ONLY the tool message; build_typed
+        // flushes deferred media after the run of tool messages ends.
         let provider = OpenAIProvider::new("test-key", "gpt-4");
         let msg = Message::Tool {
             tool_call_id: "call_1".to_string(),
@@ -1128,17 +1757,45 @@ mod tests {
         };
 
         let converted = provider.convert_message(&msg).expect("convert success");
-        assert_eq!(converted.len(), 2);
+        assert_eq!(converted.len(), 1);
         match &converted[0] {
             ChatCompletionRequestMessage::Tool(tool_msg) => {
                 assert_eq!(tool_msg.tool_call_id.as_str(), "call_1");
             }
-            _ => panic!("first message should be tool"),
+            _ => panic!("only message should be tool"),
         }
-        match &converted[1] {
-            ChatCompletionRequestMessage::User(_) => {}
-            _ => panic!("second message should be user"),
-        }
+
+        // Through build_typed, two adjacent tool messages with media must
+        // keep their tool messages contiguous, with media flushed after.
+        let tool2 = Message::Tool {
+            tool_call_id: "call_2".to_string(),
+            tool_name: Some("read_file".to_string()),
+            content: "second".to_string(),
+            media: vec![ContentPart::Image {
+                data: "Wg==".to_string(),
+                mime_type: "image/png".to_string(),
+            }],
+        };
+        let assistant = Message::Assistant {
+            content: None,
+            reasoning: None,
+            replay: None,
+            tool_calls: None,
+        };
+        let request = provider
+            .build_typed(&[msg, tool2, assistant], &[])
+            .expect("build success");
+        let roles: Vec<String> = request
+            .messages
+            .iter()
+            .map(|m| match m {
+                ChatCompletionRequestMessage::Tool(_) => "tool".to_string(),
+                ChatCompletionRequestMessage::User(_) => "user".to_string(),
+                ChatCompletionRequestMessage::Assistant(_) => "assistant".to_string(),
+                ChatCompletionRequestMessage::System(_) => "system".to_string(),
+            })
+            .collect();
+        assert_eq!(roles, vec!["tool", "tool", "user", "user", "assistant"]);
     }
 
     fn make_chunk(
@@ -1284,6 +1941,8 @@ mod tests {
         let provider = OpenAIProvider::new("test-key", "gpt-4");
         let msg = Message::Assistant {
             content: Some("Hello world".to_string()),
+            reasoning: None,
+            replay: None,
             tool_calls: None,
         };
         let converted = provider.convert_message(&msg).expect("convert success");
@@ -1301,6 +1960,8 @@ mod tests {
         let provider = OpenAIProvider::new("test-key", "gpt-4");
         let msg = Message::Assistant {
             content: None,
+            reasoning: None,
+            replay: None,
             tool_calls: Some(vec![CoreToolCall {
                 id: "call_1".to_string(),
                 r#type: "function".to_string(),
@@ -1386,6 +2047,8 @@ mod tests {
         let provider = AnthropicProvider::new("test-key", "claude-3-5-sonnet");
         let msg = Message::Assistant {
             content: None,
+            reasoning: None,
+            replay: None,
             tool_calls: Some(vec![CoreToolCall {
                 id: "toolu_1".to_string(),
                 r#type: "function".to_string(),
@@ -1398,7 +2061,8 @@ mod tests {
 
         let converted = provider.convert_message(&msg).expect("convert success");
         match &converted[0] {
-            AnthropicMessage::Assistant(message) => match message.content.as_ref().unwrap().first() {
+            AnthropicMessage::Assistant(message) => match message.content.as_ref().unwrap().first()
+            {
                 Some(ContentBlock::ToolUse { id, name, input }) => {
                     assert_eq!(id, "toolu_1");
                     assert_eq!(name, "websearch");
@@ -1423,7 +2087,11 @@ mod tests {
         let converted = provider.convert_message(&msg).expect("convert success");
         match &converted[0] {
             AnthropicMessage::User(message) => match message.content.first() {
-                Some(ContentBlock::ToolResult { tool_use_id, content, is_error }) => {
+                Some(ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                }) => {
                     assert_eq!(tool_use_id, "toolu_1");
                     assert_eq!(content, "Search results");
                     assert_eq!(*is_error, None);
@@ -1441,7 +2109,10 @@ mod tests {
             content: "You are helpful".to_string(),
         };
         let converted = provider.convert_message(&msg).expect("convert success");
-        assert!(converted.is_empty(), "System messages should return empty for Anthropic");
+        assert!(
+            converted.is_empty(),
+            "System messages should return empty for Anthropic"
+        );
     }
 
     struct MockTool {
@@ -1498,9 +2169,10 @@ mod tests {
     #[test]
     fn anthropic_convert_tools() {
         let provider = AnthropicProvider::new("test-key", "claude-3-5-sonnet");
-        let tools: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(MockTool::new("get_weather", "Get weather for a city")),
-        ];
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool::new(
+            "get_weather",
+            "Get weather for a city",
+        ))];
         let converted = provider.convert_tools(&tools).expect("convert success");
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].name, "get_weather");
@@ -1525,32 +2197,6 @@ mod tests {
         assert_eq!(wire_tools.len(), 1);
         assert_eq!(wire_tools[0]["type"], "function");
         assert_eq!(wire_tools[0]["function"]["name"], "get_weather");
-    }
-
-    #[test]
-    fn openai_reasoning_effort_is_opt_in_on_the_wire() {
-        let messages = vec![Message::User {
-            content: vec![ContentPart::Text {
-                text: "hello".to_string(),
-            }],
-        }];
-        let tools: Vec<Arc<dyn Tool>> = Vec::new();
-        let default = OpenAIProvider::new("test-key", "gpt-4o")
-            .build(&messages, &tools)
-            .expect("build success");
-        assert!(default.get("reasoning_effort").is_none());
-
-        let low = OpenAIProvider::new("test-key", "glm-flash")
-            .with_reasoning_effort(Some(" LOW ".to_string()))
-            .build(&messages, &tools)
-            .expect("build success");
-        assert_eq!(low["reasoning_effort"], "low");
-
-        let blank = OpenAIProvider::new("test-key", "glm-flash")
-            .with_reasoning_effort(Some("   ".to_string()))
-            .build(&messages, &tools)
-            .expect("build success");
-        assert!(blank.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -1606,8 +2252,17 @@ mod tests {
 
     #[tokio::test]
     async fn stream_response_logs_wire_request_before_sending() {
-        // Unroutable endpoint: send fails, but the request is logged first.
-        let provider = OpenAIProvider::new_with_endpoint("test-key", "http://127.0.0.1:1", "gpt-4o");
+        // The request must be logged before it goes over the wire; a
+        // successful canned response proves it was sent and the log filled.
+        let sse = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let addr = serve_canned(vec![http_response(
+            "HTTP/1.1 200 OK",
+            &[("Content-Type", "text/event-stream")],
+            sse,
+        )])
+        .await;
+        let provider =
+            OpenAIProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "gpt-4o");
         let buffer = SharedBuffer::default();
         let messages = vec![Message::User {
             content: vec![ContentPart::Text {
@@ -1619,22 +2274,30 @@ mod tests {
         let result = provider
             .stream_response(&messages, &tools, Some(&buffer.handle()))
             .await;
-        assert!(result.is_err(), "send should fail against 127.0.0.1:1");
+        assert!(result.is_ok(), "send should succeed against the canned server");
 
         let entries = parse_log_entries(&buffer.contents());
         assert_eq!(entries.len(), 1);
         assert!(entries[0]["timestamp"].is_string());
         assert_eq!(entries[0]["request"]["model"], "gpt-4o");
-        assert_eq!(entries[0]["request"]["messages"].as_array().unwrap().len(), 1);
         assert_eq!(
-            entries[0]["request"]["tools"].as_array().unwrap().len(),
+            entries[0]["request"]["messages"].as_array().unwrap().len(),
             1
         );
+        assert_eq!(entries[0]["request"]["tools"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn stream_response_without_log_sends_normally() {
-        let provider = OpenAIProvider::new_with_endpoint("test-key", "http://127.0.0.1:1", "gpt-4o");
+        let sse = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let addr = serve_canned(vec![http_response(
+            "HTTP/1.1 200 OK",
+            &[("Content-Type", "text/event-stream")],
+            sse,
+        )])
+        .await;
+        let provider =
+            OpenAIProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "gpt-4o");
         let messages = vec![Message::User {
             content: vec![ContentPart::Text {
                 text: "hello".to_string(),
@@ -1642,7 +2305,7 @@ mod tests {
         }];
 
         let result = provider.stream_response(&messages, &[], None).await;
-        assert!(result.is_err(), "send should fail against 127.0.0.1:1");
+        assert!(result.is_ok(), "send should succeed against the canned server");
     }
 
     #[test]
@@ -1652,6 +2315,8 @@ mod tests {
         let provider = OpenAIProvider::new("test-key", "gpt-4o");
         let messages = vec![Message::Assistant {
             content: None,
+            reasoning: None,
+            replay: None,
             tool_calls: Some(vec![CoreToolCall {
                 id: "call_1".to_string(),
                 r#type: "function".to_string(),
@@ -1717,5 +2382,313 @@ mod tests {
             .collect();
         assert_eq!(reasoning, "Step one");
         assert_eq!(content, "Answer");
+    }
+
+    // -- 429 rate-limit handling -------------------------------------------
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Builds a complete HTTP/1.1 response with `Connection: close` so the
+    /// client never reuses the connection across canned replies.
+    fn http_response(status_line: &str, headers: &[(&str, &str)], body: &str) -> String {
+        let mut response = format!("{status_line}\r\n");
+        for (name, value) in headers {
+            response.push_str(&format!("{name}: {value}\r\n"));
+        }
+        response.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        response.push_str("Connection: close\r\n\r\n");
+        response.push_str(body);
+        response
+    }
+
+    /// Serves one canned response per connection, in order, then stops
+    /// accepting. Requests are drained before each reply.
+    async fn serve_canned(responses: Vec<String>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut socket, _)) = listener.accept().await else { break };
+                // Drain the request head and body so the reply is not reset.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    let mut data = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let head_end = data.windows(4).position(|w| w == b"\r\n\r\n");
+                        if let Some(head_end) = head_end {
+                            let head = String::from_utf8_lossy(&data[..head_end]).to_string();
+                            let length = head
+                                .lines()
+                                .find_map(|line| {
+                                    let lowered = line.to_ascii_lowercase();
+                                    let value = lowered.strip_prefix("content-length:")?;
+                                    value.trim().parse::<usize>().ok()
+                                })
+                                .unwrap_or(0);
+                            if data.len() >= head_end + 4 + length { break; }
+                        }
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => data.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                })
+                .await;
+                if socket.write_all(response.as_bytes()).await.is_err() {
+                    break;
+                }
+                let _ = socket.shutdown().await;
+            }
+        });
+        addr
+    }
+
+    const NEW_API_429_BODY: &str = r#"{"error":{"code":"user_rate_limit_exceeded","message":"You have reached the request limit: at most 1 requests per 60 minutes","type":"new_api_error"}}"#;
+
+    #[tokio::test]
+    async fn openai_rate_limit_with_short_hint_is_retried() {
+        let sse = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let addr = serve_canned(vec![
+            http_response(
+                "HTTP/1.1 429 Too Many Requests",
+                &[("Retry-After", "0")],
+                r#"{"error":{"message":"slow down","type":"new_api_error"}}"#,
+            ),
+            http_response("HTTP/1.1 200 OK", &[("Content-Type", "text/event-stream")], sse),
+        ])
+        .await;
+        let provider = OpenAIProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "gpt-4o")
+            .with_retry_backoff(std::time::Duration::from_millis(1));
+
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text { text: "hello".to_string() }],
+        }];
+        let events: Vec<_> = provider
+            .stream_response(&messages, &[], None)
+            .await
+            .expect("retry after the short hint should succeed")
+            .map(|event| event.expect("event should parse"))
+            .collect()
+            .await;
+        let content: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ContentDelta { delta } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(content, "hi");
+    }
+
+    #[tokio::test]
+    async fn openai_rate_limit_with_long_hint_is_clamped_and_retried() {
+        let sse = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let addr = serve_canned(vec![
+            http_response(
+                "HTTP/1.1 429 Too Many Requests",
+                &[("Retry-After", "3600")],
+                NEW_API_429_BODY,
+            ),
+            http_response("HTTP/1.1 200 OK", &[("Content-Type", "text/event-stream")], sse),
+        ])
+        .await;
+        // Tiny injected cap: the hour-long hint clamps to it instead of
+        // stalling the test for minutes.
+        let provider = OpenAIProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "gpt-4o")
+            .with_retry_backoff(std::time::Duration::from_millis(1))
+            .with_retry_max_wait(std::time::Duration::from_millis(1));
+
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text { text: "hello".to_string() }],
+        }];
+        let events: Vec<_> = provider
+            .stream_response(&messages, &[], None)
+            .await
+            .expect("clamped retry should succeed despite the hour-long hint")
+            .map(|event| event.expect("event should parse"))
+            .collect()
+            .await;
+        let content: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ContentDelta { delta } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(content, "hi");
+    }
+
+    #[tokio::test]
+    async fn anthropic_rate_limit_with_long_hint_is_clamped_and_retried() {
+        let sse = "event: message_stop\ndata: {}\n\n";
+        let addr = serve_canned(vec![
+            http_response(
+                "HTTP/1.1 429 Too Many Requests",
+                &[("retry-after", "3600")],
+                r#"{"type":"error","error":{"type":"rate_limit_error","message":"Number of requests too high"}}"#,
+            ),
+            http_response("HTTP/1.1 200 OK", &[("Content-Type", "text/event-stream")], sse),
+        ])
+        .await;
+        let provider = AnthropicProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "claude")
+            .with_retry_backoff(std::time::Duration::from_millis(1))
+            .with_retry_max_wait(std::time::Duration::from_millis(1));
+
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text { text: "hello".to_string() }],
+        }];
+        let events: Vec<ProviderEvent> = provider
+            .stream_response(&messages, &[], None)
+            .await
+            .expect("clamped retry should succeed despite the hour-long hint")
+            .map(|event| event.expect("event should parse"))
+            .collect()
+            .await;
+        // The retry delivered a clean (empty but valid) stream, not an error.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::Error { .. }))
+        );
+    }
+
+    // -- Provider-reported usage (cache accounting) ------------------------
+
+    /// Collects the parsed events from a raw OpenAI SSE body.
+    async fn openai_parse_sse(sse: &'static str) -> Vec<ProviderEvent> {
+        let body: std::collections::VecDeque<Result<bytes::Bytes, reqwest::Error>> =
+            std::collections::VecDeque::from(vec![Ok(bytes::Bytes::from_static(sse.as_bytes()))]);
+        let wire = futures::stream::iter(body);
+        OpenAIProvider::new("test-key", "gpt-4o")
+            .parse_stream(ChatCompletionStream::new(wire))
+            .map(|e| e.expect("event should parse"))
+            .collect()
+            .await
+    }
+
+    /// Collects the parsed events from a raw Anthropic SSE body.
+    async fn anthropic_parse_sse(sse: &'static str) -> Vec<ProviderEvent> {
+        let body: std::collections::VecDeque<Result<bytes::Bytes, reqwest::Error>> =
+            std::collections::VecDeque::from(vec![Ok(bytes::Bytes::from_static(sse.as_bytes()))]);
+        let wire = futures::stream::iter(body);
+        AnthropicProvider::new("test-key", "claude-3-5-sonnet")
+            .parse_stream(AnthropicStream::new(wire))
+            .map(|e| e.expect("event should parse"))
+            .collect()
+            .await
+    }
+
+    fn usage_events(events: &[ProviderEvent]) -> Vec<gewu_core::types::TokenUsage> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::Usage { usage } => Some(*usage),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn anthropic_usage_merges_start_and_delta_cache_figures() {
+        // Proxies (LiteLLM/OpenRouter) zero the cache fields on
+        // `message_start` and report real numbers in the final
+        // `message_delta`; each field must keep its latest non-zero value.
+        let sse = concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"m1","role":"assistant","content":[],"usage":{"input_tokens":100,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            "\n\n",
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42,"cache_read_input_tokens":700,"cache_creation_input_tokens":50}}"#,
+            "\n\n",
+            "event: message_stop\n",
+            "data: {}\n\n",
+        );
+        let events = anthropic_parse_sse(sse).await;
+        let usages = usage_events(&events);
+        assert_eq!(usages.len(), 1, "usage emitted once: {events:?}");
+        let usage = usages[0];
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cached_tokens, 700);
+        assert_eq!(usage.cache_write_tokens, 50);
+        assert_eq!(usage.output_tokens, 42);
+        // 700 of 850 prompt tokens were served from cache.
+        assert_eq!(usage.cache_hit_rate_percent(), Some(82));
+    }
+
+    #[tokio::test]
+    async fn anthropic_usage_without_stop_reason_is_not_emitted() {
+        // A cumulative `message_delta` without a stop reason is not the
+        // terminal one; emitting per delta would double-count.
+        let sse = concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"m1","role":"assistant","content":[],"usage":{"input_tokens":10,"output_tokens":1}}}"#,
+            "\n\n",
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{},"usage":{"output_tokens":2}}"#,
+            "\n\n",
+        );
+        let events = anthropic_parse_sse(sse).await;
+        assert!(
+            usage_events(&events).is_empty(),
+            "no Usage before Finish: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_usage_chunk_maps_cached_tokens() {
+        // The final chunk (empty `choices`) carries the usage; cached tokens
+        // are a subset of prompt tokens and the rest was billed uncached.
+        let sse = concat!(
+            r#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Answer"}}]}"#,
+            "\n\n",
+            r#"data: {"id":"c1","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":20,"total_tokens":1020,"prompt_tokens_details":{"cached_tokens":800},"completion_tokens_details":{"reasoning_tokens":7}}}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let events = openai_parse_sse(sse).await;
+        let usages = usage_events(&events);
+        assert_eq!(usages.len(), 1, "usage emitted once: {events:?}");
+        let usage = usages[0];
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(usage.cached_tokens, 800);
+        assert_eq!(usage.cache_write_tokens, 0);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.reasoning_tokens, 7);
+        assert_eq!(usage.cache_hit_rate_percent(), Some(80));
+    }
+
+    #[tokio::test]
+    async fn openai_usage_without_reasoning_details_reports_zero() {
+        // Gateways may omit `completion_tokens_details`; thinking tokens
+        // are unknown, not zero-billed.
+        let sse = concat!(
+            r#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Answer"}}]}"#,
+            "\n\n",
+            r#"data: {"id":"c1","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let events = openai_parse_sse(sse).await;
+        let usages = usage_events(&events);
+        assert_eq!(usages[0].reasoning_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn openai_usage_without_details_reports_no_cache_hits() {
+        // Gateways (DeepSeek/GLM) may omit `prompt_tokens_details`; the
+        // request must still parse, with every prompt token uncached.
+        let sse = concat!(
+            r#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Answer"}}]}"#,
+            "\n\n",
+            r#"data: {"id":"c1","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":20,"total_tokens":1020}}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let events = openai_parse_sse(sse).await;
+        let usages = usage_events(&events);
+        assert_eq!(usages.len(), 1, "{events:?}");
+        assert_eq!(usages[0].input_tokens, 1000);
+        assert_eq!(usages[0].cached_tokens, 0);
+        assert_eq!(usages[0].cache_hit_rate_percent(), Some(0));
     }
 }

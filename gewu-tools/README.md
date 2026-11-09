@@ -12,7 +12,7 @@
 - **`BashTool`**: Executes shell commands in a controlled working directory.
 - **`WebFetchTool`**, **`WebSearchTool`**, and **`CodeSearchTool`**: Fetch and search external information.
 - **`TodoReadTool`** and **`TodoWriteTool`**: Maintain an agent task list.
-- **`BatchTool`**: Executes independent tool calls concurrently, including shell and mutation tools; nested batches are rejected.
+- **`TaskTool`**: Launches sub-agents (build/explore/general) for complex tasks; resumable via `task_id`.
 
 ### MCP (Model Context Protocol)
 

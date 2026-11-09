@@ -21,7 +21,6 @@
       <div class="brand" title="GeWu agent">
         <span class="brand-mark">格物</span>
         <span class="brand-name">GEWU</span>
-        <span class="uplink"><span class="uplink-label">uplink</span><span id="upstream" class="upstream" title="Upstream server"></span></span>
       </div>
       <div class="tab-bar">
         <nav id="tabs" class="tabs" aria-label="Conversation tabs"></nav>
@@ -29,30 +28,39 @@
       </div>
       <div class="topbar-actions">
         <button id="interrupt" class="icon-button stop hidden" type="button" title="Interrupt (Esc)" aria-label="Interrupt">■</button>
+        <button id="sidebar-toggle" class="icon-button" type="button" title="Toggle sidebar (Ctrl+B)" aria-label="Toggle sidebar" aria-controls="sidebar" aria-expanded="true">◨</button>
       </div>
     </header>
 
-    <main id="transcript" class="transcript" aria-live="polite"></main>
+    <div class="workspace">
+      <main id="transcript" class="transcript" aria-live="polite"></main>
 
-    <footer class="footer">
-      <div id="status" class="status" aria-live="polite"></div>
-      <form id="composer" class="composer">
-        <span class="prompt-glyph" aria-hidden="true">›</span>
-        <textarea
-          id="prompt"
-          class="prompt"
-          rows="1"
-          placeholder="Message gewu…"
-          autocomplete="off"
-          autocapitalize="sentences"
-          spellcheck="true"
-          aria-label="Message"></textarea>
-        <button id="send" class="send" type="submit">Send <kbd>⏎</kbd></button>
-      </form>
-    </footer>
+      <footer class="footer">
+        <div id="status" class="status" aria-live="polite"></div>
+        <form id="composer" class="composer">
+          <span class="prompt-glyph" aria-hidden="true">›</span>
+          <textarea
+            id="prompt"
+            class="prompt"
+            rows="1"
+            placeholder="Message gewu…"
+            autocomplete="off"
+            autocapitalize="sentences"
+            spellcheck="true"
+            aria-label="Message"></textarea>
+          <button id="send" class="send" type="submit">Send <kbd>⏎</kbd></button>
+        </form>
+      </footer>
+
+      <aside id="sidebar" class="sidebar" aria-label="Session information"></aside>
+    </div>
   </div>
 
   <div id="toasts" class="toasts" aria-live="assertive"></div>
+
+  <input id="file-upload" type="file" multiple hidden>
+
+  <div id="file-preview" class="preview-overlay hidden" role="dialog" aria-modal="true" aria-label="File preview"></div>
 
   <div id="login" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="login-title">
     <form id="login-form" class="login-card">

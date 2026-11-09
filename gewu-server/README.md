@@ -48,6 +48,25 @@ This starts two listeners (Ctrl+C to stop):
 Options: `--host`, `--ws-port`, `--tcp-port`, plus all shared options
 (`--agent`, `--model`, `--provider`, `--db-path`, `--llm-config`, ...).
 
+#### Authentication
+
+Pass `--token <secret>` (or `GEWU_SERVE_TOKEN`) to require clients to
+authenticate before any other operation:
+
+```jsonc
+{"id": "0", "op": "auth", "token": "secret"}   // -> {"type": "auth", "id": "0", "ok": true}
+```
+
+A wrong token gets `ok: false` and the server closes the connection. Binding
+a non-loopback host without `--token` is refused at startup unless
+`--allow-anonymous` is passed explicitly.
+
+#### Line limits
+
+TCP lines longer than 1 MiB (or lines that are not valid UTF-8) are answered
+with an `error` frame and skipped; the connection stays usable. Inbound
+WebSocket messages are capped at the same size.
+
 #### Wire Protocol
 
 Every message is a JSON object. `id` is a client-chosen correlation ID
@@ -63,9 +82,10 @@ echoed on every reply.
 {"id": "5", "op": "list_sessions"}      // persisted conversations, newest first
 {"id": "6", "op": "get_session", "session_id": "s1"}  // one session's messages
 {"id": "7", "op": "delete_session", "session_id": "s1"}  // remove it from the store
-{"id": "8", "op": "info"}               // model + provider the server runs
+{"id": "8", "op": "info"}               // model, provider and cwd the server runs with
 {"id": "9", "op": "usage", "session_id": "s1"}  // context tokens vs limit
 {"id": "10", "op": "ping"}
+{"id": "0", "op": "auth", "token": "secret"}  // required first on token-protected servers
 ```
 
 **Server → Client:**
@@ -78,8 +98,9 @@ echoed on every reply.
 {"type": "interrupted", "id": "2", "request_id": "c3f1..."}
 {"type": "error", "id": "1", "error": "an ask is already in progress"}
 {"type": "pong", "id": "10"}
-{"type": "info", "id": "8", "model": "gpt-4o", "provider": "openai"}
-{"type": "usage", "id": "9", "used_tokens": 34_000, "context_limit": 128_000}
+{"type": "info", "id": "8", "model": "gpt-4o", "provider": "openai", "working_directory": "/home/me/project"}
+{"type": "usage", "id": "9", "used_tokens": 34_000, "context_limit": 128_000, "busy": false}
+{"type": "auth", "id": "0", "ok": true}
 {"type": "tools", "id": "3", "tools": ["read_file", "bash", "..."]}
 {"type": "agents", "id": "4", "agents": ["build", "explore", "general"]}
 {"type": "sessions", "id": "5", "sessions": [{"session_id": "s1", "message_count": 12, "updated_at": "2026-11-03 10:42:00"}]}
@@ -88,23 +109,36 @@ echoed on every reply.
 ```
 
 `event` payloads are the agent's own events (`content_delta`,
-`reasoning_delta`, `tool_start`, `tool_finish`, `finish`, `error`) as
-serialized JSON. Streamed `event`/`result` frames always carry `id: null`
+`reasoning_delta`, `tool_start`, `tool_finish`, `usage`, `finish`, `error`) as
+serialized JSON. The `usage` event carries the running context estimate
+(`used_tokens`/`context_limit`) and is emitted at each turn boundary so
+clients can update the usage gauge mid-ask. Streamed `event`/`result` frames
+always carry `id: null`
 (they come from the background ask task); replies (`ready`, `interrupted`,
-`error`, `pong`, `tools`, `agents`) echo the request's `id`, and `error`
-echoes it whenever it can be extracted.
+`error`, `pong`, `tools`, `agents`, `auth`, `usage`) echo the request's
+`id`, and `error` echoes it whenever it can be extracted.
 
 **Sessions:** each connection gets an agent lazily on its first
 session-needing request; conversation context persists for the life of the
 connection (and in SQLite across reconnects). Pass a `session_id` (e.g. from
 a previous `ready`/`result` message or a CLI run) to resume an existing
-conversation. One `ask` runs at a time per connection; `interrupt` aborts it.
+conversation. The first request's `session_id`/`agent` bind the connection;
+a later request naming a *different* session or agent is rejected with a
+`session mismatch` / `agent mismatch` error instead of being silently
+ignored.
+
+**Concurrency:** one `ask` runs at a time per connection, and a session
+busy with an ask on one connection rejects asks from other connections.
+While an ask is running, `usage` replies `0/0` with `busy: true` (measuring
+would require the agent lock the ask holds); `interrupt` aborts the ask. If
+the interrupted ask never produced output, its prompt is dropped from the
+history so it cannot steer the next ask; exchanges that already produced
+tool/assistant output are kept (with dangling tool calls repaired).
 
 #### Rust client
 
-The `gewu-client` library implements this protocol, with the `gewu-tui`
-terminal UI (`cargo run -p gewu-tui`) and the `gewu-gui` browser UI
-(`cargo run -p gewu-gui`) as front-ends:
+The `gewu-client` library implements this protocol, with the `gewu-gui`
+browser UI (`cargo run -p gewu-gui`) as its front-end:
 
 ```rust
 use gewu_client::Client;

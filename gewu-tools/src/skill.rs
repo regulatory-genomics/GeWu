@@ -265,19 +265,24 @@ impl Tool for SkillTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: SkillArgs = serde_json::from_value(args)?;
 
-        let info = self.skills.iter().find(|s| s.name == input.name).ok_or_else(|| {
-            let mut available: Vec<&str> = self.skills.iter().map(|s| s.name.as_str()).collect();
-            available.sort_unstable();
-            let available = if available.is_empty() {
-                "none".to_string()
-            } else {
-                available.join(", ")
-            };
-            format!(
-                "Skill \"{}\" not found. Available skills: {}",
-                input.name, available
-            )
-        })?;
+        let info = self
+            .skills
+            .iter()
+            .find(|s| s.name == input.name)
+            .ok_or_else(|| {
+                let mut available: Vec<&str> =
+                    self.skills.iter().map(|s| s.name.as_str()).collect();
+                available.sort_unstable();
+                let available = if available.is_empty() {
+                    "none".to_string()
+                } else {
+                    available.join(", ")
+                };
+                format!(
+                    "Skill \"{}\" not found. Available skills: {}",
+                    input.name, available
+                )
+            })?;
 
         let dir = info
             .location
@@ -315,9 +320,10 @@ impl Tool for SkillTool {
         result
             .metadata
             .insert("name".to_string(), serde_json::json!(info.name));
-        result
-            .metadata
-            .insert("dir".to_string(), serde_json::json!(dir.display().to_string()));
+        result.metadata.insert(
+            "dir".to_string(),
+            serde_json::json!(dir.display().to_string()),
+        );
         Ok(result)
     }
 }
@@ -332,11 +338,7 @@ mod tests {
         let skill_dir = dir.join(subdir);
         fs::create_dir_all(&skill_dir).unwrap();
         let location = skill_dir.join("SKILL.md");
-        fs::write(
-            &location,
-            format!("---\n{frontmatter}\n---\n{body}"),
-        )
-        .unwrap();
+        fs::write(&location, format!("---\n{frontmatter}\n---\n{body}")).unwrap();
         location
     }
 
@@ -349,7 +351,9 @@ mod tests {
 
     #[test]
     fn parse_entries_handles_quotes_comments_and_unknown_keys() {
-        let entries = parse_entries("name: \"my-skill\"\ndescription: 'Does things'\nversion: 2\n# comment\n");
+        let entries = parse_entries(
+            "name: \"my-skill\"\ndescription: 'Does things'\nversion: 2\n# comment\n",
+        );
         assert_eq!(lookup(&entries, "name"), Some("my-skill"));
         assert_eq!(lookup(&entries, "description"), Some("Does things"));
         assert_eq!(lookup(&entries, "version"), Some("2"));
@@ -360,7 +364,12 @@ mod tests {
     fn discover_finds_nested_skills_and_requires_name() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        write_skill(&root, "alpha", "name: alpha\ndescription: First skill", "Alpha body");
+        write_skill(
+            &root,
+            "alpha",
+            "name: alpha\ndescription: First skill",
+            "Alpha body",
+        );
         write_skill(
             &root,
             "nested/beta",
@@ -396,7 +405,12 @@ mod tests {
     async fn tool_executes_found_skill_with_sampled_files() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        write_skill(&root, "demo", "name: demo\ndescription: Demo skill", "Do the demo workflow");
+        write_skill(
+            &root,
+            "demo",
+            "name: demo\ndescription: Demo skill",
+            "Do the demo workflow",
+        );
         fs::write(root.join("demo").join("run.sh"), "#!/bin/sh\necho hi").unwrap();
         fs::write(root.join("demo").join("notes.txt"), "notes").unwrap();
 
@@ -421,7 +435,11 @@ mod tests {
         let root = dir.path().to_path_buf();
         write_skill(&root, "many", "name: many", "body");
         for i in 0..15 {
-            fs::write(root.join("many").join(format!("file{i}.txt")), i.to_string()).unwrap();
+            fs::write(
+                root.join("many").join(format!("file{i}.txt")),
+                i.to_string(),
+            )
+            .unwrap();
         }
 
         let tool = SkillTool::new(discover(&[root]));
@@ -455,7 +473,12 @@ mod tests {
     fn prompt_section_renders_skills() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        write_skill(&root, "alpha", "name: alpha\ndescription: Does <things>", "body");
+        write_skill(
+            &root,
+            "alpha",
+            "name: alpha\ndescription: Does <things>",
+            "body",
+        );
 
         let skills = discover(&[root]);
         let section = available_skills_section(&skills);

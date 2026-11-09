@@ -22,7 +22,10 @@ impl LlmProvider for DummyLlm {
     async fn send<'a>(
         &'a self,
         _request: Value,
-    ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
+    ) -> Result<
+        BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+        Box<dyn Error + Send + Sync>,
+    > {
         Err("Not implemented".into())
     }
 
@@ -33,9 +36,7 @@ impl LlmProvider for DummyLlm {
 
 #[test]
 fn test_builder_requires_llm() {
-    let result = AgentBuilder::default()
-        .with_tools(vec![])
-        .build();
+    let result = AgentBuilder::default().with_tools(vec![]).build();
 
     assert!(result.is_err());
     if let Err(e) = result {
@@ -47,9 +48,7 @@ fn test_builder_requires_llm() {
 
 #[test]
 fn test_builder_with_llm_succeeds() {
-    let result = AgentBuilder::default()
-        .llm(Arc::new(DummyLlm))
-        .build();
+    let result = AgentBuilder::default().llm(Arc::new(DummyLlm)).build();
 
     assert!(result.is_ok());
 }

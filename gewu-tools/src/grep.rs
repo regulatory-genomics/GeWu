@@ -5,12 +5,15 @@
 //! efficient searching and the `ignore` crate for parallel directory walking
 //! that respects `.gitignore` files.
 //!
-//! Output follows opencode's ripgrep-backed GrepTool behavior:
+//! Output follows opencode v2's ripgrep-backed GrepTool behavior:
+//! - a `limit` parameter bounding the number of matches (default 100),
 //! - a `limit + 1` collection cap so truncation is detectable,
 //! - matched lines truncated to 2000 characters,
-//! - results grouped by file.
+//! - results grouped by file,
+//! - hidden files searched while `.git` directories are excluded,
+//! - a file `path` scopes the search to that single file.
 
-use crate::fs_utils::{into_tool_error, resolve_safe_path};
+use crate::fs_utils::{into_tool_error, resolve_read_path};
 use anyhow::Result;
 use async_trait::async_trait;
 use gewu_core::traits::Tool;
@@ -24,16 +27,26 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-/// Maximum number of matches shown, mirroring opencode's GrepTool limit.
-const DISPLAY_LIMIT: usize = 100;
+/// Default maximum number of matches shown, mirroring opencode's GrepTool.
+const DEFAULT_GREP_LIMIT: usize = 100;
 /// Truncate each matched line to this many characters (opencode parity).
 const MAX_LINE_CHARS: usize = 2_000;
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct GrepArgs {
+    /// Regex pattern to search for in file contents
     pub pattern: String,
+    /// The directory to search in. Defaults to the current working directory.
     pub path: Option<String>,
+    /// File pattern to include in the search (e.g. "*.js", "*.{ts,tsx}")
     pub include: Option<String>,
+    /// Maximum matches to return
+    #[serde(default = "default_grep_limit")]
+    pub limit: usize,
+}
+
+fn default_grep_limit() -> usize {
+    DEFAULT_GREP_LIMIT
 }
 
 pub struct GrepTool {
@@ -51,6 +64,7 @@ struct Match {
 struct MatchSink {
     matches: Arc<Mutex<Vec<Match>>>,
     path: PathBuf,
+    limit: usize,
 }
 
 impl Sink for MatchSink {
@@ -65,7 +79,7 @@ impl Sink for MatchSink {
             .matches
             .lock()
             .map_err(|_| std::io::Error::other("grep match lock poisoned"))?;
-        if matches.len() > DISPLAY_LIMIT {
+        if matches.len() > self.limit {
             return Ok(false);
         }
 
@@ -88,10 +102,10 @@ fn truncate_line(text: &str) -> String {
 }
 
 /// Whether the collection cap is reached, signaling the walker to quit.
-fn cap_reached(matches: &Arc<Mutex<Vec<Match>>>) -> bool {
+fn cap_reached(matches: &Arc<Mutex<Vec<Match>>>, limit: usize) -> bool {
     matches
         .lock()
-        .map(|m| m.len() > DISPLAY_LIMIT)
+        .map(|m| m.len() > limit)
         .unwrap_or(false)
 }
 
@@ -112,7 +126,7 @@ impl Tool for GrepTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: GrepArgs = serde_json::from_value(args).map_err(into_tool_error)?;
         if input.pattern.is_empty() {
@@ -121,12 +135,26 @@ impl Tool for GrepTool {
 
         let search_path_str = input.path.as_deref().unwrap_or(".");
         let search_path =
-            resolve_safe_path(&self.working_directory, search_path_str).map_err(into_tool_error)?;
+            resolve_read_path(&self.working_directory, search_path_str, ctx.enforcement)
+                .await
+                .map_err(into_tool_error)?;
+
+        if input.limit == 0 {
+            return Err(into_tool_error(anyhow::anyhow!(
+                "limit must be greater than 0"
+            )));
+        }
 
         let pattern = input.pattern;
         let pattern_for_task = pattern.clone();
+        let limit = input.limit;
         let (output, total, truncated) = tokio::task::spawn_blocking(move || {
-            run_search(&pattern_for_task, input.include.as_deref(), &search_path)
+            run_search(
+                &pattern_for_task,
+                input.include.as_deref(),
+                &search_path,
+                limit,
+            )
         })
         .await
         .map_err(into_tool_error)??;
@@ -146,20 +174,117 @@ impl Tool for GrepTool {
     }
 }
 
+/// Builds the include-glob override used to filter searched files, matching
+/// ripgrep's `--glob=<include>` semantics (gitignore syntax, brace expansion).
+fn build_include_override(
+    base: &std::path::Path,
+    include: &str,
+) -> Result<ignore::overrides::Override, Box<dyn Error + Send + Sync>> {
+    let mut glob_builder = ignore::overrides::OverrideBuilder::new(base);
+    glob_builder.add(include).map_err(into_tool_error)?;
+    glob_builder.build().map_err(into_tool_error)
+}
+
+/// Searches one file and appends matches. Used when `path` points at a file
+/// rather than a directory (opencode v2 scopes the search to that file).
+fn search_single_file(
+    matcher: &grep::regex::RegexMatcher,
+    file: &std::path::Path,
+    matches: &Arc<Mutex<Vec<Match>>>,
+    limit: usize,
+) {
+    let sink = MatchSink {
+        matches: matches.clone(),
+        path: file.to_path_buf(),
+        limit,
+    };
+    let mut searcher = SearcherBuilder::new()
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .build();
+    if let Err(err) = searcher.search_path(matcher, file, sink) {
+        tracing::debug!("grep: search error on {}: {}", file.display(), err);
+    }
+}
+
+/// Formats collected matches, grouped by file, as opencode's GrepTool does.
+fn format_matches(
+    matches_guard: &[Match],
+    total: usize,
+    truncated: bool,
+    limit: usize,
+) -> String {
+    let mut output = format!(
+        "Found {} matches{}",
+        total,
+        if truncated {
+            " (more matches available)"
+        } else {
+            ""
+        }
+    );
+    let mut current_file = "";
+    for m in &matches_guard[..limit.min(matches_guard.len())] {
+        if current_file != m.path {
+            output.push_str("\n\n");
+            output.push_str(&m.path);
+            output.push(':');
+            current_file = &m.path;
+        }
+        output.push_str(&format!("\n  Line {}: {}", m.line_number, m.line_text));
+    }
+
+    if truncated {
+        output.push_str("\n\n(Results truncated. Consider using a more specific path or pattern.)");
+    }
+    output
+}
+
 /// Runs the parallel walk + search and formats results grouped by file.
+///
+/// Mirrors opencode v2's ripgrep invocation: hidden files are searched
+/// (`--hidden`), `.git` directories are always excluded
+/// (`--glob=!**/.git/**`), and `limit + 1` matches are collected so
+/// truncation is detectable.
 fn run_search(
     pattern: &str,
     include: Option<&str>,
     search_path: &std::path::Path,
+    limit: usize,
 ) -> Result<(String, usize, bool), Box<dyn Error + Send + Sync>> {
     let matcher = RegexMatcher::new(pattern).map_err(into_tool_error)?;
     let matches = Arc::new(Mutex::new(Vec::new()));
 
+    // opencode v2 scopes the search to a single file when `path` is a file.
+    if search_path.is_file() {
+        if let Some(inc) = include {
+            let base = search_path.parent().unwrap_or(std::path::Path::new("."));
+            let override_matcher = build_include_override(base, inc)?;
+            if override_matcher.matched(search_path, false).is_ignore() {
+                return Ok(("No files found".to_string(), 0, false));
+            }
+        }
+        search_single_file(&matcher, search_path, &matches, limit);
+        let guard = matches
+            .lock()
+            .map_err(|_| into_tool_error(anyhow::anyhow!("grep match lock poisoned")))?;
+        let mut sorted = guard.clone();
+        sorted.sort_by_key(|m| m.line_number);
+        return if sorted.is_empty() {
+            Ok(("No files found".to_string(), 0, false))
+        } else {
+            let total = sorted.len();
+            let truncated = total > limit;
+            Ok((format_matches(&sorted, total, truncated, limit), total, truncated))
+        };
+    }
+
     let mut builder = WalkBuilder::new(search_path);
+    // Search hidden files (ripgrep `--hidden`) but never descend into `.git`
+    // (ripgrep `--glob=!**/.git/**`).
+    builder.hidden(false);
+    builder.filter_entry(|entry| entry.file_name() != std::ffi::OsStr::new(".git"));
     if let Some(inc) = include {
-        let mut glob_builder = ignore::overrides::OverrideBuilder::new(search_path);
-        glob_builder.add(inc).map_err(into_tool_error)?;
-        builder.overrides(glob_builder.build().map_err(into_tool_error)?);
+        builder.overrides(build_include_override(search_path, inc)?);
     }
 
     let matches_for_visitor = matches.clone();
@@ -176,7 +301,7 @@ fn run_search(
                 if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                     return WalkState::Continue;
                 }
-                if cap_reached(&matches) {
+                if cap_reached(&matches, limit) {
                     return WalkState::Quit;
                 }
 
@@ -184,6 +309,7 @@ fn run_search(
                 let sink = MatchSink {
                     matches: matches.clone(),
                     path,
+                    limit,
                 };
                 let mut searcher = SearcherBuilder::new()
                     .binary_detection(BinaryDetection::quit(b'\x00'))
@@ -192,7 +318,7 @@ fn run_search(
                     tracing::debug!("grep: search error on {}: {}", entry.path().display(), err);
                 }
 
-                if cap_reached(&matches) {
+                if cap_reached(&matches, limit) {
                     WalkState::Quit
                 } else {
                     WalkState::Continue
@@ -207,36 +333,12 @@ fn run_search(
     matches_guard.sort_by(|a, b| a.path.cmp(&b.path).then(a.line_number.cmp(&b.line_number)));
 
     if matches_guard.is_empty() {
-        return Ok(("No matches found.".to_string(), 0, false));
+        return Ok(("No files found".to_string(), 0, false));
     }
 
     let total = matches_guard.len();
-    let truncated = total > DISPLAY_LIMIT;
-    let display_matches = &matches_guard[..DISPLAY_LIMIT.min(total)];
-
-    let mut output = format!(
-        "Found {} matches{}",
-        total,
-        if truncated {
-            " (more matches available)"
-        } else {
-            ""
-        }
-    );
-    let mut current_file = "";
-    for m in display_matches {
-        if current_file != m.path {
-            output.push_str("\n\n");
-            output.push_str(&m.path);
-            output.push(':');
-            current_file = &m.path;
-        }
-        output.push_str(&format!("\n  Line {}: {}", m.line_number, m.line_text));
-    }
-
-    if truncated {
-        output.push_str("\n\n(Results truncated. Consider using a more specific path or pattern.)");
-    }
+    let truncated = total > limit;
+    let output = format_matches(&matches_guard, total, truncated, limit);
 
     Ok((output, total, truncated))
 }
@@ -315,12 +417,123 @@ mod tests {
         assert!(result.truncated);
         assert_eq!(
             result.metadata.get("matches"),
-            Some(&serde_json::json!(DISPLAY_LIMIT + 1))
+            Some(&serde_json::json!(DEFAULT_GREP_LIMIT + 1))
         );
-        assert!(result.output.contains("Found 101 matches (more matches available)"));
-        assert!(result
-            .output
-            .contains("(Results truncated. Consider using a more specific path or pattern.)"));
+        assert!(
+            result
+                .output
+                .contains("Found 101 matches (more matches available)")
+        );
+        assert!(
+            result
+                .output
+                .contains("(Results truncated. Consider using a more specific path or pattern.)")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_grep_tool_limit_param() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("a.txt"), "hello\nhello\nhello\n").await?;
+
+        let tool = GrepTool {
+            working_directory: dir.path().to_path_buf(),
+        };
+        let ctx = ToolContext::new("test", "msg");
+        let result = tool
+            .execute(
+                serde_json::json!({ "pattern": "hello", "path": dir.path().to_str().unwrap(), "limit": 2 }),
+                &ctx,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+        assert!(result.truncated);
+        assert_eq!(result.metadata.get("matches"), Some(&serde_json::json!(3)));
+        assert!(result.output.contains("Found 3 matches (more matches available)"));
+        assert_eq!(result.output.matches("  Line ").count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_grep_tool_single_file_path() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("a.txt"), "hello here\n").await?;
+        fs::write(dir.path().join("b.txt"), "hello there\n").await?;
+
+        let tool = GrepTool {
+            working_directory: dir.path().to_path_buf(),
+        };
+        let ctx = ToolContext::new("test", "msg");
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "pattern": "hello",
+                    "path": dir.path().join("a.txt").to_str().unwrap()
+                }),
+                &ctx,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+        assert!(result.output.contains("a.txt:"));
+        assert!(!result.output.contains("b.txt"), "{}", result.output);
+        assert_eq!(result.metadata.get("matches"), Some(&serde_json::json!(1)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_grep_tool_hidden_files_searched_git_excluded() -> Result<()> {
+        let dir = tempdir()?;
+        fs::create_dir(dir.path().join(".git")).await?;
+        fs::write(dir.path().join(".git").join("config"), "secret in git\n").await?;
+        fs::write(dir.path().join(".hidden"), "secret in hidden\n").await?;
+        fs::write(dir.path().join("visible.txt"), "secret in visible\n").await?;
+
+        let tool = GrepTool {
+            working_directory: dir.path().to_path_buf(),
+        };
+        let ctx = ToolContext::new("test", "msg");
+        let result = tool
+            .execute(
+                serde_json::json!({ "pattern": "secret", "path": dir.path().to_str().unwrap() }),
+                &ctx,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+        assert!(result.output.contains("visible.txt"), "{}", result.output);
+        assert!(result.output.contains(".hidden"), "{}", result.output);
+        assert!(
+            !result.output.contains("config"),
+            ".git contents must be excluded: {}",
+            result.output
+        );
+        assert_eq!(result.metadata.get("matches"), Some(&serde_json::json!(2)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_grep_tool_no_matches() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("a.txt"), "nothing relevant\n").await?;
+
+        let tool = GrepTool {
+            working_directory: dir.path().to_path_buf(),
+        };
+        let ctx = ToolContext::new("test", "msg");
+        let result = tool
+            .execute(
+                serde_json::json!({ "pattern": "zzz-not-there", "path": dir.path().to_str().unwrap() }),
+                &ctx,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+        assert_eq!(result.output, "No files found");
+        assert_eq!(result.metadata.get("matches"), Some(&serde_json::json!(0)));
+        assert!(!result.truncated);
         Ok(())
     }
 
@@ -381,7 +594,11 @@ mod tests {
     async fn test_grep_tool_long_line_truncation() -> Result<()> {
         let dir = tempdir()?;
         let working_dir = dir.path().to_path_buf();
-        fs::write(dir.path().join("long.txt"), format!("{}\n", "a".repeat(2500))).await?;
+        fs::write(
+            dir.path().join("long.txt"),
+            format!("{}\n", "a".repeat(2500)),
+        )
+        .await?;
 
         let tool = GrepTool {
             working_directory: working_dir,

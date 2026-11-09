@@ -6,9 +6,12 @@
 //!
 //! # Security
 //!
-//! All file paths are resolved through [`resolve_safe_path`](crate::fs_utils::resolve_safe_path)
-//! which prevents directory traversal attacks. Paths cannot escape the
-//! configured working directory.
+//! File paths are resolved according to the [`PathEnforcement`] level carried
+//! on the [`ToolContext`]. The level is server configuration (config key
+//! `sandbox`) and defaults to `None`: paths are used as provided with no
+//! containment checks. `Contain` rejects paths escaping the working directory
+//! via [`resolve_safe_path`](crate::fs_utils::resolve_safe_path), and
+//! `Strict` additionally canonicalizes and rejects symlinks.
 //!
 //! # Available Tools
 //!
@@ -19,7 +22,7 @@
 
 use crate::fs_utils::{
     glob_with_gitignore, into_tool_error, is_binary_file, mime_type, read_bytes, read_text,
-    resolve_safe_path, write,
+    resolve_read_path, resolve_write_path, write,
 };
 use crate::replacers::smart_replace;
 use anyhow::Result;
@@ -38,6 +41,10 @@ const MAX_LINE_LENGTH: usize = 2000;
 const MAX_LINE_SUFFIX: &str = "... (line truncated to 2000 chars)";
 const MAX_BYTES: usize = 50 * 1024;
 const MAX_BYTES_LABEL: &str = "50 KB";
+/// Cap for image/PDF reads (raw bytes, before base64 inflation).
+const MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
+/// Default cap on the number of files returned by [`GlobTool`].
+const DEFAULT_GLOB_LIMIT: usize = 100;
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReadArgs {
@@ -73,8 +80,24 @@ pub struct EditArgs {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct GlobArgs {
+    /// The glob pattern to match files against
     pub pattern: String,
+    /// The directory to search in. If not specified, the current working
+    /// directory will be used. IMPORTANT: Omit this field to use the default
+    /// directory. DO NOT enter "undefined" or "null" - simply omit it for the
+    /// default behavior. Must be a valid directory path if provided.
     pub path: Option<String>,
+    /// Maximum number of results to return
+    #[serde(default = "default_glob_limit")]
+    pub limit: usize,
+    /// Include hidden files (dot-files) in the results. Hidden files are
+    /// excluded by default unless listed in .gitignore rules allow them.
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+fn default_glob_limit() -> usize {
+    DEFAULT_GLOB_LIMIT
 }
 
 pub struct ReadFileTool {
@@ -110,11 +133,12 @@ impl Tool for ReadFileTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: ReadArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_safe_path(&self.working_directory, &input.file_path)
+        let file_path = resolve_read_path(&self.working_directory, &input.file_path, ctx.enforcement)
+            .await
             .map_err(into_tool_error)?;
 
         let metadata = tokio::fs::metadata(&file_path).await;
@@ -227,6 +251,18 @@ impl Tool for ReadFileTool {
         let is_pdf = mime == "application/pdf";
 
         if is_image || is_pdf {
+            // Cap media reads like the text path: a multi-gigabyte file with
+            // an image/PDF extension would otherwise be fully loaded and
+            // base64-inflated in memory.
+            if meta.len() > MAX_MEDIA_BYTES as u64 {
+                return Ok(ToolResult::new(
+                    "read_file",
+                    format!(
+                        "Cannot read file: {} is {} bytes, which exceeds the {} byte media read cap",
+                        input.file_path, meta.len(), MAX_MEDIA_BYTES
+                    ),
+                ));
+            }
             let data = read_bytes(&file_path).await.map_err(into_tool_error)?;
             let encoded = BASE64.encode(&data);
             let msg = if is_image { "Image" } else { "PDF" };
@@ -288,7 +324,13 @@ impl Tool for ReadFileTool {
             }
 
             let truncated_line = if text.len() > MAX_LINE_LENGTH {
-                format!("{}{}", &text[..MAX_LINE_LENGTH], MAX_LINE_SUFFIX)
+                // Cut at a char boundary: byte 2000 can land mid-character
+                // in multi-byte input.
+                let mut cut = MAX_LINE_LENGTH;
+                while cut > 0 && !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                format!("{}{}", &text[..cut], MAX_LINE_SUFFIX)
             } else {
                 text.clone()
             };
@@ -321,7 +363,9 @@ impl Tool for ReadFileTool {
             .collect();
 
         let total_lines_count = total_lines;
-        let last_read_line = input.offset + lines.len() - 1;
+        // `lines` is empty when the file is empty (or the offset starts past
+        // EOF); saturating arithmetic avoids the `0 + 0 - 1` underflow.
+        let last_read_line = input.offset.saturating_sub(1) + lines.len().max(1);
         let next_offset = last_read_line + 1;
         let has_more_lines = has_more_lines || truncated_by_bytes;
 
@@ -369,12 +413,14 @@ impl Tool for WriteFileTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: WriteArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_safe_path(&self.working_directory, &input.file_path)
-            .map_err(into_tool_error)?;
+        let file_path =
+            resolve_write_path(&self.working_directory, &input.file_path, ctx.enforcement)
+                .await
+                .map_err(into_tool_error)?;
 
         write(&file_path, input.content.as_bytes())
             .await
@@ -403,12 +449,14 @@ impl Tool for EditFileTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: EditArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_safe_path(&self.working_directory, &input.file_path)
-            .map_err(into_tool_error)?;
+        let file_path =
+            resolve_write_path(&self.working_directory, &input.file_path, ctx.enforcement)
+                .await
+                .map_err(into_tool_error)?;
 
         let content = read_text(&file_path).await.map_err(into_tool_error)?;
 
@@ -447,31 +495,83 @@ impl Tool for GlobTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: GlobArgs = serde_json::from_value(args).map_err(into_tool_error)?;
+        if input.limit == 0 {
+            return Err(into_tool_error(anyhow::anyhow!(
+                "limit must be greater than 0"
+            )));
+        }
 
         let search_dir = if let Some(p) = &input.path {
-            resolve_safe_path(&self.working_directory, p).map_err(into_tool_error)?
+            resolve_read_path(&self.working_directory, p, ctx.enforcement)
+                .await
+                .map_err(into_tool_error)?
         } else {
             self.working_directory.clone()
         };
 
-        let paths = glob_with_gitignore(&search_dir, &input.pattern).map_err(into_tool_error)?;
+        if !search_dir.is_dir() {
+            return Err(into_tool_error(anyhow::anyhow!(
+                "glob path must be a directory: {}",
+                search_dir.display()
+            )));
+        }
 
-        let paths_str: Vec<String> = paths
-            .into_iter()
-            .filter(|p| {
-                let normalized = crate::fs_utils::normalize_path(p);
-                normalized.starts_with(&self.working_directory)
+        let (search_dir, pattern, hidden, limit) = (
+            search_dir.clone(),
+            input.pattern.clone(),
+            input.hidden,
+            input.limit,
+        );
+        let workdir = self.working_directory.clone();
+        let contain = ctx.enforcement != gewu_core::types::PathEnforcement::None;
+        let matches =
+            tokio::task::spawn_blocking(move || {
+                let mut matches = glob_with_gitignore(&search_dir, &pattern, hidden, limit)?;
+                if contain {
+                    // The walker follows symlinks, so drop entries that
+                    // resolve (lexically) outside the working directory.
+                    matches.entries.retain(|(path, _)| {
+                        crate::fs_utils::normalize_path(path).starts_with(&workdir)
+                    });
+                }
+                Ok::<_, anyhow::Error>(matches)
             })
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
+            .await
+            .map_err(into_tool_error)?
+            .map_err(into_tool_error)?;
 
-        Ok(ToolResult::new(
-            "glob",
-            serde_json::to_string_pretty(&paths_str).unwrap(),
-        ))
+        let truncated = matches.truncated;
+        let count = matches.entries.len();
+
+        let mut output_lines: Vec<String> = matches
+            .entries
+            .iter()
+            .map(|(path, _)| path.to_string_lossy().into_owned())
+            .collect();
+        if output_lines.is_empty() {
+            output_lines.push("No files found".to_string());
+        } else if truncated {
+            output_lines.push(String::new());
+            output_lines.push(format!(
+                "(Results are truncated: showing first {count} results. Consider using a more specific path or pattern.)"
+            ));
+        }
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("count".to_string(), serde_json::json!(count));
+        metadata.insert("truncated".to_string(), serde_json::json!(truncated));
+
+        Ok(ToolResult {
+            title: input.pattern,
+            output: output_lines.join("\n"),
+            metadata,
+            attachments: vec![],
+            truncated,
+            output_path: None,
+        })
     }
 }
 
@@ -479,6 +579,7 @@ impl Tool for GlobTool {
 mod tests {
     use super::*;
     use anyhow::Result;
+    use gewu_core::types::PathEnforcement;
     use tempfile::tempdir;
     use tokio::fs;
 
@@ -556,9 +657,157 @@ mod tests {
             .execute(args, &ctx)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        let files: Vec<String> = serde_json::from_str(&result.output)?;
+        assert_eq!(result.metadata.get("count"), Some(&serde_json::json!(2)));
+        assert_eq!(
+            result.metadata.get("truncated"),
+            Some(&serde_json::json!(false))
+        );
+        assert!(!result.truncated);
+        let lines: Vec<&str> = result.output.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with("a.txt"), "{}", result.output);
+        assert!(lines[1].ends_with("b.txt"), "{}", result.output);
+        Ok(())
+    }
 
-        assert_eq!(files.len(), 2);
+    #[tokio::test]
+    async fn glob_no_matches_says_no_files_found() -> Result<()> {
+        let dir = tempdir()?;
+        let tool = GlobTool {
+            working_directory: dir.path().to_path_buf(),
+        };
+        let ctx = ToolContext::new("test", "msg");
+        let result = tool
+            .execute(serde_json::json!({ "pattern": "*.md" }), &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert_eq!(result.output, "No files found");
+        assert_eq!(result.metadata.get("count"), Some(&serde_json::json!(0)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn glob_respects_limit_and_reports_truncation() -> Result<()> {
+        let dir = tempdir()?;
+        for i in 0..5 {
+            fs::write(dir.path().join(format!("f{i}.txt")), "").await?;
+        }
+        let tool = GlobTool {
+            working_directory: dir.path().to_path_buf(),
+        };
+        let ctx = ToolContext::new("test", "msg");
+
+        let result = tool
+            .execute(serde_json::json!({ "pattern": "*.txt", "limit": 2 }), &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert_eq!(result.metadata.get("count"), Some(&serde_json::json!(2)));
+        assert_eq!(
+            result.metadata.get("truncated"),
+            Some(&serde_json::json!(true))
+        );
+        assert!(result.truncated);
+        assert!(
+            result
+                .output
+                .contains("(Results are truncated: showing first 2 results")
+        );
+        assert_eq!(result.output.lines().count(), 4); // 2 paths + blank + note
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn glob_sorts_by_modification_time() -> Result<()> {
+        use std::fs::FileTimes;
+        use std::time::{Duration, SystemTime};
+
+        let dir = tempdir()?;
+        let old = dir.path().join("old.txt");
+        let new = dir.path().join("new.txt");
+        fs::write(&old, "").await?;
+        fs::write(&new, "").await?;
+
+        let base = SystemTime::now() - Duration::from_secs(10_000);
+        let file = std::fs::File::options().write(true).open(&old)?;
+        file.set_times(FileTimes::new().set_modified(base))?;
+        drop(file);
+        let file = std::fs::File::options().write(true).open(&new)?;
+        file.set_times(FileTimes::new().set_modified(base + Duration::from_secs(60)))?;
+        drop(file);
+
+        let tool = GlobTool {
+            working_directory: dir.path().to_path_buf(),
+        };
+        let ctx = ToolContext::new("test", "msg");
+        let result = tool
+            .execute(serde_json::json!({ "pattern": "*.txt" }), &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let lines: Vec<&str> = result.output.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with("new.txt"), "{}", result.output);
+        assert!(lines[1].ends_with("old.txt"), "{}", result.output);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn glob_excludes_git_dir_and_hidden_files_unless_requested() -> Result<()> {
+        let dir = tempdir()?;
+        fs::create_dir(dir.path().join(".git")).await?;
+        fs::write(dir.path().join(".git").join("tracked.cfg"), "").await?;
+        fs::write(dir.path().join(".hidden.txt"), "").await?;
+        fs::write(dir.path().join("visible.txt"), "").await?;
+
+        let tool = GlobTool {
+            working_directory: dir.path().to_path_buf(),
+        };
+        let ctx = ToolContext::new("test", "msg");
+
+        let result = tool
+            .execute(serde_json::json!({ "pattern": "**/*.cfg" }), &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert_eq!(result.output, "No files found");
+
+        let result = tool
+            .execute(serde_json::json!({ "pattern": "*.txt" }), &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(
+            !result.output.contains(".hidden.txt"),
+            "hidden file leaked: {}",
+            result.output
+        );
+        assert!(result.output.contains("visible.txt"));
+        assert_eq!(result.metadata.get("count"), Some(&serde_json::json!(1)));
+
+        let result = tool
+            .execute(serde_json::json!({ "pattern": "*.txt", "hidden": true }), &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(result.output.contains(".hidden.txt"));
+        assert_eq!(result.metadata.get("count"), Some(&serde_json::json!(2)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn glob_rejects_file_as_search_path() -> Result<()> {
+        let dir = tempdir()?;
+        let file = dir.path().join("not_a_dir.txt");
+        fs::write(&file, "").await?;
+
+        let tool = GlobTool {
+            working_directory: dir.path().to_path_buf(),
+        };
+        let ctx = ToolContext::new("test", "msg");
+        let result = tool
+            .execute(
+                serde_json::json!({ "pattern": "*.txt", "path": file.to_str().unwrap() }),
+                &ctx,
+            )
+            .await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("glob path must be a directory"), "{error}");
         Ok(())
     }
 
@@ -597,6 +846,39 @@ mod tests {
         let content = fs::read_to_string(&file_path).await?;
         assert_eq!(content, "baz bar baz");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_file_without_enforcement_reads_outside_root() -> Result<()> {
+        let root = tempdir()?;
+        let outside = tempdir()?;
+        let file_path = outside.path().join("outside.txt");
+        fs::write(&file_path, "outside content").await?;
+
+        let tool = ReadFileTool {
+            working_directory: root.path().to_path_buf(),
+        };
+        let ctx = ToolContext::new("test", "msg").with_enforcement(PathEnforcement::None);
+        let result = tool
+            .execute(
+                serde_json::json!({ "file_path": file_path.to_str().unwrap() }),
+                &ctx,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(result.output.contains("outside content"), "{}", result.output);
+
+        // With containment on, the same request is rejected.
+        let ctx = ToolContext::new("test", "msg").with_enforcement(PathEnforcement::Contain);
+        let result = tool
+            .execute(
+                serde_json::json!({ "file_path": file_path.to_str().unwrap() }),
+                &ctx,
+            )
+            .await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("outside of working directory"), "{error}");
         Ok(())
     }
 }

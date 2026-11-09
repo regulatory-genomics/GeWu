@@ -22,16 +22,12 @@ pub struct TodoWriteArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Default)]
 pub struct TodoReadArgs {
     #[serde(default)]
     pub _placeholder: Option<String>,
 }
 
-impl Default for TodoReadArgs {
-    fn default() -> Self {
-        Self { _placeholder: None }
-    }
-}
 
 pub struct TodoWriteTool {
     pub todos: Arc<Mutex<Vec<TodoItem>>>,

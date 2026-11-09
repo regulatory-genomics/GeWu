@@ -79,8 +79,12 @@ impl TruncationService {
     ///
     /// A [`TruncationResult`] containing either the original or truncated content
     pub fn truncate(&self, text: &str) -> TruncationResult {
-        let lines: Vec<&str> = text.lines().collect();
-        let total_bytes = text.len();
+        // Measure against the body without the trailing newline: otherwise a
+        // text over the byte limit only by its final newline triggers a
+        // "...1 bytes truncated..." notice that removes nothing meaningful.
+        let body = text.strip_suffix('\n').unwrap_or(text);
+        let lines: Vec<&str> = body.lines().collect();
+        let total_bytes = body.len();
         let total_lines = lines.len();
 
         if total_lines <= self.max_lines && total_bytes <= self.max_bytes {
@@ -95,13 +99,13 @@ impl TruncationService {
         let mut bytes = 0;
         let mut hit_bytes = false;
 
-        for i in 0..lines.len().min(self.max_lines) {
-            let line_size = lines[i].len() + if i > 0 { 1 } else { 0 };
+        for (i, line) in lines.iter().enumerate().take(lines.len().min(self.max_lines)) {
+            let line_size = line.len() + if i > 0 { 1 } else { 0 };
             if bytes + line_size > self.max_bytes {
                 hit_bytes = true;
                 break;
             }
-            out_lines.push(lines[i]);
+            out_lines.push(line);
             bytes += line_size;
         }
 
@@ -120,29 +124,22 @@ impl TruncationService {
             Full output saved to the file above. \
             Use grep to search the full content or read with offset/limit to view specific sections.";
 
-        let truncated_content = if hit_bytes {
-            format!(
-                "{}\n\n...{} {} truncated...\n\n{}",
-                preview, removed, unit, hint
-            )
-        } else {
-            format!(
-                "{}\n\n...{} {} truncated...\n\n{}",
-                preview, removed, unit, hint
-            )
-        };
+        let truncated_content = format!(
+            "{}\n\n...{} {} truncated...\n\n{}",
+            preview, removed, unit, hint
+        );
 
-        if let Err(e) = std::fs::create_dir_all(&self.truncation_dir) {
-            tracing::warn!("Failed to create truncation dir: {}", e);
-        }
-        if let Err(e) = std::fs::write(&file_path, text) {
-            tracing::warn!("Failed to write truncation file: {}", e);
+        let dir_created = std::fs::create_dir_all(&self.truncation_dir).is_ok();
+        let write_ok = dir_created && std::fs::write(&file_path, text).is_ok();
+        if !write_ok {
+            tracing::warn!("Failed to write truncation file: {}", file_path.display());
         }
 
         TruncationResult {
             content: truncated_content,
             truncated: true,
-            output_path: Some(file_path),
+            // Only point the model at the file when it actually exists.
+            output_path: write_ok.then_some(file_path),
         }
     }
 }

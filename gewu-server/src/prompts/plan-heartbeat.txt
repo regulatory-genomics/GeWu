@@ -1,0 +1,5 @@
+<system-reminder>
+Plan mode remains active: READ-ONLY. Do not edit files or run non-readonly
+commands. Discuss the plan in the conversation; do not create plan files.
+Implementation requires the user to switch to Build.
+</system-reminder>

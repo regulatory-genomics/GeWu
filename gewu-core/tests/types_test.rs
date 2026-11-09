@@ -1,6 +1,6 @@
 use gewu_core::types::{
     AgentEvent, Capabilities, ContentPart, FileAttachment, FunctionCall, InputCapabilities,
-    Message, OutputCapabilities, ProviderEvent, ToolCall, ToolContext, ToolResult,
+    Message, OutputCapabilities, ProviderEvent, TokenUsage, ToolCall, ToolContext, ToolResult,
     TruncationResult,
 };
 
@@ -203,15 +203,20 @@ fn test_message_user() {
 fn test_message_assistant_with_content() {
     let msg = Message::Assistant {
         content: Some("I can help".to_string()),
+        reasoning: Some("thinking".to_string()),
+        replay: None,
         tool_calls: None,
     };
 
     if let Message::Assistant {
         content,
+        reasoning,
+        replay: _,
         tool_calls,
     } = msg
     {
         assert_eq!(content.unwrap(), "I can help");
+        assert_eq!(reasoning.unwrap(), "thinking");
         assert!(tool_calls.is_none());
     }
 }
@@ -220,6 +225,8 @@ fn test_message_assistant_with_content() {
 fn test_message_assistant_with_tool_calls() {
     let msg = Message::Assistant {
         content: None,
+        reasoning: None,
+        replay: None,
         tool_calls: Some(vec![ToolCall {
             id: "call_1".to_string(),
             r#type: "function".to_string(),
@@ -232,10 +239,13 @@ fn test_message_assistant_with_tool_calls() {
 
     if let Message::Assistant {
         content,
+        reasoning,
+        replay: _,
         tool_calls,
     } = msg
     {
         assert!(content.is_none());
+        assert!(reasoning.is_none());
         let calls = tool_calls.unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "bash");
@@ -398,6 +408,49 @@ fn test_agent_event_finish() {
     if let AgentEvent::Finish { response } = event {
         assert_eq!(response, "Done");
     }
+}
+
+#[test]
+fn test_agent_event_usage_round_trip() {
+    let event = AgentEvent::Usage {
+        used_tokens: 34_000,
+        context_limit: 128_000,
+        provider: Some(TokenUsage {
+            input_tokens: 1_000,
+            cached_tokens: 30_000,
+            cache_write_tokens: 3_000,
+            output_tokens: 500,
+            reasoning_tokens: 120,
+        }),
+    };
+
+    let json = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["type"], "usage");
+    assert_eq!(json["used_tokens"], 34_000);
+    assert_eq!(json["context_limit"], 128_000);
+    // Provider usage serializes inline (not skipped) when present.
+    assert_eq!(json["provider"]["cached_tokens"], 30_000);
+
+    let decoded: AgentEvent = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded, event);
+
+    // Provider usage is optional: older event payloads (or providers that
+    // report nothing) decode with `provider: None` and round-trip without
+    // the field on the wire.
+    let legacy: AgentEvent = serde_json::from_str(
+        r#"{"type":"usage","used_tokens":10,"context_limit":100}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        legacy,
+        AgentEvent::Usage {
+            used_tokens: 10,
+            context_limit: 100,
+            provider: None,
+        }
+    );
+    let encoded = serde_json::to_string(&legacy).unwrap();
+    assert!(!encoded.contains("provider"), "{encoded}");
 }
 
 #[test]

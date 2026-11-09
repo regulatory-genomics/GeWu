@@ -37,12 +37,33 @@ pub enum OpenAIError {
     /// Error parsing Server-Sent Events response.
     #[error("SSE parse error: {0}")]
     SseParse(String),
+    /// The provider rejected the request with a 429 rate limit. Carries the
+    /// parsed human message and the `Retry-After` hint when one was sent, so
+    /// the retry layer can decide whether waiting is worthwhile.
+    #[error("provider rate limit (429): {message}")]
+    RateLimit {
+        message: String,
+        retry_after: Option<std::time::Duration>,
+    },
     /// API returned an error response.
     #[error("API error: {0}")]
     Api(String),
     /// Error building request (missing required fields, etc.).
     #[error("Build error: {0}")]
     Build(String),
+}
+
+/// Builds the rate-limit error for a 429 response body.
+///
+/// `retry_after` is the `Retry-After` hint extracted from the headers before
+/// the body was consumed. The hint is advisory only: the retry layer clamps
+/// it to its per-wait cap, so every rate limit is retried indefinitely.
+pub(crate) fn rate_limit_error(
+    retry_after: Option<std::time::Duration>,
+    body: &str,
+) -> OpenAIError {
+    let message = crate::http::rate_limit_message(body);
+    OpenAIError::RateLimit { message, retry_after }
 }
 
 /// Configuration for the OpenAI API client.
@@ -78,14 +99,12 @@ impl OpenAIClient {
     pub fn with_config(config: OpenAIConfig) -> Self {
         Self {
             config,
-            http_client: HttpClient::new(),
+            http_client: crate::http::client(),
         }
     }
 
     pub fn chat(&self) -> ChatCompletions<'_> {
-        ChatCompletions {
-            client: self,
-        }
+        ChatCompletions { client: self }
     }
 
     pub fn models(&self) -> Models<'_> {
@@ -103,11 +122,21 @@ impl<'a> ChatCompletions<'a> {
         mut request: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionStream, OpenAIError> {
         request.stream = Some(true);
+        // Ask for the final usage chunk; without this the stream carries no
+        // token accounting (and no cache-hit figures).
+        request.stream_options = Some(StreamOptions {
+            include_usage: Some(true),
+        });
         let url = format!("{}/chat/completions", self.client.config.base_url);
-        
-        let response = self.client.http_client
+
+        let response = self
+            .client
+            .http_client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.client.config.api_key))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.client.config.api_key),
+            )
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .json(&request)
@@ -116,7 +145,11 @@ impl<'a> ChatCompletions<'a> {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = crate::http::retry_after(&response);
             let error_text = response.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(rate_limit_error(retry_after, &error_text));
+            }
             return Err(OpenAIError::Api(format!("{}: {}", status, error_text)));
         }
 
@@ -176,25 +209,17 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            if let Some(pos) = self.buffer.iter().position(|&b| b == b'\n') {
+            while let Some(pos) = self.buffer.iter().position(|&b| b == b'\n') {
                 // Decode only complete lines, so a multi-byte character split
                 // across chunk boundaries is decoded once the line is whole.
                 let line = String::from_utf8_lossy(&self.buffer[..pos]).into_owned();
                 self.buffer.drain(..=pos);
 
-                let line = line.trim();
-                if line.is_empty() || line.starts_with(':') {
-                    continue;
-                }
-
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data == "[DONE]" {
-                        return Poll::Ready(None);
-                    }
-                    match serde_json::from_str::<ChatCompletionChunk>(data) {
-                        Ok(chunk) => return Poll::Ready(Some(Ok(chunk))),
-                        Err(e) => return Poll::Ready(Some(Err(OpenAIError::SseParse(e.to_string())))),
-                    }
+                match Self::process_line(&line) {
+                    LineOutcome::Continue => {}
+                    LineOutcome::Chunk(chunk) => return Poll::Ready(Some(Ok(chunk))),
+                    LineOutcome::Error(e) => return Poll::Ready(Some(Err(e))),
+                    LineOutcome::Done => return Poll::Ready(None),
                 }
             }
 
@@ -206,15 +231,59 @@ where
                     return Poll::Ready(Some(Err(OpenAIError::Http(e))));
                 }
                 Poll::Ready(None) => {
-                    if self.buffer.is_empty() {
-                        return Poll::Ready(None);
+                    // A final line without a trailing newline is still a
+                    // complete SSE field; process it before ending.
+                    if !self.buffer.is_empty() {
+                        let line = String::from_utf8_lossy(&self.buffer).into_owned();
+                        self.buffer.clear();
+                        match Self::process_line(&line) {
+                            LineOutcome::Chunk(chunk) => return Poll::Ready(Some(Ok(chunk))),
+                            LineOutcome::Error(e) => return Poll::Ready(Some(Err(e))),
+                            _ => {}
+                        }
                     }
-                    self.buffer.clear();
                     return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+/// Result of processing one SSE line.
+enum LineOutcome {
+    /// Keep scanning for more lines.
+    Continue,
+    /// A complete data event was parsed.
+    Chunk(ChatCompletionChunk),
+    /// The event failed to parse.
+    Error(OpenAIError),
+    /// The `[DONE]` terminator was reached.
+    Done,
+}
+
+impl<S> SseStream<S>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>>,
+{
+    fn process_line(raw: &str) -> LineOutcome {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(':') {
+            return LineOutcome::Continue;
+        }
+        // The single space after the colon is optional per the SSE spec;
+        // servers and proxies may emit `data:{...}`.
+        if let Some(data) = line.strip_prefix("data:") {
+            let data = data.strip_prefix(' ').unwrap_or(data);
+            if data == "[DONE]" {
+                return LineOutcome::Done;
+            }
+            return match serde_json::from_str::<ChatCompletionChunk>(data) {
+                Ok(chunk) => LineOutcome::Chunk(chunk),
+                Err(e) => LineOutcome::Error(OpenAIError::SseParse(e.to_string())),
+            };
+        }
+        LineOutcome::Continue
     }
 }
 
@@ -225,16 +294,25 @@ pub struct Models<'a> {
 impl<'a> Models<'a> {
     pub async fn list(&self) -> Result<ModelsResponse, OpenAIError> {
         let url = format!("{}/models", self.client.config.base_url);
-        
-        let response = self.client.http_client
+
+        let response = self
+            .client
+            .http_client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.client.config.api_key))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.client.config.api_key),
+            )
             .send()
             .await?;
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = crate::http::retry_after(&response);
             let error_text = response.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(rate_limit_error(retry_after, &error_text));
+            }
             return Err(OpenAIError::Api(format!("{}: {}", status, error_text)));
         }
 
@@ -261,20 +339,29 @@ pub struct Model {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateChatCompletionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub model: String,
     pub messages: Vec<ChatCompletionRequestMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ChatCompletionTools>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// Set with `stream: true` to have the final chunk carry `usage`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
-    /// Ask reasoning-capable models to think less (`low`) or more (`high`).
-    /// Omitted for models and gateways that do not understand it.
+}
+
+/// `stream_options` for chat completion requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamOptions {
+    /// Stream one extra final chunk carrying `usage` for the whole request.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
+    pub include_usage: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,6 +385,8 @@ pub struct UserMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantMessage {
+    #[serde(flatten)]
+    pub reasoning: std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -428,22 +517,22 @@ impl FunctionObjectArgs {
             parameters: Value::Object(serde_json::Map::new()),
         }
     }
-    
+
     pub fn name(mut self, name: &str) -> Self {
         self.name = name.to_string();
         self
     }
-    
+
     pub fn description(mut self, description: &str) -> Self {
         self.description = Some(description.to_string());
         self
     }
-    
+
     pub fn parameters(mut self, parameters: Value) -> Self {
         self.parameters = parameters;
         self
     }
-    
+
     pub fn build(self) -> Result<FunctionObject, OpenAIError> {
         if self.name.is_empty() {
             return Err(OpenAIError::Build("name is required".to_string()));
@@ -457,22 +546,18 @@ impl FunctionObjectArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct ChatCompletionRequestSystemMessageArgs {
     content: Option<String>,
 }
 
-impl Default for ChatCompletionRequestSystemMessageArgs {
-    fn default() -> Self {
-        Self { content: None }
-    }
-}
 
 impl ChatCompletionRequestSystemMessageArgs {
     pub fn content(mut self, content: String) -> Self {
         self.content = Some(content);
         self
     }
-    
+
     pub fn build(self) -> Result<SystemMessage, OpenAIError> {
         Ok(SystemMessage {
             content: self.content.unwrap_or_default(),
@@ -481,22 +566,18 @@ impl ChatCompletionRequestSystemMessageArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct ChatCompletionRequestUserMessageArgs {
     content: Option<Vec<ChatCompletionRequestUserMessageContentPart>>,
 }
 
-impl Default for ChatCompletionRequestUserMessageArgs {
-    fn default() -> Self {
-        Self { content: None }
-    }
-}
 
 impl ChatCompletionRequestUserMessageArgs {
     pub fn content(mut self, content: Vec<ChatCompletionRequestUserMessageContentPart>) -> Self {
         self.content = Some(content);
         self
     }
-    
+
     pub fn build(self) -> Result<UserMessage, OpenAIError> {
         Ok(UserMessage {
             content: self.content.unwrap_or_default(),
@@ -505,34 +586,29 @@ impl ChatCompletionRequestUserMessageArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct ChatCompletionRequestToolMessageArgs {
     tool_call_id: Option<String>,
     content: Option<String>,
 }
 
-impl Default for ChatCompletionRequestToolMessageArgs {
-    fn default() -> Self {
-        Self {
-            tool_call_id: None,
-            content: None,
-        }
-    }
-}
 
 impl ChatCompletionRequestToolMessageArgs {
     pub fn tool_call_id(mut self, tool_call_id: String) -> Self {
         self.tool_call_id = Some(tool_call_id);
         self
     }
-    
+
     pub fn content(mut self, content: String) -> Self {
         self.content = Some(content);
         self
     }
-    
+
     pub fn build(self) -> Result<ToolMessage, OpenAIError> {
         Ok(ToolMessage {
-            tool_call_id: self.tool_call_id.ok_or_else(|| OpenAIError::Build("tool_call_id is required".to_string()))?,
+            tool_call_id: self
+                .tool_call_id
+                .ok_or_else(|| OpenAIError::Build("tool_call_id is required".to_string()))?,
             content: self.content.unwrap_or_default(),
         })
     }
@@ -561,15 +637,15 @@ pub struct ChatDelta {
     #[serde(default)]
     pub content: Option<String>,
     // Reasoning models stream their thinking under different field names:
-    // GLM (and some other gateways) use "reasoning", DeepSeek-style APIs use
-    // "reasoning_content". Accept both on deserialize; serialize as
-    // "reasoning_content" to preserve the existing wire behavior.
+    // Keep the native field name: alternative/custom reasoning fields are
+    // retained in `extra` and detected by the provider's stream parser.
     #[serde(
         rename = "reasoning_content",
-        alias = "reasoning",
         skip_serializing_if = "Option::is_none"
     )]
     pub reasoning_content: Option<String>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
 }
@@ -598,6 +674,32 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Cache/cost breakdown of the prompt tokens. OpenAI reports
+    /// `cached_tokens` under this object; third-party gateways that omit
+    /// the whole object must still parse (`#[serde(default)]`).
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Breakdown of the completion tokens. OpenAI reports thinking tokens
+    /// as `reasoning_tokens` under this object; gateways that omit it must
+    /// still parse.
+    #[serde(default)]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+/// Breakdown of completion tokens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionTokensDetails {
+    /// Output tokens the model spent thinking (not visible content).
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
+}
+
+/// Breakdown of prompt tokens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptTokensDetails {
+    /// Prompt tokens served from the provider's prompt cache (cache hits).
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
 }
 
 #[cfg(test)]
@@ -614,7 +716,7 @@ mod tests {
     fn chat_delta_parses_glm_reasoning_field() {
         // GLM-style gateways stream thinking under "reasoning".
         let delta: ChatDelta = serde_json::from_str(r#"{"reasoning":"thinking..."}"#).unwrap();
-        assert_eq!(delta.reasoning_content.as_deref(), Some("thinking..."));
+        assert_eq!(delta.extra.get("reasoning").and_then(serde_json::Value::as_str), Some("thinking..."));
     }
 
     #[test]
@@ -649,10 +751,7 @@ mod tests {
             events.push(ev.expect("chunk should parse"));
         }
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].choices[0].delta.content.as_deref(),
-            Some("你好")
-        );
+        assert_eq!(events[0].choices[0].delta.content.as_deref(), Some("你好"));
     }
 
     #[tokio::test]
@@ -664,16 +763,53 @@ mod tests {
             "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" user\"}}]}\n\n",
             "data: [DONE]\n\n",
         );
-        let mut stream = ChatCompletionStream::new(body_stream(vec![Bytes::from_static(
-            sse.as_bytes(),
-        )]));
+        let mut stream =
+            ChatCompletionStream::new(body_stream(vec![Bytes::from_static(sse.as_bytes())]));
         let mut reasoning = String::new();
         while let Some(ev) = stream.next().await {
             let chunk = ev.expect("chunk should parse");
-            if let Some(r) = &chunk.choices[0].delta.reasoning_content {
+            if let Some(r) = chunk.choices[0].delta.extra.get("reasoning").and_then(serde_json::Value::as_str) {
                 reasoning.push_str(r);
             }
         }
         assert_eq!(reasoning, "The user");
+    }
+
+    #[tokio::test]
+    async fn sse_stream_accepts_data_field_without_space() {
+        // The SSE spec makes the single space after the colon optional;
+        // `data:{...}` must parse, not be silently skipped.
+        let sse = concat!(
+            "data:{\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data:[DONE]\n\n",
+        );
+        let mut stream =
+            ChatCompletionStream::new(body_stream(vec![Bytes::from_static(sse.as_bytes())]));
+        let mut count = 0;
+        while let Some(ev) = stream.next().await {
+            let chunk = ev.expect("chunk should parse");
+            assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
+            count += 1;
+        }
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn sse_stream_processes_final_line_without_trailing_newline() {
+        // A complete-but-unterminated last event must still be delivered.
+        let sse = concat!(
+            "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"}}]}\n",
+        );
+        let mut stream =
+            ChatCompletionStream::new(body_stream(vec![Bytes::from_static(sse.as_bytes())]));
+        let mut text = String::new();
+        while let Some(ev) = stream.next().await {
+            let chunk = ev.expect("chunk should parse");
+            if let Some(c) = &chunk.choices[0].delta.content {
+                text.push_str(c);
+            }
+        }
+        assert_eq!(text, "ab");
     }
 }

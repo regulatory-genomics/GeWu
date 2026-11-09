@@ -1,5 +1,18 @@
-const SINGLE_CANDIDATE_SIMILARITY_THRESHOLD: f64 = 0.0;
+const SINGLE_CANDIDATE_SIMILARITY_THRESHOLD: f64 = 0.3;
 const MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD: f64 = 0.3;
+
+/// Slices `line` from byte index `idx`, backing up to the nearest UTF-8 char
+/// boundary so multi-byte input never panics mid-character.
+fn slice_from_char_boundary(line: &str, idx: usize) -> &str {
+    if idx >= line.len() {
+        return "";
+    }
+    let mut idx = idx;
+    while idx > 0 && !line.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    &line[idx..]
+}
 
 fn levenshtein(a: &str, b: &str) -> f64 {
     if a.is_empty() || b.is_empty() {
@@ -13,11 +26,11 @@ fn levenshtein(a: &str, b: &str) -> f64 {
 
     let mut matrix = vec![vec![0usize; b_len + 1]; a_len + 1];
 
-    for i in 0..=a_len {
-        matrix[i][0] = i;
+    for (i, row) in matrix.iter_mut().enumerate() {
+        row[0] = i;
     }
-    for j in 0..=b_len {
-        matrix[0][j] = j;
+    for (j, cell) in matrix[0].iter_mut().enumerate() {
+        *cell = j;
     }
 
     for i in 1..=a_len {
@@ -52,7 +65,11 @@ fn line_trimmed_replace(content: &str, search: &str) -> Option<(usize, usize)> {
         search_lines.pop();
     }
 
-    for i in 0..=(original_lines.len() as isize - search_lines.len() as isize) as usize {
+    if search_lines.is_empty() || search_lines.len() > original_lines.len() {
+        return None;
+    }
+
+    for i in 0..=(original_lines.len() - search_lines.len()) {
         let mut matches_line = true;
 
         for j in 0..search_lines.len() {
@@ -66,10 +83,10 @@ fn line_trimmed_replace(content: &str, search: &str) -> Option<(usize, usize)> {
         }
 
         if matches_line {
-            let mut match_start_index = 0;
-            for k in 0..i {
-                match_start_index += original_lines[k].len() + 1;
-            }
+            let match_start_index: usize = original_lines[..i]
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum();
 
             let mut match_end_index = match_start_index;
             for k in 0..search_lines.len() {
@@ -117,7 +134,7 @@ fn remove_indentation(text: &str) -> (String, usize) {
             if line.trim().is_empty() {
                 line.to_string()
             } else {
-                line[min_indent.min(line.len())..].to_string()
+                slice_from_char_boundary(line, min_indent).to_string()
             }
         })
         .collect::<Vec<_>>()
@@ -154,8 +171,8 @@ fn block_anchor_replace(content: &str, search: &str) -> Option<(usize, usize)> {
             continue;
         }
 
-        for j in (i + 2)..original_lines.len() {
-            if original_lines[j].trim() == last_line_search {
+        for (j, line) in original_lines.iter().enumerate().skip(i + 2) {
+            if line.trim() == last_line_search {
                 candidates.push(Candidate {
                     start_line: i,
                     end_line: j,
@@ -173,40 +190,48 @@ fn block_anchor_replace(content: &str, search: &str) -> Option<(usize, usize)> {
         let cand = &candidates[0];
         let actual_block_size = cand.end_line - cand.start_line + 1;
 
-        let mut similarity = 0.0;
         let lines_to_check = (search_block_size - 2).min(actual_block_size.saturating_sub(2));
+        
 
-        if lines_to_check > 0 {
-            for j in 1..search_block_size - 1 {
+        let similarity = if lines_to_check > 0 {
+            // Average similarity across ALL middle lines of the candidate
+            // block, then gate on the threshold. Checking a single line and
+            // breaking early would make the gate a no-op (any two non-empty
+            // lines have Levenshtein similarity > 0), allowing wildly
+            // different blocks to match and corrupting the file.
+            let mut total = 0.0;
+            for (j, raw_search_line) in search_lines.iter().enumerate().take(search_block_size - 1).skip(1) {
                 let orig_idx = cand.start_line + j;
                 if orig_idx >= original_lines.len() {
                     break;
                 }
                 let original_line = original_lines[orig_idx].trim();
-                let search_line = search_lines[j].trim();
+                let search_line = raw_search_line.trim();
                 let max_len = original_line.len().max(search_line.len());
                 if max_len == 0 {
                     continue;
                 }
                 let distance = levenshtein(original_line, search_line);
-                similarity += (1.0 - distance / max_len as f64) / lines_to_check as f64;
-
-                if similarity >= SINGLE_CANDIDATE_SIMILARITY_THRESHOLD {
-                    break;
-                }
+                total += 1.0 - distance / max_len as f64;
             }
+            total / lines_to_check as f64
         } else {
-            similarity = 1.0;
-        }
+            1.0
+        };
 
         if similarity >= SINGLE_CANDIDATE_SIMILARITY_THRESHOLD {
-            let mut match_start_index = 0;
-            for k in 0..cand.start_line {
-                match_start_index += original_lines[k].len() + 1;
-            }
+            let match_start_index: usize = original_lines[..cand.start_line]
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum();
             let mut match_end_index = match_start_index;
-            for k in cand.start_line..=cand.end_line {
-                match_end_index += original_lines[k].len();
+            for (k, line) in original_lines
+                .iter()
+                .enumerate()
+                .take(cand.end_line + 1)
+                .skip(cand.start_line)
+            {
+                match_end_index += line.len();
                 if k < cand.end_line {
                     match_end_index += 1;
                 }
@@ -225,13 +250,13 @@ fn block_anchor_replace(content: &str, search: &str) -> Option<(usize, usize)> {
         let lines_to_check = (search_block_size - 2).min(actual_block_size.saturating_sub(2));
 
         if lines_to_check > 0 {
-            for j in 1..search_block_size - 1 {
+            for (j, raw_search_line) in search_lines.iter().enumerate().take(search_block_size - 1).skip(1) {
                 let orig_idx = cand.start_line + j;
                 if orig_idx >= original_lines.len() {
                     continue;
                 }
                 let original_line = original_lines[orig_idx].trim();
-                let search_line = search_lines[j].trim();
+                let search_line = raw_search_line.trim();
                 let max_len = original_line.len().max(search_line.len());
                 if max_len == 0 {
                     continue;
@@ -250,22 +275,26 @@ fn block_anchor_replace(content: &str, search: &str) -> Option<(usize, usize)> {
         }
     }
 
-    if max_similarity >= MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD {
-        if let Some(best) = best_match {
-            let mut match_start_index = 0;
-            for k in 0..best.start_line {
-                match_start_index += original_lines[k].len() + 1;
-            }
+    if max_similarity >= MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD
+        && let Some(best) = best_match {
+            let match_start_index: usize = original_lines[..best.start_line]
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum();
             let mut match_end_index = match_start_index;
-            for k in best.start_line..=best.end_line {
-                match_end_index += original_lines[k].len();
+            for (k, line) in original_lines
+                .iter()
+                .enumerate()
+                .take(best.end_line + 1)
+                .skip(best.start_line)
+            {
+                match_end_index += line.len();
                 if k < best.end_line {
                     match_end_index += 1;
                 }
             }
             return Some((match_start_index, match_end_index));
         }
-    }
 
     None
 }
@@ -279,10 +308,7 @@ fn whitespace_normalized_replace(content: &str, search: &str) -> Option<(usize, 
         let normalized_line = normalize(line);
 
         if normalized_line == normalized_search {
-            let mut start = 0;
-            for j in 0..i {
-                start += lines[j].len() + 1;
-            }
+            let start: usize = lines[..i].iter().map(|line| line.len() + 1).sum();
             return Some((start, start + line.len()));
         }
     }
@@ -294,16 +320,20 @@ fn indentation_flexible_replace(content: &str, search: &str) -> Option<(usize, u
     let content_lines: Vec<&str> = content.split('\n').collect();
     let find_lines: Vec<&str> = search.split('\n').collect();
 
+    if find_lines.is_empty() || find_lines.len() > content_lines.len() {
+        return None;
+    }
+
     let (normalized_find, _) = remove_indentation(search);
 
-    for i in 0..=(content_lines.len() as isize - find_lines.len() as isize) as usize {
+    for i in 0..=(content_lines.len() - find_lines.len()) {
         let block = content_lines[i..i + find_lines.len()].join("\n");
         let (normalized_block, _) = remove_indentation(&block);
         if normalized_block == normalized_find {
-            let mut start = 0;
-            for j in 0..i {
-                start += content_lines[j].len() + 1;
-            }
+            let start: usize = content_lines[..i]
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum();
             let end = start + block.len();
             return Some((start, end));
         }
@@ -426,10 +456,10 @@ fn context_aware_replace(content: &str, search: &str) -> Option<(usize, usize)> 
                     };
 
                     if ratio >= 0.5 {
-                        let mut start = 0;
-                        for k in 0..i {
-                            start += content_lines[k].len() + 1;
-                        }
+                        let start: usize = content_lines[..i]
+                            .iter()
+                            .map(|line| line.len() + 1)
+                            .sum();
                         let end = start + block.len();
                         return Some((start, end));
                     }
@@ -489,9 +519,10 @@ pub fn smart_replace(
         multi_occurrence_replace,
     ] {
         if let Some((start, end)) = strategy(content, old_string) {
-            if replace_all {
-                return Ok(content.replace(old_string, new_string));
-            }
+            // Reaching the strategy loop with `replace_all` implies zero exact
+            // occurrences, so `content.replace` would be a silent no-op
+            // reporting success without changing anything. Apply the single
+            // fuzzy span instead so the edit actually happens.
             let prefix = &content[..start];
             let suffix = &content[end..];
             return Ok(format!("{}{}{}", prefix, new_string, suffix));
@@ -596,5 +627,55 @@ mod tests {
             false,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_block_anchor_single_candidate_rejects_dissimilar_block() {
+        // The anchors match but the middle of the candidate block is entirely
+        // different from the search — the fuzzy gate must reject it instead of
+        // silently replacing the whole 30-line span.
+        let mut content = String::from("fn config() {\n");
+        for i in 0..30 {
+            content.push_str(&format!("    real_line_{}();\n", i));
+        }
+        content.push_str("}\n");
+        content.push_str("fn other() {}\n");
+
+        let search = "fn config() {\nplaceholder\n}";
+        let result = smart_replace(&content, search, "fn config() {\n}\n", false);
+        assert!(result.is_err(), "dissimilar block must not match");
+    }
+
+    #[test]
+    fn test_block_anchor_single_candidate_accepts_similar_block() {
+        // Small typo in one middle line: fuzzy match should still succeed.
+        let content = "fn foo() {\n    let x = 1;\n    let y = 2;\n}\nfn bar() {}";
+        let search = "fn foo() {\n    let x = 1;\n    let y = 3;\n}";
+        let result = smart_replace(content, search, "fn foo() {\n    let x = 10;\n}", false);
+        assert!(result.is_ok());
+        let replaced = result.unwrap();
+        assert!(replaced.contains("let x = 10;"));
+        assert!(!replaced.contains("let y = 2;"));
+    }
+
+    #[test]
+    fn test_search_longer_than_file_is_not_found() {
+        // old_string with more lines than the file used to wrap the loop bound
+        // (usize underflow) and panic with an out-of-bounds index.
+        let content = "only one line";
+        let search = "line one\nline two\nline three";
+        let result = smart_replace(content, search, "replacement", false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("oldString not found"));
+    }
+
+    #[test]
+    fn test_replace_all_fuzzy_actually_changes_content() {
+        // replace_all with a fuzzy (whitespace) match used to return the
+        // content unchanged while reporting success.
+        let content = "foo   bar\nbaz";
+        let result = smart_replace(content, "foo bar", "qux", true);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "qux\nbaz");
     }
 }

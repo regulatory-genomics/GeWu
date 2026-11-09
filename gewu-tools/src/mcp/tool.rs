@@ -44,7 +44,7 @@ impl Tool for McpToolWrapper {
             .await
             .map_err(|e| {
                 let s = e.to_string();
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, s))
+                Box::new(std::io::Error::other(s))
                     as Box<dyn std::error::Error + Send + Sync>
             })?;
 

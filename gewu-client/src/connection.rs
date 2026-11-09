@@ -2,7 +2,7 @@
 //! one JSON message per text frame).
 
 use futures::{SinkExt, StreamExt};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message as WsMessage};
 
@@ -53,18 +53,66 @@ impl ConnSink {
 
 /// The read half of a connection.
 pub(crate) enum ConnSource {
-    Tcp(tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>),
+    Tcp(BufReader<tokio::net::tcp::OwnedReadHalf>),
     Ws(futures::stream::SplitStream<WsStream>),
+}
+
+/// Upper bound on a single server message. Server snapshots (full session
+/// history) can be large, but a hostile/broken server must not be able to
+/// balloon client memory without limit on an unterminated line.
+const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Reads one newline-terminated line, enforcing [`MAX_LINE_BYTES`].
+/// Returns `Ok(None)` on clean EOF at a message boundary.
+async fn read_bounded_line(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> Result<Option<String>, Error> {
+    use tokio::io::AsyncBufReadExt;
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let available = reader
+            .fill_buf()
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            return Err(Error::Connection(
+                "connection closed in the middle of a message".to_string(),
+            ));
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                line.extend_from_slice(&available[..pos]);
+                let line_len = pos + 1;
+                reader.consume(line_len);
+                let text = String::from_utf8_lossy(&line).into_owned();
+                return Ok(Some(text));
+            }
+            None => {
+                let n = available.len();
+                line.extend_from_slice(available);
+                reader.consume(n);
+                if line.len() > MAX_LINE_BYTES {
+                    return Err(Error::Connection(format!(
+                        "server message exceeds the {} MB line cap",
+                        MAX_LINE_BYTES / (1024 * 1024)
+                    )));
+                }
+            }
+        }
+    }
 }
 
 impl ConnSource {
     /// Next message from the server; `None` when the connection closed.
     async fn next_message(&mut self) -> Option<Result<String, Error>> {
         match self {
-            ConnSource::Tcp(lines) => match lines.next_line().await {
+            ConnSource::Tcp(reader) => match read_bounded_line(reader).await {
                 Ok(Some(line)) => Some(Ok(line)),
                 Ok(None) => None,
-                Err(e) => Some(Err(Error::Connection(e.to_string()))),
+                Err(e) => Some(Err(e)),
             },
             ConnSource::Ws(source) => loop {
                 match source.next().await {
@@ -95,7 +143,7 @@ impl Connection {
         let (read, write) = stream.into_split();
         Ok(Self {
             sink: ConnSink::Tcp(write),
-            source: ConnSource::Tcp(BufReader::new(read).lines()),
+            source: ConnSource::Tcp(BufReader::new(read)),
         })
     }
 

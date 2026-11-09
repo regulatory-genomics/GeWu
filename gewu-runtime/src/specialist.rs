@@ -38,6 +38,9 @@ pub struct SpecialistDescriptor {
     pub max_turns: Option<usize>,
     #[serde(default)]
     pub max_tool_calls: Option<usize>,
+    /// Model context window used for compaction. `None` keeps GeWu's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<usize>,
 }
 
 impl SpecialistDescriptor {
@@ -158,6 +161,9 @@ impl SpecialistRegistry {
         if let Some(memory) = build.memory {
             builder = builder.memory(memory);
         }
+        if let Some(limit) = descriptor.context_limit {
+            builder = builder.context_limit(limit);
+        }
         builder.build().map_err(|error| SpecialistError::Build(error.to_string()))
     }
 }
@@ -194,6 +200,7 @@ mod tests {
             tools: Vec::new(),
             max_turns: None,
             max_tool_calls: None,
+            context_limit: None,
         };
 
         let error = registry
@@ -219,6 +226,7 @@ mod tests {
             tools: vec!["nope".into()],
             max_turns: None,
             max_tool_calls: None,
+            context_limit: None,
         };
 
         let error = registry

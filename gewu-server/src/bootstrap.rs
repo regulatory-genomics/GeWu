@@ -5,12 +5,14 @@
 
 use anyhow::{Context, Result};
 use gewu_core::traits::{LlmProvider, RequestLog};
-use gewu_providers::{AnthropicProvider, OpenAIProvider};
+use gewu_core::types::PathEnforcement;
+use gewu_providers::{AnthropicProvider, ChatCompletionsProvider, DeepSeekProvider, GlmProvider, MoonshotProvider, OpenAIProvider, ProviderProfile};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
+use std::collections::BTreeMap;
 use std::env;
 use std::sync::{Arc, Mutex};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::LoadedConfig;
@@ -34,7 +36,7 @@ pub struct CommonArgs {
     #[arg(long, short, env = "OPENAI_MODEL")]
     pub model: Option<String>,
 
-    /// LLM Provider to use (openai or anthropic)
+    /// Provider profile for direct CLI use (configured models own their provider)
     #[arg(long, env = "GEWU_PROVIDER")]
     pub provider: Option<String>,
 
@@ -55,6 +57,20 @@ pub struct CommonArgs {
     pub llm_config: Option<String>,
 }
 
+/// One switchable model: a ready provider plus the settings agents need.
+#[derive(Clone)]
+pub struct ModelEntry {
+    pub provider: Arc<dyn LlmProvider>,
+    pub provider_name: String,
+    /// API model id (or catalog key) shown in UIs.
+    pub label: String,
+    /// Resolved context window used for compaction.
+    pub context_limit: usize,
+}
+
+/// AgentBuilder's default context window, used when a model configures none.
+const DEFAULT_CONTEXT_LIMIT: usize = 256_000;
+
 /// Everything needed to build agents, resolved from CLI args + config + env.
 pub struct Bootstrap {
     pub provider: Arc<dyn LlmProvider>,
@@ -66,9 +82,28 @@ pub struct Bootstrap {
     pub log_writer: Option<RequestLog>,
     pub model: String,
     pub provider_name: String,
+    /// Working directory all tools resolve paths against; captured once at
+    /// startup so the UI can show it.
+    pub working_directory: String,
+    /// File-path confinement level for tools and file-tree operations.
+    pub enforcement: PathEnforcement,
+    /// Model context window (tokens) forwarded to agents for compaction;
+    /// `None` keeps the agent's built-in default.
+    pub context_limit: Option<usize>,
+    /// Every switchable model by `endpoint/model` selector. Always contains
+    /// the default model, so sessions can always resolve their selector.
+    pub models: BTreeMap<String, ModelEntry>,
+    /// The default model's selector (the key it occupies in `models`).
+    pub model_selector: String,
 }
 
 /// Initialize tracing from the `--log-level` flag.
+///
+/// Idempotent: safe to call from both a subcommand handler and the shared
+/// `bootstrap()` path. When a global dispatcher is already installed (e.g.
+/// `run` initialized it before calling `bootstrap()`), the call is a no-op
+/// instead of failing with "a global default trace dispatcher has already
+/// been set".
 pub fn init_tracing(log_level: &str) -> Result<()> {
     let level = match log_level.to_lowercase().as_str() {
         "error" => tracing::Level::ERROR,
@@ -79,7 +114,9 @@ pub fn init_tracing(log_level: &str) -> Result<()> {
         _ => tracing::Level::INFO,
     };
     let subscriber = tracing_subscriber::fmt().with_max_level(level).finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    if tracing::subscriber::set_global_default(subscriber).is_err() {
+        tracing::debug!("tracing already initialized; keeping the existing dispatcher");
+    }
     Ok(())
 }
 
@@ -126,14 +163,33 @@ pub fn build_provider(
     args: &CommonArgs,
     file_config: &crate::config::Config,
 ) -> Result<(Arc<dyn LlmProvider>, String, String)> {
+    file_config.validate()?;
+    let selected = args.model.clone()
+        .or_else(|| env::var("OPENAI_MODEL").ok())
+        .or_else(|| file_config.model.clone())
+        .context("select a configured model with --model or the config's model field")?;
+    let resolved = if file_config.endpoints.is_empty() { None } else { Some(file_config.resolve_model(&selected)?) };
+    let entry = resolved.map(|(_, entry, _)| entry);
+    let override_provider = args.provider.clone().or_else(|| env::var("GEWU_PROVIDER").ok());
+    let profile = if let Some(entry) = entry {
+        if let Some(name) = &override_provider {
+            anyhow::ensure!(name.parse::<ProviderProfile>().map_err(anyhow::Error::msg)? == entry.provider,
+                "provider override conflicts with provider assigned to model '{selected}'");
+        }
+        entry.provider
+    } else {
+        override_provider.context("--provider is required for direct CLI model selection")?
+            .parse::<ProviderProfile>().map_err(anyhow::Error::msg)?
+    };
+    let settings = resolved.map(|(endpoint, _, _)| endpoint);
+    let model = entry.and_then(|entry| entry.model.clone()).unwrap_or_else(|| resolved.map(|(_, _, name)| name.to_string()).unwrap_or(selected));
+    let max_tokens = entry.and_then(|entry| entry.max_tokens);
     let api_key = args
         .api_key
         .clone()
-        .or_else(|| env::var("OPENAI_API_KEY").ok())
-        .or(file_config.api_key.clone())
-        .context(
-            "OPENAI_API_KEY not provided. Set via --api-key, OPENAI_API_KEY env var, or config.json",
-        )?;
+        .or_else(|| env::var(profile.api_key_env()).ok())
+        .or_else(|| settings.and_then(|settings| settings.api_key.clone()))
+        .with_context(|| format!("API key required: use --api-key, {}, or endpoints.<name>.api_key", profile.api_key_env()))?;
 
     let base_url = args
         .base_url
@@ -141,40 +197,134 @@ pub fn build_provider(
         .or_else(|| env::var("OPENAI_BASE_URL").ok())
         .or(args.endpoint.clone())
         .or_else(|| env::var("OPENAI_ENDPOINT").ok())
-        .or(file_config.base_url.clone());
+        .or_else(|| settings.map(|settings| settings.base_url.clone()))
+        .or_else(|| profile.base_url().map(str::to_string))
+        .with_context(|| format!("providers.{}.base_url is required", profile.id()))?;
 
-    let provider_name = args
-        .provider
-        .clone()
-        .or_else(|| env::var("GEWU_PROVIDER").ok())
-        .or_else(|| file_config.provider.clone())
-        .unwrap_or_else(|| "openai".to_string());
+    let provider_name = profile.id().to_string();
 
-    let model = args
-        .model
-        .clone()
-        .or_else(|| env::var("OPENAI_MODEL").ok())
-        .or(file_config.model.clone())
-        .unwrap_or_else(|| "gpt-5.3-codex".to_string());
-
-    let provider: Arc<dyn LlmProvider> = match provider_name.to_lowercase().as_str() {
-        "anthropic" => {
-            if let Some(url) = base_url {
-                Arc::new(AnthropicProvider::new_with_endpoint(&api_key, &url, &model))
-            } else {
-                Arc::new(AnthropicProvider::new(&api_key, &model))
-            }
-        }
-        _ => {
-            if let Some(url) = base_url {
-                Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &url, &model))
-            } else {
-                Arc::new(OpenAIProvider::new(&api_key, &model))
-            }
-        }
-    };
+    let provider = construct_provider(
+        profile,
+        &api_key,
+        &base_url,
+        &model,
+        max_tokens,
+        entry.and_then(|entry| entry.reasoning_effort.as_deref()),
+        entry.and_then(|entry| entry.reasoning_summary),
+    )?;
 
     Ok((provider, provider_name, model))
+}
+
+/// Construct the provider for one resolved model entry.
+fn construct_provider(
+    profile: ProviderProfile,
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+    max_tokens: Option<u32>,
+    reasoning_effort: Option<&str>,
+    reasoning_summary: Option<bool>,
+) -> Result<Arc<dyn LlmProvider>> {
+    let provider: Arc<dyn LlmProvider> = match profile {
+        ProviderProfile::Anthropic => {
+            let mut builder = AnthropicProvider::new_with_endpoint(api_key, base_url, model);
+            if let Some(effort) = reasoning_effort { builder = builder.with_reasoning_effort(effort); }
+            if let Some(max_tokens) = max_tokens {
+                builder = builder.with_max_tokens(max_tokens);
+            }
+            info!(
+                "Anthropic max_tokens: {} (override with `max_tokens` in the config file)",
+                builder.max_tokens()
+            );
+            Arc::new(builder)
+        }
+        ProviderProfile::Deepseek => {
+            let mut provider = DeepSeekProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens);
+            if let Some(effort) = reasoning_effort { provider = provider.with_reasoning_effort(effort); }
+            Arc::new(provider)
+        }
+        ProviderProfile::Glm => {
+            let mut provider = GlmProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens);
+            if let Some(effort) = reasoning_effort { provider = provider.with_reasoning_effort(effort); }
+            Arc::new(provider)
+        }
+        ProviderProfile::Moonshot => {
+            let mut provider = MoonshotProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens);
+            if let Some(effort) = reasoning_effort { provider = provider.with_reasoning_effort(effort); }
+            Arc::new(provider)
+        }
+        ProviderProfile::Openai => {
+            let mut provider = OpenAIProvider::new_with_endpoint(api_key, base_url, model);
+            if let Some(enabled) = reasoning_summary { provider = provider.with_reasoning_summary(enabled); }
+            if let Some(limit) = max_tokens { provider = provider.with_max_output_tokens(limit)?; }
+            if let Some(effort) = reasoning_effort { provider = provider.with_reasoning_effort(effort)?; }
+            Arc::new(provider)
+        }
+        ProviderProfile::OpenaiCompatible => {
+            let mut provider = ChatCompletionsProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens);
+            if let Some(effort) = reasoning_effort { provider = provider.with_reasoning_effort(effort); }
+            Arc::new(provider)
+        }
+    };
+    Ok(provider)
+}
+
+/// Build a provider for every configured endpoint model so sessions can
+/// switch models at runtime. Models whose API key cannot be resolved (or
+/// whose options fail provider construction) are skipped with a warning;
+/// the default model is guaranteed present via `bootstrap()`.
+pub fn build_model_catalog(
+    args: &CommonArgs,
+    file_config: &crate::config::Config,
+) -> BTreeMap<String, ModelEntry> {
+    let mut catalog = BTreeMap::new();
+    for (endpoint_name, settings) in &file_config.endpoints {
+        for (key, model_config) in &settings.models {
+            let selector = format!("{endpoint_name}/{key}");
+            let profile = model_config.provider;
+            let Some(api_key) = args
+                .api_key
+                .clone()
+                .or_else(|| env::var(profile.api_key_env()).ok())
+                .or_else(|| settings.api_key.clone())
+            else {
+                warn!(
+                    "model '{selector}' is not switchable: no API key (set endpoints.{endpoint_name}.api_key or {})",
+                    profile.api_key_env()
+                );
+                continue;
+            };
+            let label = model_config.model.clone().unwrap_or_else(|| key.clone());
+            match construct_provider(
+                profile,
+                &api_key,
+                &settings.base_url,
+                &label,
+                model_config.max_tokens,
+                model_config.reasoning_effort.as_deref(),
+                model_config.reasoning_summary,
+            ) {
+                Ok(provider) => {
+                    catalog.insert(selector.clone(), ModelEntry {
+                        provider,
+                        provider_name: profile.id().to_string(),
+                        label,
+                        context_limit: model_config.context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT),
+                    });
+                }
+                Err(e) => warn!("model '{selector}' is not switchable: {e}"),
+            }
+        }
+    }
+    catalog
+}
+
+fn selected_context_limit(args: &CommonArgs, config: &crate::config::Config) -> Result<Option<usize>> {
+    if config.endpoints.is_empty() { return Ok(None); }
+    let selected = args.model.clone().or_else(|| env::var("OPENAI_MODEL").ok()).or_else(|| config.model.clone())
+        .context("select a configured model")?;
+    Ok(config.resolve_model(&selected)?.1.context_limit)
 }
 
 /// Open the optional LLM request log file when configured.
@@ -207,6 +357,38 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
     info!("Using model: {}", model);
     info!("Using provider: {}", provider_name);
 
+    let context_limit = selected_context_limit(args, file_config)?;
+    let mut models = build_model_catalog(args, file_config);
+    // The default model's catalog selector. Direct CLI use (no configured
+    // endpoints) has no selector, so the default joins the catalog under its
+    // display name.
+    let model_selector = if file_config.endpoints.is_empty() {
+        let selector = model.clone();
+        models.insert(selector.clone(), ModelEntry {
+            provider: provider.clone(),
+            provider_name: provider_name.clone(),
+            label: model.clone(),
+            context_limit: context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT),
+        });
+        selector
+    } else {
+        // `build_provider` validated the selection, so the entry exists.
+        let selected = args
+            .model
+            .clone()
+            .or_else(|| env::var("OPENAI_MODEL").ok())
+            .or_else(|| file_config.model.clone())
+            .expect("build_provider validated the selected model");
+        models.entry(selected.clone()).or_insert_with(|| ModelEntry {
+            provider: provider.clone(),
+            provider_name: provider_name.clone(),
+            label: model.clone(),
+            context_limit: context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT),
+        });
+        selected
+    };
+    info!("Switchable models: {}", models.keys().cloned().collect::<Vec<_>>().join(", "));
+
     let db_path = resolve_db_path(args.db_path.clone())?;
     info!("Using database: {}", db_path);
     let db_url = format!("sqlite://{}?mode=rwc", db_path);
@@ -228,16 +410,7 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
         found
     };
 
-    let web_fetch = Arc::new(
-        file_config
-            .web_fetch
-            .as_ref()
-            .map(|config| config.policy())
-            .unwrap_or_default(),
-    );
-    if web_fetch.block_private_networks {
-        info!("webfetch: private networks are blocked");
-    }
+    let web_fetch = Arc::new(gewu_tools::WebFetchPolicy::default());
 
     Ok(Bootstrap {
         provider,
@@ -248,10 +421,171 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
         log_writer,
         model,
         provider_name,
+        working_directory: env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+            .to_string_lossy()
+            .to_string(),
+        enforcement: loaded_config.config.sandbox,
+        context_limit,
+        models,
+        model_selector,
     })
 }
 
 /// Default session ID generation shared by subcommands.
 pub fn new_session_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_models_share_endpoint_and_keep_their_own_settings() {
+        let config = serde_json::from_value(serde_json::json!({
+            "endpoints": {"shared": {"base_url":"https://example.com/v1", "api_key":"shared-key", "models": {
+                "glm": {"provider":"glm", "max_tokens":1024, "context_limit":131072},
+                "deepseek": {"provider":"deepseek", "max_tokens":2048},
+                "gpt": {"provider":"openai", "model":"gpt-api-id", "max_tokens":4096, "reasoning_effort":"high"}
+            }}}
+        })).unwrap();
+        for (key, profile, budget) in [("glm", "glm",1024), ("deepseek","deepseek",2048), ("gpt","openai",4096)] {
+            let args = CommonArgs { model:Some(format!("shared/{key}")), api_key:Some("shared-key".into()),
+                base_url:Some("https://example.com/v1".into()), provider:Some(profile.into()), ..Default::default() };
+            let (provider, actual, model) = build_provider(&args,&config).unwrap();
+            assert_eq!(actual,profile);
+            let payload = provider.build(&[],&[]).unwrap();
+            assert_eq!(payload[if key == "gpt" {"max_output_tokens"} else {"max_tokens"}],budget);
+            assert_eq!(model,if key == "gpt" {"gpt-api-id"} else {key});
+            assert_eq!(selected_context_limit(&args,&config).unwrap(),if key == "glm" {Some(131072)} else {None});
+        }
+    }
+
+    #[test]
+    fn configured_model_selects_provider_and_api_model_id() {
+        let config = serde_json::from_str(r#"{"model":"west/coding","endpoints":{"west":{"base_url":"https://example.com/v1","api_key":"test","models":{"coding":{"provider":"deepseek","model":"deepseek-reasoner"}}}}}"#).unwrap();
+        let args = CommonArgs { api_key: Some("test".into()), model: Some("west/coding".into()), provider: Some("deepseek".into()), ..Default::default() };
+        let (_, provider, model) = build_provider(&args, &config).unwrap();
+        assert_eq!(provider, "deepseek");
+        assert_eq!(model, "deepseek-reasoner");
+        let conflict = CommonArgs { provider: Some("openai".into()), ..args.clone() };
+        assert!(build_provider(&conflict, &config).is_err());
+        let unknown = CommonArgs { model: Some("missing".into()), ..args };
+        assert!(build_provider(&unknown, &config).is_err());
+    }
+
+    #[test]
+    fn startup_constructs_service_specific_providers() {
+        for (name, field) in [("deepseek", "reasoning_content"), ("moonshot", "reasoning_content"), ("glm", "reasoning")] {
+            let config = serde_json::from_value(serde_json::json!({
+                "endpoints": {"west": {"base_url": "https://example.com/v1", "models": {"coding": {"provider": name, "model": "arbitrary-model"}}}}
+            })).unwrap();
+            let args = CommonArgs {
+                api_key: Some("key".into()), model: Some("west/coding".into()),
+                provider: Some(name.into()), base_url: Some("https://example.com/v1".into()),
+                ..Default::default()
+            };
+            let (provider, selected, model) = build_provider(&args, &config).unwrap();
+            assert_eq!(selected, name);
+            assert_eq!(model, "arbitrary-model");
+            let payload = provider.build(&[gewu_core::types::Message::Assistant {
+                content: Some("answer".into()), reasoning: None, replay: None, tool_calls: None,
+            }], &[]).unwrap();
+            assert!(payload["messages"][0].get(field).is_none());
+        }
+    }
+
+    #[test]
+    fn arbitrary_effort_is_forwarded_in_provider_native_shape() {
+        for profile in [ProviderProfile::Openai, ProviderProfile::Glm, ProviderProfile::Deepseek,
+            ProviderProfile::Moonshot, ProviderProfile::OpenaiCompatible, ProviderProfile::Anthropic] {
+            for effort in ["max", "vendor-custom", ""] {
+                let provider = construct_provider(profile, "key", "https://example.com/v1", "model", None, Some(effort), None).unwrap();
+                let body = provider.build(&[], &[]).unwrap();
+                let forwarded = match profile {
+                    ProviderProfile::Openai => &body["reasoning"]["effort"],
+                    ProviderProfile::Anthropic => &body["output_config"]["effort"],
+                    _ => &body["reasoning_effort"],
+                };
+                assert_eq!(forwarded, effort);
+            }
+        }
+    }
+
+    #[test]
+    fn reasoning_summary_opt_out_reaches_default_and_catalog_providers() {
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "model":"relay/gpt", "endpoints":{"relay":{"base_url":"https://example.com/v1", "api_key":"test-key",
+                "models":{"gpt":{"provider":"openai", "reasoning_summary":false}}}}
+        })).unwrap();
+        config.validate().unwrap();
+        let args = CommonArgs::default();
+        let (provider, _, _) = build_provider(&args, &config).unwrap();
+        assert!(provider.build(&[], &[]).unwrap().get("reasoning").is_none());
+        let catalog = build_model_catalog(&args, &config);
+        assert!(catalog["relay/gpt"].provider.build(&[], &[]).unwrap().get("reasoning").is_none());
+        let invalid: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "endpoints":{"relay":{"base_url":"https://example.com/v1",
+                "models":{"chat":{"provider":"openai-compatible", "reasoning_summary":false}}}}
+        })).unwrap();
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn openai_selects_responses_and_compatible_selects_chat() {
+        for (name, key) in [("openai", "input"), ("openai-compatible", "messages")] {
+            let config = serde_json::from_value(serde_json::json!({
+                "endpoints": {"west": {"base_url": "https://example.com/v1", "models": {"coding": {
+                    "provider": name, "model": "test-model", "max_tokens": 2048,
+                    "reasoning_effort": if name == "openai" { Some("high") } else { None }
+                }}}}
+            })).unwrap();
+            let args = CommonArgs {
+                api_key: Some("key".into()), model: Some("west/coding".into()),
+                provider: Some(name.into()), base_url: Some("https://example.com/v1".into()),
+                ..Default::default()
+            };
+            let (provider, _, _) = build_provider(&args, &config).unwrap();
+            let payload = provider.build(&[], &[]).unwrap();
+            assert!(payload.get(key).is_some());
+            if name == "openai" {
+                assert_eq!(payload["store"], false);
+                assert_eq!(payload["reasoning"]["effort"], "high");
+                assert_eq!(payload["max_output_tokens"], 2048);
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_covers_every_configured_model_with_own_settings() {
+        let config = serde_json::from_value(serde_json::json!({
+            "model": "west/coding",
+            "endpoints": {"west": {"base_url": "https://example.com/v1", "api_key": "shared", "models": {
+                "coding": {"provider": "deepseek", "model": "deepseek-reasoner", "max_tokens": 2048, "context_limit": 131072},
+                "fast": {"provider": "openai", "max_tokens": 4096}
+            }}}
+        })).unwrap();
+        let args = CommonArgs { api_key: Some("shared".into()), model: Some("west/coding".into()), base_url: Some("https://example.com/v1".into()), provider: Some("deepseek".into()), ..Default::default() };
+        let catalog = build_model_catalog(&args, &config);
+        let selectors: Vec<_> = catalog.keys().cloned().collect();
+        assert_eq!(selectors, vec!["west/coding", "west/fast"]);
+        assert_eq!(catalog["west/coding"].label, "deepseek-reasoner");
+        assert_eq!(catalog["west/coding"].provider_name, "deepseek");
+        assert_eq!(catalog["west/coding"].context_limit, 131_072);
+        assert_eq!(catalog["west/fast"].label, "fast");
+        assert_eq!(catalog["west/fast"].provider_name, "openai");
+        assert_eq!(catalog["west/fast"].context_limit, DEFAULT_CONTEXT_LIMIT);
+        assert_eq!(catalog["west/coding"].provider.build(&[], &[]).unwrap()["max_tokens"], 2048);
+        assert_eq!(catalog["west/fast"].provider.build(&[], &[]).unwrap()["max_output_tokens"], 4096);
+    }
+
+    #[test]
+    fn init_tracing_is_idempotent() {
+        // Regression: `run` called init_tracing and then bootstrap() called
+        // it again, which failed with "a global default trace dispatcher has
+        // already been set" and killed every `run` invocation.
+        init_tracing("info").unwrap();
+        init_tracing("debug").unwrap();
+    }
 }

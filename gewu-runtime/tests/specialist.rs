@@ -77,6 +77,7 @@ fn descriptor(tools: &[&str]) -> SpecialistDescriptor {
         tools: tools.iter().map(|name| name.to_string()).collect(),
         max_turns: Some(4),
         max_tool_calls: Some(8),
+        context_limit: None,
     }
 }
 

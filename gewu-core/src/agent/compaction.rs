@@ -1,13 +1,19 @@
 //! Agent-side compaction logic.
 //!
-//! This module provides the compaction functionality specific to the Agent,
-//! including history summarization when context limits are exceeded.
+//! Implements opencode V2-style compaction: when history overflows the
+//! context limit, everything older than a small verbatim tail is summarized
+//! by the LLM (tool outputs truncated in the summarizer's view), and history
+//! gains a durable checkpoint carrying the summary plus the serialized recent
+//! tail. Older messages are excluded from model context, never deleted.
 
-use crate::compaction::{self, estimate_message_tokens, is_overflow};
+use crate::compaction::{
+    self, build_summary_prompt, compaction_body,
+    is_overflow, serialize_messages, select_recent_tail, KEEP_TOKENS, SUMMARY_OUTPUT_TOKENS,
+};
 use crate::types::{ContentPart, Message, ProviderEvent};
 use anyhow::{Result, anyhow};
 use futures::StreamExt;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::Agent;
 
@@ -27,11 +33,13 @@ impl std::fmt::Display for CompactionError {
 impl std::error::Error for CompactionError {}
 
 impl Agent {
+    #[cfg(test)]
     pub(super) async fn compact_if_needed(&mut self) -> Result<bool> {
-        let mut total_tokens: usize = 0;
-        for msg in self.memory.messages() {
-            total_tokens += estimate_message_tokens(msg);
-        }
+        let total_tokens = compaction::active_context(self.memory.messages()).estimate_tokens();
+        self.compact_with_estimate(total_tokens).await
+    }
+
+    pub(super) async fn compact_with_estimate(&mut self, total_tokens: usize) -> Result<bool> {
 
         if !is_overflow(total_tokens, self.context_limit) {
             return Ok(false);
@@ -39,102 +47,73 @@ impl Agent {
 
         info!("Compacting history (total tokens: {})", total_tokens);
 
-        let prompt = "Provide a detailed prompt for continuing our conversation above.
-Focus on information that would be helpful for continuing the conversation, including what we did, what we're doing, which files we're working on, and what we're going to do next.
-The summary that you construct will be used so that another agent can read it and continue the work.
+        // Body = everything the summarizer may touch: after the system
+        // prompt, and after any prior checkpoint (whose summary/recent
+        // already represent the older history).
+        let (prior_checkpoint, body) = compaction_body(self.memory.messages());
 
-When constructing the summary, try to stick to this template:
----
-## Goal
+        // Keep the newest slice verbatim; summarize everything before it.
+        let split = select_recent_tail(body, KEEP_TOKENS);
+        let head = &body[..split];
+        let recent = &body[split..];
 
-[What goal(s) is the user trying to accomplish?]
+        // Prior checkpoint's recent tail is context for the new summary too.
+        let prior_recent = prior_checkpoint.map(|(_, recent)| recent);
 
-## Instructions
+        if head.is_empty() && prior_recent.as_ref().is_none_or(|r| r.is_empty()) {
+            // Nothing older than the tail exists to summarize (e.g. one huge
+            // message). Compaction cannot shrink this further; let the
+            // request through and surface any provider overflow directly.
+            warn!("Compaction skipped: no history older than the kept tail");
+            return Ok(false);
+        }
 
-- [What important instructions did the user give you that are relevant]
-- [If there is a plan or spec, include information about it so next agent can continue using it]
+        let mut context = Vec::new();
+        if let Some(recent) = &prior_recent
+            && !recent.is_empty()
+        {
+            context.push((*recent).to_owned());
+        }
+        context.push(serialize_messages(head));
+        let prior_summary = prior_checkpoint.map(|(summary, _)| summary);
+        let prompt = build_summary_prompt(prior_summary, &context);
 
-## Discoveries
+        // The summarizer sees a capped transcript, so the prompt is far
+        // smaller than the raw history; still, respect the window.
+        if compaction::estimate_tokens(&prompt) + SUMMARY_OUTPUT_TOKENS > self.context_limit {
+            warn!("Compaction skipped: summary prompt would not fit the context window");
+            return Ok(false);
+        }
 
-[What notable things were learned during this conversation that would be useful for the next agent to know when continuing the work]
-
-## Accomplished
-
-[What work has been completed, what work is still in progress, and what work is left?]
-
-## Relevant files / directories
-
-[Construct a structured list of relevant files that have been read, edited, or created that pertain to the task at hand. If all the files in a directory are relevant, include the path to the directory.]
----";
-
-        let mut request_messages = self.memory.messages().to_vec();
-        request_messages.push(Message::User {
-            content: vec![ContentPart::Text {
-                text: prompt.to_string(),
-            }],
-        });
-
+        let summary_request = vec![Message::User {
+            content: vec![ContentPart::Text { text: prompt }],
+        }];
         let provider = self.llm.clone();
         let mut stream = provider
-            .stream_response(&request_messages, &[], self.log.as_ref())
+            .stream_response(&summary_request, &[], self.log.as_ref())
             .await
             .map_err(|e| anyhow!("Compaction failed: {}", e))?;
 
         let mut summary_text = String::new();
         while let Some(event_result) = stream.next().await {
             let event = event_result.map_err(|e| anyhow!("Compaction stream error: {}", e))?;
-            if let ProviderEvent::ContentDelta { delta } = event {
-                summary_text.push_str(&delta);
+            match event {
+                ProviderEvent::ContentDelta { delta } => summary_text.push_str(&delta),
+                // The compaction request is a real LLM request; its usage
+                // counts toward the session's provider-reported totals.
+                ProviderEvent::Usage { usage } => self.provider_usage.add(&usage),
+                ProviderEvent::Error { error } => return Err(anyhow!("Compaction failed: {error}")),
+                _ => {}
             }
         }
 
-        if summary_text.is_empty() {
-            compaction::prune(self.memory.messages_mut());
-            if is_overflow(
-                self.memory
-                    .messages()
-                    .iter()
-                    .map(|m| estimate_message_tokens(m))
-                    .sum(),
-                self.context_limit,
-            ) {
-                return Err(anyhow!(
-                    "Compaction failed: LLM returned empty summary and pruning was insufficient"
-                ));
-            }
-            return Ok(false);
+        if summary_text.trim().is_empty() {
+            // Returning an error (instead of silently continuing) keeps the
+            // loop from retrying the expensive summary on every iteration.
+            return Err(anyhow!("Compaction failed: LLM returned an empty summary"));
         }
 
-        let mut new_history = Vec::new();
-
-        if let Some(sys_msg) = self
-            .memory
-            .messages()
-            .iter()
-            .find(|m| matches!(m, Message::System { .. }))
-        {
-            new_history.push(sys_msg.clone());
-        }
-
-        new_history.push(Message::Assistant {
-            content: Some(format!(
-                "Summary of previous conversation:\n{}",
-                summary_text
-            )),
-            tool_calls: None,
-        });
-
-        if let Some(last_user_msg) = self
-            .memory
-            .messages()
-            .iter()
-            .rev()
-            .find(|m| matches!(m, Message::User { .. }))
-        {
-            new_history.push(last_user_msg.clone());
-        }
-
-        self.memory.replace(new_history).await;
+        self.memory.append_compaction(summary_text.trim().to_string(), serialize_messages(recent)).await?;
         Ok(true)
     }
 }

@@ -50,7 +50,13 @@ impl LlmProvider for MockLlm {
 
         let s = async_stream::try_stream! {
             match response {
-                Message::Assistant { content, tool_calls } => {
+                Message::Assistant { content, reasoning, tool_calls, replay } => {
+                    if let Some(replay) = replay {
+                        yield ProviderEvent::ReasoningReplay { replay };
+                    }
+                    if let Some(delta) = reasoning {
+                        yield ProviderEvent::ReasoningDelta { delta };
+                    }
                     if let Some(c) = content {
                         yield ProviderEvent::ContentDelta { delta: c };
                     }
@@ -100,6 +106,12 @@ impl Tool for MockTool {
 
 #[tokio::test]
 async fn test_agent_loop() {
+    let replay = gewu_core::types::ReasoningReplay {
+        origin: "chat:https://example.com/v1".into(),
+        model: "reasoner".into(),
+        field: Some("reasoning_content".into()),
+        blocks: vec![],
+    };
     let tool_call = ToolCall {
         id: "call_1".to_string(),
         r#type: "function".to_string(),
@@ -112,10 +124,14 @@ async fn test_agent_loop() {
     let responses = vec![
         Message::Assistant {
             content: None,
+            reasoning: Some("I should call the tool".into()),
+            replay: Some(replay.clone()),
             tool_calls: Some(vec![tool_call]),
         },
         Message::Assistant {
             content: Some("Done: Tool output".to_string()),
+            reasoning: None,
+            replay: None,
             tool_calls: None,
         },
     ];
@@ -158,6 +174,56 @@ async fn test_agent_loop() {
     assert_eq!(output, "Tool output");
     assert_eq!(metadata["kind"], serde_json::json!("mock"));
     assert_eq!(result, "Done: Tool output");
+    drop(stream);
+    assert!(agent.memory.messages().iter().any(|message| matches!(message,
+        Message::Assistant { reasoning: Some(text), replay: Some(state), .. }
+        if text == "I should call the tool" && state == &replay
+    )));
+}
+
+#[tokio::test]
+async fn test_agent_emits_usage_at_turn_boundaries() {
+    let responses = vec![Message::Assistant {
+        content: Some("Done".to_string()),
+        reasoning: None,
+        replay: None,
+        tool_calls: None,
+    }];
+
+    let llm = Arc::new(MockLlm {
+        responses: Arc::new(Mutex::new(responses)),
+    });
+
+    let mut agent = AgentBuilder::default()
+        .llm(llm)
+        .with_tools(vec![])
+        .system_prompt("System")
+        .build()
+        .unwrap();
+
+    let mut stream = Box::pin(agent.ask("Do something"));
+    let mut kinds = Vec::new();
+    let mut usage = None;
+    while let Some(event) = stream.next().await {
+        match event.unwrap() {
+            AgentEvent::Usage {
+                used_tokens,
+                context_limit,
+                ..
+            } => {
+                kinds.push("usage");
+                usage = Some((used_tokens, context_limit));
+            }
+            AgentEvent::Finish { .. } => kinds.push("finish"),
+            _ => {}
+        }
+    }
+
+    // One usage snapshot per turn, emitted before the terminal event.
+    assert_eq!(kinds, vec!["usage", "finish"]);
+    let (used_tokens, context_limit) = usage.unwrap();
+    assert!(used_tokens > 0, "history should count: {used_tokens}");
+    assert_eq!(context_limit, 256_000);
 }
 
 #[tokio::test]
@@ -178,10 +244,14 @@ async fn test_apply_patch_metadata_through_agent_loop() {
         responses: Arc::new(Mutex::new(vec![
             Message::Assistant {
                 content: None,
+                reasoning: None,
+                replay: None,
                 tool_calls: Some(vec![tool_call]),
             },
             Message::Assistant {
                 content: Some("patched".to_string()),
+                reasoning: None,
+                replay: None,
                 tool_calls: None,
             },
         ])),
@@ -222,4 +292,204 @@ async fn test_apply_patch_metadata_through_agent_loop() {
             .unwrap(),
         "created\n"
     );
+}
+
+/// A tool that sleeps for a configurable duration and echoes its id, used to
+/// observe parallel execution and result ordering.
+struct SlowTool;
+
+#[async_trait]
+impl Tool for SlowTool {
+    fn name(&self) -> &str {
+        "slow_tool"
+    }
+    fn description(&self) -> &str {
+        "Sleeps then echoes its id"
+    }
+    fn schema(&self) -> schemars::schema::RootSchema {
+        schemars::schema_for!(serde_json::Value)
+    }
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let ms = args["ms"].as_u64().unwrap_or(0);
+        let id = args["id"].as_u64().unwrap_or(0);
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        Ok(ToolResult::new("slow", format!("result-{id}")))
+    }
+}
+
+#[tokio::test]
+async fn test_parallel_tool_calls_run_concurrently_in_call_order() {
+    let make_call = |id: u64, call_id: &str| ToolCall {
+        id: call_id.to_string(),
+        r#type: "function".to_string(),
+        function: FunctionCall {
+            name: "slow_tool".to_string(),
+            arguments: serde_json::json!({ "id": id, "ms": 300 }).to_string(),
+        },
+    };
+
+    let responses = vec![
+        Message::Assistant {
+            content: None,
+            reasoning: None,
+            replay: None,
+            tool_calls: Some(vec![
+                make_call(1, "call_1"),
+                make_call(2, "call_2"),
+                make_call(3, "call_3"),
+            ]),
+        },
+        Message::Assistant {
+            content: Some("all done".to_string()),
+            reasoning: None,
+            replay: None,
+            tool_calls: None,
+        },
+    ];
+
+    let llm = Arc::new(MockLlm {
+        responses: Arc::new(Mutex::new(responses)),
+    });
+    let tool: Arc<dyn Tool> = Arc::new(SlowTool);
+
+    let mut agent = AgentBuilder::default()
+        .llm(llm)
+        .with_tools(vec![tool])
+        .system_prompt("System")
+        .build()
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let mut finish_order = Vec::new();
+    {
+        let mut stream = Box::pin(agent.ask("Run three slow tools"));
+        while let Some(event) = stream.next().await {
+            if let AgentEvent::ToolFinish { output, .. } = event.unwrap() {
+                finish_order.push(output);
+            }
+        }
+    }
+    let elapsed = started.elapsed();
+
+    // Three 300ms sleeps must overlap: sequential execution would take
+    // ~900ms, concurrent execution should finish well under that.
+    assert!(
+        elapsed < std::time::Duration::from_millis(700),
+        "tool calls appear to run sequentially: took {elapsed:?}"
+    );
+
+    // Results are applied in the original call order regardless of which
+    // finished first (all sleeps are equal here, so completion order is
+    // nondeterministic while application order must not be).
+    assert_eq!(finish_order, vec!["result-1", "result-2", "result-3"]);
+
+    // History contains one tool message per call, in call order.
+    let tool_outputs: Vec<String> = agent
+        .memory
+        .messages()
+        .iter()
+        .filter_map(|m| match m {
+            Message::Tool { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_outputs, vec!["result-1", "result-2", "result-3"]);
+}
+
+/// Malformed calls (invalid JSON arguments, empty tool name) must still get a
+/// tool message in history — an assistant turn with unanswered tool_calls is
+/// rejected by strict providers — and the loop must continue to a final
+/// answer instead of stalling.
+#[tokio::test]
+async fn test_malformed_tool_calls_still_record_tool_results() {
+    let responses = vec![
+        Message::Assistant {
+            content: None,
+            reasoning: None,
+            replay: None,
+            tool_calls: Some(vec![
+                ToolCall {
+                    id: "call_bad_json".to_string(),
+                    r#type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "mock_tool".to_string(),
+                        arguments: "not-json".to_string(),
+                    },
+                },
+                ToolCall {
+                    id: "call_empty_name".to_string(),
+                    r#type: "function".to_string(),
+                    function: FunctionCall {
+                        name: String::new(),
+                        arguments: "{}".to_string(),
+                    },
+                },
+            ]),
+        },
+        Message::Assistant {
+            content: Some("recovered".to_string()),
+            reasoning: None,
+            replay: None,
+            tool_calls: None,
+        },
+    ];
+
+    let llm = Arc::new(MockLlm {
+        responses: Arc::new(Mutex::new(responses)),
+    });
+    let tool: Arc<dyn Tool> = Arc::new(MockTool);
+
+    let mut agent = AgentBuilder::default()
+        .llm(llm)
+        .with_tools(vec![tool])
+        .system_prompt("System")
+        .build()
+        .unwrap();
+
+    let mut finish: Vec<(String, String)> = Vec::new();
+    let mut final_response: Option<String> = None;
+    {
+        let mut stream = Box::pin(agent.ask("Trigger malformed calls"));
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                AgentEvent::ToolFinish { tool, output, .. } => {
+                    finish.push((tool, output));
+                }
+                AgentEvent::Finish { response } => final_response = Some(response),
+                _ => {}
+            }
+        }
+    }
+
+    // The loop continued to a final answer after the malformed calls.
+    assert_eq!(final_response.as_deref(), Some("recovered"));
+
+    // Both malformed calls produced a ToolFinish with an error output.
+    assert_eq!(finish.len(), 2);
+    assert_eq!(finish[0].0, "mock_tool");
+    assert!(finish[0].1.contains("invalid arguments"));
+    assert!(finish[1].1.contains("empty name"));
+
+    // History contains one answered tool message per tool_call, including
+    // the malformed ones.
+    let tool_messages: Vec<(String, String)> = agent
+        .memory
+        .messages()
+        .iter()
+        .filter_map(|m| match m {
+            Message::Tool {
+                tool_call_id,
+                content,
+                ..
+            } => Some((tool_call_id.clone(), content.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_messages.len(), 2);
+    assert!(tool_messages.iter().any(|(id, _)| id == "call_bad_json"));
+    assert!(tool_messages.iter().any(|(id, _)| id == "call_empty_name"));
 }

@@ -1,4 +1,5 @@
 pub mod bootstrap;
+pub mod cli;
 pub mod config;
 pub mod mcp_loader;
 pub mod registry;

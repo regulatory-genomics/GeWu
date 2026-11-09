@@ -17,8 +17,8 @@
 //! ```
 
 use async_trait::async_trait;
-use gewu_core::types::{AgentEvent, ToolContext, ToolResult};
 use gewu_core::Agent;
+use gewu_core::types::{AgentEvent, ToolContext, ToolResult};
 use schemars::schema::RootSchema;
 use serde::Deserialize;
 use std::error::Error;
@@ -31,19 +31,25 @@ use gewu_core::traits::Tool;
 /// Implement this trait to wire the task tool into an agent registry.
 /// Pass a prior session id in `resume` to continue that session; the
 /// returned string is the actual session id used (a fresh one when
-/// `resume` is `None`).
+/// `resume` is `None`). `parent_session` is the conversation running the
+/// task tool (from [`ToolContext::session_id`](gewu_core::types::ToolContext));
+/// implementations may use it to track lineage. The factory itself holds no
+/// per-session state.
 #[async_trait]
 pub trait AgentFactory: Send + Sync {
     async fn create(
         &self,
         subagent_type: &str,
         resume: Option<String>,
+        parent_session: &str,
     ) -> Result<(Agent, String), Box<dyn Error + Send + Sync>>;
 }
 
 pub struct TaskTool {
     factory: Arc<dyn AgentFactory>,
     description: String,
+    /// Subagent types this tool may launch; enforced in `execute`.
+    allowed: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -75,7 +81,10 @@ fn schema() -> RootSchema {
 
 impl TaskTool {
     /// Creates a task tool. `agents` is the (name, description) list
-    /// rendered into the tool description.
+    /// rendered into the tool description. The same list is enforced as an
+    /// allow-list: calls with any other `subagent_type` are rejected with an
+    /// error result, so restricting the list (e.g. to read-only agents)
+    /// actually restricts delegation.
     pub fn new(factory: Arc<dyn AgentFactory>, agents: Vec<(String, String)>) -> Self {
         let agent_list = agents
             .iter()
@@ -84,9 +93,11 @@ impl TaskTool {
             .join("\n");
 
         let description = include_str!("prompts/task.txt").replace("{agents}", &agent_list);
+        let allowed = agents.into_iter().map(|(name, _)| name).collect();
         Self {
             factory,
             description,
+            allowed,
         }
     }
 }
@@ -108,13 +119,24 @@ impl Tool for TaskTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: TaskArgs = serde_json::from_value(args)?;
 
+        if !self.allowed.iter().any(|name| name == &input.subagent_type) {
+            return Ok(ToolResult::new(
+                "task",
+                format!(
+                    "Error: subagent type '{}' is not available. Available subagents: {}.",
+                    input.subagent_type,
+                    self.allowed.join(", ")
+                ),
+            ));
+        }
+
         let (mut agent, session_id) = self
             .factory
-            .create(&input.subagent_type, input.task_id)
+            .create(&input.subagent_type, input.task_id, &ctx.session_id)
             .await
             .map_err(|e| format!("Failed to create agent: {}", e))?;
 
@@ -123,6 +145,15 @@ impl Tool for TaskTool {
         let mut result = String::new();
 
         while let Some(event_result) = stream.next().await {
+            // Stop consuming the subagent stream once the parent turn has
+            // been aborted; otherwise a canceled turn waits for the entire
+            // subagent run to finish anyway.
+            if ctx.is_aborted() {
+                return Ok(ToolResult::new(
+                    input.description,
+                    "Error: task aborted because the parent turn was canceled.",
+                ));
+            }
             match event_result {
                 Ok(event) => match event {
                     AgentEvent::ContentDelta { delta } => {
@@ -153,9 +184,9 @@ impl Tool for TaskTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::stream::BoxStream;
     use gewu_core::traits::LlmProvider;
     use gewu_core::types::{Message, ProviderEvent};
-    use futures_util::stream::BoxStream;
     use std::sync::Mutex;
 
     /// Streams canned provider events.
@@ -199,7 +230,7 @@ mod tests {
         events: Vec<ProviderEvent>,
         fail_stream: bool,
         fail_create: bool,
-        requests: Mutex<Vec<(String, Option<String>)>>,
+        requests: Mutex<Vec<(String, Option<String>, String)>>,
     }
 
     impl MockFactory {
@@ -219,6 +250,7 @@ mod tests {
             &self,
             subagent_type: &str,
             resume: Option<String>,
+            parent_session: &str,
         ) -> Result<(Agent, String), Box<dyn Error + Send + Sync>> {
             if self.fail_create {
                 return Err("unknown agent type".into());
@@ -226,7 +258,7 @@ mod tests {
             self.requests
                 .lock()
                 .unwrap()
-                .push((subagent_type.to_string(), resume.clone()));
+                .push((subagent_type.to_string(), resume.clone(), parent_session.to_string()));
             let agent = Agent::builder()
                 .llm(Arc::new(MockLlm {
                     events: self.events.clone(),
@@ -275,7 +307,10 @@ mod tests {
         let tool = make_tool(factory.clone());
 
         let result = tool
-            .execute(args("Check files", "build", None), &ToolContext::new("s", "m"))
+            .execute(
+                args("Check files", "build", None),
+                &ToolContext::new("s", "m"),
+            )
             .await
             .expect("task should succeed");
 
@@ -288,6 +323,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].0, "build");
         assert_eq!(requests[0].1, None);
+        assert_eq!(requests[0].2, "s");
     }
 
     #[tokio::test]
@@ -296,7 +332,10 @@ mod tests {
         let tool = make_tool(factory.clone());
 
         let result = tool
-            .execute(args("Resume", "explore", Some("prior-1")), &ToolContext::new("s", "m"))
+            .execute(
+                args("Resume", "explore", Some("prior-1")),
+                &ToolContext::new("s", "m"),
+            )
             .await
             .expect("task should succeed");
 
@@ -304,6 +343,7 @@ mod tests {
         let requests = factory.requests.lock().unwrap();
         assert_eq!(requests[0].0, "explore");
         assert_eq!(requests[0].1.as_deref(), Some("prior-1"));
+        assert_eq!(requests[0].2, "s");
     }
 
     #[tokio::test]
@@ -341,12 +381,30 @@ mod tests {
         factory.fail_create = true;
         let tool = make_tool(Arc::new(factory));
 
+        // "build" is advertised, so the call reaches the factory and its
+        // failure surfaces.
         let error = tool
-            .execute(args("Check", "nope", None), &ToolContext::new("s", "m"))
+            .execute(args("Check", "build", None), &ToolContext::new("s", "m"))
             .await
             .expect_err("factory error should surface");
 
         assert!(error.to_string().contains("Failed to create agent"));
+    }
+
+    #[tokio::test]
+    async fn task_rejects_unadvertised_subagent_type() {
+        let factory = Arc::new(MockFactory::new(content_finish_events()));
+        let tool = make_tool(factory.clone());
+
+        let result = tool
+            .execute(args("Check", "general", None), &ToolContext::new("s", "m"))
+            .await
+            .expect("unadvertised type should be an error result, not a stream failure");
+
+        assert!(result.output.contains("not available"));
+        assert!(result.output.contains("explore"));
+        // The factory must never be asked to create the denied agent.
+        assert!(factory.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

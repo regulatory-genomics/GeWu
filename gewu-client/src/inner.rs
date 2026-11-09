@@ -18,6 +18,7 @@ struct Pending {
 /// streamed frames until a terminal one arrives.
 struct ActiveAsk {
     request_id: String,
+    persistent: bool,
     tx: tokio::sync::broadcast::Sender<Result<ServerMessage, Error>>,
 }
 /// Commands the [`Client`](crate::Client) sends to the actor.
@@ -29,6 +30,10 @@ pub(crate) enum Command {
     },
     /// Start an ask and return the stream of its frames.
     Ask {
+        request: ClientRequest,
+        stream: oneshot::Sender<Result<AskHandle, Error>>,
+    },
+    Subscribe {
         request: ClientRequest,
         stream: oneshot::Sender<Result<AskHandle, Error>>,
     },
@@ -45,13 +50,15 @@ pub(crate) enum Command {
 pub(crate) struct AskHandle {
     rx: tokio::sync::broadcast::Receiver<Result<ServerMessage, Error>>,
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    persistent: bool,
 }
 
 impl AskHandle {
-    fn new(tx: tokio::sync::broadcast::Sender<Result<ServerMessage, Error>>) -> Self {
+    fn new(tx: tokio::sync::broadcast::Sender<Result<ServerMessage, Error>>, persistent: bool) -> Self {
         Self {
             rx: tx.subscribe(),
             done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            persistent,
         }
     }
 
@@ -62,10 +69,10 @@ impl AskHandle {
         }
         match self.rx.recv().await {
             Ok(frame) => {
-                let terminal = matches!(
+                let terminal = !self.persistent && (matches!(
                     frame.as_ref().ok(),
                     Some(m) if m.is_ask_terminal().is_some()
-                );
+                ) || matches!(frame.as_ref().ok(), Some(ServerMessage::SessionSnapshot { busy: false, .. })));
                 if terminal {
                     self.done.store(true, std::sync::atomic::Ordering::Release);
                 }
@@ -115,13 +122,15 @@ impl Inner {
     }
 }
 
-/// Key used to match replies to pending requests. Numbers and strings are
-/// matched on their string form so `1` and `"1"` both work; the server
-/// echoes the id verbatim.
+/// Key used to match replies to pending requests. The key is type-tagged so
+/// a numeric id `1` and a string id `"1"` never collide (the server echoes
+/// the id verbatim, so same-type matching is exact).
 fn key_for(id: &serde_json::Value) -> String {
     match id {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
+        serde_json::Value::String(s) => format!("s:{s}"),
+        serde_json::Value::Number(n) => format!("n:{n}"),
+        serde_json::Value::Null => "null".to_string(),
+        other => format!("o:{other}"),
     }
 }
 
@@ -162,8 +171,8 @@ impl Inner {
                 // An `interrupted` reply confirms the abort of the active
                 // ask; the server does not emit a terminal frame for the
                 // aborted ask itself, so end its stream here.
-                let interrupted_active_ask =
-                    matches!(msg, ServerMessage::Interrupted { .. }) && self.active_ask.is_some();
+                let interrupted_active_ask = matches!(msg, ServerMessage::Interrupted { .. })
+                    && self.active_ask.as_ref().is_some_and(|ask| !ask.persistent);
                 let _ = pending.reply.send(Ok(msg));
                 if interrupted_active_ask && let Some(ask) = self.active_ask.take() {
                     let _ = ask.tx.send(Err(Error::Interrupted));
@@ -176,12 +185,16 @@ impl Inner {
         // Terminal frames end the in-flight ask: clear it so the next ask
         // is accepted and close the broadcast channel after the terminal
         // frame (the consumer sees it, then `None`).
-        if msg.is_ask_terminal().is_some()
-            && let Some(ask) = self.active_ask.take()
-        {
-            let _ = ask.tx.send(Ok(msg));
-            drop(ask.tx);
-            return;
+        if msg.is_ask_terminal().is_some() || matches!(&msg, ServerMessage::SessionSnapshot { busy: false, .. }) {
+            if self.active_ask.as_ref().is_some_and(|ask| ask.persistent) {
+                if let Some(ask) = &self.active_ask { let _ = ask.tx.send(Ok(msg)); }
+                return;
+            }
+            if let Some(ask) = self.active_ask.take() {
+                let _ = ask.tx.send(Ok(msg));
+                drop(ask.tx);
+                return;
+            }
         }
         // No active ask: fall through to the unmatched-frame path.
 
@@ -189,7 +202,7 @@ impl Inner {
         match &mut self.active_ask {
             Some(ask) => {
                 // Sanity: the server tags ask frames with the ask's request id.
-                if let ServerMessage::Event { request_id, .. } = &msg {
+                if let ServerMessage::Event { request_id, .. } = &msg && !ask.persistent {
                     debug_assert_eq!(
                         request_id, &ask.request_id,
                         "event request id should match the active ask"
@@ -231,7 +244,7 @@ pub(crate) async fn run(mut inner: Inner) {
                         }
                     }
                     Some(Command::Ask { request, stream }) => {
-                        match inner.start_ask(request).await {
+                        match inner.start_ask(request, false).await {
                             Ok(handle) => {
                                 let _ = stream.send(Ok(handle));
                             }
@@ -245,6 +258,12 @@ pub(crate) async fn run(mut inner: Inner) {
                                 inner.shutdown(Error::Connection("connection closed".to_string()));
                                 break;
                             }
+                        }
+                    }
+                    Some(Command::Subscribe { request, stream }) => {
+                        match inner.start_ask(request, true).await {
+                            Ok(handle) => { let _ = stream.send(Ok(handle)); }
+                            Err(e) => { let _ = stream.send(Err(e)); }
                         }
                     }
                     Some(Command::GetSession { reply }) => {
@@ -289,7 +308,7 @@ pub(crate) async fn run(mut inner: Inner) {
 impl Inner {
     /// Begin an ask: send the request, await `ready`, and hand back a stream
     /// handle for the subsequent frames.
-    async fn start_ask(&mut self, request: ClientRequest) -> Result<AskHandle, Error> {
+    async fn start_ask(&mut self, request: ClientRequest, persistent: bool) -> Result<AskHandle, Error> {
         if self.active_ask.is_some() {
             return Err(Error::Busy);
         }
@@ -320,8 +339,8 @@ impl Inner {
                         } => {
                             self.session_id = Some(session_id);
                             let (tx, _) = tokio::sync::broadcast::channel(1024);
-                            let handle = AskHandle::new(tx.clone());
-                            self.active_ask = Some(ActiveAsk { request_id, tx });
+                            let handle = AskHandle::new(tx.clone(), persistent);
+                            self.active_ask = Some(ActiveAsk { request_id, persistent, tx });
                             return Ok(handle);
                         }
                         ServerMessage::Error { error, .. } => {

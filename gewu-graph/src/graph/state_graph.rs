@@ -10,6 +10,10 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+/// The boxed async node handler shared behind the graph's nodes.
+type SharedNodeHandler<S> =
+    Arc<dyn Fn(S) -> Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>> + Send + Sync>;
+
 const MAX_SUBGRAPH_DEPTH: usize = 10;
 const DEFAULT_MAX_STEPS: usize = 1000;
 
@@ -250,7 +254,7 @@ impl StreamWriter {
 #[derive(Clone)]
 pub struct NodeHandler<S: State> {
     name: String,
-    handler: Arc<dyn Fn(S) -> Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>> + Send + Sync>,
+    handler: SharedNodeHandler<S>,
     subgraph: Option<Box<CompiledGraph<S>>>,
 }
 
@@ -271,9 +275,7 @@ impl<S: State + 'static> NodeHandler<S> {
         Fut: Future<Output = NodeResult<S>> + Send + 'static,
     {
         let handler = Arc::new(handler);
-        let wrapper: Arc<
-            dyn Fn(S) -> Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>> + Send + Sync,
-        > = Arc::new(move |state: S| {
+        let wrapper: SharedNodeHandler<S> = Arc::new(move |state: S| {
             let h = handler.clone();
             Box::pin(async move { h(state).await })
                 as Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>>
@@ -291,9 +293,7 @@ impl<S: State + 'static> NodeHandler<S> {
     /// with the provided state and return the subgraph's final state
     /// as a partial update.
     pub fn with_subgraph(subgraph: CompiledGraph<S>) -> Self {
-        let wrapper: Arc<
-            dyn Fn(S) -> Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>> + Send + Sync,
-        > = Arc::new(move |_: S| {
+        let wrapper: SharedNodeHandler<S> = Arc::new(move |_: S| {
             Box::pin(async move { NodeResult::map_partial(S::Partial::default()) })
                 as Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>>
         });

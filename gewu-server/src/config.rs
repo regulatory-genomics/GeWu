@@ -2,47 +2,54 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 use tracing::warn;
+use gewu_providers::ProviderProfile;
+use std::collections::BTreeMap;
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelConfig {
+    pub provider: ProviderProfile,
+    /// API model ID; defaults to the catalog key.
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    /// Request visible reasoning summaries (OpenAI Responses only; default true).
+    pub reasoning_summary: Option<bool>,
+    /// Output budget, including reasoning tokens.
+    pub max_tokens: Option<u32>,
+    /// Context window used by history compaction.
+    pub context_limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointConfig {
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub models: BTreeMap<String, ModelConfig>,
+}
+
+use gewu_core::types::PathEnforcement;
 use gewu_tools::mcp::types::McpServerConfig;
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
-    pub base_url: Option<String>,
-    pub api_key: Option<String>,
+    #[serde(default)]
+    pub endpoints: BTreeMap<String, EndpointConfig>,
     pub model: Option<String>,
-    pub provider: Option<String>,
     /// Optional path to a log file recording every wire LLM request as JSONL.
     pub log: Option<String>,
     /// Optional directories to scan for skills (files named `SKILL.md`).
     #[serde(default)]
     pub skills: Option<Vec<String>>,
-    /// Destination policy for the `webfetch` tool.
-    #[serde(rename = "webFetch", default)]
-    pub web_fetch: Option<WebFetchConfig>,
+    /// File-path confinement for tools and file-tree operations:
+    /// `"none"` (default) applies no checks, `"contain"` rejects paths that
+    /// escape the working directory, `"strict"` also canonicalizes and
+    /// rejects symlinks.
+    #[serde(default)]
+    pub sandbox: PathEnforcement,
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
-}
-
-/// `webFetch` section of the config file.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WebFetchConfig {
-    /// Refuse destinations that resolve to a private address and do not follow
-    /// redirects. Off by default.
-    #[serde(default)]
-    pub block_private_networks: bool,
-    /// Host suffixes that may be fetched. Empty means "no host allowlist".
-    #[serde(default)]
-    pub allowed_hosts: Vec<String>,
-}
-
-impl WebFetchConfig {
-    pub fn policy(&self) -> gewu_tools::web_fetch::WebFetchPolicy {
-        gewu_tools::web_fetch::WebFetchPolicy {
-            block_private_networks: self.block_private_networks,
-            allowed_hosts: self.allowed_hosts.clone(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -74,11 +81,40 @@ impl LoadedConfig {
 
         let config: Config = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+        config.validate()?;
 
         Ok(LoadedConfig {
             config,
             path: Some(path),
         })
+    }
+}
+
+impl Config {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(model) = &self.model {
+            self.resolve_model(model)?;
+        }
+        for (endpoint, settings) in &self.endpoints {
+            anyhow::ensure!(!endpoint.trim().is_empty() && !endpoint.contains('/'), "endpoint names must be nonempty and cannot contain '/'");
+            anyhow::ensure!(settings.base_url.starts_with("https://") || settings.base_url.starts_with("http://"), "endpoint '{endpoint}' needs an HTTP(S) base_url");
+            for (name, model) in &settings.models {
+                anyhow::ensure!(!name.trim().is_empty(), "model catalog keys cannot be empty");
+                anyhow::ensure!(model.model.as_ref().is_none_or(|id| !id.trim().is_empty()), "API model ID for '{name}' cannot be empty");
+                anyhow::ensure!(model.max_tokens != Some(0) && model.context_limit != Some(0), "model '{endpoint}/{name}' limits must be positive");
+                if model.reasoning_summary.is_some() {
+                    anyhow::ensure!(model.provider == ProviderProfile::Openai, "reasoning_summary is only supported by openai models ({endpoint}/{name})");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn resolve_model(&self, selected: &str) -> Result<(&EndpointConfig, &ModelConfig, &str)> {
+        let (endpoint, name) = selected.split_once('/').context("model selector must be endpoint/model")?;
+        let settings = self.endpoints.get(endpoint).with_context(|| format!("unknown endpoint '{endpoint}'"))?;
+        let (key, model) = settings.models.get_key_value(name).with_context(|| format!("unknown model '{selected}'"))?;
+        Ok((settings, model, key.as_str()))
     }
 }
 
@@ -126,6 +162,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn validates_model_options_and_selectors() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({"endpoints":{"shared":{
+            "base_url":"https://example.com/v1","models":{"vendor/model":{"provider":"openai", "max_tokens":1}}
+        }}})).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.resolve_model("shared/vendor/model").unwrap().2,"vendor/model");
+        for selected in ["shared", "missing/model", "shared/missing"] { assert!(config.resolve_model(selected).is_err()); }
+        config.endpoints.get_mut("shared").unwrap().models.get_mut("vendor/model").unwrap().max_tokens = Some(0);
+        assert!(config.validate().is_err());
+        let config: Config = serde_json::from_value(serde_json::json!({"endpoints":{"shared":{
+            "base_url":"https://example.com/v1","models":{"glm":{"provider":"glm", "reasoning_effort":"high"}}
+        }}})).unwrap();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn models_require_known_providers() {
+        assert!(serde_json::from_str::<ModelConfig>(r#"{}"#).is_err());
+        assert!(serde_json::from_str::<ModelConfig>(r#"{"provider":"typo"}"#).is_err());
+        let config: Config = serde_json::from_str(r#"{"model":"west/m","endpoints":{"west":{"base_url":"https://example.com/v1","models":{"m":{"provider":"deepseek"}}}}}"#).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.endpoints["west"].models["m"].provider, ProviderProfile::Deepseek);
+        assert!(config.endpoints["west"].models["m"].model.is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_defaults_and_removed_settings() {
+        let config: Config = serde_json::from_str(r#"{"model":"missing"}"#).unwrap();
+        assert!(config.validate().is_err());
+        for field in ["reasoning_field", "require_reasoning", "provider", "api_key", "base_url"] {
+            assert!(serde_json::from_str::<Config>(&format!(r#"{{"{field}":null}}"#)).is_err());
+        }
+    }
+
+    #[test]
     fn parses_log_option() {
         let config: Config = serde_json::from_str(r#"{"log": "gewu-requests.jsonl"}"#).unwrap();
         assert_eq!(config.log.as_deref(), Some("gewu-requests.jsonl"));
@@ -135,6 +206,26 @@ mod tests {
     fn log_is_optional() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert!(config.log.is_none());
+    }
+
+    #[test]
+    fn parses_max_tokens_option() {
+        let config: ModelConfig = serde_json::from_str(r#"{"provider":"openai", "max_tokens": 65536}"#).unwrap();
+        assert_eq!(config.max_tokens, Some(65536));
+    }
+
+    #[test]
+    fn parses_context_limit_option() {
+        let config: ModelConfig = serde_json::from_str(r#"{"provider":"glm", "context_limit": 131072}"#).unwrap();
+        assert_eq!(config.context_limit, Some(131_072));
+        let config: ModelConfig = serde_json::from_str(r#"{"provider":"glm"}"#).unwrap();
+        assert_eq!(config.context_limit, None);
+    }
+
+    #[test]
+    fn max_tokens_is_optional() {
+        let config: ModelConfig = serde_json::from_str(r#"{"provider":"glm"}"#).unwrap();
+        assert!(config.max_tokens.is_none());
     }
 
     #[test]
@@ -154,20 +245,21 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_web_fetch_policy() {
-        let config: Config = serde_json::from_str(
-            r#"{"webFetch": {"blockPrivateNetworks": true, "allowedHosts": ["pubmed.ncbi.nlm.nih.gov"]}}"#,
-        )
-        .unwrap();
-
-        let policy = config.web_fetch.expect("webFetch").policy();
-        assert!(policy.block_private_networks);
-        assert_eq!(policy.allowed_hosts, vec!["pubmed.ncbi.nlm.nih.gov"]);
+    fn sandbox_defaults_to_no_enforcement() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.sandbox, PathEnforcement::None);
     }
 
     #[test]
-    fn web_fetch_is_permissive_when_omitted() {
-        let config: Config = serde_json::from_str("{}").unwrap();
-        assert!(config.web_fetch.is_none());
+    fn parses_sandbox_levels() {
+        for (text, expected) in [
+            (r#""none""#, PathEnforcement::None),
+            (r#""contain""#, PathEnforcement::Contain),
+            (r#""strict""#, PathEnforcement::Strict),
+        ] {
+            let config: Config = serde_json::from_str(&format!("{{\"sandbox\": {text}}}")).unwrap();
+            assert_eq!(config.sandbox, expected, "parsing {text}");
+        }
+        assert!(serde_json::from_str::<Config>("{\"sandbox\": \"yolo\"}").is_err());
     }
 }

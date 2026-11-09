@@ -18,6 +18,10 @@ pub struct TabInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ClientMsg {
+    RevertChat { tab: u64, block: Option<usize>, undo: bool },
+    SwitchAgent { tab: u64, agent: String },
+    /// Switch the tab's LLM model (an `endpoint/model` selector).
+    SwitchModel { tab: u64, model: String },
     /// First message when the GUI requires a token.
     Auth { token: String },
     /// Send a prompt to a tab.
@@ -34,31 +38,77 @@ pub enum ClientMsg {
     ToggleTool { tab: u64, block: usize },
     /// Show or hide a run of consecutive tool calls.
     ToggleGroup { tab: u64, block: usize },
+    /// Show or hide a thought block's reasoning text.
+    ToggleThought { tab: u64, block: usize },
     /// Ask for a fresh snapshot (e.g. after a transient UI error).
     Refresh,
+    /// Expand or collapse a directory in the file tree.
+    ToggleDir { path: String },
+    /// Open a file preview.
+    ReadFile { path: String },
+    /// Refresh the file tree.
+    RefreshTree,
+    /// Upload files into the working-directory root. Names are sanitized
+    /// server-side; contents are base64-encoded.
+    UploadFiles { files: Vec<UploadedFile> },
+    /// Close the file preview.
+    ClosePreview,
+}
+
+/// One file to upload: browser-provided name plus base64-encoded body.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UploadedFile {
+    pub name: String,
+    pub content_base64: String,
 }
 
 /// GUI -> browser messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
-    /// Full initial state: tabs, active tab, transcript HTML, status HTML.
+    /// Replace only the tool panel; leave transcript and sidebar tabs intact.
+    Tools { html: String },
+    /// Full initial state: tabs, active tab, transcript, status and sidebar HTML.
     Snapshot {
         tabs: Vec<TabInfo>,
         active: u64,
         transcript: String,
         status: String,
+        sidebar: String,
     },
     /// Tab bar state changed (open/close/switch/busy marker).
     Tabs { tabs: Vec<TabInfo>, active: u64 },
     /// Replace the active transcript with freshly rendered HTML.
     Transcript { html: String },
-    /// Append streamed assistant text to one block.
-    TextDelta { block: usize, delta: String },
+    /// Replace one tool card in the active transcript (`first` is its run's
+    /// starting block index).
+    ToolCard { first: usize, html: String },
+    /// Append a fresh tool card at the end of the transcript (start of a new
+    /// tool run). `assistant` optionally carries the preceding assistant
+    /// block's index and final Markdown body, converting it out of its
+    /// streaming form.
+    ToolCardStart {
+        first: usize,
+        html: String,
+        assistant: Option<(usize, String)>,
+    },
+    /// Append one rendered block at the end of the transcript.
+    BlockAppend { index: usize, html: String },
+    /// Replace one streaming block's rendered Markdown body in place
+    /// (throttled to roughly ten updates per second).
+    StreamingBody { index: usize, html: String },
     /// Replace the status line.
     Status { html: String },
     /// A protocol or upstream error to surface as a toast.
     Error { message: String },
+    /// A non-error notification to surface as a toast.
+    Notice { message: String },
+    /// Replace the rendered file tree.
+    FileTree { html: String },
+    /// Show the requested file preview.
+    FilePreview { html: String },
+    /// Close the file preview overlay.
+    ClosePreview,
 }
 
 #[cfg(test)]
@@ -79,6 +129,11 @@ mod tests {
             ClientMsg::ToggleTool { tab: 1, block: 7 }
         );
         assert_eq!(
+            serde_json::from_str::<ClientMsg>(r#"{"op":"toggle_thought","tab":2,"block":5}"#)
+                .unwrap(),
+            ClientMsg::ToggleThought { tab: 2, block: 5 }
+        );
+        assert_eq!(
             serde_json::from_str::<ClientMsg>(r#"{"op":"open_tab"}"#).unwrap(),
             ClientMsg::OpenTab
         );
@@ -92,13 +147,13 @@ mod tests {
 
     #[test]
     fn serializes_server_messages_with_type_tags() {
-        let msg = ServerMsg::TextDelta {
-            block: 2,
-            delta: "hello".to_string(),
+        let msg = ServerMsg::StreamingBody {
+            index: 2,
+            html: "<div class=\"body markdown\"></div>".to_string(),
         };
         let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["type"], "text_delta");
-        assert_eq!(json["block"], 2);
+        assert_eq!(json["type"], "streaming_body");
+        assert_eq!(json["index"], 2);
 
         let msg = ServerMsg::Tabs {
             tabs: vec![TabInfo {
@@ -113,5 +168,81 @@ mod tests {
         assert_eq!(json["type"], "tabs");
         assert_eq!(json["active"], 1);
         assert_eq!(json["tabs"][0]["label"], "new");
+
+        let msg = ServerMsg::Snapshot {
+            tabs: Vec::new(),
+            active: 1,
+            transcript: String::new(),
+            status: String::new(),
+            sidebar: "<section></section>".to_string(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "snapshot");
+        assert_eq!(json["sidebar"], "<section></section>");
+
+        let msg = ServerMsg::ToolCard {
+            first: 4,
+            html: "<div></div>".to_string(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "tool_card");
+        assert_eq!(json["first"], 4);
+        assert_eq!(json["html"], "<div></div>");
+
+        let msg = ServerMsg::ToolCardStart {
+            first: 4,
+            html: "<div></div>".to_string(),
+            assistant: Some((3, "<div class=\"body markdown\"></div>".to_string())),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "tool_card_start");
+        assert_eq!(json["first"], 4);
+        assert_eq!(json["assistant"][0], 3);
+
+        let msg = ServerMsg::BlockAppend {
+            index: 2,
+            html: "<div class=\"block\"></div>".to_string(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "block_append");
+        assert_eq!(json["index"], 2);
+
+        let msg = ServerMsg::Notice {
+            message: "Uploaded notes.bin (1 kB)".to_string(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "notice");
+        assert_eq!(json["message"], "Uploaded notes.bin (1 kB)");
+    }
+
+    #[test]
+    fn parses_upload_files_commands() {
+        let msg = serde_json::from_str::<ClientMsg>(
+            r#"{"op":"upload_files","files":[
+                {"name":"notes.bin","content_base64":"aGVsbG8="},
+                {"name":"img.png","content_base64":""}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            msg,
+            ClientMsg::UploadFiles {
+                files: vec![
+                    UploadedFile {
+                        name: "notes.bin".to_string(),
+                        content_base64: "aGVsbG8=".to_string(),
+                    },
+                    UploadedFile {
+                        name: "img.png".to_string(),
+                        content_base64: String::new(),
+                    },
+                ],
+            }
+        );
+        assert!(serde_json::from_str::<ClientMsg>(r#"{"op":"upload_files"}"#).is_err());
+        assert!(serde_json::from_str::<ClientMsg>(
+            r#"{"op":"upload_files","files":[{"name":"a.txt"}]}"#
+        )
+        .is_err());
     }
 }

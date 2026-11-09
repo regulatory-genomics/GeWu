@@ -46,7 +46,9 @@ pub use stream::AskStream;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-use gewu_protocol::{ClientRequest, Message, ServerMessage, SessionSummary};
+use gewu_protocol::{
+    ClientRequest, FileEntry, Message, ServerMessage, SessionSummary, TokenUsage,
+};
 use inner::Command;
 
 /// Alias for a [`Result`](std::result::Result) with this crate's error type.
@@ -59,6 +61,8 @@ pub struct ServerInfo {
     pub model: String,
     /// Provider name, e.g. `openai`.
     pub provider: String,
+    /// The working directory the server's agent operates in (absolute).
+    pub working_directory: String,
 }
 
 /// The session's context usage against the agent's context window.
@@ -69,6 +73,16 @@ pub struct Usage {
     pub used_tokens: u64,
     /// The agent's context window in tokens; `0` when unknown.
     pub context_limit: u64,
+    /// Whether an ask is currently running on the connection. When `true`,
+    /// the numeric fields are `0` because the running ask holds the agent
+    /// lock; query again once it finishes. `0/0` with `busy: false` means
+    /// the connection has no session yet.
+    pub busy: bool,
+    /// Provider-reported token accounting accumulated across the session
+    /// (uncached input, cache hits, cache writes, output). `None` until the
+    /// provider reports usage; from it, `TokenUsage::cache_hit_rate_percent`
+    /// gives the session cache-hit rate.
+    pub provider_usage: Option<TokenUsage>,
 }
 
 /// Errors produced by the client.
@@ -86,6 +100,9 @@ pub enum Error {
     /// An ask is already running on this connection; interrupt it first.
     #[error("an ask is already in progress; interrupt it first")]
     Busy,
+    /// The server rejected the authentication token.
+    #[error("authentication failed: {0}")]
+    Auth(String),
     /// The ask was aborted by [`Client::interrupt`](Client::interrupt); the
     /// server does not send a terminal frame for it, so the ask's stream
     /// ends with this error instead.
@@ -112,17 +129,82 @@ pub struct AskBuilder<'a> {
 }
 
 impl Client {
+    /// Observe this session across turn boundaries until the connection closes.
+    pub async fn watch_session(&self, session_id: impl Into<String>) -> Result<AskStream> {
+        let request = ClientRequest::subscribe_session(self.next_correlation_id(), session_id);
+        let (tx, rx) = oneshot::channel();
+        self.commands.send(Command::Subscribe { request, stream: tx }).await
+            .map_err(|_| Error::Connection("connection closed".into()))?;
+        Ok(AskStream::new(rx.await.map_err(|_| Error::Connection("connection closed".into()))??))
+    }
+    /// Restore a session's current transcript and attach to its active turn.
+    pub async fn subscribe_session(&self, session_id: impl Into<String>) -> Result<AskStream> {
+        let request = ClientRequest::subscribe_session(self.next_correlation_id(), session_id);
+        let (tx, rx) = oneshot::channel();
+        self.commands.send(Command::Ask { request, stream: tx }).await
+            .map_err(|_| Error::Connection("connection closed".into()))?;
+        Ok(AskStream::new(rx.await.map_err(|_| Error::Connection("connection closed".into()))??))
+    }
+    pub async fn revert_chat(&self, turn: Option<usize>, undo: bool) -> Result<(String, Vec<Message>)> {
+        match self.request(ClientRequest::revert_chat(self.next_correlation_id(), turn, undo)).await? {
+            ServerMessage::Session { session_id, messages, .. } => Ok((session_id, messages)),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "session")),
+        }
+    }
+    /// Switch profiles on an idle session, retaining its stored history.
+    pub async fn switch_agent(&self, agent: impl Into<String>) -> Result<(String, Vec<String>)> {
+        let request = ClientRequest::switch_agent(self.next_correlation_id(), agent);
+        match self.request(request).await? {
+            ServerMessage::AgentSwitched { session_id, tools, .. } => Ok((session_id, tools)),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "agent_switched")),
+        }
+    }
+    /// Every switchable model as `endpoint/model` selectors with display labels.
+    pub async fn list_models(&self) -> Result<Vec<gewu_protocol::ModelSummary>> {
+        let request = ClientRequest::list_models(self.next_correlation_id());
+        match self.request(request).await? {
+            ServerMessage::Models { models, .. } => Ok(models),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "models")),
+        }
+    }
+    /// Switch the LLM model on an idle session, retaining its stored history.
+    /// Returns the session id and the new model's display label.
+    pub async fn switch_model(&self, model: impl Into<String>) -> Result<(String, String)> {
+        let request = ClientRequest::switch_model(self.next_correlation_id(), model);
+        match self.request(request).await? {
+            ServerMessage::ModelSwitched { session_id, label, .. } => Ok((session_id, label)),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "model_switched")),
+        }
+    }
     /// Connect over TCP (newline-delimited JSON; the server listens on
     /// port 8421 by default).
     pub async fn tcp(host: &str, port: u16) -> Result<Self> {
+        Self::tcp_with_token(host, port, None).await
+    }
+
+    /// Connect over TCP, authenticating with `token` when the server runs
+    /// with `--token`.
+    pub async fn tcp_with_token(host: &str, port: u16, token: Option<&str>) -> Result<Self> {
         let conn = connection::Connection::tcp(&format!("{host}:{port}")).await?;
+        let conn = authenticate(conn, token).await?;
         Ok(Self::spawn(conn))
     }
 
     /// Connect over WebSocket (`ws://` or `wss://`; the server listens on
     /// port 8420 by default).
     pub async fn websocket(url: &str) -> Result<Self> {
+        Self::websocket_with_token(url, None).await
+    }
+
+    /// Connect over WebSocket, authenticating with `token` when the server
+    /// runs with `--token`.
+    pub async fn websocket_with_token(url: &str, token: Option<&str>) -> Result<Self> {
         let conn = connection::Connection::websocket(url).await?;
+        let conn = authenticate(conn, token).await?;
         Ok(Self::spawn(conn))
     }
 
@@ -177,6 +259,43 @@ impl Client {
         }
     }
 
+    pub async fn list_files(&self, path: impl Into<String>) -> Result<Vec<FileEntry>> {
+        let path = path.into();
+        let request = ClientRequest::list_files(self.next_correlation_id(), path.clone());
+        match self.request(request).await? {
+            ServerMessage::Files { entries, .. } => Ok(entries),
+            other => Err(unexpected(other, "files")),
+        }
+    }
+
+    pub async fn read_file(&self, path: impl Into<String>) -> Result<(String, bool)> {
+        let path = path.into();
+        let request = ClientRequest::read_file(self.next_correlation_id(), path);
+        match self.request(request).await? {
+            ServerMessage::FileContent {
+                content, truncated, ..
+            } => Ok((content, truncated)),
+            other => Err(unexpected(other, "file_content")),
+        }
+    }
+
+    /// Write (create or overwrite) a file in the server's working-directory
+    /// root. `path` must be a bare file name; returns the name used and the
+    /// number of bytes written.
+    pub async fn write_file(
+        &self,
+        path: impl Into<String>,
+        bytes: &[u8],
+    ) -> Result<(String, u64)> {
+        use base64::Engine as _;
+        let content_base64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let request = ClientRequest::write_file(self.next_correlation_id(), path, content_base64);
+        match self.request(request).await? {
+            ServerMessage::FileWritten { path, bytes, .. } => Ok((path, bytes)),
+            other => Err(unexpected(other, "file_written")),
+        }
+    }
+
     /// List the available agent profiles (build/explore/general).
     pub async fn list_agents(&self) -> Result<Vec<String>> {
         let request = ClientRequest::list_agents(self.next_correlation_id());
@@ -219,13 +338,20 @@ impl Client {
         self.request(request).await.map(|_| ())
     }
 
-    /// The model and provider the server was started with.
+    /// The model, provider, and working directory the server runs with.
     pub async fn info(&self) -> Result<ServerInfo> {
         let request = ClientRequest::info(self.next_correlation_id());
         match self.request(request).await? {
             ServerMessage::Info {
-                model, provider, ..
-            } => Ok(ServerInfo { model, provider }),
+                model,
+                provider,
+                working_directory,
+                ..
+            } => Ok(ServerInfo {
+                model,
+                provider,
+                working_directory,
+            }),
             other => Err(unexpected(other, "info")),
         }
     }
@@ -234,7 +360,8 @@ impl Client {
     ///
     /// Pass the session id to have the server create/load that session before
     /// measuring (so a resumed conversation reports real numbers). While an
-    /// ask is streaming the reply carries zeros — query when idle.
+    /// ask is streaming the reply carries zeros with `busy: true` — query
+    /// when idle, or check [`Usage::busy`].
     pub async fn usage(&self, session_id: Option<&str>) -> Result<Usage> {
         let mut request = ClientRequest::usage(self.next_correlation_id());
         if let Some(session_id) = session_id {
@@ -244,10 +371,14 @@ impl Client {
             ServerMessage::Usage {
                 used_tokens,
                 context_limit,
+                busy,
+                provider_usage,
                 ..
             } => Ok(Usage {
                 used_tokens,
                 context_limit,
+                busy,
+                provider_usage,
             }),
             other => Err(unexpected(other, "usage")),
         }
@@ -265,7 +396,7 @@ impl Client {
         rx.await.ok().flatten()
     }
 
-    /// Close the connection, aborting any running ask. Other `Client`
+    /// Close the connection, detaching from any server-owned turn. Other `Client`
     /// clones become unusable too; in-flight calls fail with
     /// [`Error::Connection`].
     pub async fn close(&self) {
@@ -338,4 +469,39 @@ fn unexpected(msg: ServerMessage, expected: &str) -> Error {
         expected,
         msg.kind()
     ))
+}
+
+/// Perform the `auth` handshake on a fresh connection, when a token is set.
+///
+/// No-op when `token` is `None` (servers without `--token` accept any first
+/// request). Consumes and returns the connection so it can be handed to the
+/// connection actor only after authentication succeeded.
+async fn authenticate(
+    mut conn: connection::Connection,
+    token: Option<&str>,
+) -> Result<connection::Connection> {
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
+        return Ok(conn);
+    };
+    let request = ClientRequest::auth(0u64, token);
+    conn.send(&request.to_line()).await?;
+    loop {
+        match conn.next_message().await {
+            Some(Ok(line)) => match serde_json::from_str::<ServerMessage>(&line) {
+                Ok(ServerMessage::Auth { ok: true, .. }) => return Ok(conn),
+                Ok(ServerMessage::Auth { .. }) => {
+                    return Err(Error::Auth("the server rejected the token".to_string()));
+                }
+                // Unrelated frames before the auth reply are ignored.
+                Ok(_) => continue,
+                Err(_) => continue,
+            },
+            Some(Err(e)) => return Err(e),
+            None => {
+                return Err(Error::Connection(
+                    "connection closed during authentication".to_string(),
+                ));
+            }
+        }
+    }
 }

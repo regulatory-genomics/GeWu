@@ -111,7 +111,7 @@ body {
 
 .app {
   display: grid;
-  grid-template-rows: auto auto 1fr auto;
+  grid-template-rows: auto auto 1fr;
   height: 100dvh;
   min-height: 0;
 }
@@ -207,35 +207,6 @@ body {
   font-size: 12px;
   letter-spacing: 0.32em;
   color: var(--text);
-}
-
-.uplink {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding-left: 12px;
-  border-left: 1px solid var(--line);
-  font-family: var(--mono);
-  font-size: 11px;
-  min-width: 0;
-}
-
-.uplink:has(.upstream:empty) {
-  display: none;
-}
-
-.uplink-label {
-  color: var(--text-faint);
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
-  font-size: 10px;
-}
-
-.upstream {
-  color: var(--text-dim);
-  max-width: 240px;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .tab-bar {
@@ -405,8 +376,27 @@ body {
 
 /* -- transcript -------------------------------------------------------- */
 
-.transcript {
+.workspace {
   grid-row: 3;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--sidebar-width, 240px);
+  grid-template-rows: minmax(0, 1fr) auto;
+  min-height: 0;
+  position: relative;
+}
+
+.app.sidebar-collapsed .workspace {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.app.sidebar-collapsed .sidebar {
+  display: none;
+}
+
+.transcript {
+  grid-row: 1;
+  grid-column: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 28px clamp(14px, 6vw, 90px) 40px;
   background-color: var(--bg);
@@ -465,11 +455,41 @@ body {
   position: relative;
   width: fit-content;
   max-width: min(82%, 64ch);
-  padding: 8px 14px 8px 30px;
+  padding: 8px 36px 8px 30px;
   background: linear-gradient(180deg, rgba(79, 209, 197, 0.07), rgba(79, 209, 197, 0.035));
   border: 1px solid rgba(79, 209, 197, 0.2);
   border-radius: 8px 8px 2px 8px;
   color: var(--text);
+}
+
+.block.user .body.plain {
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.block.user:hover .body.plain,
+.block.user:focus-within .body.plain,
+.block.user:has(.message-menu-trigger[aria-expanded="true"]) .body.plain {
+  background: var(--bg-hover);
+  border-color: var(--accent-dim);
+}
+
+.message-menu-trigger::after {
+  content: "⋯";
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  z-index: 2;
+  color: var(--accent);
+  font: 16px/1 var(--mono);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s;
+}
+
+.block.user:hover .message-menu-trigger::after,
+.block.user:focus-within .message-menu-trigger::after,
+.message-menu-trigger[aria-expanded="true"]::after {
+  opacity: 1;
 }
 
 .block.user .body.plain::before {
@@ -502,6 +522,63 @@ body {
   border-left: 1px solid var(--line-strong);
 }
 
+.block.compaction {
+  color: var(--text-faint);
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.block.compaction summary {
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.block.compaction .body {
+  margin-top: 10px;
+}
+
+/* Collapsed thinking indicator: "Thinking… 1.2s" while reasoning streams,
+ * settling into a dim "Thought 5.6s" line. When reasoning content exists the
+ * label becomes a `+`/`−` toggle revealing the reasoning text. */
+.block.thought .body {
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding-left: 14px;
+  font-style: italic;
+}
+
+.block.thought .thought-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  white-space: pre-wrap;
+}
+
+.block.thought .thought-toggle:hover {
+  color: var(--text-dim);
+  text-decoration: underline;
+}
+
+.block.thought .thought-body {
+  margin: 4px 0 0;
+  padding-left: 14px;
+  border-left: 1px solid var(--line-strong);
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-style: italic;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
 .block .body.plain {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -511,6 +588,27 @@ body {
 
 .markdown {
   color: var(--text);
+}
+
+/* LaTeX math rendered server-side to MathML. */
+.markdown .math-block {
+  display: block;
+  margin: 0.85em 0;
+  overflow-x: auto;
+  text-align: center;
+}
+.markdown .math-block math {
+  margin: 0 auto;
+  font-size: 1.08em;
+}
+.markdown .math-inline math {
+  vertical-align: -0.25em;
+}
+.markdown .math-source {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
 }
 
 .markdown > :first-child {
@@ -746,12 +844,11 @@ body {
 }
 
 .body.streaming {
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
-/* block cursor while streaming */
-.streaming::after {
+/* block cursor while streaming, inline at the end of the last element */
+.body.streaming > :last-child::after {
   content: "";
   display: inline-block;
   width: 0.55em;
@@ -816,6 +913,13 @@ body {
   transition: background 0.12s, color 0.12s;
 }
 
+/* The whole card body is clickable to expand/collapse, so it reads that way. */
+.tool,
+.tool-group,
+.tool-output {
+  cursor: pointer;
+}
+
 .tool-summary {
   color: var(--text);
 }
@@ -859,6 +963,22 @@ body {
   border-left: 1px dashed var(--line-strong);
 }
 
+/* Full command shown when a tool is expanded; the inline title ellipsizes. */
+.tool-input {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  margin: 4px 0 0 6px;
+  padding: 8px 12px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .tool-output {
   position: relative;
   font-family: var(--mono);
@@ -882,10 +1002,40 @@ body {
   margin: 0 0 4px 6px;
 }
 
+/* running-tool indicator: a spinning arc next to the tool name */
+.tool-spinner {
+  flex: 0 0 auto;
+  align-self: center;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--accent-dim);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* while any tool in a group is still running, its label pulses */
+.tool-group.running .tool-summary {
+  animation: group-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes group-pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+
 /* -- footer ------------------------------------------------------------ */
 
 .footer {
-  grid-row: 4;
+  grid-row: 2;
+  grid-column: 1;
   border-top: 1px solid var(--line);
   background: var(--bg-panel);
   padding: 10px clamp(14px, 6vw, 90px) 14px;
@@ -969,30 +1119,8 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-.gauge {
-  position: relative;
-  width: 84px;
-  height: 4px;
-  background: var(--bg-inset);
-  border: 1px solid var(--line);
-  border-radius: 1px;
-  overflow: hidden;
-}
-
-/* 25% graduation ticks */
-.gauge::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: repeating-linear-gradient(90deg, transparent 0 calc(25% - 1px), var(--line-strong) calc(25% - 1px) 25%);
-}
-
-.gauge-fill {
-  display: block;
-  height: 100%;
-  width: 0;
-  background: var(--accent);
-  box-shadow: 0 0 6px var(--accent-glow);
+.status .cache {
+  font-variant-numeric: tabular-nums;
 }
 
 .usage.warn {
@@ -1002,33 +1130,6 @@ body {
 .usage.warn .v {
   color: var(--warn);
 }
-
-.usage.warn .gauge-fill {
-  background: var(--warn);
-  box-shadow: 0 0 6px var(--warn-soft);
-}
-
-.g0 { width: 0; }
-.g5 { width: 5%; }
-.g10 { width: 10%; }
-.g15 { width: 15%; }
-.g20 { width: 20%; }
-.g25 { width: 25%; }
-.g30 { width: 30%; }
-.g35 { width: 35%; }
-.g40 { width: 40%; }
-.g45 { width: 45%; }
-.g50 { width: 50%; }
-.g55 { width: 55%; }
-.g60 { width: 60%; }
-.g65 { width: 65%; }
-.g70 { width: 70%; }
-.g75 { width: 75%; }
-.g80 { width: 80%; }
-.g85 { width: 85%; }
-.g90 { width: 90%; }
-.g95 { width: 95%; }
-.g100 { width: 100%; }
 
 .composer {
   display: flex;
@@ -1311,6 +1412,161 @@ body {
   box-shadow: 0 0 18px var(--accent-glow);
 }
 
+/* -- sidebar ----------------------------------------------------------- */
+.block.user { position: relative; }
+.message-menu-trigger { position: absolute; inset: 0; width: 100%; background: transparent; border: 0; cursor: pointer; }
+.block.user .body { position: relative; z-index: 1; pointer-events: auto; }
+.message-menu-trigger:focus-visible { outline: 2px solid var(--accent); border-radius: 4px; }
+.message-menu { position: absolute; right: 0; top: 100%; z-index: 10; min-width: 150px; padding: 6px; background: var(--bg-panel); border: 1px solid var(--line); border-radius: 5px; box-shadow: 0 6px 18px rgba(0,0,0,.35); }
+.message-menu[hidden] { display: none; }
+.message-menu .chat-revert { width: 100%; text-align: left; }
+.chat-revert { background: transparent; color: var(--text-dim); border: 1px solid var(--line); border-radius: 3px; font: 11px var(--mono); padding: 3px 6px; cursor: pointer; }
+.chat-revert:hover { color: var(--accent); border-color: var(--accent); }
+.mode-button { background: transparent; border: 1px solid var(--line); color: var(--text-dim); font: inherit; cursor: pointer; border-radius: 3px; }
+.mode-button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+.mode-button:disabled { opacity: .5; cursor: default; }
+.model-picker { background: transparent; border: 1px solid var(--line); border-radius: 3px; color: var(--text-dim); font: 11px var(--mono); padding: 2px 4px; cursor: pointer; max-width: 180px; }
+.model-picker:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+.model-picker:disabled { opacity: .5; cursor: default; }
+.model-picker option { background: var(--bg, #111); color: var(--text, #eee); }
+
+.sidebar {
+  grid-row: 1 / -1;
+  grid-column: 2;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+  padding: 16px 14px;
+  background: var(--bg-panel);
+  border-left: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.sidebar-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  margin: -2px 0 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.sidebar-tab {
+  padding: 7px 9px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text-faint);
+  font: 11px var(--mono);
+  letter-spacing: 0.08em;
+  cursor: pointer;
+}
+
+.sidebar-tab:hover,
+.sidebar-tab.active {
+  color: var(--accent);
+}
+
+.sidebar-tab.active {
+  border-bottom-color: var(--accent);
+}
+
+.sidebar-panel[hidden] {
+  display: none;
+}
+
+.sidebar-panel.active {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.side-section + .side-section {
+  margin-top: 20px;
+}
+
+.side-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0 0 8px;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.side-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.side-list li {
+  padding: 3px 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.side-note {
+  margin: 0;
+  color: var(--text-faint);
+}
+
+.side-note.error {
+  color: var(--error);
+}
+
+.tree-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.tree-root { min-width: 0; margin: 0; color: var(--text-dim); overflow-wrap: anywhere; }
+.tree-list, .tree-children { margin: 0; padding: 0; list-style: none; }
+.tree-children { margin-left: 10px; }
+.tree-entry { margin: 1px 0; }
+.tree-dir, .tree-file { display: flex; width: 100%; gap: 5px; padding: 3px 2px; border: 0; background: transparent; color: var(--text); text-align: left; font: inherit; cursor: pointer; }
+.tree-dir:hover, .tree-file:hover { color: var(--accent); background: var(--bg-hover); }
+.tree-caret { width: 10px; color: var(--text-faint); }
+.tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-empty { padding: 3px 0; color: var(--text-faint); }
+.tree-refresh { border: 0; background: transparent; color: var(--text-dim); cursor: pointer; font: inherit; }
+.tree-refresh:hover { color: var(--accent); }
+.tree-actions { display: flex; gap: 8px; align-items: center; }
+.tree-upload { border: 0; background: transparent; color: var(--text-dim); cursor: pointer; font: inherit; }
+.tree-upload:hover { color: var(--accent); }
+#app.drag-over .file-tree-section { outline: 2px dashed var(--accent); outline-offset: -2px; }
+.preview-overlay { position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column; margin-left: 8vw; padding: 0; background: var(--bg-panel); border-left: 1px solid var(--line); box-shadow: -12px 0 32px rgba(0,0,0,.45); }
+.preview-overlay.hidden { display: none; }
+.preview-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
+.preview-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font: 12px var(--mono); }
+.preview-content { flex: 1; overflow: auto; margin: 0; padding: 18px; color: var(--text); font: 12px/1.6 var(--mono); white-space: pre; }
+.preview-truncated { margin: 0; padding: 8px 18px; color: var(--text-faint); border-top: 1px solid var(--line); font-size: 11px; }
+
+#sidebar-toggle[aria-expanded="true"] {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
+/* On narrow screens the sidebar overlays the transcript. */
+@media (max-width: 800px) {
+  .workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .sidebar {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(260px, 85vw);
+    z-index: 5;
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.4);
+  }
+}
+
 /* -- small screens ----------------------------------------------------- */
 
 @media (max-width: 640px) {
@@ -1320,7 +1576,6 @@ body {
   }
 
   .brand-name,
-  .uplink,
   .status .hint {
     display: none;
   }
@@ -1337,9 +1592,6 @@ body {
     max-width: 150px;
   }
 
-  .gauge {
-    width: 48px;
-  }
 }
 
 /* -- reduced motion ---------------------------------------------------- */

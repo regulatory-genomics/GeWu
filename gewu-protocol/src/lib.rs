@@ -19,7 +19,15 @@
 //! `id` is a client-chosen correlation ID (any JSON value) echoed on every
 //! reply. `session_id` and `agent` are optional and only honored when the
 //! connection's session is first created (by the first request that needs
-//! one); later requests reuse the session.
+//! one); later requests reuse the session — a later request with a
+//! *different* `session_id`/`agent` is rejected.
+//!
+//! When the server was started with a token (`gewu-server serve --token …`),
+//! a connection must authenticate before any other operation:
+//!
+//! ```json
+//! {"id": "0", "op": "auth", "token": "secret"}
+//! ```
 //!
 //! # Server → Client
 //!
@@ -33,28 +41,48 @@
 //! {"type": "pong", "id": "5"}
 //! {"type": "tools", "id": "3", "tools": ["read_file", "bash", "..."]}
 //! {"type": "agents", "id": "4", "agents": ["build", "explore", "general"]}
+//! {"type": "auth", "id": "0", "ok": true}
 //! ```
 //!
 //! `event` payloads are serialized [`AgentEvent`]s (tagged with `"type"`:
 //! `content_delta`, `reasoning_delta`, `tool_start`, `tool_finish`,
-//! `finish`, `error`).
+//! `usage`, `finish`, `error`).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use gewu_core::types::{AgentEvent, ContentPart, FunctionCall, Message, ToolCall};
+pub use gewu_core::types::{
+    AgentEvent, ContentPart, FunctionCall, Message, TokenUsage, ToolCall,
+};
 
 /// Operations a client can request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
+    RevertChat { turn: Option<usize>, undo: bool },
     /// Run an agent turn with the given prompt; events stream back.
     Ask { prompt: String },
+    /// Attach to a session, restoring its live turn if one is running.
+    SubscribeSession,
     /// Interrupt the currently running `ask` on this connection, if any.
     Interrupt,
     /// List the tool names available to the agent.
     ListTools,
+    /// Explicitly change the active profile without replacing the conversation.
+    SwitchAgent { agent: String },
+    /// List visible files and directories directly within a working-directory path.
+    ListFiles { path: String },
+    /// Read a bounded text file within the working directory.
+    ReadFile { path: String },
+    /// Write a base64-encoded file into the working-directory root. The
+    /// path must be a bare file name; existing files are overwritten.
+    WriteFile { path: String, content_base64: String },
     /// List the available agent profiles (build/explore/general).
     ListAgents,
+    /// List the model selectors available for [`Op::SwitchModel`].
+    ListModels,
+    /// Switch the connection session's LLM model without replacing the
+    /// conversation. `model` is a catalog selector (`endpoint/model`).
+    SwitchModel { model: String },
     /// List persisted conversation sessions, newest first.
     ListSessions,
     /// Load one persisted session's messages. The session id is carried in
@@ -70,6 +98,9 @@ pub enum Op {
     Usage,
     /// Liveness check.
     Ping,
+    /// Authenticate the connection with the server's shared token. Required
+    /// before any other operation when the server runs with `--token`.
+    Auth { token: String },
 }
 
 /// A request sent by a client, or received by the server.
@@ -96,18 +127,62 @@ impl Serialize for ClientRequest {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let extra = self.session_id.is_some() as usize
+            + if matches!(self.op, Op::RevertChat { .. }) { 2 } else { 0 }
+            + (matches!(self.op, Op::SwitchAgent { .. } | Op::SwitchModel { .. })) as usize
             + self.agent.is_some() as usize
-            + matches!(self.op, Op::Ask { .. }) as usize;
+            + matches!(
+                self.op,
+                Op::Ask { .. }
+                    | Op::Auth { .. }
+                    | Op::ListFiles { .. }
+                    | Op::ReadFile { .. }
+                    | Op::WriteFile { .. }
+            ) as usize;
         let mut map = serializer.serialize_map(Some(2 + extra))?;
         map.serialize_entry("id", &self.id)?;
         match &self.op {
+            Op::RevertChat { turn, undo } => {
+                map.serialize_entry("op", "revert_chat")?;
+                map.serialize_entry("turn", turn)?;
+                map.serialize_entry("undo", undo)?;
+            }
+            Op::SwitchAgent { agent } => {
+                map.serialize_entry("op", "switch_agent")?;
+                map.serialize_entry("target_agent", agent)?;
+            }
+            Op::SwitchModel { model } => {
+                map.serialize_entry("op", "switch_model")?;
+                map.serialize_entry("model", model)?;
+            }
             Op::Ask { prompt } => {
                 map.serialize_entry("op", "ask")?;
                 map.serialize_entry("prompt", prompt)?;
             }
+            Op::Auth { token } => {
+                map.serialize_entry("op", "auth")?;
+                map.serialize_entry("token", token)?;
+            }
+            Op::ListFiles { path } => {
+                map.serialize_entry("op", "list_files")?;
+                map.serialize_entry("path", path)?;
+            }
+            Op::ReadFile { path } => {
+                map.serialize_entry("op", "read_file")?;
+                map.serialize_entry("path", path)?;
+            }
+            Op::WriteFile {
+                path,
+                content_base64,
+            } => {
+                map.serialize_entry("op", "write_file")?;
+                map.serialize_entry("path", path)?;
+                map.serialize_entry("content_base64", content_base64)?;
+            }
             Op::Interrupt => map.serialize_entry("op", "interrupt")?,
+            Op::SubscribeSession => map.serialize_entry("op", "subscribe_session")?,
             Op::ListTools => map.serialize_entry("op", "list_tools")?,
             Op::ListAgents => map.serialize_entry("op", "list_agents")?,
+            Op::ListModels => map.serialize_entry("op", "list_models")?,
             Op::ListSessions => map.serialize_entry("op", "list_sessions")?,
             Op::GetSession => map.serialize_entry("op", "get_session")?,
             Op::DeleteSession => map.serialize_entry("op", "delete_session")?,
@@ -126,6 +201,16 @@ impl Serialize for ClientRequest {
 }
 
 impl ClientRequest {
+    pub fn revert_chat(id: impl Into<Value>, turn: Option<usize>, undo: bool) -> Self {
+        Self::simple(id, Op::RevertChat { turn, undo })
+    }
+    pub fn switch_agent(id: impl Into<Value>, agent: impl Into<String>) -> Self {
+        Self::simple(id, Op::SwitchAgent { agent: agent.into() })
+    }
+    /// Build a `switch_model` request (a configured `endpoint/model` selector).
+    pub fn switch_model(id: impl Into<Value>, model: impl Into<String>) -> Self {
+        Self::simple(id, Op::SwitchModel { model: model.into() })
+    }
     /// Build an `ask` request.
     pub fn ask(id: impl Into<Value>, prompt: impl Into<String>) -> Self {
         Self {
@@ -157,14 +242,60 @@ impl ClientRequest {
         Self::simple(id, Op::Interrupt)
     }
 
+    pub fn subscribe_session(id: impl Into<Value>, session_id: impl Into<String>) -> Self {
+        Self::simple(id, Op::SubscribeSession).with_session(session_id)
+    }
+
     /// Build a `list_tools` request.
     pub fn list_tools(id: impl Into<Value>) -> Self {
         Self::simple(id, Op::ListTools)
     }
 
+    pub fn list_files(id: impl Into<Value>, path: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            op: Op::ListFiles { path: path.into() },
+            session_id: None,
+            agent: None,
+        }
+    }
+
+    pub fn read_file(id: impl Into<Value>, path: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            op: Op::ReadFile { path: path.into() },
+            session_id: None,
+            agent: None,
+        }
+    }
+
+    /// Build a `write_file` request: `content_base64` is the base64-encoded
+    /// file body; `path` must be a bare file name inside the working
+    /// directory root.
+    pub fn write_file(
+        id: impl Into<Value>,
+        path: impl Into<String>,
+        content_base64: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            op: Op::WriteFile {
+                path: path.into(),
+                content_base64: content_base64.into(),
+            },
+            session_id: None,
+            agent: None,
+        }
+    }
+
     /// Build a `list_agents` request.
     pub fn list_agents(id: impl Into<Value>) -> Self {
         Self::simple(id, Op::ListAgents)
+    }
+
+    /// Build a `list_models` request (the switchable model catalog).
+    pub fn list_models(id: impl Into<Value>) -> Self {
+        Self::simple(id, Op::ListModels)
     }
 
     /// Build a `list_sessions` request.
@@ -198,6 +329,19 @@ impl ClientRequest {
     /// to have the server create/load that session before measuring.
     pub fn usage(id: impl Into<Value>) -> Self {
         Self::simple(id, Op::Usage)
+    }
+
+    /// Build an `auth` request (required before other ops on token-protected
+    /// servers).
+    pub fn auth(id: impl Into<Value>, token: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            op: Op::Auth {
+                token: token.into(),
+            },
+            session_id: None,
+            agent: None,
+        }
     }
 
     fn simple(id: impl Into<Value>, op: Op) -> Self {
@@ -257,6 +401,20 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
         .ok_or_else(|| RequestError::Invalid("missing required field 'op'".to_string()))?;
 
     let op = match op_str {
+        "revert_chat" => {
+            let turn = match obj.get("turn") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(value.as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(|| RequestError::Invalid("turn must be a nonnegative integer".into()))?),
+            };
+            let undo = match obj.get("undo") { None => false, Some(value) => value.as_bool().ok_or_else(|| RequestError::Invalid("undo must be boolean".into()))? };
+            Op::RevertChat { turn, undo }
+        }
+        "switch_agent" => Op::SwitchAgent {
+            agent: obj.get("target_agent").and_then(Value::as_str).ok_or_else(|| RequestError::Invalid("switch_agent requires target_agent".into()))?.to_string(),
+        },
+        "switch_model" => Op::SwitchModel {
+            model: obj.get("model").and_then(Value::as_str).ok_or_else(|| RequestError::Invalid("switch_model requires model".into()))?.to_string(),
+        },
         "ask" => {
             let prompt = obj
                 .get("prompt")
@@ -269,7 +427,41 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
         }
         "interrupt" => Op::Interrupt,
         "list_tools" => Op::ListTools,
+        "list_files" | "read_file" => {
+            let path = obj
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RequestError::Invalid(format!("op '{}' requires a 'path' string", op_str))
+                })?
+                .to_string();
+            if op_str == "list_files" {
+                Op::ListFiles { path }
+            } else {
+                Op::ReadFile { path }
+            }
+        }
         "list_agents" => Op::ListAgents,
+        "list_models" => Op::ListModels,
+        "write_file" => {
+            let path = obj
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RequestError::Invalid("op 'write_file' requires a 'path' string".to_string())
+                })?
+                .to_string();
+            let content_base64 = obj
+                .get("content_base64")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RequestError::Invalid(
+                        "op 'write_file' requires a 'content_base64' string".to_string(),
+                    )
+                })?
+                .to_string();
+            Op::WriteFile { path, content_base64 }
+        }
         "list_sessions" => Op::ListSessions,
         "get_session" => {
             if obj.get("session_id").and_then(Value::as_str).is_none() {
@@ -287,9 +479,20 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
             }
             Op::DeleteSession
         }
+        "subscribe_session" => Op::SubscribeSession,
         "ping" => Op::Ping,
         "info" => Op::Info,
         "usage" => Op::Usage,
+        "auth" => {
+            let token = obj
+                .get("token")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RequestError::Invalid("op 'auth' requires a 'token' string".to_string())
+                })?
+                .to_string();
+            Op::Auth { token }
+        }
         other => {
             return Err(RequestError::Invalid(format!("unknown op '{}'", other)));
         }
@@ -330,6 +533,8 @@ pub fn agent_event_to_value(event: &AgentEvent) -> Value {
 /// Summary of one persisted conversation session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {
+    #[serde(default = "default_agent_name")]
+    pub agent: String,
     /// Server session id, usable to resume the conversation.
     pub session_id: String,
     /// Number of stored messages.
@@ -338,10 +543,52 @@ pub struct SessionSummary {
     pub updated_at: String,
 }
 
+fn default_agent_name() -> String { "build".into() }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// One switchable model in the server's catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSummary {
+    /// `endpoint/model` selector accepted by `switch_model`.
+    pub selector: String,
+    /// Human-readable model id shown in UIs.
+    pub label: String,
+}
+
 /// Messages the server sends to the client.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    /// Consistent reconnect boundary: history before the turn and every
+    /// streamed frame through `seq`. Subsequent frames are newer than it.
+    SessionSnapshot {
+        session_id: String,
+        messages: Vec<Message>,
+        frames: Vec<ServerMessage>,
+        busy: bool,
+        seq: u64,
+        /// The session's model selector (`endpoint/model`), when the sending
+        /// server tracks it. `None`/absent from older servers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+    AgentSwitched { id: Value, session_id: String, agent: String, tools: Vec<String> },
+    /// Reply to a `switch_model` request: the session now runs the model.
+    ModelSwitched {
+        /// Echo of the client request id.
+        id: Value,
+        /// Session the switch applied to.
+        session_id: String,
+        /// The session's new model selector.
+        model: String,
+        /// The new model's display label.
+        label: String,
+    },
     /// Sent when an `ask` begins; carries the server-assigned request id
     /// and the session handling the request.
     Ready {
@@ -408,6 +655,9 @@ pub enum ServerMessage {
         model: String,
         /// Provider name (e.g. `openai`).
         provider: String,
+        /// The working directory the server's agent operates in (absolute).
+        #[serde(default)]
+        working_directory: String,
     },
     /// Reply to a `usage` request: the session's context usage.
     Usage {
@@ -418,6 +668,26 @@ pub enum ServerMessage {
         used_tokens: u64,
         /// The agent's context window in tokens. `0` when unknown.
         context_limit: u64,
+        /// Whether an ask is currently running on this connection. When
+        /// `true`, `used_tokens`/`context_limit` are `0` because the agent
+        /// lock is held by the running ask and cannot be measured; `0/0`
+        /// with `busy: false` instead means no session exists yet.
+        #[serde(default)]
+        busy: bool,
+        /// Provider-reported token accounting accumulated across the
+        /// session (cache hits/writes, uncached input, output). `None` when
+        /// the provider has not reported any usage yet; defaults to `None`
+        /// when decoding frames from older servers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_usage: Option<TokenUsage>,
+    },
+    /// Reply to an `auth` request. When `ok` is `false` the server closes
+    /// the connection right after this frame.
+    Auth {
+        /// Echo of the client request id.
+        id: Value,
+        /// Whether the token was accepted.
+        ok: bool,
     },
     /// Reply to a `list_tools` request.
     Tools {
@@ -426,12 +696,41 @@ pub enum ServerMessage {
         /// Names of the tools available to the agent.
         tools: Vec<String>,
     },
+    /// One level of visible working-directory entries.
+    Files {
+        id: Value,
+        path: String,
+        entries: Vec<FileEntry>,
+    },
+    /// Bounded text file contents for the GUI preview.
+    FileContent {
+        id: Value,
+        path: String,
+        content: String,
+        truncated: bool,
+    },
+    /// Reply to a `write_file` request: the file was created or overwritten.
+    FileWritten {
+        /// Echo of the client request id.
+        id: Value,
+        /// The file name the content was written under.
+        path: String,
+        /// Number of bytes written.
+        bytes: u64,
+    },
     /// Reply to a `list_agents` request.
     Agents {
         /// Echo of the client request id.
         id: Value,
         /// Available agent profile names.
         agents: Vec<String>,
+    },
+    /// Reply to a `list_models` request.
+    Models {
+        /// Echo of the client request id.
+        id: Value,
+        /// Switchable models, sorted by selector.
+        models: Vec<ModelSummary>,
     },
     /// Reply to a `list_sessions` request.
     Sessions {
@@ -469,6 +768,9 @@ impl ServerMessage {
     /// The message's `"type"` tag, e.g. `"event"`, `"result"`, `"error"`.
     pub fn kind(&self) -> &'static str {
         match self {
+            ServerMessage::SessionSnapshot { .. } => "session_snapshot",
+            ServerMessage::AgentSwitched { .. } => "agent_switched",
+            ServerMessage::ModelSwitched { .. } => "model_switched",
             ServerMessage::Ready { .. } => "ready",
             ServerMessage::Event { .. } => "event",
             ServerMessage::Result { .. } => "result",
@@ -477,8 +779,13 @@ impl ServerMessage {
             ServerMessage::Pong { .. } => "pong",
             ServerMessage::Info { .. } => "info",
             ServerMessage::Usage { .. } => "usage",
+            ServerMessage::Auth { .. } => "auth",
             ServerMessage::Tools { .. } => "tools",
+            ServerMessage::Files { .. } => "files",
+            ServerMessage::FileContent { .. } => "file_content",
+            ServerMessage::FileWritten { .. } => "file_written",
             ServerMessage::Agents { .. } => "agents",
+            ServerMessage::Models { .. } => "models",
             ServerMessage::Sessions { .. } => "sessions",
             ServerMessage::Session { .. } => "session",
             ServerMessage::Deleted { .. } => "deleted",
@@ -491,17 +798,25 @@ impl ServerMessage {
     /// are emitted by the background ask task; those return `None` here.
     pub fn correlation_id(&self) -> Option<&Value> {
         match self {
+            ServerMessage::AgentSwitched { id, .. } => Some(id),
+            ServerMessage::ModelSwitched { id, .. } => Some(id),
             ServerMessage::Ready { id, .. }
             | ServerMessage::Pong { id }
             | ServerMessage::Info { id, .. }
             | ServerMessage::Usage { id, .. }
+            | ServerMessage::Auth { id, .. }
             | ServerMessage::Tools { id, .. }
+            | ServerMessage::Files { id, .. }
+            | ServerMessage::FileContent { id, .. }
+            | ServerMessage::FileWritten { id, .. }
             | ServerMessage::Agents { id, .. }
+            | ServerMessage::Models { id, .. }
             | ServerMessage::Sessions { id, .. }
             | ServerMessage::Session { id, .. }
             | ServerMessage::Deleted { id, .. } => Some(id),
             ServerMessage::Interrupted { id, .. } | ServerMessage::Error { id, .. } => id.as_ref(),
-            ServerMessage::Event { .. } | ServerMessage::Result { .. } => None,
+            ServerMessage::Event { .. } | ServerMessage::Result { .. }
+            | ServerMessage::SessionSnapshot { .. } => None,
         }
     }
 
@@ -524,6 +839,84 @@ impl ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_revert_requests_round_trip() {
+        for (turn, undo) in [(None, false), (Some(2), false), (None, true)] {
+            let request = ClientRequest::revert_chat(1, turn, undo);
+            assert_eq!(parse_request(&request.to_line()).unwrap(), request);
+        }
+        assert!(parse_request(r#"{"id":1,"op":"revert_chat","turn":-1}"#).is_err());
+    }
+
+    #[test]
+    fn switch_agent_round_trip() {
+        let request = ClientRequest::switch_agent(7, "plan");
+        assert_eq!(parse_request(&request.to_line()).unwrap(), request);
+        assert!(parse_request(r#"{"id":1,"op":"switch_agent"}"#).is_err());
+        let reply = ServerMessage::AgentSwitched { id: 7.into(), session_id: "s".into(), agent: "plan".into(), tools: vec![] };
+        assert_eq!(reply.kind(), "agent_switched");
+        assert_eq!(reply.correlation_id(), Some(&Value::from(7)));
+        assert_eq!(serde_json::from_str::<ServerMessage>(&reply.to_line()).unwrap(), reply);
+    }
+
+    #[test]
+    fn switch_model_round_trip() {
+        let request = ClientRequest::switch_model(7, "west/coding");
+        assert_eq!(parse_request(&request.to_line()).unwrap(), request);
+        assert_eq!(
+            request.to_line(),
+            r#"{"id":7,"op":"switch_model","model":"west/coding"}"#
+        );
+        assert!(parse_request(r#"{"id":1,"op":"switch_model"}"#).is_err());
+        let reply = ServerMessage::ModelSwitched {
+            id: 7.into(),
+            session_id: "s".into(),
+            model: "west/coding".into(),
+            label: "deepseek-reasoner".into(),
+        };
+        assert_eq!(reply.kind(), "model_switched");
+        assert_eq!(reply.correlation_id(), Some(&Value::from(7)));
+        assert_eq!(reply.is_ask_terminal(), None);
+        assert_eq!(serde_json::from_str::<ServerMessage>(&reply.to_line()).unwrap(), reply);
+    }
+
+    #[test]
+    fn list_models_round_trip() {
+        let request = ClientRequest::list_models(3);
+        assert_eq!(request.to_line(), r#"{"id":3,"op":"list_models"}"#);
+        assert_eq!(parse_request(&request.to_line()).unwrap(), request);
+        let reply = ServerMessage::Models {
+            id: 3.into(),
+            models: vec![ModelSummary { selector: "west/coding".into(), label: "deepseek-reasoner".into() }],
+        };
+        assert_eq!(reply.kind(), "models");
+        assert_eq!(reply.correlation_id(), Some(&Value::from(3)));
+        let decoded: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
+        assert_eq!(decoded, reply);
+    }
+
+    #[test]
+    fn session_snapshot_model_field_is_optional() {
+        let legacy = r#"{"type":"session_snapshot","session_id":"s1","messages":[],"frames":[],"busy":false,"seq":0}"#;
+        let decoded: ServerMessage = serde_json::from_str(legacy).unwrap();
+        match decoded {
+            ServerMessage::SessionSnapshot { model, .. } => assert_eq!(model, None),
+            other => panic!("expected session_snapshot, got {}", other.kind()),
+        }
+        let with_model = ServerMessage::SessionSnapshot {
+            session_id: "s1".into(),
+            messages: vec![],
+            frames: vec![],
+            busy: false,
+            seq: 0,
+            model: Some("west/coding".into()),
+        };
+        let decoded: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&with_model).unwrap()).unwrap();
+        assert_eq!(decoded, with_model);
+    }
 
     #[test]
     fn parses_ask_request() {
@@ -625,6 +1018,7 @@ mod tests {
             id: Value::Number(1.into()),
             model: "gpt-4o".into(),
             provider: "openai".into(),
+            working_directory: "/tmp/proj".into(),
         };
         assert_eq!(info.kind(), "info");
         assert!(info.correlation_id().is_some());
@@ -648,17 +1042,69 @@ mod tests {
             id: Value::Number(1.into()),
             used_tokens: 34_000,
             context_limit: 128_000,
+            busy: false,
+            provider_usage: Some(TokenUsage {
+                input_tokens: 1_000,
+                cached_tokens: 30_000,
+                cache_write_tokens: 3_000,
+                output_tokens: 500,
+                reasoning_tokens: 120,
+            }),
         };
         assert_eq!(usage.kind(), "usage");
         assert!(usage.correlation_id().is_some());
-        let decoded: ServerMessage =
-            serde_json::from_str(&serde_json::to_string(&usage).unwrap()).unwrap();
+        let encoded = serde_json::to_string(&usage).unwrap();
+        assert!(encoded.contains("provider_usage"), "{encoded}");
+        let decoded: ServerMessage = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, usage);
+
+        // `busy`/`provider_usage` default when decoding frames from older
+        // servers.
+        let legacy: ServerMessage =
+            serde_json::from_str(r#"{"type":"usage","id":1,"used_tokens":5,"context_limit":6}"#)
+                .unwrap();
+        match legacy {
+            ServerMessage::Usage { busy, provider_usage, .. } => {
+                assert!(!busy);
+                assert!(provider_usage.is_none());
+            }
+            other => panic!("expected usage, got {}", other.kind()),
+        }
+    }
+
+    #[test]
+    fn auth_round_trips() {
+        let req = parse_request(r#"{"id": 0, "op": "auth", "token": "secret"}"#).unwrap();
+        assert_eq!(
+            req.op,
+            Op::Auth {
+                token: "secret".into()
+            }
+        );
+        assert_eq!(
+            ClientRequest::auth(0, "secret").to_line(),
+            r#"{"id":0,"op":"auth","token":"secret"}"#
+        );
+
+        let err = parse_request(r#"{"id": 1, "op": "auth"}"#).unwrap_err();
+        assert!(err.to_string().contains("token"), "{err}");
+
+        let ok = ServerMessage::Auth {
+            id: Value::Number(0.into()),
+            ok: true,
+        };
+        assert_eq!(ok.kind(), "auth");
+        assert!(ok.correlation_id().is_some());
+        assert_eq!(ok.is_ask_terminal(), None);
+        let decoded: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
+        assert_eq!(decoded, ok);
     }
 
     #[test]
     fn history_replies_round_trip() {
         let summary = SessionSummary {
+            agent: "build".into(),
             session_id: "s1".into(),
             message_count: 3,
             updated_at: "now".into(),
@@ -731,6 +1177,9 @@ mod tests {
 
         let line = ClientRequest::list_agents("4").to_line();
         assert_eq!(line, r#"{"id":"4","op":"list_agents"}"#);
+
+        let line = ClientRequest::write_file("9", "data.bin", "aGk=").to_line();
+        assert_eq!(line, r#"{"id":"9","op":"write_file","path":"data.bin","content_base64":"aGk="}"#);
     }
 
     #[test]
@@ -744,6 +1193,7 @@ mod tests {
             ClientRequest::interrupt(2),
             ClientRequest::list_tools("3"),
             ClientRequest::list_agents("4"),
+            ClientRequest::write_file("9", "data.bin", "aGk="),
         ] {
             let parsed = parse_request(&req.to_line()).unwrap();
             assert_eq!(parsed.id, req.id);
@@ -795,6 +1245,19 @@ mod tests {
         assert_eq!(json["id"], Value::Null);
         assert_eq!(json["event"]["type"], "content_delta");
         assert_eq!(json["event"]["delta"], "hi");
+    }
+
+    #[test]
+    fn status_event_serializes_and_round_trips() {
+        let agent_event = AgentEvent::Status {
+            message: "LLM request failed: rate limited; retrying in 4s (attempt 1)".to_string(),
+        };
+        let value = agent_event_to_value(&agent_event);
+        assert_eq!(value["type"], "status");
+        assert_eq!(value["message"], "LLM request failed: rate limited; retrying in 4s (attempt 1)");
+
+        let decoded: AgentEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, agent_event);
     }
 
     #[test]

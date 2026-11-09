@@ -41,15 +41,21 @@
 //! }
 //! ```
 
-use crate::types::{ExperienceQuery, Message, ProviderEvent, RecalledExperience, ToolContext, ToolResult};
+use crate::types::{
+    ExperienceQuery, Message, ProviderEvent, RecalledExperience, TokenUsage, ToolContext,
+    ToolResult,
+};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::BoxStream;
+use futures::StreamExt;
 use schemars::schema::RootSchema;
 use std::error::Error;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tracing::warn;
+use uuid::Uuid;
 
 /// Defines a tool that the agent can call during execution.
 ///
@@ -157,11 +163,36 @@ pub trait ToolRegistry: Send + Sync {
 /// can take `&self` and one handle can be shared across agents.
 pub type RequestLog = Arc<Mutex<Box<dyn Write + Send + Sync>>>;
 
+/// Callback for transient provider status updates (e.g. retry backoff).
+///
+/// Providers invoke it with a human-readable message whenever a request
+/// attempt fails and will be retried; the agent layer forwards these to
+/// frontends as [`crate::types::AgentEvent::Status`] so a backoff wait is
+/// visible instead of looking like a silent hang.
+pub type StatusSink = std::sync::Arc<dyn Fn(String) + Send + Sync>;
+
+/// Timing summary of one finished LLM response, for the wire log.
+struct ResponseTiming {
+    /// `"ok"` when the stream ended normally, `"error"` on a stream error.
+    outcome: &'static str,
+    /// Send → first event. `None` when no event arrived.
+    ttft_ms: Option<u64>,
+    /// Send → stream end (or stream error).
+    total_ms: u64,
+    /// Provider events consumed.
+    events: usize,
+    /// Error message when `outcome` is `"error"`.
+    error: Option<String>,
+    /// Provider-reported usage, when the terminal chunk carried one.
+    usage: Option<TokenUsage>,
+}
+
 /// Records one wire request as a JSONL line. Generic across providers.
 ///
 /// Best-effort: write failures emit a warning and never fail the request.
-fn log_wire_request(log: &RequestLog, request: &serde_json::Value) {
+fn log_wire_request(log: &RequestLog, id: &str, request: &serde_json::Value) {
     let entry = serde_json::json!({
+        "id": id,
         "timestamp": Utc::now().to_rfc3339(),
         "request": request,
     });
@@ -170,6 +201,93 @@ fn log_wire_request(log: &RequestLog, request: &serde_json::Value) {
     {
         warn!("Failed to write LLM request log: {}", e);
     }
+}
+
+/// Records one finished LLM response's timing summary as a JSONL line.
+///
+/// Paired with its request line via `id`. Best-effort, like
+/// [`log_wire_request`]: write failures warn and never fail the turn.
+fn log_wire_response(log: &RequestLog, id: &str, timing: ResponseTiming) {
+    let entry = serde_json::json!({
+        "id": id,
+        "timestamp": Utc::now().to_rfc3339(),
+        "response": {
+            "ttft_ms": timing.ttft_ms,
+            "total_ms": timing.total_ms,
+            "events": timing.events,
+            "outcome": timing.outcome,
+            "error": timing.error,
+            "usage": timing.usage,
+        },
+    });
+    if let Ok(mut writer) = log.lock()
+        && let Err(e) = writeln!(writer, "{entry}").and_then(|()| writer.flush())
+    {
+        warn!("Failed to write LLM response log: {}", e);
+    }
+}
+
+/// Wraps a provider stream so its timing and usage are recorded when the
+/// stream finishes.
+///
+/// `started` should be captured before the request is sent, so TTFT covers
+/// the full silent window (connection + provider think time). Events pass
+/// through unchanged and in order; the summary line is written after the
+/// last event (or the error). Errors still propagate to the consumer
+/// exactly as before.
+fn record_response_timing<'a>(
+    log: &RequestLog,
+    id: String,
+    started: Instant,
+    stream: BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+) -> BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>> {
+    let log = log.clone();
+    let wrapped = async_stream::stream! {
+        let mut ttft_ms: Option<u64> = None;
+        let mut events = 0usize;
+        let mut usage: Option<TokenUsage> = None;
+        let mut stream = Box::pin(stream);
+        loop {
+            match stream.as_mut().next().await {
+                Some(Ok(event)) => {
+                    if ttft_ms.is_none() {
+                        ttft_ms = Some(started.elapsed().as_millis() as u64);
+                    }
+                    events += 1;
+                    // Usage rides on the terminal chunk; peek it for the
+                    // summary and pass the event through untouched.
+                    if let ProviderEvent::Usage { usage: reported } = &event {
+                        usage = Some(*reported);
+                    }
+                    yield Ok(event);
+                }
+                Some(Err(e)) => {
+                    log_wire_response(&log, &id, ResponseTiming {
+                        outcome: "error",
+                        ttft_ms,
+                        total_ms: started.elapsed().as_millis() as u64,
+                        events,
+                        error: Some(e.to_string()),
+                        usage,
+                    });
+                    yield Err(e);
+                    break;
+                }
+                None => {
+                    log_wire_response(&log, &id, ResponseTiming {
+                        outcome: "ok",
+                        ttft_ms,
+                        total_ms: started.elapsed().as_millis() as u64,
+                        events,
+                        error: None,
+                        usage,
+                    });
+                    break;
+                }
+            }
+        }
+    };
+    Box::pin(wrapped)
 }
 
 /// Provides access to a language model for generating responses.
@@ -220,7 +338,9 @@ pub trait LlmProvider: Send + Sync {
     /// * `messages` - The conversation history to send to the LLM
     /// * `tools` - Available tools the LLM can call
     /// * `log` - Optional request log; when supplied, the built wire request
-    ///   is recorded as one JSONL line before sending
+    ///   is recorded as one JSONL line before sending, and a timing/usage
+    ///   summary line is recorded when the response stream finishes. The two
+    ///   lines share an `id` for correlation.
     ///
     /// # Returns
     ///
@@ -235,11 +355,27 @@ pub trait LlmProvider: Send + Sync {
         Box<dyn Error + Send + Sync>,
     > {
         let request = self.build(messages, tools)?;
+        let request_id = Uuid::new_v4().to_string();
         if let Some(log) = log {
-            log_wire_request(log, &request);
+            log_wire_request(log, &request_id, &request);
         }
-        self.send(request).await
+        // The clock starts before `send` so TTFT includes connection
+        // establishment, TLS, and the provider's think time — the whole
+        // silent window a user experiences, not just body streaming.
+        let started = Instant::now();
+        let stream = self.send(request).await?;
+        Ok(match log {
+            Some(log) => record_response_timing(log, request_id, started, stream),
+            None => stream,
+        })
     }
+
+    /// Registers a sink for transient status messages (e.g. retry backoff).
+    ///
+    /// Called by the agent layer before streaming. Providers with retry
+    /// loops report each failed attempt through it; the default does
+    /// nothing (useful for test doubles).
+    fn set_status_sink(&self, _sink: Option<StatusSink>) {}
 
     /// Lists available models for this provider.
     async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>>;
@@ -265,6 +401,13 @@ pub trait Memory: Send + Sync {
 
     /// Adds a message to the conversation history.
     async fn add_message(&mut self, message: Message);
+
+    /// Persist a completed compaction before activating its context boundary.
+    /// Backends that can fail writes must override this and propagate errors.
+    async fn append_compaction(&mut self, summary: String, recent: String) -> anyhow::Result<()> {
+        self.add_message(Message::Compaction { summary, recent }).await;
+        Ok(())
+    }
 
     /// Clears all messages from the conversation history.
     async fn clear(&mut self);

@@ -1,10 +1,11 @@
 use crate::fs_utils::{
-    canonicalize_root, into_tool_error, resolve_safe_existing_path, resolve_safe_write_path,
+    canonicalize_root, into_tool_error, resolve_read_path, resolve_safe_existing_path,
+    resolve_safe_write_path, resolve_write_path,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use gewu_core::traits::Tool;
-use gewu_core::types::{ToolContext, ToolResult};
+use gewu_core::types::{PathEnforcement, ToolContext, ToolResult};
 use schemars::schema::RootSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -207,7 +208,7 @@ impl Tool for ApplyPatchTool {
         let root = canonicalize_root(&self.working_directory)
             .await
             .map_err(into_tool_error)?;
-        let changes = build_plan(&root, operations)
+        let changes = build_plan(&root, operations, ctx.enforcement)
             .await
             .map_err(into_tool_error)?;
         let (output, metadata) = describe_changes(&changes);
@@ -518,7 +519,11 @@ fn is_file_header(line: &str) -> bool {
         || line == "*** End Patch"
 }
 
-async fn build_plan(root: &Path, operations: Vec<PatchOperation>) -> Result<Vec<PlannedChange>> {
+async fn build_plan(
+    root: &Path,
+    operations: Vec<PatchOperation>,
+    enforcement: PathEnforcement,
+) -> Result<Vec<PlannedChange>> {
     let mut sources = HashSet::new();
     let mut destinations = HashSet::new();
     let mut changes = Vec::with_capacity(operations.len());
@@ -527,7 +532,7 @@ async fn build_plan(root: &Path, operations: Vec<PatchOperation>) -> Result<Vec<
     for operation in operations {
         match operation {
             PatchOperation::Add { path, lines } => {
-                let destination = resolve_safe_write_path(root, &path).await?;
+                let destination = resolve_write_path(root, &path, enforcement).await?;
                 anyhow::ensure!(
                     destinations.insert(destination.clone()),
                     "Duplicate patch destination: {path}"
@@ -562,7 +567,7 @@ async fn build_plan(root: &Path, operations: Vec<PatchOperation>) -> Result<Vec<
                 )?;
             }
             PatchOperation::Delete { path } => {
-                let source = resolve_safe_existing_path(root, &path).await?;
+                let source = resolve_read_path(root, &path, enforcement).await?;
                 anyhow::ensure!(
                     sources.insert(source.clone()),
                     "Duplicate patch source: {path}"
@@ -590,7 +595,7 @@ async fn build_plan(root: &Path, operations: Vec<PatchOperation>) -> Result<Vec<
                 move_to,
                 chunks,
             } => {
-                let source = resolve_safe_existing_path(root, &path).await?;
+                let source = resolve_read_path(root, &path, enforcement).await?;
                 anyhow::ensure!(
                     sources.insert(source.clone()),
                     "Duplicate patch source: {path}"
@@ -600,7 +605,7 @@ async fn build_plan(root: &Path, operations: Vec<PatchOperation>) -> Result<Vec<
                 let after = apply_chunks(&text, &chunks, &path)?.into_bytes();
 
                 let (kind, destination, destination_label) = if let Some(move_to) = move_to {
-                    let destination = resolve_safe_write_path(root, &move_to).await?;
+                    let destination = resolve_write_path(root, &move_to, enforcement).await?;
                     anyhow::ensure!(
                         destination != source,
                         "Move destination must differ from source: {path}"
@@ -1159,11 +1164,11 @@ async fn commit_changes(
     _options: CommitOptions,
 ) -> Result<()> {
     anyhow::ensure!(!ctx.is_aborted(), "Patch execution was aborted");
-    validate_current_state(root, changes).await?;
+    validate_current_state(root, changes, ctx.enforcement).await?;
     anyhow::ensure!(!ctx.is_aborted(), "Patch execution was aborted");
 
     let mut created_dirs = Vec::new();
-    if let Err(error) = stage_changes(root, changes, &mut created_dirs).await {
+    if let Err(error) = stage_changes(root, changes, &mut created_dirs, ctx.enforcement).await {
         cleanup_staged(changes).await;
         cleanup_directories(&created_dirs).await;
         return Err(error);
@@ -1178,7 +1183,7 @@ async fn commit_changes(
     for (index, change) in changes.iter_mut().enumerate() {
         let result = async {
             anyhow::ensure!(!ctx.is_aborted(), "Patch execution was aborted");
-            validate_change_current(root, change).await?;
+            validate_change_current(root, change, ctx.enforcement).await?;
             anyhow::ensure!(!ctx.is_aborted(), "Patch execution was aborted");
             #[cfg(test)]
             if _options.fail_after == Some(index) {
@@ -1221,21 +1226,31 @@ async fn commit_changes(
     Ok(())
 }
 
-async fn validate_current_state(root: &Path, changes: &[PlannedChange]) -> Result<()> {
+async fn validate_current_state(
+    root: &Path,
+    changes: &[PlannedChange],
+    enforcement: PathEnforcement,
+) -> Result<()> {
     for change in changes {
-        validate_change_current(root, change).await?;
+        validate_change_current(root, change, enforcement).await?;
     }
     Ok(())
 }
 
-async fn validate_change_current(root: &Path, change: &PlannedChange) -> Result<()> {
+async fn validate_change_current(
+    root: &Path,
+    change: &PlannedChange,
+    enforcement: PathEnforcement,
+) -> Result<()> {
     if let Some(source) = &change.source {
         let label = change.source_label.as_deref().unwrap_or("source");
-        let resolved = resolve_safe_existing_path(root, source).await?;
-        anyhow::ensure!(
-            &resolved == source,
-            "Patch source changed location: {label}"
-        );
+        if enforcement != PathEnforcement::None {
+            let resolved = resolve_safe_existing_path(root, source).await?;
+            anyhow::ensure!(
+                &resolved == source,
+                "Patch source changed location: {label}"
+            );
+        }
         let (metadata, current) = read_source_snapshot(source, label).await?;
         if let Some(expected) = &change.source_identity {
             anyhow::ensure!(
@@ -1252,11 +1267,13 @@ async fn validate_change_current(root: &Path, change: &PlannedChange) -> Result<
     if matches!(change.kind, ChangeKind::Add | ChangeKind::Move) {
         let destination = change.destination.as_ref().expect("destination");
         let label = change.destination_label.as_deref().unwrap_or("destination");
-        let resolved = resolve_safe_write_path(root, destination).await?;
-        anyhow::ensure!(
-            &resolved == destination,
-            "Patch destination changed location: {label}"
-        );
+        if enforcement != PathEnforcement::None {
+            let resolved = resolve_safe_write_path(root, destination).await?;
+            anyhow::ensure!(
+                &resolved == destination,
+                "Patch destination changed location: {label}"
+            );
+        }
         anyhow::ensure!(
             path_is_missing(destination).await?,
             "Patch destination was created after validation: {label}"
@@ -1269,6 +1286,7 @@ async fn stage_changes(
     root: &Path,
     changes: &mut [PlannedChange],
     created_dirs: &mut Vec<PathBuf>,
+    enforcement: PathEnforcement,
 ) -> Result<()> {
     for change in changes {
         if !matches!(
@@ -1278,8 +1296,10 @@ async fn stage_changes(
             continue;
         }
         let destination = change.destination.as_ref().expect("destination");
-        create_parent_directories(root, destination, created_dirs).await?;
-        resolve_safe_write_path(root, destination).await?;
+        create_parent_directories(root, destination, created_dirs, enforcement).await?;
+        if enforcement != PathEnforcement::None {
+            resolve_safe_write_path(root, destination).await?;
+        }
         let staged = create_temp_file(
             destination,
             "stage",
@@ -1296,6 +1316,7 @@ async fn create_parent_directories(
     root: &Path,
     path: &Path,
     created: &mut Vec<PathBuf>,
+    enforcement: PathEnforcement,
 ) -> Result<()> {
     let mut missing = Vec::new();
     let mut parent = path.parent();
@@ -1308,7 +1329,9 @@ async fn create_parent_directories(
     }
 
     for directory in missing.into_iter().rev() {
-        resolve_safe_write_path(root, &directory).await?;
+        if enforcement != PathEnforcement::None {
+            resolve_safe_write_path(root, &directory).await?;
+        }
         match fs::create_dir(&directory).await {
             Ok(()) => created.push(directory),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
@@ -1606,11 +1629,10 @@ async fn cleanup_backups(journal: &[JournalEntry]) {
             | JournalEntry::Moved { backup, .. } => Some(backup),
             JournalEntry::Created { .. } => None,
         };
-        if let Some(backup) = backup {
-            if let Err(error) = remove_if_exists(backup).await {
+        if let Some(backup) = backup
+            && let Err(error) = remove_if_exists(backup).await {
                 tracing::warn!(path = ?backup, %error, "failed to remove apply_patch backup");
             }
-        }
     }
 }
 
@@ -1654,12 +1676,20 @@ mod tests {
         root: &Path,
         patch: &str,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        run_patch_with(root, patch, PathEnforcement::Strict).await
+    }
+
+    async fn run_patch_with(
+        root: &Path,
+        patch: &str,
+        enforcement: PathEnforcement,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         ApplyPatchTool {
             working_directory: root.to_path_buf(),
         }
         .execute(
             json!({ "patch": patch }),
-            &ToolContext::new("test", "message"),
+            &ToolContext::new("test", "message").with_enforcement(enforcement),
         )
         .await
     }
@@ -2076,7 +2106,7 @@ mod tests {
             "*** Begin Patch\n*** Update File: first.txt\n@@\n-first\n+changed first\n*** Update File: second.txt\n@@\n-second\n+changed second\n*** End Patch",
         )
         .unwrap();
-        let mut changes = build_plan(&root, operations).await.unwrap();
+        let mut changes = build_plan(&root, operations, PathEnforcement::Strict).await.unwrap();
 
         let error = commit_changes(
             &root,
@@ -2124,6 +2154,7 @@ mod tests {
                     "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+after\n*** End Patch",
                 )
                 .unwrap(),
+                PathEnforcement::Strict,
             )
             .await
             .unwrap();
@@ -2164,6 +2195,7 @@ mod tests {
                 &root,
                 parse_patch("*** Begin Patch\n*** Add File: file.txt\n+added\n*** End Patch")
                     .unwrap(),
+                PathEnforcement::Strict,
             )
             .await
             .unwrap();
@@ -2192,6 +2224,7 @@ mod tests {
         let mut changes = build_plan(
             &root,
             parse_patch("*** Begin Patch\n*** Delete File: delete.txt\n*** End Patch").unwrap(),
+            PathEnforcement::Strict,
         )
         .await
         .unwrap();
@@ -2236,6 +2269,7 @@ mod tests {
                     "*** Begin Patch\n*** Update File: source.txt\n*** Move to: moved.txt\n*** End Patch",
                 )
                 .unwrap(),
+                PathEnforcement::Strict,
             )
             .await
             .unwrap();
@@ -2283,6 +2317,7 @@ mod tests {
                 "*** Begin Patch\n*** Update File: first.txt\n@@\n-first\n+changed first\n*** Update File: second.txt\n@@\n-second\n+changed second\n*** End Patch",
             )
             .unwrap(),
+            PathEnforcement::Strict,
         )
         .await
         .unwrap();
@@ -2345,6 +2380,7 @@ mod tests {
                 "*** Begin Patch\n*** Update File: first.txt\n@@\n-first\n+changed first\n*** Update File: second.txt\n@@\n-second\n+changed second\n*** End Patch",
             )
             .unwrap(),
+            PathEnforcement::Strict,
         )
         .await
         .unwrap();
@@ -2425,7 +2461,7 @@ mod tests {
             "*** Begin Patch\n*** Add File: nested/new.txt\n+created\n*** Update File: existing.txt\n@@\n-before\n+after\n*** End Patch",
         )
         .unwrap();
-        let mut changes = build_plan(&root, operations).await.unwrap();
+        let mut changes = build_plan(&root, operations, PathEnforcement::Strict).await.unwrap();
 
         commit_changes(
             &root,
@@ -2460,7 +2496,7 @@ mod tests {
             "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+after\n*** End Patch",
         )
         .unwrap();
-        let mut changes = build_plan(&root, operations).await.unwrap();
+        let mut changes = build_plan(&root, operations, PathEnforcement::Strict).await.unwrap();
         fs::write(dir.path().join("file.txt"), "external change\n")
             .await
             .unwrap();
@@ -2587,6 +2623,7 @@ mod tests {
                 "*** Begin Patch\n*** Update File: planned.txt\n@@\n-before\n+after\n*** End Patch",
             )
             .unwrap(),
+            PathEnforcement::Strict,
         )
         .await
         .unwrap();
@@ -2686,7 +2723,7 @@ mod tests {
             "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+after\n*** End Patch",
         )
         .unwrap();
-        let mut changes = build_plan(&root, operations).await.unwrap();
+        let mut changes = build_plan(&root, operations, PathEnforcement::Strict).await.unwrap();
         let ctx = ToolContext::new("test", "message");
         ctx.abort();
 
@@ -2908,7 +2945,7 @@ mod tests {
             "*** Begin Patch\n*** Update File: file.txt\n@@\n-same\n+changed\n*** End Patch",
         )
         .unwrap();
-        let mut changes = build_plan(&root, operations).await.unwrap();
+        let mut changes = build_plan(&root, operations, PathEnforcement::Strict).await.unwrap();
         fs::rename(&path, &original).await.unwrap();
         fs::write(&path, "same\n").await.unwrap();
 
@@ -2933,7 +2970,7 @@ mod tests {
         let root = canonicalize_root(dir.path()).await.unwrap();
         let operations =
             parse_patch("*** Begin Patch\n*** Add File: new.txt\n+planned\n*** End Patch").unwrap();
-        let mut changes = build_plan(&root, operations).await.unwrap();
+        let mut changes = build_plan(&root, operations, PathEnforcement::Strict).await.unwrap();
         fs::write(dir.path().join("new.txt"), "external\n")
             .await
             .unwrap();
@@ -3004,10 +3041,10 @@ mod tests {
             "*** Begin Patch\n*** Update File: private.txt\n@@\n-before\n+after\n*** End Patch",
         )
         .unwrap();
-        let mut changes = build_plan(&root, operations).await.unwrap();
+        let mut changes = build_plan(&root, operations, PathEnforcement::Strict).await.unwrap();
         let mut directories = Vec::new();
 
-        stage_changes(&root, &mut changes, &mut directories)
+        stage_changes(&root, &mut changes, &mut directories, PathEnforcement::Strict)
             .await
             .unwrap();
         let staged = changes[0].staged.as_ref().unwrap();

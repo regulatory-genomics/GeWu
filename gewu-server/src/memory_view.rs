@@ -46,7 +46,7 @@ async fn print_sessions(pool: &SqlitePool) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<38} {:>8}  {}", "SESSION ID", "MESSAGES", "UPDATED");
+    println!("{:<38} {:>8}  UPDATED", "SESSION ID", "MESSAGES");
     for session in sessions {
         println!(
             "{:<38} {:>8}  {}",
@@ -75,13 +75,23 @@ async fn print_session(pool: &SqlitePool, session_id: &str) -> Result<()> {
 
 fn format_message(message: &Message) -> (&'static str, String) {
     match message {
+        Message::Compaction { summary, recent } => (
+            "COMPACTION", format!("{summary}\n\nRecent context:\n{recent}")),
         Message::System { content } => ("SYSTEM", content.clone()),
         Message::User { content } => ("USER", format_content_parts(content)),
         Message::Assistant {
             content,
+            reasoning,
+            replay: _,
             tool_calls,
         } => {
             let mut output = content.clone().unwrap_or_default();
+            if let Some(reasoning) = reasoning.as_deref().filter(|r| !r.is_empty()) {
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str(&format!("Reasoning: {reasoning}"));
+            }
             if let Some(tool_calls) = tool_calls {
                 for call in tool_calls {
                     if !output.is_empty() {
@@ -120,7 +130,7 @@ fn format_content_parts(parts: &[ContentPart]) -> String {
     parts
         .iter()
         .map(|part| match part {
-            ContentPart::Text { text } => text.clone(),
+            ContentPart::Text { text } | ContentPart::Reminder { text } => text.clone(),
             ContentPart::Image { mime_type, .. } => format!("[image: {}]", mime_type),
             ContentPart::Audio { mime_type, .. } => format!("[audio: {}]", mime_type),
             ContentPart::Video { mime_type, .. } => format!("[video: {}]", mime_type),
@@ -220,6 +230,8 @@ mod tests {
             "session",
             &Message::Assistant {
                 content: Some("second".to_string()),
+                reasoning: None,
+                replay: None,
                 tool_calls: None,
             },
             1,
@@ -244,6 +256,8 @@ mod tests {
     fn formats_tool_calls_and_results() {
         let assistant = Message::Assistant {
             content: None,
+            reasoning: None,
+            replay: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call-1".to_string(),
                 r#type: "function".to_string(),
