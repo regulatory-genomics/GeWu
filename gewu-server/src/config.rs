@@ -42,6 +42,9 @@ pub struct Config {
     /// Optional directories to scan for skills (files named `SKILL.md`).
     #[serde(default)]
     pub skills: Option<Vec<String>>,
+    /// Destination policy shared by agents and their subagents.
+    #[serde(rename = "webFetch", default)]
+    pub web_fetch: Option<WebFetchConfig>,
     /// File-path confinement for tools and file-tree operations:
     /// `"none"` (default) applies no checks, `"contain"` rejects paths that
     /// escape the working directory, `"strict"` also canonicalizes and
@@ -56,6 +59,24 @@ pub struct Config {
 pub struct LoadedConfig {
     pub config: Config,
     pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebFetchConfig {
+    #[serde(default)]
+    pub block_private_networks: bool,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+}
+
+impl WebFetchConfig {
+    pub fn policy(&self) -> gewu_tools::WebFetchPolicy {
+        gewu_tools::WebFetchPolicy {
+            block_private_networks: self.block_private_networks,
+            allowed_hosts: gewu_tools::WebFetchPolicy::parse_hosts(&self.allowed_hosts.join(",")),
+        }
+    }
 }
 
 impl LoadedConfig {
@@ -160,6 +181,14 @@ fn resolve_config_path(config_path: Option<&str>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_existing_web_fetch_policy() {
+        let config: Result<Config, _> = serde_json::from_str(
+            r#"{"webFetch":{"blockPrivateNetworks":true,"allowedHosts":["example.org"]}}"#,
+        );
+        assert!(config.is_ok(), "existing webFetch configurations must remain valid: {config:?}");
+    }
 
     #[test]
     fn validates_model_options_and_selectors() {

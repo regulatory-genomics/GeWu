@@ -262,6 +262,7 @@ async fn run(cli: RunArgs) -> Result<()> {
             working_directory: boot.working_directory.clone().into(),
             additional_tools: boot.mcp_tools,
             skills: boot.skills,
+            web_fetch: boot.web_fetch,
             enforcement: boot.enforcement,
             context_limit: boot.context_limit,
             session_id: &session_id,

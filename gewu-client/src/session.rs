@@ -574,12 +574,14 @@ mod tests {
         let _ = m.apply_event(&AgentEvent::ToolStart {
             tool: "bash".into(),
             input: r#"{"command":"seq 60"}"#.into(),
+            call_id: "seq".into(),
         });
         let _ = m.apply_event(&AgentEvent::ToolFinish {
             tool: "bash".into(),
             title: String::new(),
             output: output.clone(),
             metadata: Default::default(),
+            call_id: "seq".into(),
         });
         let Some(Block::Tool {
             output: Some(stored),
@@ -707,6 +709,7 @@ mod tests {
         m.apply_event(&AgentEvent::ToolStart {
             tool: "bash".into(),
             input: "{}".into(),
+            call_id: "thought".into(),
         });
         match &m.blocks[1] {
             Block::Thought { text, started, .. } => {
@@ -731,6 +734,7 @@ mod tests {
             m.apply_event(&AgentEvent::ToolStart {
                 tool: "bash".into(),
                 input: "{}".into(),
+                call_id: "collapse".into(),
             }),
             Some(2)
         );
@@ -741,6 +745,7 @@ mod tests {
             title: String::new(),
             output: "ok".into(),
             metadata: Default::default(),
+            call_id: "collapse".into(),
         });
         assert_eq!(m.take_collapsed(), None);
     }
@@ -798,6 +803,7 @@ mod tests {
             m.apply_event(&AgentEvent::ToolStart {
                 tool: "bash".into(),
                 input: "{}".into(),
+                call_id: "affected".into(),
             }),
             Some(1)
         );
@@ -807,6 +813,7 @@ mod tests {
                 title: String::new(),
                 output: "ok".into(),
                 metadata: Default::default(),
+                call_id: "affected".into(),
             }),
             Some(1)
         );
@@ -826,6 +833,7 @@ mod tests {
             m.apply_event(&AgentEvent::ToolStart {
                 tool: "grep".into(),
                 input: "{}".into(),
+                call_id: "next".into(),
             }),
             Some(2)
         );

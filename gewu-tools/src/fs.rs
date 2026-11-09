@@ -644,6 +644,12 @@ mod tests {
         fs::write(&file1, "").await?;
         fs::write(&file2, "").await?;
         fs::write(&file3, "").await?;
+        // Equal mtimes exercise the alphabetical tie-break independent of filesystem timing.
+        for path in [&file1, &file2] {
+            std::fs::File::options().write(true).open(path)?.set_times(
+                std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
+            )?;
+        }
 
         let tool = GlobTool {
             working_directory: working_dir,

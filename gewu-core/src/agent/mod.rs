@@ -149,6 +149,27 @@ impl CancelHandle {
     }
 }
 
+fn run_stop_reason(abort: &AtomicBool, deadline: Option<tokio::time::Instant>) -> Option<AgentEvent> {
+    if deadline.is_some_and(|limit| tokio::time::Instant::now() >= limit) {
+        Some(AgentEvent::Error { error: "Run deadline exceeded.".into() })
+    } else if abort.load(Ordering::SeqCst) {
+        Some(AgentEvent::Cancelled { reason: "cancelled by owner".into() })
+    } else {
+        None
+    }
+}
+
+async fn wait_for_run_stop(abort: &AtomicBool, deadline: Option<tokio::time::Instant>) -> AgentEvent {
+    loop {
+        if let Some(event) = run_stop_reason(abort, deadline) {
+            return event;
+        }
+        // ToolContext also exposes the atomic flag, so observe tool-initiated aborts.
+        let next = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
+        tokio::time::sleep_until(deadline.map_or(next, |limit| limit.min(next))).await;
+    }
+}
+
 /// Builder for constructing `Agent` instances.
 pub struct AgentBuilder {
     /// The LLM provider (required).
@@ -232,12 +253,12 @@ impl Agent {
         self.llm = llm;
     }
 
-    /// The current mode reminder state (for persistence).
     /// A handle that cancels the currently streaming run.
     pub fn cancel_handle(&self) -> CancelHandle {
         CancelHandle(self.run_abort.clone())
     }
 
+    /// The current mode reminder state (for persistence).
     pub fn reminder(&self) -> &Reminder {
         &self.reminder
     }
@@ -311,6 +332,11 @@ impl Agent {
         options: RunOptions,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
         async_stream::try_stream! {
+            self.run_abort.store(false, Ordering::SeqCst);
+            let abort = self.run_abort.clone();
+            let deadline = options.deadline.map(|limit| tokio::time::Instant::now() + limit);
+            let stop = wait_for_run_stop(&abort, deadline);
+            tokio::pin!(stop);
             if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
                 self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
             }
@@ -322,12 +348,9 @@ impl Agent {
             // them instead of only the first provider call.
             self.reminder.apply(self.memory.messages_mut());
 
-            self.run_abort.store(false, Ordering::SeqCst);
-            let abort = self.run_abort.clone();
             let run_id = Uuid::new_v4().to_string();
             let max_turns = options.max_turns.or(self.max_turns);
             let max_tool_calls = options.max_tool_calls;
-            let deadline = options.deadline.map(|limit| std::time::Instant::now() + limit);
             let mut tool_calls_made = 0usize;
 
             let mut turn = 0;
@@ -342,12 +365,8 @@ impl Agent {
             })));
 
             loop {
-                if abort.load(Ordering::SeqCst) {
-                    yield AgentEvent::Cancelled { reason: "cancelled by owner".to_string() };
-                    break;
-                }
-                if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
-                    yield AgentEvent::Error { error: "Run deadline exceeded.".to_string() };
+                if let Some(event) = run_stop_reason(&abort, deadline) {
+                    yield event;
                     break;
                 }
                 let context_tokens = crate::compaction::active_context(self.memory.messages())
@@ -356,7 +375,12 @@ impl Agent {
                 if compacting {
                     yield AgentEvent::Status { message: "Compacting context…".into() };
                 }
-                if self.compact_with_estimate(context_tokens).await? {
+                let compacted = tokio::select! {
+                    biased;
+                    event = &mut stop => { yield event; return; }
+                    result = self.compact_with_estimate(context_tokens) => result,
+                };
+                if compacted? {
                     info!("History compacted.");
                     let summary = match self.memory.messages().last() {
                         Some(Message::Compaction { summary, .. }) => summary.clone(),
@@ -401,6 +425,8 @@ impl Agent {
                 tokio::pin!(stream_fut);
                 let stream_result: Option<Result<_, _>> = loop {
                     tokio::select! {
+                        biased;
+                        event = &mut stop => { yield event; return; }
                         result = &mut stream_fut => break Some(result),
                         status = status_rx.recv(), if status_open => {
                             match status {
@@ -420,7 +446,13 @@ impl Agent {
                 // The aggregator drops it, so it is captured here before the
                 // event is passed on.
                 let mut finish_reason: Option<String> = None;
-                while let Some(event_result) = stream.next().await {
+                loop {
+                    let event_result = tokio::select! {
+                        biased;
+                        event = &mut stop => { yield event; return; }
+                        event = stream.next() => event,
+                    };
+                    let Some(event_result) = event_result else { break; };
                     let event = event_result.map_err(|e| anyhow::anyhow!(e))?;
                     match &event {
                         ProviderEvent::Finish { reason } => finish_reason = reason.clone(),
@@ -434,8 +466,8 @@ impl Agent {
                     }
                 }
 
-                if abort.load(Ordering::SeqCst) {
-                    yield AgentEvent::Cancelled { reason: "cancelled while streaming".to_string() };
+                if let Some(event) = run_stop_reason(&abort, deadline) {
+                    yield event;
                     break;
                 }
 
@@ -486,62 +518,39 @@ impl Agent {
                 // all concurrently. Doom-loop bookkeeping stays sequential so
                 // the detector state matches the old per-call behavior.
                 let mut pending: Vec<(usize, ToolCall, String)> = Vec::new();
-                // Calls of this turn already announced with `ToolStart`. If
-                // the doom-loop check aborts the turn, each of them must
-                // still receive a `ToolFinish`, or the UI shows a tool card
-                // that never completes.
-                let mut announced: Vec<ToolCall> = Vec::new();
+                let mut announced = vec![false; tool_calls.len()];
+                let mut terminal = None;
+                let mut tool_errors = Vec::new();
                 for (index, call) in tool_calls.iter().enumerate() {
                     let tool_name = call.function.name.clone();
                     let args = call.function.arguments.clone();
 
-                    if abort.load(Ordering::SeqCst) {
-                        yield AgentEvent::Cancelled { reason: "cancelled between tool calls".to_string() };
-                        return;
+                    if let Some(event) = run_stop_reason(&abort, deadline) {
+                        terminal = Some(event);
+                        pending.clear();
+                        break;
                     }
                     if let Some(max) = max_tool_calls {
                         if tool_calls_made >= max {
-                            yield AgentEvent::Error {
-                                error: format!("Tool call budget of {max} exhausted."),
-                            };
-                            return;
+                            let error = format!("Tool call budget of {max} exhausted.");
+                            results[index] = Some(Ok(ToolResult::new(
+                                tool_name, format!("Error: {error} Not executed."),
+                            )));
+                            terminal = Some(AgentEvent::Error { error });
+                            continue;
                         }
                     }
                     tool_calls_made += 1;
 
                     if let Some(error) = doom_loop.check(&tool_name, &args) {
-                        yield AgentEvent::Error { error };
-                        // Close out every announced call of this turn so the
-                        // UI has no eternally "running" tool cards.
-                        let not_executed = "Error: not executed because a doom loop was detected \
-                                            and the run was stopped."
-                            .to_string();
-                        for announced_call in announced.drain(..) {
-                            yield AgentEvent::ToolFinish {
-                                call_id: announced_call.id.clone(),
-                                tool: announced_call.function.name.clone(),
-                                title: announced_call.function.name.clone(),
-                                output: not_executed.clone(),
-                                metadata: Default::default(),
-                            };
-                        }
-                        // Close out every tool call of this turn so the
-                        // persisted history has no dangling tool_calls.
-                        for call in &tool_calls {
-                            self.memory.add_message(Message::Tool {
-                                tool_call_id: call.id.clone(),
-                                tool_name: Some(call.function.name.clone()),
-                                content: not_executed.clone(),
-                                media: Vec::new(),
-                            })
-                            .await;
-                        }
-                        return;
+                        terminal = Some(AgentEvent::Error { error });
+                        pending.clear();
+                        break;
                     }
                     doom_loop.record(tool_name.clone(), args.clone());
 
                     if tool_name.is_empty() {
-                        yield AgentEvent::Error { error: "Tool name is empty, skipping execution".to_string() };
+                        tool_errors.push("Tool name is empty, skipping execution".to_string());
                         results[index] = Some(Ok(ToolResult::new(
                             tool_name.clone(),
                             "Error: the tool call had an empty name and was not executed.",
@@ -549,8 +558,8 @@ impl Agent {
                         continue;
                     }
 
+                    announced[index] = true;
                     yield AgentEvent::ToolStart { call_id: call.id.clone(), tool: tool_name.clone(), input: args.clone() };
-                    announced.push(call.clone());
                     pending.push((index, call.clone(), Uuid::new_v4().to_string()));
                 }
 
@@ -574,6 +583,9 @@ impl Agent {
                     join_set.spawn(async move {
                         let _permit = semaphore.acquire_owned().await.ok();
                         let tool_name = call.function.name.clone();
+                        if let Some(event) = run_stop_reason(&abort, deadline) {
+                            return (index, Ok(ToolResult::new(tool_name, format!("Error: not executed: {event:?}"))));
+                        }
                         let ctx = ToolContext::with_call(
                             &session_id,
                             &run_id,
@@ -595,32 +607,56 @@ impl Agent {
                 }
 
                 // Collect results keyed by the original call index.
-                while let Some(joined) = join_set.join_next().await {
-                    if let Ok((index, result)) = joined {
+                while !join_set.is_empty() {
+                    let joined = tokio::select! {
+                        biased;
+                        event = &mut stop => {
+                            abort.store(true, Ordering::SeqCst);
+                            terminal = Some(event);
+                            break;
+                        }
+                        joined = join_set.join_next() => joined,
+                    };
+                    if let Some(Ok((index, result))) = joined {
                         results[index] = Some(result);
                     }
+                }
+
+                if !join_set.is_empty() {
+                    // Let abort-aware shells kill/reap their process groups before dropping them.
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        while let Some(joined) = join_set.join_next().await {
+                            if let Ok((index, result)) = joined {
+                                results[index] = Some(result);
+                            }
+                        }
+                    }).await;
+                    join_set.shutdown().await;
                 }
 
                 // Apply the results in the original call order so the
                 // conversation history stays deterministic regardless of
                 // completion order.
-                for (call, result) in tool_calls.iter().zip(results) {
+                for (index, (call, result)) in tool_calls.iter().zip(results).enumerate() {
                     let tool_name = call.function.name.clone();
                     let result = match result {
                         Some(Ok(result)) => result,
                         Some(Err(e)) => {
-                            yield AgentEvent::Error { error: e.to_string() };
+                            tool_errors.push(e.to_string());
                             ToolResult::new(tool_name.clone(), format!("Error: {}", e))
                         }
                         // The call's task panicked or was lost; still answer
                         // the tool_call so history stays consistent.
                         None => ToolResult::new(
                             tool_name.clone(),
-                            "Error: the tool call did not produce a result (execution task failed).",
+                            match &terminal {
+                                Some(event) => format!("Error: tool execution stopped: {event:?}"),
+                                None => "Error: the tool call did not produce a result (execution task failed).".into(),
+                            },
                         ),
                     };
 
-                    yield AgentEvent::ToolFinish {
+                    let finished = AgentEvent::ToolFinish {
                         call_id: call.id.clone(),
                         tool: tool_name.clone(),
                         title: result.title.clone(),
@@ -649,11 +685,17 @@ impl Agent {
                         content,
                         media: media_parts,
                     }).await;
+                    if announced[index] || call.function.name.is_empty() {
+                        yield finished;
+                    }
                 }
 
-                if abort.load(Ordering::SeqCst) {
-                    yield AgentEvent::Cancelled { reason: "cancelled between tool calls".to_string() };
+                if let Some(event) = terminal.or_else(|| run_stop_reason(&abort, deadline)) {
+                    yield event;
                     break;
+                }
+                for error in tool_errors {
+                    yield AgentEvent::Error { error };
                 }
                 // Report usage AFTER the tool results are in history: the
                 // next LLM request will carry them, and emitting before would

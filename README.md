@@ -141,6 +141,18 @@ cargo run -p gewu-gui -- --open                        # open a browser too
 cargo run -p gewu-gui -- --host 0.0.0.0 --token "$(openssl rand -hex 16)"  # remote, token-protected
 ```
 
+### Building and testing the workspace
+
+`rust-toolchain.toml` pins Rust 1.96.0, required by the GUI math renderer. The
+checked-in `Cargo.lock` pins the dependencies tested with that toolchain.
+
+```sh
+cargo test --workspace --locked
+```
+
+This includes client/server transport tests and the run lifecycle regressions
+(cancellation, deadlines, tool-call budgets and resumable tool history).
+
 ### Embedding from Rust
 
 ```rust

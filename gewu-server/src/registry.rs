@@ -42,6 +42,7 @@ pub struct ProfileInputs<'a> {
     pub working_directory: std::path::PathBuf,
     pub additional_tools: Vec<Arc<dyn Tool>>,
     pub skills: Vec<SkillInfo>,
+    pub web_fetch: Arc<gewu_tools::WebFetchPolicy>,
     pub enforcement: PathEnforcement,
     pub context_limit: Option<usize>,
     pub session_id: &'a str,
@@ -122,6 +123,7 @@ struct SqliteAgentFactory {
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
     skills: Vec<SkillInfo>,
+    web_fetch: Arc<gewu_tools::WebFetchPolicy>,
     enforcement: PathEnforcement,
     /// Model context window forwarded to subagent agents for compaction.
     context_limit: Option<usize>,
@@ -170,6 +172,7 @@ impl AgentFactory for SqliteAgentFactory {
                 working_directory,
                 additional_tools: Vec::new(),
                 skills: self.skills.clone(),
+                web_fetch: self.web_fetch.clone(),
                 enforcement: self.enforcement,
                 context_limit,
                 session_id: &session_id,
@@ -189,6 +192,7 @@ fn task_tool(
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
     skills: Vec<SkillInfo>,
+    web_fetch: Arc<gewu_tools::WebFetchPolicy>,
     enforcement: PathEnforcement,
     context_limit: Option<usize>,
     allowed: &[&str],
@@ -198,6 +202,7 @@ fn task_tool(
         provider,
         pool,
         skills,
+        web_fetch,
         enforcement,
         context_limit,
     });
@@ -225,7 +230,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
         "build" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(inputs.model_catalog.clone(), provider.clone(), pool.clone(), skills.clone(), *enforcement, *context_limit, &[])),
+                Box::new(task_tool(inputs.model_catalog.clone(), provider.clone(), pool.clone(), skills.clone(), inputs.web_fetch.clone(), *enforcement, *context_limit, &[])),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -248,7 +253,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 Box::new(GrepTool {
                     working_directory: working_directory.clone(),
                 }),
-                Box::new(WebFetchTool::default()),
+                Box::new(WebFetchTool::with_shared_policy(inputs.web_fetch.clone())),
                 Box::new(ListTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -261,7 +266,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
         "plan" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(inputs.model_catalog.clone(), provider.clone(), pool.clone(), skills.clone(), *enforcement, *context_limit, &["explore"])),
+                Box::new(task_tool(inputs.model_catalog.clone(), provider.clone(), pool.clone(), skills.clone(), inputs.web_fetch.clone(), *enforcement, *context_limit, &["explore"])),
                 Box::new(ReadFileTool { working_directory: working_directory.clone() }),
                 Box::new(GlobTool { working_directory: working_directory.clone() }),
                 Box::new(GrepTool { working_directory: working_directory.clone() }),
@@ -270,7 +275,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                     working_directory: working_directory.clone(),
                     safe_mode: false,
                 }),
-                Box::new(WebFetchTool::default()),
+                Box::new(WebFetchTool::with_shared_policy(inputs.web_fetch.clone())),
                 Box::new(WebSearchTool),
                 Box::new(TodoWriteTool::new(todos.clone())),
                 Box::new(TodoReadTool::new(todos.clone())),
@@ -291,7 +296,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 Box::new(GrepTool {
                     working_directory: working_directory.clone(),
                 }),
-                Box::new(WebFetchTool::default()),
+                Box::new(WebFetchTool::with_shared_policy(inputs.web_fetch.clone())),
                 Box::new(ListTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -302,7 +307,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
         "general" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(inputs.model_catalog.clone(), provider.clone(), pool.clone(), skills.clone(), *enforcement, *context_limit, &[])),
+                Box::new(task_tool(inputs.model_catalog.clone(), provider.clone(), pool.clone(), skills.clone(), inputs.web_fetch.clone(), *enforcement, *context_limit, &[])),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -325,7 +330,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 Box::new(GrepTool {
                     working_directory: working_directory.clone(),
                 }),
-                Box::new(WebFetchTool::default()),
+                Box::new(WebFetchTool::with_shared_policy(inputs.web_fetch.clone())),
                 Box::new(ListTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -384,6 +389,7 @@ pub async fn create_agent(
         pool,
         additional_tools,
         skills,
+        web_fetch,
         enforcement,
         context_limit,
         session_id,
@@ -401,6 +407,7 @@ pub async fn create_agent(
         working_directory,
         additional_tools,
         skills,
+        web_fetch,
         enforcement,
         context_limit,
         session_id,
@@ -448,6 +455,7 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
         working_directory,
         additional_tools,
         skills,
+        web_fetch,
         enforcement,
         context_limit,
         session_id,
@@ -460,6 +468,7 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
         working_directory,
         additional_tools,
         skills: skills.clone(),
+        web_fetch,
         enforcement,
         context_limit,
         session_id,
@@ -500,6 +509,31 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn web_fetch_policy_reaches_every_profile_and_subagent() {
+        let config: crate::config::Config = serde_json::from_str(
+            r#"{"webFetch":{"allowedHosts":[" EXAMPLE.ORG. "]}}"#,
+        ).unwrap();
+        let policy = Arc::new(config.web_fetch.unwrap().policy());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for profile in ["build", "plan", "explore", "general"] {
+            let mut inputs = test_inputs(profile, Arc::new(DummyLlm), pool.clone(), dir.path().into(), vec![], vec![], "parent");
+            inputs.web_fetch = policy.clone();
+            let (_, _, registry) = agent_profile(inputs).unwrap();
+            let error = registry.execute("webfetch", serde_json::json!({"url":"http://127.0.0.1:9"}), &ToolContext::new("parent", "m")).await.unwrap_err();
+            assert!(error.to_string().contains("not in the allowed hosts list"), "{profile}: {error}");
+        }
+        SqliteMemory::new(pool.clone(), "parent".into()).await.unwrap();
+        let factory = SqliteAgentFactory {
+            model_catalog: None, provider: Arc::new(DummyLlm), pool,
+            skills: vec![], web_fetch: policy, enforcement: PathEnforcement::None, context_limit: None,
+        };
+        let (child, _) = factory.create("explore", None, "parent").await.unwrap();
+        let error = child.execute("webfetch", serde_json::json!({"url":"http://127.0.0.1:9"}), &ToolContext::new("child", "m")).await.unwrap_err();
+        assert!(error.to_string().contains("not in the allowed hosts list"), "{error}");
+    }
+
+    #[tokio::test]
     async fn subagent_inherits_current_model_and_resume_keeps_its_selection() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
         SqliteMemory::new(pool.clone(), "parent".into()).await.unwrap();
@@ -509,7 +543,7 @@ mod tests {
                 label: key.into(), context_limit })
         }).collect();
         let factory = SqliteAgentFactory { model_catalog: Some(ModelCatalog { entries: Arc::new(entries), default: "old".into() }),
-            provider, pool: pool.clone(), skills: vec![], enforcement: PathEnforcement::None, context_limit: Some(10_000) };
+            provider, pool: pool.clone(), skills: vec![], web_fetch: Arc::default(), enforcement: PathEnforcement::None, context_limit: Some(10_000) };
         gewu_storage::set_session_model(&pool, "parent", "new").await.unwrap();
         let (child, id) = factory.create("explore", None, "parent").await.unwrap();
         assert_eq!(child.context_limit, 50_000);
@@ -539,6 +573,7 @@ mod tests {
             working_directory,
             additional_tools,
             skills,
+            web_fetch: Arc::default(),
             enforcement: PathEnforcement::Contain,
             context_limit: None,
             session_id,
@@ -832,6 +867,7 @@ mod tests {
             provider: provider.clone(),
             pool: pool.clone(),
             skills: Vec::new(),
+            web_fetch: Arc::default(),
             enforcement: PathEnforcement::None,
             context_limit: None,
         };

@@ -410,7 +410,7 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
         found
     };
 
-    let web_fetch = Arc::new(gewu_tools::WebFetchPolicy::default());
+    let web_fetch = Arc::new(file_config.web_fetch.as_ref().map(|config| config.policy()).unwrap_or_default());
 
     Ok(Bootstrap {
         provider,
