@@ -93,3 +93,13 @@
 - Canvas tests: 325 passed, 1 skipped. `npm run typecheck` still reports pre-existing
   test-typing errors in ArtifactMarkdownNode/ArtifactTableNode fixtures; runtime tests
   pass.
+
+## Embedding call-stack error
+- `embedding` artifact is valid: 2,581 points in 8 `scattergl` traces, 217 KB.
+- Large WebGL is unnecessary at this size; Plotly's scattergl path is fragile in
+  some browsers and produced `Maximum call stack size exceeded`.
+- Tachyon Canvas `06cbff9` converts traces to SVG `scatter` when total points
+  are at most 10,000; regression test asserts the conversion. Tachyon Browser
+  `9e405a3` rebuilds the embedded assets. Deployed stable commit `9e405a3`.
+- Browser bundle load and Canvas session rendering could not be fully exercised in
+  the headless Review tab; the unit test covers the renderer path.
