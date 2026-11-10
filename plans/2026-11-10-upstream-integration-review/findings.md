@@ -63,3 +63,18 @@
   or deploy a mutable shared Cargo target while other work is building it.
 - Production port 8406 was not restarted by this review. Live-provider inference,
   visual UI interaction and ignored container tests were not run in this effort.
+
+## Deployment correction (after review close-out)
++- Reported symptom reproduced: 8406 ran `./target/release/tachyon-browser` with
++  commit 6b0fd1e and `/api/agent/sessions` returned 404. This was a non-agent build.
++- Root cause: `deploy/serve.sh` silently fell back to the shared target/release
++  binary when the stable agent path was unavailable; the systemd unit template also
++  pointed at target/release.
++- Fix in tachyon-browser d6f926a: serve.sh refuses the fallback and exits nonzero if
++  the agent route is 404; the unit uses `_build/serve/tachyon-browser-agent` and the
++  full dataset root.
++- Rebuilt from clean worktree at 618c01b with an isolated target dir, verified the
++  binary (`commit=618c01bd3d8e`, agent route 200), replaced stable, and restarted.
++  Live 8406 now runs the stable agent binary; `/api/agent/sessions` and history are
++  200.
++
