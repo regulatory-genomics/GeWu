@@ -78,3 +78,18 @@
 +  Live 8406 now runs the stable agent binary; `/api/agent/sessions` and history are
 +  200.
 +
+## Evidence rendering defect
+- Latest collection `agent-cc41fc0e33b1408239056c55f71650e2`: DE, embedding,
+  violin, enrichment and summary all succeeded; `de.evidence` is valid 87 KB JSON
+  with counts, method, `analysis_purpose=pipeline_validation` and
+  `inference_eligible=false`.
+- The Canvas error `figure needs a non-empty data array` was display-only: every
+  `.json` artifact was inferred as Plotly, but evidence has no `data` trace array.
+- Tachyon Canvas `06b5284`: non-figure JSON falls back to a pretty JSON viewer;
+  `evidence.json` infers as markdown; MarkdownNode pretty-prints JSON.
+- Tachyon Browser `19689a3`: maps `tachyon.analysis-evidence.v1` to markdown when
+  `show_artifact` infers a kind, and rebuilds the embedded assets. Deployed stable
+  at `_build/serve/tachyon-browser-agent`; health commit `19689a3`; agent route 200.
+- Canvas tests: 325 passed, 1 skipped. `npm run typecheck` still reports pre-existing
+  test-typing errors in ArtifactMarkdownNode/ArtifactTableNode fixtures; runtime tests
+  pass.
