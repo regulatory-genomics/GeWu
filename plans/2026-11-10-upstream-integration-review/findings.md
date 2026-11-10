@@ -95,11 +95,11 @@
   pass.
 
 ## Embedding call-stack error
-- `embedding` artifact is valid: 2,581 points in 8 `scattergl` traces, 217 KB.
-- Large WebGL is unnecessary at this size; Plotly's scattergl path is fragile in
-  some browsers and produced `Maximum call stack size exceeded`.
-- Tachyon Canvas `06cbff9` converts traces to SVG `scatter` when total points
-  are at most 10,000; regression test asserts the conversion. Tachyon Browser
-  `9e405a3` rebuilds the embedded assets. Deployed stable commit `9e405a3`.
-- Browser bundle load and Canvas session rendering could not be fully exercised in
-  the headless Review tab; the unit test covers the renderer path.
+- The small 2,581-point artifact is valid. A separate 1M-cell embedding exposed the
+  real cause in the workspace embedding panel: `Math.min(...xs)` / `Math.max(...ys)`
+  spread one million coordinates as function arguments and exceeded the JS call stack.
+- Tachyon Browser `be5e8b9` computes bounds with a loop and adds a 200k-point
+  regression test. Deployed stable commit `be5e8b9`; health and agent routes pass.
+- Canvas `06cbff9` / Browser `9e405a3` additionally convert small scattergl plots
+  to SVG scatter and cap rendered embeddings at 50k points; this is a separate
+  rendering safeguard, not the root cause of the workspace error.
