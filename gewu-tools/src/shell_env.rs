@@ -14,6 +14,10 @@
 //!
 //! It does not claim a cgroup memory cap. `--contain` is not `--containall`;
 //! the build host here rejects `--containall`.
+//!
+//! Placement: nothing inside GeWu calls this module. Its only consumer is the
+//! Tachyon browser host, which ships it from here so the deployment image and
+//! its sandbox flags stay one dependency instead of a copy.
 
 use std::io;
 use std::os::unix::process::ExitStatusExt;

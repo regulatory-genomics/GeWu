@@ -140,10 +140,13 @@ pub struct SpecialistBuild {
 }
 
 impl SpecialistRegistry {
-    /// Assemble an agent from a declaration.
+    /// Assembles an agent from a declaration. The resulting agent can only call
+    /// the tools the descriptor lists: no shell, filesystem or sub-agent tool is
+    /// added implicitly.
     ///
-    /// The resulting agent can only call the tools the descriptor lists: no
-    /// shell, filesystem or sub-agent tool is added implicitly.
+    /// Budgets are per run, so they are applied by
+    /// [`run_with`](Agent::run_with)`(message, descriptor.to_run_options())`,
+    /// not here; `max_turns` is the one exception because the builder owns it.
     pub fn build(
         &self,
         descriptor: &SpecialistDescriptor,
