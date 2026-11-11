@@ -88,7 +88,9 @@ impl Subscriber {
         if self.out.try_send(line.to_owned()).is_err() {
             self.failed.send_replace(true);
             false
-        } else { true }
+        } else {
+            true
+        }
     }
 }
 
@@ -118,7 +120,10 @@ impl LiveTurn {
         self.bytes += line.len();
         self.frames.push(message);
         if self.bytes > 16 * 1024 * 1024
-            && let Some(cancel) = self.cancel.take() { let _ = cancel.send(()); }
+            && let Some(cancel) = self.cancel.take()
+        {
+            let _ = cancel.send(());
+        }
         // Disconnect slow readers rather than silently losing updates.
         self.subscribers.retain(|subscriber| subscriber.send(&line));
     }
@@ -135,13 +140,20 @@ async fn attach_subscriber(
         // Hold the turn lock through snapshot send and registration; a
         // publisher cannot send an event into the snapshot/live gap.
         let snapshot = ServerMessage::SessionSnapshot {
-            session_id: session_id.to_owned(), messages: live.messages.clone(),
-            frames: live.frames.clone(), busy: live.busy, seq: live.seq,
+            session_id: session_id.to_owned(),
+            messages: live.messages.clone(),
+            frames: live.frames.clone(),
+            busy: live.busy,
+            seq: live.seq,
             model: Some(live.model.clone()),
         };
-        subscriber.out.send(snapshot.to_line()).await
+        subscriber
+            .out
+            .send(snapshot.to_line())
+            .await
             .map_err(|_| RequestError::Failed("subscriber disconnected".into()))?;
-        live.subscribers.retain(|s| !s.out.same_channel(&subscriber.out));
+        live.subscribers
+            .retain(|s| !s.out.same_channel(&subscriber.out));
         live.subscribers.push(subscriber);
         return Ok(());
     }
@@ -149,15 +161,37 @@ async fn attach_subscriber(
         return Err(RequestError::Failed("unknown session".into()));
     };
     let messages = session.agent.lock().await.memory.messages().to_vec();
-    subscriber.out.send(ServerMessage::SessionSnapshot {
-        session_id: session_id.to_owned(), messages: messages.clone(), frames: vec![], busy: false, seq: 0,
-        model: Some(session.model.clone()),
-    }.to_line()).await.map_err(|_| RequestError::Failed("subscriber disconnected".into()))?;
-    state.turns.lock().await.insert(session_id.to_owned(), Arc::new(Mutex::new(LiveTurn {
-        request_id: String::new(), messages, frames: vec![], bytes: 0, seq: 0, busy: false, model: session.model.clone(),
-        done: Arc::new(tokio::sync::Notify::new()),
-        subscribers: vec![subscriber], cancel: None, terminal: None,
-    })));
+    subscriber
+        .out
+        .send(
+            ServerMessage::SessionSnapshot {
+                session_id: session_id.to_owned(),
+                messages: messages.clone(),
+                frames: vec![],
+                busy: false,
+                seq: 0,
+                model: Some(session.model.clone()),
+            }
+            .to_line(),
+        )
+        .await
+        .map_err(|_| RequestError::Failed("subscriber disconnected".into()))?;
+    state.turns.lock().await.insert(
+        session_id.to_owned(),
+        Arc::new(Mutex::new(LiveTurn {
+            request_id: String::new(),
+            messages,
+            frames: vec![],
+            bytes: 0,
+            seq: 0,
+            busy: false,
+            model: session.model.clone(),
+            done: Arc::new(tokio::sync::Notify::new()),
+            subscribers: vec![subscriber],
+            cancel: None,
+            terminal: None,
+        })),
+    );
     Ok(())
 }
 
@@ -362,7 +396,10 @@ impl ServerState {
         // Serialize initialization so multiple observers share one agent.
         let mut sessions = self.sessions.lock().await;
         if let Some(existing) = sessions.get(&session_id) {
-            if agent_name.as_ref().is_some_and(|name| name != &existing.agent_name) {
+            if agent_name
+                .as_ref()
+                .is_some_and(|name| name != &existing.agent_name)
+            {
                 anyhow::bail!("session agent mismatch");
             }
             *current = Some(existing.clone());
@@ -398,7 +435,10 @@ impl ServerState {
 
         let (agent, _registry) = create_agent(
             registry::ProfileInputs {
-                model_catalog: Some(registry::ModelCatalog { entries: Arc::new(self.bootstrap.models.clone()), default: self.bootstrap.model_selector.clone() }),
+                model_catalog: Some(registry::ModelCatalog {
+                    entries: Arc::new(self.bootstrap.models.clone()),
+                    default: self.bootstrap.model_selector.clone(),
+                }),
                 name: &agent_name,
                 provider: entry.provider.clone(),
                 pool: self.bootstrap.pool.clone(),
@@ -408,12 +448,16 @@ impl ServerState {
                 web_fetch: self.bootstrap.web_fetch.clone(),
                 enforcement: self.bootstrap.enforcement,
                 context_limit: Some(entry.context_limit),
+                agents: self.bootstrap.agents.clone(),
                 session_id: &session_id,
             },
             self.bootstrap.log_writer.clone(),
         )
         .await?;
-        info!("Created session {} (agent: {}, model: {})", session_id, agent_name, model);
+        info!(
+            "Created session {} (agent: {}, model: {})",
+            session_id, agent_name, model
+        );
 
         let agent = Arc::new(Mutex::new(agent));
         {
@@ -457,8 +501,12 @@ impl ServerState {
         let turn = self.turns.lock().await.get(session_id).cloned()?;
         let request_id = {
             let mut turn = turn.lock().await;
-            if !turn.busy { return None; }
-            if let Some(cancel) = turn.cancel.take() { let _ = cancel.send(()); }
+            if !turn.busy {
+                return None;
+            }
+            if let Some(cancel) = turn.cancel.take() {
+                let _ = cancel.send(());
+            }
             turn.request_id.clone()
         };
         // Finalization repairs history before releasing the session claim.
@@ -470,7 +518,9 @@ impl ServerState {
         loop {
             let notified = done.notified();
             tokio::pin!(notified);
-            if !turn.lock().await.busy { break; }
+            if !turn.lock().await.busy {
+                break;
+            }
             notified.await;
         }
         Some(request_id)
@@ -478,7 +528,9 @@ impl ServerState {
 
     async fn shutdown_turns(&self) {
         let ids: Vec<_> = self.turns.lock().await.keys().cloned().collect();
-        for id in ids { self.cancel_turn(&id).await; }
+        for id in ids {
+            self.cancel_turn(&id).await;
+        }
     }
 }
 
@@ -566,7 +618,10 @@ enum Handled {
         session_id: String,
         prompt: String,
     },
-    Subscribe { id: Value, session: ConnectionSession },
+    Subscribe {
+        id: Value,
+        session: ConnectionSession,
+    },
 }
 
 /// Handle one parsed client request, producing a reply or an ask to run.
@@ -581,23 +636,51 @@ async fn handle_request(
     request: ClientRequest,
 ) -> Result<Handled, RequestError> {
     if let Some(active) = running.as_ref()
-        && !state.busy_sessions.lock().await.contains(&active.session_id) { *running = None; }
+        && !state
+            .busy_sessions
+            .lock()
+            .await
+            .contains(&active.session_id)
+    {
+        *running = None;
+    }
     match request.op {
         Op::SubscribeSession => {
-            let current = state.get_or_create_session(session, request.session_id, request.agent)
-                .await.map_err(|e| RequestError::Failed(e.to_string()))?;
-            Ok(Handled::Subscribe { id: request.id, session: current })
+            let current = state
+                .get_or_create_session(session, request.session_id, request.agent)
+                .await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            Ok(Handled::Subscribe {
+                id: request.id,
+                session: current,
+            })
         }
         Op::RevertChat { turn, undo } => {
-            if running.is_some() { return Err(RequestError::Failed("cannot revert a running turn".into())); }
-            let current = state.get_or_create_session(session, request.session_id, None).await.map_err(|e| RequestError::Failed(e.to_string()))?;
-            if !state.claim_session(&current.session_id).await { return Err(RequestError::Failed("session is busy".into())); }
+            if running.is_some() {
+                return Err(RequestError::Failed("cannot revert a running turn".into()));
+            }
+            let current = state
+                .get_or_create_session(session, request.session_id, None)
+                .await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            if !state.claim_session(&current.session_id).await {
+                return Err(RequestError::Failed("session is busy".into()));
+            }
             let result = async {
                 let reminder = current.agent.lock().await.reminder().clone();
                 let (messages, restored_reminder) = gewu_storage::revert_chat(
-                    &state.bootstrap.pool, &current.session_id, turn, undo, Some(&reminder),
-                ).await?;
-                let memory = gewu_storage::SqliteMemory::new(state.bootstrap.pool.clone(), current.session_id.clone()).await?;
+                    &state.bootstrap.pool,
+                    &current.session_id,
+                    turn,
+                    undo,
+                    Some(&reminder),
+                )
+                .await?;
+                let memory = gewu_storage::SqliteMemory::new(
+                    state.bootstrap.pool.clone(),
+                    current.session_id.clone(),
+                )
+                .await?;
                 {
                     let mut agent = current.agent.lock().await;
                     agent.memory = Box::new(memory);
@@ -610,7 +693,10 @@ async fn handle_request(
                         None => {
                             let (full, sparse) = agent.reminder().texts();
                             if gewu_core::agent::Reminder::in_history(&messages) {
-                                let user_turns = messages.iter().filter(|m| matches!(m, Message::User { .. })).count();
+                                let user_turns = messages
+                                    .iter()
+                                    .filter(|m| matches!(m, Message::User { .. }))
+                                    .count();
                                 gewu_core::agent::Reminder::continue_at(full, sparse, user_turns)
                             } else {
                                 registry::profile_reminder(None, &current.agent_name)
@@ -618,12 +704,19 @@ async fn handle_request(
                         }
                     };
                     agent.set_reminder(next);
-                    if let Err(e) = gewu_storage::set_reminder(&state.bootstrap.pool, &current.session_id, agent.reminder()).await {
+                    if let Err(e) = gewu_storage::set_reminder(
+                        &state.bootstrap.pool,
+                        &current.session_id,
+                        agent.reminder(),
+                    )
+                    .await
+                    {
                         tracing::error!("failed to persist reminder state after revert: {e}");
                     }
                 }
                 Ok::<_, anyhow::Error>(messages)
-            }.await;
+            }
+            .await;
             state.release_session(&current.session_id).await;
             if let Ok(messages) = &result {
                 // Keep the idle turn entry alive: observers registered on it
@@ -646,23 +739,40 @@ async fn handle_request(
                 }
             }
             result
-                .map(|messages| Handled::Reply(ServerMessage::Session { id: request.id, session_id: current.session_id.clone(), messages }))
+                .map(|messages| {
+                    Handled::Reply(ServerMessage::Session {
+                        id: request.id,
+                        session_id: current.session_id.clone(),
+                        messages,
+                    })
+                })
                 .map_err(|e| RequestError::Failed(e.to_string()))
         }
         Op::SwitchAgent { agent: target } => {
             if running.is_some() {
-                return Err(RequestError::Failed("cannot switch agent while a turn is running".into()));
+                return Err(RequestError::Failed(
+                    "cannot switch agent while a turn is running".into(),
+                ));
             }
             if !["build", "plan"].contains(&target.as_str()) {
-                return Err(RequestError::Invalid("switch_agent supports build or plan".into()));
+                return Err(RequestError::Invalid(
+                    "switch_agent supports build or plan".into(),
+                ));
             }
-            let current = state.get_or_create_session(session, request.session_id, None).await
+            let current = state
+                .get_or_create_session(session, request.session_id, None)
+                .await
                 .map_err(|e| RequestError::Failed(e.to_string()))?;
             if !state.claim_session(&current.session_id).await {
-                return Err(RequestError::Failed("session is busy on another connection".into()));
+                return Err(RequestError::Failed(
+                    "session is busy on another connection".into(),
+                ));
             }
             let replacement = registry::agent_profile(registry::ProfileInputs {
-                model_catalog: Some(registry::ModelCatalog { entries: Arc::new(state.bootstrap.models.clone()), default: state.bootstrap.model_selector.clone() }),
+                model_catalog: Some(registry::ModelCatalog {
+                    entries: Arc::new(state.bootstrap.models.clone()),
+                    default: state.bootstrap.model_selector.clone(),
+                }),
                 name: &target,
                 provider: current.provider.clone(),
                 pool: state.bootstrap.pool.clone(),
@@ -672,21 +782,51 @@ async fn handle_request(
                 web_fetch: state.bootstrap.web_fetch.clone(),
                 enforcement: state.bootstrap.enforcement,
                 context_limit: Some(current.context_limit),
+                agents: state.bootstrap.agents.clone(),
                 session_id: &current.session_id,
             });
             let result = match replacement {
-                Ok((tools, prompt, _)) => match gewu_storage::set_session_agent(&state.bootstrap.pool, &current.session_id, &target).await {
+                Ok((tools, prompt, _)) => match gewu_storage::set_session_agent(
+                    &state.bootstrap.pool,
+                    &current.session_id,
+                    &target,
+                )
+                .await
+                {
                     Ok(()) => {
                         let mut agent = current.agent.lock().await;
-                        let reminder = registry::profile_reminder(Some(&current.agent_name), &target);
+                        let reminder =
+                            registry::profile_reminder(Some(&current.agent_name), &target);
                         agent.set_profile(prompt, tools, reminder);
-                        if let Err(e) = gewu_storage::set_reminder(&state.bootstrap.pool, &current.session_id, agent.reminder()).await {
+                        if let Err(e) = gewu_storage::set_reminder(
+                            &state.bootstrap.pool,
+                            &current.session_id,
+                            agent.reminder(),
+                        )
+                        .await
+                        {
                             tracing::error!("failed to persist reminder state after switch: {e}");
                         }
                         let tools = agent.list_tools();
-                         *session = Some(ConnectionSession { agent: current.agent.clone(), session_id: current.session_id.clone(), agent_name: target.clone(), model: current.model.clone(), provider: current.provider.clone(), context_limit: current.context_limit, tools: tools.clone() });
-                        state.sessions.lock().await.insert(current.session_id.clone(), session.as_ref().unwrap().clone());
-                        Ok(Handled::Reply(ServerMessage::AgentSwitched { id: request.id, session_id: current.session_id.clone(), agent: target, tools }))
+                        *session = Some(ConnectionSession {
+                            agent: current.agent.clone(),
+                            session_id: current.session_id.clone(),
+                            agent_name: target.clone(),
+                            model: current.model.clone(),
+                            provider: current.provider.clone(),
+                            context_limit: current.context_limit,
+                            tools: tools.clone(),
+                        });
+                        state.sessions.lock().await.insert(
+                            current.session_id.clone(),
+                            session.as_ref().unwrap().clone(),
+                        );
+                        Ok(Handled::Reply(ServerMessage::AgentSwitched {
+                            id: request.id,
+                            session_id: current.session_id.clone(),
+                            agent: target,
+                            tools,
+                        }))
                     }
                     Err(e) => Err(RequestError::Failed(e.to_string())),
                 },
@@ -697,15 +837,27 @@ async fn handle_request(
         }
         Op::SwitchModel { model: target } => {
             if running.is_some() {
-                return Err(RequestError::Failed("cannot switch model while a turn is running".into()));
+                return Err(RequestError::Failed(
+                    "cannot switch model while a turn is running".into(),
+                ));
             }
-            let current = state.get_or_create_session(session, request.session_id, None).await
+            let current = state
+                .get_or_create_session(session, request.session_id, None)
+                .await
                 .map_err(|e| RequestError::Failed(e.to_string()))?;
             if !state.claim_session(&current.session_id).await {
-                return Err(RequestError::Failed("session is busy on another connection".into()));
+                return Err(RequestError::Failed(
+                    "session is busy on another connection".into(),
+                ));
             }
             let result = match state.bootstrap.models.get(&target) {
-                Some(entry) => match gewu_storage::set_session_model(&state.bootstrap.pool, &current.session_id, &target).await {
+                Some(entry) => match gewu_storage::set_session_model(
+                    &state.bootstrap.pool,
+                    &current.session_id,
+                    &target,
+                )
+                .await
+                {
                     Ok(()) => {
                         {
                             let mut agent = current.agent.lock().await;
@@ -722,7 +874,11 @@ async fn handle_request(
                             tools: current.tools.clone(),
                         };
                         *session = Some(replacement.clone());
-                        state.sessions.lock().await.insert(current.session_id.clone(), replacement);
+                        state
+                            .sessions
+                            .lock()
+                            .await
+                            .insert(current.session_id.clone(), replacement);
                         Ok(Handled::Reply(ServerMessage::ModelSwitched {
                             id: request.id,
                             session_id: current.session_id.clone(),
@@ -794,15 +950,16 @@ async fn handle_request(
                     provider_usage: None,
                 }));
             };
-            let used_tokens: usize = gewu_core::compaction::active_context(agent.memory.messages())
-                .estimate_tokens();
+            let used_tokens: usize =
+                gewu_core::compaction::active_context(agent.memory.messages()).estimate_tokens();
             let provider_usage = agent.provider_usage();
             Ok(Handled::Reply(ServerMessage::Usage {
                 id: request.id,
                 used_tokens: used_tokens as u64,
                 context_limit: agent.context_limit as u64,
                 busy: false,
-                provider_usage: (provider_usage.prompt_tokens() > 0 || provider_usage.output_tokens > 0)
+                provider_usage: (provider_usage.prompt_tokens() > 0
+                    || provider_usage.output_tokens > 0)
                     .then_some(provider_usage),
             }))
         }
@@ -951,7 +1108,10 @@ async fn handle_request(
             }))
         }
 
-        Op::WriteFile { path, content_base64 } => {
+        Op::WriteFile {
+            path,
+            content_base64,
+        } => {
             const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
             // Only a bare file name is accepted: uploads land in the
             // working-directory root, and the browser-provided name is
@@ -961,9 +1121,7 @@ async fn handle_request(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .filter(|name| !name.is_empty() && *name != "." && *name != "..")
-                .ok_or_else(|| {
-                    RequestError::Invalid("path must be a file name".into())
-                })?;
+                .ok_or_else(|| RequestError::Invalid("path must be a file name".into()))?;
             use base64::Engine as _;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(content_base64.as_bytes())
@@ -1055,7 +1213,9 @@ async fn handle_request(
         }
 
         Op::Interrupt => {
-            let target = request.session_id.or_else(|| session.as_ref().map(|s| s.session_id.clone()));
+            let target = request
+                .session_id
+                .or_else(|| session.as_ref().map(|s| s.session_id.clone()));
             let request_id = match target {
                 Some(id) => state.cancel_turn(&id).await,
                 None => None,
@@ -1098,7 +1258,9 @@ async fn handle_request(
                 }
             }
             let request_id = crate::bootstrap::new_session_id();
-            if let Err(e) = gewu_storage::commit_chat_revert(&state.bootstrap.pool, &session.session_id).await {
+            if let Err(e) =
+                gewu_storage::commit_chat_revert(&state.bootstrap.pool, &session.session_id).await
+            {
                 state.release_session(&session.session_id).await;
                 return Err(RequestError::Failed(e.to_string()));
             }
@@ -1202,48 +1364,84 @@ async fn execute_ask<E, Fut>(
 
 /// Spawn an ask task that emits protocol lines through `out`.
 async fn start_session_turn(
-    state: Arc<ServerState>, session: ConnectionSession, request_id: String,
-    prompt: String, ready: ServerMessage, subscriber: Subscriber,
+    state: Arc<ServerState>,
+    session: ConnectionSession,
+    request_id: String,
+    prompt: String,
+    ready: ServerMessage,
+    subscriber: Subscriber,
 ) {
     let mut messages = session.agent.lock().await.memory.messages().to_vec();
-    messages.push(Message::User { content: vec![protocol::ContentPart::Text { text: prompt.clone() }] });
+    messages.push(Message::User {
+        content: vec![protocol::ContentPart::Text {
+            text: prompt.clone(),
+        }],
+    });
     let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
     let live = Arc::new(Mutex::new(LiveTurn {
-        request_id: request_id.clone(), messages, frames: vec![], bytes: 0,
-        seq: 0, busy: true, model: session.model.clone(),
+        request_id: request_id.clone(),
+        messages,
+        frames: vec![],
+        bytes: 0,
+        seq: 0,
+        busy: true,
+        model: session.model.clone(),
         done: Arc::new(tokio::sync::Notify::new()),
-        subscribers: vec![], cancel: Some(cancel), terminal: None,
+        subscribers: vec![],
+        cancel: Some(cancel),
+        terminal: None,
     }));
     // Register execution before acknowledging it: a failed socket write does
     // not strand a claimed session without its worker.
-    let previous = state.turns.lock().await.insert(session.session_id.clone(), live.clone());
+    let previous = state
+        .turns
+        .lock()
+        .await
+        .insert(session.session_id.clone(), live.clone());
     if let Some(previous) = previous {
         let mut previous = previous.lock().await;
         let snapshot = ServerMessage::SessionSnapshot {
-            session_id: session.session_id.clone(), messages: live.lock().await.messages.clone(),
-            frames: vec![], busy: true, seq: 0, model: Some(session.model.clone()),
-        }.to_line();
+            session_id: session.session_id.clone(),
+            messages: live.lock().await.messages.clone(),
+            frames: vec![],
+            busy: true,
+            seq: 0,
+            model: Some(session.model.clone()),
+        }
+        .to_line();
         for observer in previous.subscribers.drain(..).filter(|s| s.persistent) {
             if !observer.out.same_channel(&subscriber.out) && observer.send(&snapshot) {
                 live.lock().await.subscribers.push(observer);
             }
         }
     }
-    if subscriber.send(&ready.to_line()) { live.lock().await.subscribers.push(subscriber); }
+    if subscriber.send(&ready.to_line()) {
+        live.lock().await.subscribers.push(subscriber);
+    }
     let worker_pool = state.bootstrap.pool.clone();
     tokio::spawn(async move {
         let worker_session = session.clone();
         let worker_live = live.clone();
         let mut worker = tokio::spawn(async move {
-            execute_ask(&worker_session, &request_id, &prompt, &worker_pool, |message| {
-                let live = worker_live.clone();
-                async move {
-                    let mut live = live.lock().await;
-                    if message.is_ask_terminal().is_some() { live.terminal = Some(message); }
-                    else { live.publish(message); }
-                    Ok(())
-                }
-            }).await;
+            execute_ask(
+                &worker_session,
+                &request_id,
+                &prompt,
+                &worker_pool,
+                |message| {
+                    let live = worker_live.clone();
+                    async move {
+                        let mut live = live.lock().await;
+                        if message.is_ask_terminal().is_some() {
+                            live.terminal = Some(message);
+                        } else {
+                            live.publish(message);
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await;
         });
         let failure = tokio::select! {
             result = &mut worker => result.err().map(|e| format!("turn task failed: {e}")),
@@ -1255,9 +1453,12 @@ async fn start_session_turn(
         {
             let mut agent = session.agent.lock().await;
             patch_dangling_tool_calls(&mut agent).await;
-            if failure.is_some() { drop_dangling_prompt(&mut agent).await; }
+            if failure.is_some() {
+                drop_dangling_prompt(&mut agent).await;
+            }
             let mut live = live.lock().await;
-            let terminal = failure.map(|error| ServerMessage::Error { id: None, error })
+            let terminal = failure
+                .map(|error| ServerMessage::Error { id: None, error })
                 .or_else(|| live.terminal.take());
             live.messages = agent.memory.messages().to_vec();
             live.frames.clear();
@@ -1267,14 +1468,16 @@ async fn start_session_turn(
             live.cancel = None;
             // Wake any interrupt awaiting finalization (see `cancel_turn`).
             live.done.notify_waiters();
-            if let Some(terminal) = terminal { live.publish(terminal); }
+            if let Some(terminal) = terminal {
+                live.publish(terminal);
+            }
             live.frames.clear();
             live.bytes = 0;
-            live.subscribers.retain(|s| s.persistent && !s.out.is_closed());
+            live.subscribers
+                .retain(|s| s.persistent && !s.out.is_closed());
         }
     });
 }
-
 
 // ---------------------------------------------------------------------------
 // Connection loop
@@ -1415,7 +1618,10 @@ async fn drive_connection(
     // A socket is only an observer. Session-owned workers survive detachment.
     let turns: Vec<_> = state.turns.lock().await.values().cloned().collect();
     for turn in turns {
-        turn.lock().await.subscribers.retain(|subscriber| !subscriber.out.same_channel(&out));
+        turn.lock()
+            .await
+            .subscribers
+            .retain(|subscriber| !subscriber.out.same_channel(&out));
     }
     result
 }
@@ -1641,15 +1847,25 @@ mod tests {
 
     #[async_trait::async_trait]
     impl gewu_core::traits::LlmProvider for CompactionLlm {
-        fn build(&self, messages: &[Message], _tools: &[Arc<dyn gewu_core::traits::Tool>])
-            -> std::result::Result<Value, Box<dyn Error + Send + Sync>> {
+        fn build(
+            &self,
+            messages: &[Message],
+            _tools: &[Arc<dyn gewu_core::traits::Tool>],
+        ) -> std::result::Result<Value, Box<dyn Error + Send + Sync>> {
             self.requests.lock().unwrap().push(messages.to_vec());
             Ok(serde_json::json!({}))
         }
 
-        async fn send<'a>(&'a self, _request: Value) -> std::result::Result<
-            futures::stream::BoxStream<'a, std::result::Result<gewu_core::types::ProviderEvent, Box<dyn Error + Send + Sync>>>,
-            Box<dyn Error + Send + Sync>> {
+        async fn send<'a>(
+            &'a self,
+            _request: Value,
+        ) -> std::result::Result<
+            futures::stream::BoxStream<
+                'a,
+                std::result::Result<gewu_core::types::ProviderEvent, Box<dyn Error + Send + Sync>>,
+            >,
+            Box<dyn Error + Send + Sync>,
+        > {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Box::pin(async_stream::try_stream! {
                 yield gewu_core::types::ProviderEvent::ContentDelta { delta: "summary or answer".into() };
@@ -1661,7 +1877,9 @@ mod tests {
             }))
         }
 
-        async fn list_models(&self) -> std::result::Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+        async fn list_models(
+            &self,
+        ) -> std::result::Result<Vec<String>, Box<dyn Error + Send + Sync>> {
             Ok(vec![])
         }
     }
@@ -1921,7 +2139,10 @@ mod tests {
     }
 
     async fn collect_ask(session: &ConnectionSession, prompt: &str) -> Vec<String> {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
         let (tx, mut rx) = mpsc::channel::<String>(256);
         let handle = tokio::spawn({
             let session = session.clone();
@@ -2160,35 +2381,80 @@ mod tests {
         for block_call in [None, Some(0), Some(1)] {
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 let provider = Arc::new(CompactionLlm {
-                    block_call, calls: AtomicUsize::new(0), blocked: tokio::sync::Notify::new(),
+                    block_call,
+                    calls: AtomicUsize::new(0),
+                    blocked: tokio::sync::Notify::new(),
                     requests: std::sync::Mutex::new(vec![]),
                 });
                 let state = server_state_with(provider.clone());
-                let session = state.get_or_create_session(&mut None, Some("compact".into()), None).await.unwrap();
-                let original = Message::User { content: vec![ContentPart::Text { text: "archived-original".repeat(3200) }] };
+                let session = state
+                    .get_or_create_session(&mut None, Some("compact".into()), None)
+                    .await
+                    .unwrap();
+                let original = Message::User {
+                    content: vec![ContentPart::Text {
+                        text: "archived-original".repeat(3200),
+                    }],
+                };
                 {
                     let mut agent = session.agent.lock().await;
                     agent.context_limit = 24_000;
                     agent.memory.add_message(original.clone()).await;
                 }
                 let (input, mut output, connection) = spawn_connection(state.clone()).await;
-                input.send(ClientRequest::ask(1, "continue").with_session("compact").to_line()).await.unwrap();
+                input
+                    .send(
+                        ClientRequest::ask(1, "continue")
+                            .with_session("compact")
+                            .to_line(),
+                    )
+                    .await
+                    .unwrap();
                 assert_eq!(recv_json(&mut output).await["type"], "ready");
                 if block_call.is_some() {
                     provider.blocked.notified().await;
-                    input.send(ClientRequest::interrupt(2).with_session("compact").to_line()).await.unwrap();
-                    loop { if recv_json(&mut output).await["type"] == "interrupted" { break; } }
+                    input
+                        .send(
+                            ClientRequest::interrupt(2)
+                                .with_session("compact")
+                                .to_line(),
+                        )
+                        .await
+                        .unwrap();
+                    loop {
+                        if recv_json(&mut output).await["type"] == "interrupted" {
+                            break;
+                        }
+                    }
                 } else {
-                    loop { if recv_json(&mut output).await["type"] == "result" { break; } }
+                    loop {
+                        if recv_json(&mut output).await["type"] == "result" {
+                            break;
+                        }
+                    }
                 }
-                let loaded = gewu_storage::SqliteMemory::new(state.bootstrap.pool.clone(), "compact".into()).await.unwrap();
+                let loaded =
+                    gewu_storage::SqliteMemory::new(state.bootstrap.pool.clone(), "compact".into())
+                        .await
+                        .unwrap();
                 use gewu_core::traits::Memory;
-                assert!(loaded.messages().contains(&original), "original must survive reload");
-                let checkpoints = loaded.messages().iter().filter(|m| matches!(m, Message::Compaction { .. })).count();
+                assert!(
+                    loaded.messages().contains(&original),
+                    "original must survive reload"
+                );
+                let checkpoints = loaded
+                    .messages()
+                    .iter()
+                    .filter(|m| matches!(m, Message::Compaction { .. }))
+                    .count();
                 assert_eq!(checkpoints, usize::from(block_call != Some(0)));
                 let requests = provider.requests.lock().unwrap().clone();
                 if block_call != Some(0) {
-                    assert_eq!(requests.len(), 2, "summary and post-compaction model request");
+                    assert_eq!(
+                        requests.len(),
+                        2,
+                        "summary and post-compaction model request"
+                    );
                     let request = serde_json::to_string(&requests[1]).unwrap();
                     assert!(request.contains("<conversation-checkpoint>"));
                     assert!(!request.contains("archived-original"));
@@ -2197,7 +2463,9 @@ mod tests {
                 }
                 drop(input);
                 connection.await.unwrap().unwrap();
-            }).await.expect("compaction lifecycle must complete");
+            })
+            .await
+            .expect("compaction lifecycle must complete");
         }
     }
 
@@ -2205,49 +2473,105 @@ mod tests {
     async fn observer_receives_turns_started_after_idle_subscription() {
         let state = server_state_with(TestLlm::plain());
         let (observer, mut updates, observer_task) = spawn_connection(state.clone()).await;
-        observer.send(ClientRequest::subscribe_session(1, "observed").to_line()).await.unwrap();
+        observer
+            .send(ClientRequest::subscribe_session(1, "observed").to_line())
+            .await
+            .unwrap();
         assert_eq!(recv_json(&mut updates).await["type"], "ready");
         assert_eq!(recv_json(&mut updates).await["busy"], false);
         let (writer, mut replies, writer_task) = spawn_connection(state.clone()).await;
         for id in 2..4 {
-            writer.send(ClientRequest::ask(id, "hello").with_session("observed").to_line()).await.unwrap();
+            writer
+                .send(
+                    ClientRequest::ask(id, "hello")
+                        .with_session("observed")
+                        .to_line(),
+                )
+                .await
+                .unwrap();
             assert_eq!(recv_json(&mut replies).await["type"], "ready");
             let snapshot = recv_json(&mut updates).await;
             assert_eq!(snapshot["type"], "session_snapshot");
             assert_eq!(snapshot["busy"], true);
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop { if recv_json(&mut updates).await["type"] == "result" { break; } }
-                loop { if recv_json(&mut replies).await["type"] == "result" { break; } }
-            }).await.unwrap();
+                loop {
+                    if recv_json(&mut updates).await["type"] == "result" {
+                        break;
+                    }
+                }
+                loop {
+                    if recv_json(&mut replies).await["type"] == "result" {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
         }
-        drop(observer); drop(writer); drop(updates); drop(replies);
+        drop(observer);
+        drop(writer);
+        drop(updates);
+        drop(replies);
         observer_task.await.unwrap().unwrap();
         writer_task.await.unwrap().unwrap();
-        assert!(state.turns.lock().await["observed"].lock().await.subscribers.is_empty());
+        assert!(
+            state.turns.lock().await["observed"]
+                .lock()
+                .await
+                .subscribers
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn observer_survives_a_revert_and_sees_the_next_turn() {
         let state = server_state_with(TestLlm::plain());
         let (observer, mut updates, observer_task) = spawn_connection(state.clone()).await;
-        observer.send(ClientRequest::subscribe_session(1, "observed").to_line()).await.unwrap();
+        observer
+            .send(ClientRequest::subscribe_session(1, "observed").to_line())
+            .await
+            .unwrap();
         assert_eq!(recv_json(&mut updates).await["type"], "ready");
         assert_eq!(recv_json(&mut updates).await["busy"], false);
         let (writer, mut replies, writer_task) = spawn_connection(state.clone()).await;
 
         // One completed exchange gives the revert something to remove.
-        writer.send(ClientRequest::ask(2, "hello").with_session("observed").to_line()).await.unwrap();
+        writer
+            .send(
+                ClientRequest::ask(2, "hello")
+                    .with_session("observed")
+                    .to_line(),
+            )
+            .await
+            .unwrap();
         assert_eq!(recv_json(&mut replies).await["type"], "ready");
         let snapshot = recv_json(&mut updates).await;
         assert_eq!(snapshot["busy"], true);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop { if recv_json(&mut updates).await["type"] == "result" { break; } }
-            loop { if recv_json(&mut replies).await["type"] == "result" { break; } }
-        }).await.unwrap();
+            loop {
+                if recv_json(&mut updates).await["type"] == "result" {
+                    break;
+                }
+            }
+            loop {
+                if recv_json(&mut replies).await["type"] == "result" {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
 
         // Revert the exchange; the observer sees the truncated history
         // (only the system prompt remains).
-        writer.send(ClientRequest::revert_chat(3, None, false).with_session("observed").to_line()).await.unwrap();
+        writer
+            .send(
+                ClientRequest::revert_chat(3, None, false)
+                    .with_session("observed")
+                    .to_line(),
+            )
+            .await
+            .unwrap();
         let reverted = recv_json(&mut updates).await;
         assert_eq!(reverted["type"], "session_snapshot");
         assert_eq!(reverted["busy"], false);
@@ -2259,7 +2583,14 @@ mod tests {
         // A turn started after the revert must reach the observer again —
         // its snapshot carries the new user prompt, which is what the GUI
         // renders as the message.
-        writer.send(ClientRequest::ask(4, "again").with_session("observed").to_line()).await.unwrap();
+        writer
+            .send(
+                ClientRequest::ask(4, "again")
+                    .with_session("observed")
+                    .to_line(),
+            )
+            .await
+            .unwrap();
         assert_eq!(recv_json(&mut replies).await["type"], "ready");
         let snapshot = recv_json(&mut updates).await;
         assert_eq!(snapshot["type"], "session_snapshot");
@@ -2267,17 +2598,35 @@ mod tests {
         let messages = snapshot["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2, "system prompt plus the new user prompt");
         assert_eq!(messages[1]["role"], "user");
-        assert!(serde_json::to_value(&messages[1]).unwrap().to_string().contains("again"));
+        assert!(
+            serde_json::to_value(&messages[1])
+                .unwrap()
+                .to_string()
+                .contains("again")
+        );
 
         // Keep both receivers alive until the second turn finishes. Closing
         // them after the initial snapshot races with the remaining events
         // and intentionally trips the subscriber-failure path.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop { if recv_json(&mut updates).await["type"] == "result" { break; } }
-            loop { if recv_json(&mut replies).await["type"] == "result" { break; } }
-        }).await.unwrap();
+            loop {
+                if recv_json(&mut updates).await["type"] == "result" {
+                    break;
+                }
+            }
+            loop {
+                if recv_json(&mut replies).await["type"] == "result" {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
 
-        drop(observer); drop(writer); drop(updates); drop(replies);
+        drop(observer);
+        drop(writer);
+        drop(updates);
+        drop(replies);
         observer_task.await.unwrap().unwrap();
         writer_task.await.unwrap().unwrap();
     }
@@ -2286,7 +2635,11 @@ mod tests {
     async fn slow_subscriber_signals_connection_failure() {
         let (out, _receiver) = mpsc::channel(1);
         let (failed, failure) = tokio::sync::watch::channel(false);
-        let subscriber = Subscriber { out, failed, persistent: true };
+        let subscriber = Subscriber {
+            out,
+            failed,
+            persistent: true,
+        };
         assert!(subscriber.send("first"));
         assert!(!subscriber.send("second"));
         assert!(*failure.borrow());
@@ -2296,7 +2649,10 @@ mod tests {
     async fn disconnected_turn_can_be_observed_and_cancelled_from_new_connection() {
         let state = server_state_with(TestLlm::slow_tool_call());
         let (input, mut output, connection) = spawn_connection(state.clone()).await;
-        input.send(ClientRequest::ask(1, "work").to_line()).await.unwrap();
+        input
+            .send(ClientRequest::ask(1, "work").to_line())
+            .await
+            .unwrap();
         let ready = recv_json(&mut output).await;
         let id = ready["session_id"].as_str().unwrap().to_owned();
         drop(input);
@@ -2305,16 +2661,24 @@ mod tests {
         assert!(state.busy_sessions.lock().await.contains(&id));
 
         let (input, mut output, connection) = spawn_connection(state.clone()).await;
-        input.send(ClientRequest::subscribe_session(2, &id).to_line()).await.unwrap();
+        input
+            .send(ClientRequest::subscribe_session(2, &id).to_line())
+            .await
+            .unwrap();
         assert_eq!(recv_json(&mut output).await["type"], "ready");
         let snapshot = recv_json(&mut output).await;
         assert_eq!(snapshot["type"], "session_snapshot");
         assert_eq!(snapshot["busy"], true);
         assert_eq!(snapshot["messages"][0]["role"], "user");
-        input.send(ClientRequest::interrupt(3).with_session(&id).to_line()).await.unwrap();
+        input
+            .send(ClientRequest::interrupt(3).with_session(&id).to_line())
+            .await
+            .unwrap();
         loop {
             let message = recv_json(&mut output).await;
-            if message["type"] == "interrupted" { break; }
+            if message["type"] == "interrupted" {
+                break;
+            }
         }
         assert!(!state.busy_sessions.lock().await.contains(&id));
         drop(input);
@@ -2326,7 +2690,10 @@ mod tests {
     async fn detached_turn_finishes_without_a_subscriber() {
         let state = server_state_with(TestLlm::plain());
         let (input, mut output, connection) = spawn_connection(state.clone()).await;
-        input.send(ClientRequest::ask(1, "hello").to_line()).await.unwrap();
+        input
+            .send(ClientRequest::ask(1, "hello").to_line())
+            .await
+            .unwrap();
         let ready = recv_json(&mut output).await;
         let id = ready["session_id"].as_str().unwrap().to_owned();
         drop(input);
@@ -2334,13 +2701,29 @@ mod tests {
         connection.await.unwrap().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if !state.busy_sessions.lock().await.contains(&id) { break; }
+                if !state.busy_sessions.lock().await.contains(&id) {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let mut current = None;
-        let session = state.get_or_create_session(&mut current, Some(id), None).await.unwrap();
-        assert!(session.agent.lock().await.memory.messages().iter().any(|m| matches!(m, Message::Assistant { .. })));
+        let session = state
+            .get_or_create_session(&mut current, Some(id), None)
+            .await
+            .unwrap();
+        assert!(
+            session
+                .agent
+                .lock()
+                .await
+                .memory
+                .messages()
+                .iter()
+                .any(|m| matches!(m, Message::Assistant { .. }))
+        );
     }
 
     fn server_state_with(provider: Arc<dyn gewu_core::traits::LlmProvider>) -> Arc<ServerState> {
@@ -2376,6 +2759,7 @@ mod tests {
                     },
                 )]),
                 model_selector: "test-model".to_string(),
+                agents: Arc::new(BTreeMap::new()),
             },
             token: token.map(str::to_string),
             busy_sessions: Mutex::new(HashSet::new()),
@@ -2389,17 +2773,39 @@ mod tests {
     async fn chat_revert_updates_live_history_and_undo_restores_it() {
         let state = server_state_with(TestLlm::plain());
         let mut session = None;
-        let current = state.get_or_create_session(&mut session, Some("revert-test".into()), None).await.unwrap();
+        let current = state
+            .get_or_create_session(&mut session, Some("revert-test".into()), None)
+            .await
+            .unwrap();
         {
             let mut agent = current.agent.lock().await;
             for text in ["first", "second"] {
-                agent.memory.add_message(Message::User { content: vec![gewu_core::types::ContentPart::Text { text: text.into() }] }).await;
+                agent
+                    .memory
+                    .add_message(Message::User {
+                        content: vec![gewu_core::types::ContentPart::Text { text: text.into() }],
+                    })
+                    .await;
             }
         }
         let mut running = None;
-        handle_request(&state, &mut session, &mut running, ClientRequest::revert_chat(1, None, false)).await.unwrap();
+        handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::revert_chat(1, None, false),
+        )
+        .await
+        .unwrap();
         assert_eq!(current.agent.lock().await.memory.messages().len(), 1);
-        handle_request(&state, &mut session, &mut running, ClientRequest::revert_chat(2, None, true)).await.unwrap();
+        handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::revert_chat(2, None, true),
+        )
+        .await
+        .unwrap();
         assert_eq!(current.agent.lock().await.memory.messages().len(), 2);
     }
 
@@ -2410,26 +2816,56 @@ mod tests {
     async fn revert_past_the_switch_reminder_re_arms_it() {
         let state = server_state_with(TestLlm::plain());
         let mut session = None;
-        let current = state.get_or_create_session(&mut session, Some("revert-plan".into()), Some("plan".into())).await.unwrap();
+        let current = state
+            .get_or_create_session(
+                &mut session,
+                Some("revert-plan".into()),
+                Some("plan".into()),
+            )
+            .await
+            .unwrap();
         {
             let mut agent = current.agent.lock().await;
             // Simulate the first plan turn: reminder consumed into history.
             let (full, sparse) = agent.reminder().texts();
             agent.set_reminder(gewu_core::agent::Reminder::continue_at(full, sparse, 1));
-            agent.memory.add_message(Message::User { content: vec![
-                gewu_core::types::ContentPart::Text { text: "Update README.md".into() },
-                gewu_core::types::ContentPart::Reminder { text: "Plan mode is active".into() },
-            ]}).await;
+            agent
+                .memory
+                .add_message(Message::User {
+                    content: vec![
+                        gewu_core::types::ContentPart::Text {
+                            text: "Update README.md".into(),
+                        },
+                        gewu_core::types::ContentPart::Reminder {
+                            text: "Plan mode is active".into(),
+                        },
+                    ],
+                })
+                .await;
         }
         let mut running = None;
-        handle_request(&state, &mut session, &mut running, ClientRequest::revert_chat(0, None, false)).await.unwrap();
+        handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::revert_chat(0, None, false),
+        )
+        .await
+        .unwrap();
         let agent = current.agent.lock().await;
         assert!(
-            agent.memory.messages().iter().all(|m| !matches!(m, Message::User { .. })),
+            agent
+                .memory
+                .messages()
+                .iter()
+                .all(|m| !matches!(m, Message::User { .. })),
             "revert to turn 0 truncates every user message"
         );
         let reminder = agent.reminder();
-        assert!(reminder.pending().is_some(), "a fresh reminder must be pending after the revert");
+        assert!(
+            reminder.pending().is_some(),
+            "a fresh reminder must be pending after the revert"
+        );
         assert_eq!(reminder.user_turns(), 0);
     }
 
@@ -2439,27 +2875,62 @@ mod tests {
     async fn revert_with_retained_reminder_does_not_duplicate_it() {
         let state = server_state_with(TestLlm::plain());
         let mut session = None;
-        let current = state.get_or_create_session(&mut session, Some("revert-keep".into()), Some("plan".into())).await.unwrap();
+        let current = state
+            .get_or_create_session(
+                &mut session,
+                Some("revert-keep".into()),
+                Some("plan".into()),
+            )
+            .await
+            .unwrap();
         {
             let mut agent = current.agent.lock().await;
             let (full, sparse) = agent.reminder().texts();
             agent.set_reminder(gewu_core::agent::Reminder::continue_at(full, sparse, 2));
-            agent.memory.add_message(Message::User { content: vec![
-                gewu_core::types::ContentPart::Text { text: "first".into() },
-                gewu_core::types::ContentPart::Reminder { text: "Plan mode is active".into() },
-            ]}).await;
-            agent.memory.add_message(Message::User { content: vec![
-                gewu_core::types::ContentPart::Text { text: "second".into() },
-            ]}).await;
+            agent
+                .memory
+                .add_message(Message::User {
+                    content: vec![
+                        gewu_core::types::ContentPart::Text {
+                            text: "first".into(),
+                        },
+                        gewu_core::types::ContentPart::Reminder {
+                            text: "Plan mode is active".into(),
+                        },
+                    ],
+                })
+                .await;
+            agent
+                .memory
+                .add_message(Message::User {
+                    content: vec![gewu_core::types::ContentPart::Text {
+                        text: "second".into(),
+                    }],
+                })
+                .await;
         }
         let mut running = None;
         // Revert to turn 1: the first user message (with its reminder) stays.
-        handle_request(&state, &mut session, &mut running, ClientRequest::revert_chat(1, None, false)).await.unwrap();
+        handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::revert_chat(1, None, false),
+        )
+        .await
+        .unwrap();
         let agent = current.agent.lock().await;
         assert_eq!(agent.memory.messages().len(), 1);
         let reminder = agent.reminder();
-        assert!(reminder.pending().is_none(), "retained reminder must not be duplicated");
-        assert_eq!(reminder.user_turns(), 1, "cadence realigns with retained history");
+        assert!(
+            reminder.pending().is_none(),
+            "retained reminder must not be duplicated"
+        );
+        assert_eq!(
+            reminder.user_turns(),
+            1,
+            "cadence realigns with retained history"
+        );
     }
 
     #[tokio::test]
@@ -2479,15 +2950,30 @@ mod tests {
             bootstrap.working_directory = root.path().to_string_lossy().to_string();
             bootstrap.enforcement = PathEnforcement::None;
         }
-        let handled = handle_request(&state, &mut session, &mut running, ClientRequest::read_file(1, &outside_path)).await.unwrap();
+        let handled = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::read_file(1, &outside_path),
+        )
+        .await
+        .unwrap();
         match handled {
-            Handled::Reply(ServerMessage::FileContent { content, .. }) => assert_eq!(content, "outside"),
+            Handled::Reply(ServerMessage::FileContent { content, .. }) => {
+                assert_eq!(content, "outside")
+            }
             _ => panic!("unexpected reply"),
         }
 
         // Contain: the same request is rejected as outside the root.
         Arc::get_mut(&mut state).unwrap().bootstrap.enforcement = PathEnforcement::Contain;
-        let result = handle_request(&state, &mut session, &mut running, ClientRequest::read_file(2, &outside_path)).await;
+        let result = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::read_file(2, &outside_path),
+        )
+        .await;
         assert!(result.is_err(), "expected containment rejection");
     }
 
@@ -2520,7 +3006,10 @@ mod tests {
             }
             _ => panic!("unexpected reply"),
         }
-        assert_eq!(std::fs::read(root.path().join("data.bin")).unwrap(), payload);
+        assert_eq!(
+            std::fs::read(root.path().join("data.bin")).unwrap(),
+            payload
+        );
 
         // Overwriting an existing file is allowed.
         let replaced = b"replacement";
@@ -2533,7 +3022,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(std::fs::read(root.path().join("data.bin")).unwrap(), replaced);
+        assert_eq!(
+            std::fs::read(root.path().join("data.bin")).unwrap(),
+            replaced
+        );
     }
 
     #[tokio::test]
@@ -2564,7 +3056,10 @@ mod tests {
             std::fs::read(root.path().join("victim.txt")).unwrap(),
             b"payload"
         );
-        assert_eq!(std::fs::read(outside.path().join("victim.txt")).unwrap(), b"victim");
+        assert_eq!(
+            std::fs::read(outside.path().join("victim.txt")).unwrap(),
+            b"victim"
+        );
     }
 
     #[tokio::test]
@@ -2635,17 +3130,35 @@ mod tests {
     async fn switching_profiles_keeps_live_memory() {
         let state = server_state_with(TestLlm::plain());
         let original = plain_session();
-        original.agent.lock().await.memory.add_message(Message::User {
-            content: vec![gewu_core::types::ContentPart::Text { text: "live memory not stored in SQLite".into() }],
-        }).await;
+        original
+            .agent
+            .lock()
+            .await
+            .memory
+            .add_message(Message::User {
+                content: vec![gewu_core::types::ContentPart::Text {
+                    text: "live memory not stored in SQLite".into(),
+                }],
+            })
+            .await;
         let before = original.agent.lock().await.memory.messages().to_vec();
         let mut session = Some(original.clone());
         let mut running = None;
         for mode in ["plan", "build"] {
-            handle_request(&state, &mut session, &mut running, ClientRequest::switch_agent(1, mode)).await.unwrap();
+            handle_request(
+                &state,
+                &mut session,
+                &mut running,
+                ClientRequest::switch_agent(1, mode),
+            )
+            .await
+            .unwrap();
             let current = session.as_ref().unwrap();
             assert!(Arc::ptr_eq(&original.agent, &current.agent));
-            assert_eq!(current.agent.lock().await.memory.messages(), before.as_slice());
+            assert_eq!(
+                current.agent.lock().await.memory.messages(),
+                before.as_slice()
+            );
             assert_eq!(current.agent_name, mode);
         }
     }
@@ -2654,21 +3167,56 @@ mod tests {
     async fn switching_profiles_preserves_session_and_persists_mode() {
         let state = server_state_with(TestLlm::plain());
         let (tx, mut rx, handle) = spawn_connection(state.clone()).await;
-        tx.send(ClientRequest::switch_agent(1, "plan").to_line()).await.unwrap();
+        tx.send(ClientRequest::switch_agent(1, "plan").to_line())
+            .await
+            .unwrap();
         let plan = recv_json(&mut rx).await;
         assert_eq!(plan["type"], "agent_switched");
         assert_eq!(plan["agent"], "plan");
         let id = plan["session_id"].as_str().unwrap().to_string();
-        assert!(plan["tools"].as_array().unwrap().iter().any(|t| t == "bash"));
-        assert!(plan["tools"].as_array().unwrap().iter().any(|t| t == "task"));
-        assert!(!plan["tools"].as_array().unwrap().iter().any(|t| t == "write_file"));
-        assert_eq!(gewu_storage::session_agent(&state.bootstrap.pool, &id).await.unwrap(), "plan");
-        tx.send(ClientRequest::switch_agent(2, "build").to_line()).await.unwrap();
+        assert!(
+            plan["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "bash")
+        );
+        assert!(
+            plan["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "task")
+        );
+        assert!(
+            !plan["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "write_file")
+        );
+        assert_eq!(
+            gewu_storage::session_agent(&state.bootstrap.pool, &id)
+                .await
+                .unwrap(),
+            "plan"
+        );
+        tx.send(ClientRequest::switch_agent(2, "build").to_line())
+            .await
+            .unwrap();
         let build = recv_json(&mut rx).await;
         assert_eq!(build["session_id"], id);
         assert_eq!(build["agent"], "build");
-        assert!(build["tools"].as_array().unwrap().iter().any(|t| t == "bash"));
-        tx.send(ClientRequest::switch_agent(3, "unknown").to_line()).await.unwrap();
+        assert!(
+            build["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "bash")
+        );
+        tx.send(ClientRequest::switch_agent(3, "unknown").to_line())
+            .await
+            .unwrap();
         assert_eq!(recv_json(&mut rx).await["type"], "error");
         drop(tx);
         handle.await.unwrap().unwrap();
@@ -2814,6 +3362,7 @@ mod tests {
                     },
                 )]),
                 model_selector: "test-model".to_string(),
+                agents: Arc::new(BTreeMap::new()),
             },
             token: None,
             busy_sessions: Mutex::new(HashSet::new()),
@@ -2991,9 +3540,14 @@ mod tests {
             }],
         };
         for name in ["sub-a", "sub-b"] {
-            gewu_storage::record_subagent_session(&state.bootstrap.pool, name, &session_id, "explore")
-                .await
-                .unwrap();
+            gewu_storage::record_subagent_session(
+                &state.bootstrap.pool,
+                name,
+                &session_id,
+                "explore",
+            )
+            .await
+            .unwrap();
             sqlx::query("INSERT INTO memory_messages (session_id, content) VALUES (?, ?)")
                 .bind(name)
                 .bind(serde_json::to_string(&user).unwrap())
@@ -3013,11 +3567,17 @@ mod tests {
             .iter()
             .map(|s| s["session_id"].as_str().unwrap())
             .collect();
-        assert_eq!(listed, vec![session_id.as_str()], "subagent sessions must not be listed");
+        assert_eq!(
+            listed,
+            vec![session_id.as_str()],
+            "subagent sessions must not be listed"
+        );
 
         // Deleting the conversation removes its subagent transcripts too.
         in_tx
-            .send(format!(r#"{{"id": 3, "op": "delete_session", "session_id": "{session_id}"}}"#))
+            .send(format!(
+                r#"{{"id": 3, "op": "delete_session", "session_id": "{session_id}"}}"#
+            ))
             .await
             .unwrap();
         assert_eq!(recv_json(&mut out_rx).await["type"], "deleted");
@@ -3110,7 +3670,9 @@ mod tests {
             .await
             .unwrap();
         let mut interrupted = recv_json(&mut out_rx).await;
-        if interrupted["type"] == "error" { interrupted = recv_json(&mut out_rx).await; }
+        if interrupted["type"] == "error" {
+            interrupted = recv_json(&mut out_rx).await;
+        }
         assert_eq!(interrupted["type"], "interrupted");
         assert_eq!(interrupted["request_id"], request_id.as_str());
         assert_eq!(interrupted["id"], 2);
@@ -3228,7 +3790,10 @@ mod tests {
         };
 
         let (tx, mut rx) = mpsc::channel::<String>(256);
-        let pool = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
         let handle = tokio::spawn({
             let session = session.clone();
             async move {
@@ -3678,7 +4243,9 @@ mod tests {
             .await
             .unwrap();
         let mut interrupted = recv_json(&mut out_rx).await;
-        if interrupted["type"] == "error" { interrupted = recv_json(&mut out_rx).await; }
+        if interrupted["type"] == "error" {
+            interrupted = recv_json(&mut out_rx).await;
+        }
         assert_eq!(interrupted["type"], "interrupted");
 
         // The next ask's LLM request must not contain the aborted prompt.

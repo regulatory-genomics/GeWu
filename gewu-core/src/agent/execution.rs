@@ -173,7 +173,14 @@ impl LlmResponseAggregator {
     /// # Returns
     ///
     /// Content, display reasoning, tool calls, and native reasoning replay state.
-    pub(super) fn take_parts(&mut self) -> (String, String, Vec<ToolCall>, Option<crate::types::ReasoningReplay>) {
+    pub(super) fn take_parts(
+        &mut self,
+    ) -> (
+        String,
+        String,
+        Vec<ToolCall>,
+        Option<crate::types::ReasoningReplay>,
+    ) {
         (
             std::mem::take(&mut self.content),
             std::mem::take(&mut self.reasoning),

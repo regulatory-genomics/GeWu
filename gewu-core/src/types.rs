@@ -10,12 +10,16 @@
 //! - [`ToolResult`] - Structured result from tool execution
 //! - [`ToolContext`] - Execution context passed to tools
 //! - [`PathEnforcement`] - File-path confinement level for tools
+//! - [`SessionState`] - Typed handle for per-session tool state
 //! - [`FileAttachment`] - File attachment in tool results
 //! - [`TruncationResult`] - Result of output truncation
 
+use crate::traits::SessionStateStore;
+use serde::de::DeserializeOwned;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -389,6 +393,88 @@ pub enum PathEnforcement {
     Strict,
 }
 
+/// Typed handle to per-session key/value state shared by tools.
+///
+/// Tools receive a clone of this handle on every [`ToolContext`], keeping the
+/// tools themselves stateless. Values are stored as JSON strings under a
+/// tool-chosen key (e.g. `"todos"`) scoped to the current session, so state
+/// survives process restarts when a persistent store is wired in.
+#[derive(Clone)]
+pub struct SessionState {
+    store: Arc<dyn SessionStateStore>,
+}
+
+impl std::fmt::Debug for SessionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionState").finish_non_exhaustive()
+    }
+}
+
+impl SessionState {
+    /// Creates a handle backed by the given store.
+    pub fn new(store: Arc<dyn SessionStateStore>) -> Self {
+        Self { store }
+    }
+
+    /// Creates a handle backed by a fresh in-memory store.
+    ///
+    /// This is the default for [`ToolContext::new`]; persistent backends
+    /// inject themselves via [`ToolContext::with_session_state`].
+    pub fn in_memory() -> Self {
+        Self::new(Arc::new(InMemorySessionStateStore::default()))
+    }
+
+    /// Reads and deserializes the value stored for `key`, if any.
+    pub async fn read<T: DeserializeOwned>(
+        &self,
+        session_id: &str,
+        key: &str,
+    ) -> anyhow::Result<Option<T>> {
+        match self.store.load(session_id, key).await? {
+            Some(value) => Ok(Some(serde_json::from_str(&value)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Serializes and stores `value` for `key`, replacing any previous value.
+    pub async fn write<T: Serialize>(
+        &self,
+        session_id: &str,
+        key: &str,
+        value: &T,
+    ) -> anyhow::Result<()> {
+        let value = serde_json::to_string(value)?;
+        self.store.save(session_id, key, value).await
+    }
+}
+
+/// In-memory [`SessionStateStore`], the default when no persistent backend
+/// is wired in. State lives for as long as a clone of the store is held.
+#[derive(Default)]
+pub struct InMemorySessionStateStore {
+    entries: std::sync::Mutex<std::collections::HashMap<(String, String), String>>,
+}
+
+#[async_trait]
+impl SessionStateStore for InMemorySessionStateStore {
+    async fn load(&self, session_id: &str, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .entries
+            .lock()
+            .expect("session state mutex poisoned")
+            .get(&(session_id.to_string(), key.to_string()))
+            .cloned())
+    }
+
+    async fn save(&self, session_id: &str, key: &str, value: String) -> anyhow::Result<()> {
+        self.entries
+            .lock()
+            .expect("session state mutex poisoned")
+            .insert((session_id.to_string(), key.to_string()), value);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ToolContext {
     pub session_id: String,
@@ -403,6 +489,8 @@ pub struct ToolContext {
     pub metadata: std::collections::HashMap<String, serde_json::Value>,
     /// File-path confinement level for this execution.
     pub enforcement: PathEnforcement,
+    /// Per-session key/value state tools can persist across turns.
+    pub session_state: SessionState,
 }
 
 impl ToolContext {
@@ -417,6 +505,7 @@ impl ToolContext {
             abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metadata: Default::default(),
             enforcement: PathEnforcement::default(),
+            session_state: SessionState::in_memory(),
         }
     }
 
@@ -436,12 +525,19 @@ impl ToolContext {
             abort,
             metadata: Default::default(),
             enforcement: PathEnforcement::default(),
+            session_state: SessionState::in_memory(),
         }
     }
 
     /// Returns the context with a different path-enforcement level.
     pub fn with_enforcement(mut self, enforcement: PathEnforcement) -> Self {
         self.enforcement = enforcement;
+        self
+    }
+
+    /// Returns the context backed by a different session-state store.
+    pub fn with_session_state(mut self, session_state: SessionState) -> Self {
+        self.session_state = session_state;
         self
     }
 

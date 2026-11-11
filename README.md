@@ -79,6 +79,11 @@ The server provides pre-configured agent profiles, selected with `--agent`:
 Subagents launched via `task` run as fresh `Agent` instances with their own
 memory and cannot spawn further subagents (depth limit 1).
 
+You can define additional agents in the config file's `agents` block (see
+[Configuration](#configuration)). They derive from a built-in profile and are
+spawnable via `task` by `build` and `general`; they are never selectable as
+the primary agent.
+
 ## Built-in Tools
 
 | Tool | Name | Description |
@@ -94,8 +99,8 @@ memory and cannot spawn further subagents (depth limit 1).
 | Web Fetch | `webfetch` | Fetch web pages as markdown/text/html |
 | Web Search | `websearch` | Search the web (Exa) |
 | Code Search | `codesearch` | Semantic code search with library/API context (Exa) |
-| Todo Read/Write | `todoread` / `todowrite` | Maintain the agent task list |
-| Task | `task` | Launch sub-agents (build/explore/general/plan) for complex tasks; resumable via `task_id` |
+| Todo Read/Write | `todoread` / `todowrite` | Maintain the conversation's task list (persisted per session, survives restarts) |
+| Task | `task` | Launch sub-agents (build/explore/general/plan plus config-defined agents) for complex tasks; resumable via `task_id` |
 | Skill | `skill` | Load skill instructions from config-declared `SKILL.md` directories into the conversation |
 | MCP tools | varies | Tools loaded from configured MCP servers (stdio or SSE) |
 
@@ -215,6 +220,14 @@ in the project directory, then `~/.gewu/config.json(c)`. If both `.json` and
   "log": "gewu-requests.jsonl",              // record every wire LLM request/response as JSONL
   "sandbox": "none",                         // path confinement: "none" | "contain" | "strict"
   "skills": ["skills"],                      // directories scanned for SKILL.md
+  "agents": {                                // user-defined agents, spawnable via `task`
+    "code-reviewer": {
+      "base": "general",                     // built-in profile providing the tools (required)
+      "description": "Reviews diffs for bugs and style",  // shown to the model (required)
+      "instructions": "You are meticulous about error handling...",  // replaces the base prompt
+      "tools": ["read_file", "grep", "glob"] // narrows the base profile's tool set
+    }
+  },
   "mcpServers": {                            // MCP servers (stdio or SSE)
     "filesystem": {
       "command": "npx",
@@ -241,6 +254,16 @@ Credentials and URLs belong to endpoints; generation options (`max_tokens`,
 `reasoning_effort`, `context_limit`) belong to models. `reasoning_effort` is
 only supported for `openai` models. The previous top-level `models` and
 `providers` maps and top-level generation settings are not supported.
+
+Each `agents` entry defines a subagent spawnable via the `task` tool by the
+`build` and `general` profiles. `base` (one of `build`, `plan`, `explore`,
+`general`) supplies the tool set; `description` is required and shown to the
+model. `instructions`, when present, replace the base profile's system
+prompt entirely; otherwise the base prompt applies. `tools` narrows the base
+profile's tool set — it can only remove tools, and `task` is never included
+(subagents cannot delegate). Names must be unique letters/digits/`-`/`_` and
+cannot shadow built-in profiles. Config agents are not selectable as the
+primary agent.
 
 Provider credentials may instead come from `OPENAI_API_KEY`,
 `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, or `GLM_API_KEY`.

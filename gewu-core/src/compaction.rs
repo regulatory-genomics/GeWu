@@ -200,7 +200,12 @@ pub fn serialize_message(msg: &Message) -> Vec<String> {
             )];
             lines
         }
-        Message::Assistant { content, reasoning, tool_calls, .. } => {
+        Message::Assistant {
+            content,
+            reasoning,
+            tool_calls,
+            ..
+        } => {
             let _ = reasoning;
             let mut lines = Vec::new();
             if let Some(text) = content
@@ -294,14 +299,16 @@ pub fn build_checkpoint_message(summary: &str, recent: &str) -> Message {
 /// after (plus combine the prior summary).
 pub fn find_checkpoint(messages: &[Message]) -> Option<(String, String)> {
     if let Some(Message::Compaction { summary, recent }) = messages
-        .iter().rev().find(|m| matches!(m, Message::Compaction { .. }))
+        .iter()
+        .rev()
+        .find(|m| matches!(m, Message::Compaction { .. }))
     {
         return Some((summary.clone(), recent.clone()));
     }
     let msg = messages.iter().rev().find(|m| match m {
-        Message::User { content } => content.iter().any(
-            |p| matches!(p, ContentPart::Text { text } if text.starts_with(CHECKPOINT_OPEN)),
-        ),
+        Message::User { content } => content
+            .iter()
+            .any(|p| matches!(p, ContentPart::Text { text } if text.starts_with(CHECKPOINT_OPEN))),
         _ => false,
     })?;
     let text = match msg {
@@ -347,19 +354,22 @@ impl ContextMessage<'_> {
 
 impl<'a> ActiveContext<'a> {
     pub fn iter(&self) -> impl Iterator<Item = ContextMessage<'a>> + '_ {
-        self.messages.iter().enumerate().filter_map(move |(index, message)| {
-            if let Some(boundary) = self.boundary {
-                if index < boundary && !matches!(message, Message::System { .. }) {
-                    return None;
-                }
-                if index == boundary {
-                    if let Message::Compaction { summary, recent } = message {
-                        return Some(ContextMessage::Checkpoint(summary, recent));
+        self.messages
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, message)| {
+                if let Some(boundary) = self.boundary {
+                    if index < boundary && !matches!(message, Message::System { .. }) {
+                        return None;
+                    }
+                    if index == boundary {
+                        if let Message::Compaction { summary, recent } = message {
+                            return Some(ContextMessage::Checkpoint(summary, recent));
+                        }
                     }
                 }
-            }
-            Some(ContextMessage::Borrowed(message))
-        })
+                Some(ContextMessage::Borrowed(message))
+            })
     }
 
     pub fn estimate_tokens(&self) -> usize {
@@ -374,7 +384,9 @@ impl<'a> ActiveContext<'a> {
 pub fn active_context(messages: &[Message]) -> ActiveContext<'_> {
     ActiveContext {
         messages,
-        boundary: messages.iter().rposition(|message| matches!(message, Message::Compaction { .. })),
+        boundary: messages
+            .iter()
+            .rposition(|message| matches!(message, Message::Compaction { .. })),
     }
 }
 
@@ -382,11 +394,22 @@ pub fn active_context(messages: &[Message]) -> ActiveContext<'_> {
 /// into user text. Legacy checkpoints are recognized only at the original
 /// checkpoint position (the first non-system message), never in later input.
 pub fn compaction_body(messages: &[Message]) -> (Option<(&str, &str)>, &[Message]) {
-    if let Some(index) = messages.iter().rposition(|m| matches!(m, Message::Compaction { .. })) {
-        let Message::Compaction { summary, recent } = &messages[index] else { unreachable!() };
-        return (Some((summary.as_str(), recent.as_str())), &messages[index + 1..]);
+    if let Some(index) = messages
+        .iter()
+        .rposition(|m| matches!(m, Message::Compaction { .. }))
+    {
+        let Message::Compaction { summary, recent } = &messages[index] else {
+            unreachable!()
+        };
+        return (
+            Some((summary.as_str(), recent.as_str())),
+            &messages[index + 1..],
+        );
     }
-    let start = messages.iter().position(|m| !matches!(m, Message::System { .. })).unwrap_or(messages.len());
+    let start = messages
+        .iter()
+        .position(|m| !matches!(m, Message::System { .. }))
+        .unwrap_or(messages.len());
     let body = &messages[start..];
     let legacy = body.first().and_then(|message| match message {
         Message::User { content } => content.iter().find_map(|part| match part {
@@ -396,7 +419,10 @@ pub fn compaction_body(messages: &[Message]) -> (Option<(&str, &str)>, &[Message
         _ => None,
     });
     if let Some(checkpoint) = legacy.and_then(|text| {
-        Some((extract_tag_ref(text, "<summary>")?, extract_tag_ref(text, "<recent-context>")?))
+        Some((
+            extract_tag_ref(text, "<summary>")?,
+            extract_tag_ref(text, "<recent-context>")?,
+        ))
     }) {
         return (Some(checkpoint), &body[1..]);
     }

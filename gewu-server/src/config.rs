@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
+use gewu_providers::ProviderProfile;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tracing::warn;
-use gewu_providers::ProviderProfile;
-use std::collections::BTreeMap;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +31,26 @@ pub struct EndpointConfig {
 use gewu_core::types::PathEnforcement;
 use gewu_tools::mcp::types::McpServerConfig;
 
+/// Built-in agent profiles; config-defined agents derive from one of these
+/// and cannot shadow their names.
+pub const BUILTIN_AGENT_NAMES: &[&str] = &["build", "plan", "explore", "general"];
+
+/// A user-defined agent from the config file: a base profile plus optional
+/// overrides. Spawnable through the `task` tool (and later workflows);
+/// never selectable as the primary agent.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentEntry {
+    /// Built-in profile providing the tool set.
+    pub base: String,
+    /// Shown to the model in the task tool's agent list.
+    pub description: String,
+    /// Replaces the base profile's system prompt when present.
+    pub instructions: Option<String>,
+    /// Narrows the base profile's tool set to these names.
+    pub tools: Option<Vec<String>>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -53,6 +73,9 @@ pub struct Config {
     pub sandbox: PathEnforcement,
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
+    /// User-defined agents keyed by name; spawnable via the `task` tool.
+    #[serde(default)]
+    pub agents: BTreeMap<String, AgentEntry>,
 }
 
 #[derive(Debug)]
@@ -117,14 +140,74 @@ impl Config {
             self.resolve_model(model)?;
         }
         for (endpoint, settings) in &self.endpoints {
-            anyhow::ensure!(!endpoint.trim().is_empty() && !endpoint.contains('/'), "endpoint names must be nonempty and cannot contain '/'");
-            anyhow::ensure!(settings.base_url.starts_with("https://") || settings.base_url.starts_with("http://"), "endpoint '{endpoint}' needs an HTTP(S) base_url");
+            anyhow::ensure!(
+                !endpoint.trim().is_empty() && !endpoint.contains('/'),
+                "endpoint names must be nonempty and cannot contain '/'"
+            );
+            anyhow::ensure!(
+                settings.base_url.starts_with("https://")
+                    || settings.base_url.starts_with("http://"),
+                "endpoint '{endpoint}' needs an HTTP(S) base_url"
+            );
             for (name, model) in &settings.models {
-                anyhow::ensure!(!name.trim().is_empty(), "model catalog keys cannot be empty");
-                anyhow::ensure!(model.model.as_ref().is_none_or(|id| !id.trim().is_empty()), "API model ID for '{name}' cannot be empty");
-                anyhow::ensure!(model.max_tokens != Some(0) && model.context_limit != Some(0), "model '{endpoint}/{name}' limits must be positive");
+                anyhow::ensure!(
+                    !name.trim().is_empty(),
+                    "model catalog keys cannot be empty"
+                );
+                anyhow::ensure!(
+                    model.model.as_ref().is_none_or(|id| !id.trim().is_empty()),
+                    "API model ID for '{name}' cannot be empty"
+                );
+                anyhow::ensure!(
+                    model.max_tokens != Some(0) && model.context_limit != Some(0),
+                    "model '{endpoint}/{name}' limits must be positive"
+                );
                 if model.reasoning_summary.is_some() {
-                    anyhow::ensure!(model.provider == ProviderProfile::Openai, "reasoning_summary is only supported by openai models ({endpoint}/{name})");
+                    anyhow::ensure!(
+                        model.provider == ProviderProfile::Openai,
+                        "reasoning_summary is only supported by openai models ({endpoint}/{name})"
+                    );
+                }
+            }
+        }
+        for (name, agent) in &self.agents {
+            anyhow::ensure!(
+                !name.trim().is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "agent name '{name}' must be nonempty and use only letters, digits, '-' or '_'"
+            );
+            anyhow::ensure!(
+                !BUILTIN_AGENT_NAMES.contains(&name.as_str()),
+                "agent name '{name}' collides with a built-in profile"
+            );
+            anyhow::ensure!(
+                BUILTIN_AGENT_NAMES.contains(&agent.base.as_str()),
+                "agent '{name}': unknown base profile '{}' (expected one of {})",
+                agent.base,
+                BUILTIN_AGENT_NAMES.join(", ")
+            );
+            anyhow::ensure!(
+                !agent.description.trim().is_empty(),
+                "agent '{name}' needs a nonempty description"
+            );
+            if let Some(instructions) = &agent.instructions {
+                anyhow::ensure!(
+                    !instructions.trim().is_empty(),
+                    "agent '{name}': instructions cannot be empty"
+                );
+            }
+            if let Some(tools) = &agent.tools {
+                anyhow::ensure!(
+                    !tools.is_empty(),
+                    "agent '{name}': tools cannot be an empty list (omit it to keep the base profile's tools)"
+                );
+                for tool in tools {
+                    anyhow::ensure!(
+                        !tool.trim().is_empty(),
+                        "agent '{name}': tool names cannot be empty"
+                    );
                 }
             }
         }
@@ -132,9 +215,17 @@ impl Config {
     }
 
     pub fn resolve_model(&self, selected: &str) -> Result<(&EndpointConfig, &ModelConfig, &str)> {
-        let (endpoint, name) = selected.split_once('/').context("model selector must be endpoint/model")?;
-        let settings = self.endpoints.get(endpoint).with_context(|| format!("unknown endpoint '{endpoint}'"))?;
-        let (key, model) = settings.models.get_key_value(name).with_context(|| format!("unknown model '{selected}'"))?;
+        let (endpoint, name) = selected
+            .split_once('/')
+            .context("model selector must be endpoint/model")?;
+        let settings = self
+            .endpoints
+            .get(endpoint)
+            .with_context(|| format!("unknown endpoint '{endpoint}'"))?;
+        let (key, model) = settings
+            .models
+            .get_key_value(name)
+            .with_context(|| format!("unknown model '{selected}'"))?;
         Ok((settings, model, key.as_str()))
     }
 }
@@ -196,9 +287,21 @@ mod tests {
             "base_url":"https://example.com/v1","models":{"vendor/model":{"provider":"openai", "max_tokens":1}}
         }}})).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.resolve_model("shared/vendor/model").unwrap().2,"vendor/model");
-        for selected in ["shared", "missing/model", "shared/missing"] { assert!(config.resolve_model(selected).is_err()); }
-        config.endpoints.get_mut("shared").unwrap().models.get_mut("vendor/model").unwrap().max_tokens = Some(0);
+        assert_eq!(
+            config.resolve_model("shared/vendor/model").unwrap().2,
+            "vendor/model"
+        );
+        for selected in ["shared", "missing/model", "shared/missing"] {
+            assert!(config.resolve_model(selected).is_err());
+        }
+        config
+            .endpoints
+            .get_mut("shared")
+            .unwrap()
+            .models
+            .get_mut("vendor/model")
+            .unwrap()
+            .max_tokens = Some(0);
         assert!(config.validate().is_err());
         let config: Config = serde_json::from_value(serde_json::json!({"endpoints":{"shared":{
             "base_url":"https://example.com/v1","models":{"glm":{"provider":"glm", "reasoning_effort":"high"}}
@@ -212,7 +315,10 @@ mod tests {
         assert!(serde_json::from_str::<ModelConfig>(r#"{"provider":"typo"}"#).is_err());
         let config: Config = serde_json::from_str(r#"{"model":"west/m","endpoints":{"west":{"base_url":"https://example.com/v1","models":{"m":{"provider":"deepseek"}}}}}"#).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.endpoints["west"].models["m"].provider, ProviderProfile::Deepseek);
+        assert_eq!(
+            config.endpoints["west"].models["m"].provider,
+            ProviderProfile::Deepseek
+        );
         assert!(config.endpoints["west"].models["m"].model.is_none());
     }
 
@@ -220,7 +326,13 @@ mod tests {
     fn rejects_invalid_defaults_and_removed_settings() {
         let config: Config = serde_json::from_str(r#"{"model":"missing"}"#).unwrap();
         assert!(config.validate().is_err());
-        for field in ["reasoning_field", "require_reasoning", "provider", "api_key", "base_url"] {
+        for field in [
+            "reasoning_field",
+            "require_reasoning",
+            "provider",
+            "api_key",
+            "base_url",
+        ] {
             assert!(serde_json::from_str::<Config>(&format!(r#"{{"{field}":null}}"#)).is_err());
         }
     }
@@ -239,13 +351,15 @@ mod tests {
 
     #[test]
     fn parses_max_tokens_option() {
-        let config: ModelConfig = serde_json::from_str(r#"{"provider":"openai", "max_tokens": 65536}"#).unwrap();
+        let config: ModelConfig =
+            serde_json::from_str(r#"{"provider":"openai", "max_tokens": 65536}"#).unwrap();
         assert_eq!(config.max_tokens, Some(65536));
     }
 
     #[test]
     fn parses_context_limit_option() {
-        let config: ModelConfig = serde_json::from_str(r#"{"provider":"glm", "context_limit": 131072}"#).unwrap();
+        let config: ModelConfig =
+            serde_json::from_str(r#"{"provider":"glm", "context_limit": 131072}"#).unwrap();
         assert_eq!(config.context_limit, Some(131_072));
         let config: ModelConfig = serde_json::from_str(r#"{"provider":"glm"}"#).unwrap();
         assert_eq!(config.context_limit, None);
@@ -290,5 +404,89 @@ mod tests {
             assert_eq!(config.sandbox, expected, "parsing {text}");
         }
         assert!(serde_json::from_str::<Config>("{\"sandbox\": \"yolo\"}").is_err());
+    }
+
+    #[test]
+    fn parses_agents_option() {
+        let config: Config = serde_json::from_str(
+            r#"{"agents":{"reviewer":{"base":"general","description":"Reviews diffs","instructions":"Be meticulous","tools":["read_file","grep"]}}}"#,
+        )
+        .unwrap();
+        let agent = config.agents.get("reviewer").unwrap();
+        assert_eq!(agent.base, "general");
+        assert_eq!(agent.description, "Reviews diffs");
+        assert_eq!(agent.instructions.as_deref(), Some("Be meticulous"));
+        assert_eq!(
+            agent.tools.as_ref().unwrap(),
+            &["read_file".to_string(), "grep".to_string()]
+        );
+    }
+
+    #[test]
+    fn agents_is_optional() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.agents.is_empty());
+    }
+
+    #[test]
+    fn agent_entries_reject_unknown_fields() {
+        assert!(
+            serde_json::from_str::<Config>(
+                r#"{"agents":{"r":{"base":"general","description":"d","model":"x"}}}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validates_agent_entries() {
+        serde_json::from_str::<Config>(
+            r#"{"agents":{"reviewer":{"base":"explore","description":"d"}}}"#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+
+        for (text, needle) in [
+            (
+                r#"{"agents":{"":{"base":"general","description":"d"}}}"#,
+                "nonempty",
+            ),
+            (
+                r#"{"agents":{"bad name":{"base":"general","description":"d"}}}"#,
+                "letters, digits",
+            ),
+            (
+                r#"{"agents":{"build":{"base":"general","description":"d"}}}"#,
+                "collides",
+            ),
+            (
+                r#"{"agents":{"reviewer":{"base":"nope","description":"d"}}}"#,
+                "unknown base profile",
+            ),
+            (
+                r#"{"agents":{"reviewer":{"base":"general","description":"  "}}}"#,
+                "nonempty description",
+            ),
+            (
+                r#"{"agents":{"reviewer":{"base":"general","description":"d","instructions":"  "}}}"#,
+                "instructions cannot be empty",
+            ),
+            (
+                r#"{"agents":{"reviewer":{"base":"general","description":"d","tools":[]}}}"#,
+                "tools cannot be an empty list",
+            ),
+            (
+                r#"{"agents":{"reviewer":{"base":"general","description":"d","tools":["read_file","  "]}}}"#,
+                "tool names cannot be empty",
+            ),
+        ] {
+            let err = serde_json::from_str::<Config>(text)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "unexpected error for {text}: {err}");
+        }
     }
 }

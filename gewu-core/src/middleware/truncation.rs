@@ -99,7 +99,11 @@ impl TruncationService {
         let mut bytes = 0;
         let mut hit_bytes = false;
 
-        for (i, line) in lines.iter().enumerate().take(lines.len().min(self.max_lines)) {
+        for (i, line) in lines
+            .iter()
+            .enumerate()
+            .take(lines.len().min(self.max_lines))
+        {
             let line_size = line.len() + if i > 0 { 1 } else { 0 };
             if bytes + line_size > self.max_bytes {
                 hit_bytes = true;

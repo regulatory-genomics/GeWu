@@ -58,27 +58,24 @@ pub async fn execute_tool_with_panic_recovery(
             match join_err.try_into_panic() {
                 Ok(panic_payload) => {
                     let panic_msg = extract_panic_message(panic_payload);
-                    Err(Box::new(std::io::Error::other(
-                        format!(
-                            "Tool '{}' panicked during execution: {}. This may indicate an issue \
+                    Err(Box::new(std::io::Error::other(format!(
+                        "Tool '{}' panicked during execution: {}. This may indicate an issue \
                             with the tool implementation or invalid input. Consider adjusting the \
                             tool arguments or checking the tool's requirements.",
-                            tool_name, panic_msg
-                        ),
-                    )) as Box<dyn Error + Send + Sync>)
+                        tool_name, panic_msg
+                    ))) as Box<dyn Error + Send + Sync>)
                 }
                 // Could not retrieve panic payload (rare, e.g., if payload is !Send)
-                Err(_) => Err(Box::new(std::io::Error::other(
-                    format!(
-                        "Tool '{}' panicked but could not retrieve panic message",
-                        tool_name
-                    ),
-                )) as Box<dyn Error + Send + Sync>),
+                Err(_) => Err(Box::new(std::io::Error::other(format!(
+                    "Tool '{}' panicked but could not retrieve panic message",
+                    tool_name
+                ))) as Box<dyn Error + Send + Sync>),
             }
         }
         // Task was cancelled (e.g., runtime shutdown)
-        Err(_) => Err(Box::new(std::io::Error::other(
-            format!("Tool '{}' task was cancelled", tool_name),
-        )) as Box<dyn Error + Send + Sync>),
+        Err(_) => Err(Box::new(std::io::Error::other(format!(
+            "Tool '{}' task was cancelled",
+            tool_name
+        ))) as Box<dyn Error + Send + Sync>),
     }
 }

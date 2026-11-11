@@ -6,7 +6,10 @@
 use anyhow::{Context, Result};
 use gewu_core::traits::{LlmProvider, RequestLog};
 use gewu_core::types::PathEnforcement;
-use gewu_providers::{AnthropicProvider, ChatCompletionsProvider, DeepSeekProvider, GlmProvider, MoonshotProvider, OpenAIProvider, ProviderProfile};
+use gewu_providers::{
+    AnthropicProvider, ChatCompletionsProvider, DeepSeekProvider, GlmProvider, MoonshotProvider,
+    OpenAIProvider, ProviderProfile,
+};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
 use std::collections::BTreeMap;
@@ -95,6 +98,9 @@ pub struct Bootstrap {
     pub models: BTreeMap<String, ModelEntry>,
     /// The default model's selector (the key it occupies in `models`).
     pub model_selector: String,
+    /// User-defined agents from the config file, spawnable via the `task`
+    /// tool.
+    pub agents: Arc<BTreeMap<String, crate::config::AgentEntry>>,
 }
 
 /// Initialize tracing from the `--log-level` flag.
@@ -164,32 +170,58 @@ pub fn build_provider(
     file_config: &crate::config::Config,
 ) -> Result<(Arc<dyn LlmProvider>, String, String)> {
     file_config.validate()?;
-    let selected = args.model.clone()
+    let selected = args
+        .model
+        .clone()
         .or_else(|| env::var("OPENAI_MODEL").ok())
         .or_else(|| file_config.model.clone())
         .context("select a configured model with --model or the config's model field")?;
-    let resolved = if file_config.endpoints.is_empty() { None } else { Some(file_config.resolve_model(&selected)?) };
+    let resolved = if file_config.endpoints.is_empty() {
+        None
+    } else {
+        Some(file_config.resolve_model(&selected)?)
+    };
     let entry = resolved.map(|(_, entry, _)| entry);
-    let override_provider = args.provider.clone().or_else(|| env::var("GEWU_PROVIDER").ok());
+    let override_provider = args
+        .provider
+        .clone()
+        .or_else(|| env::var("GEWU_PROVIDER").ok());
     let profile = if let Some(entry) = entry {
         if let Some(name) = &override_provider {
-            anyhow::ensure!(name.parse::<ProviderProfile>().map_err(anyhow::Error::msg)? == entry.provider,
-                "provider override conflicts with provider assigned to model '{selected}'");
+            anyhow::ensure!(
+                name.parse::<ProviderProfile>()
+                    .map_err(anyhow::Error::msg)?
+                    == entry.provider,
+                "provider override conflicts with provider assigned to model '{selected}'"
+            );
         }
         entry.provider
     } else {
-        override_provider.context("--provider is required for direct CLI model selection")?
-            .parse::<ProviderProfile>().map_err(anyhow::Error::msg)?
+        override_provider
+            .context("--provider is required for direct CLI model selection")?
+            .parse::<ProviderProfile>()
+            .map_err(anyhow::Error::msg)?
     };
     let settings = resolved.map(|(endpoint, _, _)| endpoint);
-    let model = entry.and_then(|entry| entry.model.clone()).unwrap_or_else(|| resolved.map(|(_, _, name)| name.to_string()).unwrap_or(selected));
+    let model = entry
+        .and_then(|entry| entry.model.clone())
+        .unwrap_or_else(|| {
+            resolved
+                .map(|(_, _, name)| name.to_string())
+                .unwrap_or(selected)
+        });
     let max_tokens = entry.and_then(|entry| entry.max_tokens);
     let api_key = args
         .api_key
         .clone()
         .or_else(|| env::var(profile.api_key_env()).ok())
         .or_else(|| settings.and_then(|settings| settings.api_key.clone()))
-        .with_context(|| format!("API key required: use --api-key, {}, or endpoints.<name>.api_key", profile.api_key_env()))?;
+        .with_context(|| {
+            format!(
+                "API key required: use --api-key, {}, or endpoints.<name>.api_key",
+                profile.api_key_env()
+            )
+        })?;
 
     let base_url = args
         .base_url
@@ -229,7 +261,9 @@ fn construct_provider(
     let provider: Arc<dyn LlmProvider> = match profile {
         ProviderProfile::Anthropic => {
             let mut builder = AnthropicProvider::new_with_endpoint(api_key, base_url, model);
-            if let Some(effort) = reasoning_effort { builder = builder.with_reasoning_effort(effort); }
+            if let Some(effort) = reasoning_effort {
+                builder = builder.with_reasoning_effort(effort);
+            }
             if let Some(max_tokens) = max_tokens {
                 builder = builder.with_max_tokens(max_tokens);
             }
@@ -240,30 +274,48 @@ fn construct_provider(
             Arc::new(builder)
         }
         ProviderProfile::Deepseek => {
-            let mut provider = DeepSeekProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens);
-            if let Some(effort) = reasoning_effort { provider = provider.with_reasoning_effort(effort); }
+            let mut provider = DeepSeekProvider::new_with_endpoint(api_key, base_url, model)
+                .with_max_tokens(max_tokens);
+            if let Some(effort) = reasoning_effort {
+                provider = provider.with_reasoning_effort(effort);
+            }
             Arc::new(provider)
         }
         ProviderProfile::Glm => {
-            let mut provider = GlmProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens);
-            if let Some(effort) = reasoning_effort { provider = provider.with_reasoning_effort(effort); }
+            let mut provider = GlmProvider::new_with_endpoint(api_key, base_url, model)
+                .with_max_tokens(max_tokens);
+            if let Some(effort) = reasoning_effort {
+                provider = provider.with_reasoning_effort(effort);
+            }
             Arc::new(provider)
         }
         ProviderProfile::Moonshot => {
-            let mut provider = MoonshotProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens);
-            if let Some(effort) = reasoning_effort { provider = provider.with_reasoning_effort(effort); }
+            let mut provider = MoonshotProvider::new_with_endpoint(api_key, base_url, model)
+                .with_max_tokens(max_tokens);
+            if let Some(effort) = reasoning_effort {
+                provider = provider.with_reasoning_effort(effort);
+            }
             Arc::new(provider)
         }
         ProviderProfile::Openai => {
             let mut provider = OpenAIProvider::new_with_endpoint(api_key, base_url, model);
-            if let Some(enabled) = reasoning_summary { provider = provider.with_reasoning_summary(enabled); }
-            if let Some(limit) = max_tokens { provider = provider.with_max_output_tokens(limit)?; }
-            if let Some(effort) = reasoning_effort { provider = provider.with_reasoning_effort(effort)?; }
+            if let Some(enabled) = reasoning_summary {
+                provider = provider.with_reasoning_summary(enabled);
+            }
+            if let Some(limit) = max_tokens {
+                provider = provider.with_max_output_tokens(limit)?;
+            }
+            if let Some(effort) = reasoning_effort {
+                provider = provider.with_reasoning_effort(effort)?;
+            }
             Arc::new(provider)
         }
         ProviderProfile::OpenaiCompatible => {
-            let mut provider = ChatCompletionsProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens);
-            if let Some(effort) = reasoning_effort { provider = provider.with_reasoning_effort(effort); }
+            let mut provider = ChatCompletionsProvider::new_with_endpoint(api_key, base_url, model)
+                .with_max_tokens(max_tokens);
+            if let Some(effort) = reasoning_effort {
+                provider = provider.with_reasoning_effort(effort);
+            }
             Arc::new(provider)
         }
     };
@@ -306,12 +358,17 @@ pub fn build_model_catalog(
                 model_config.reasoning_summary,
             ) {
                 Ok(provider) => {
-                    catalog.insert(selector.clone(), ModelEntry {
-                        provider,
-                        provider_name: profile.id().to_string(),
-                        label,
-                        context_limit: model_config.context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT),
-                    });
+                    catalog.insert(
+                        selector.clone(),
+                        ModelEntry {
+                            provider,
+                            provider_name: profile.id().to_string(),
+                            label,
+                            context_limit: model_config
+                                .context_limit
+                                .unwrap_or(DEFAULT_CONTEXT_LIMIT),
+                        },
+                    );
                 }
                 Err(e) => warn!("model '{selector}' is not switchable: {e}"),
             }
@@ -320,9 +377,18 @@ pub fn build_model_catalog(
     catalog
 }
 
-fn selected_context_limit(args: &CommonArgs, config: &crate::config::Config) -> Result<Option<usize>> {
-    if config.endpoints.is_empty() { return Ok(None); }
-    let selected = args.model.clone().or_else(|| env::var("OPENAI_MODEL").ok()).or_else(|| config.model.clone())
+fn selected_context_limit(
+    args: &CommonArgs,
+    config: &crate::config::Config,
+) -> Result<Option<usize>> {
+    if config.endpoints.is_empty() {
+        return Ok(None);
+    }
+    let selected = args
+        .model
+        .clone()
+        .or_else(|| env::var("OPENAI_MODEL").ok())
+        .or_else(|| config.model.clone())
         .context("select a configured model")?;
     Ok(config.resolve_model(&selected)?.1.context_limit)
 }
@@ -364,12 +430,15 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
     // display name.
     let model_selector = if file_config.endpoints.is_empty() {
         let selector = model.clone();
-        models.insert(selector.clone(), ModelEntry {
-            provider: provider.clone(),
-            provider_name: provider_name.clone(),
-            label: model.clone(),
-            context_limit: context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT),
-        });
+        models.insert(
+            selector.clone(),
+            ModelEntry {
+                provider: provider.clone(),
+                provider_name: provider_name.clone(),
+                label: model.clone(),
+                context_limit: context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT),
+            },
+        );
         selector
     } else {
         // `build_provider` validated the selection, so the entry exists.
@@ -379,15 +448,20 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
             .or_else(|| env::var("OPENAI_MODEL").ok())
             .or_else(|| file_config.model.clone())
             .expect("build_provider validated the selected model");
-        models.entry(selected.clone()).or_insert_with(|| ModelEntry {
-            provider: provider.clone(),
-            provider_name: provider_name.clone(),
-            label: model.clone(),
-            context_limit: context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT),
-        });
+        models
+            .entry(selected.clone())
+            .or_insert_with(|| ModelEntry {
+                provider: provider.clone(),
+                provider_name: provider_name.clone(),
+                label: model.clone(),
+                context_limit: context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT),
+            });
         selected
     };
-    info!("Switchable models: {}", models.keys().cloned().collect::<Vec<_>>().join(", "));
+    info!(
+        "Switchable models: {}",
+        models.keys().cloned().collect::<Vec<_>>().join(", ")
+    );
 
     let db_path = resolve_db_path(args.db_path.clone())?;
     info!("Using database: {}", db_path);
@@ -429,6 +503,7 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
         context_limit,
         models,
         model_selector,
+        agents: Arc::new(file_config.agents.clone()),
     })
 }
 
@@ -450,58 +525,117 @@ mod tests {
                 "gpt": {"provider":"openai", "model":"gpt-api-id", "max_tokens":4096, "reasoning_effort":"high"}
             }}}
         })).unwrap();
-        for (key, profile, budget) in [("glm", "glm",1024), ("deepseek","deepseek",2048), ("gpt","openai",4096)] {
-            let args = CommonArgs { model:Some(format!("shared/{key}")), api_key:Some("shared-key".into()),
-                base_url:Some("https://example.com/v1".into()), provider:Some(profile.into()), ..Default::default() };
-            let (provider, actual, model) = build_provider(&args,&config).unwrap();
-            assert_eq!(actual,profile);
-            let payload = provider.build(&[],&[]).unwrap();
-            assert_eq!(payload[if key == "gpt" {"max_output_tokens"} else {"max_tokens"}],budget);
-            assert_eq!(model,if key == "gpt" {"gpt-api-id"} else {key});
-            assert_eq!(selected_context_limit(&args,&config).unwrap(),if key == "glm" {Some(131072)} else {None});
+        for (key, profile, budget) in [
+            ("glm", "glm", 1024),
+            ("deepseek", "deepseek", 2048),
+            ("gpt", "openai", 4096),
+        ] {
+            let args = CommonArgs {
+                model: Some(format!("shared/{key}")),
+                api_key: Some("shared-key".into()),
+                base_url: Some("https://example.com/v1".into()),
+                provider: Some(profile.into()),
+                ..Default::default()
+            };
+            let (provider, actual, model) = build_provider(&args, &config).unwrap();
+            assert_eq!(actual, profile);
+            let payload = provider.build(&[], &[]).unwrap();
+            assert_eq!(
+                payload[if key == "gpt" {
+                    "max_output_tokens"
+                } else {
+                    "max_tokens"
+                }],
+                budget
+            );
+            assert_eq!(model, if key == "gpt" { "gpt-api-id" } else { key });
+            assert_eq!(
+                selected_context_limit(&args, &config).unwrap(),
+                if key == "glm" { Some(131072) } else { None }
+            );
         }
     }
 
     #[test]
     fn configured_model_selects_provider_and_api_model_id() {
         let config = serde_json::from_str(r#"{"model":"west/coding","endpoints":{"west":{"base_url":"https://example.com/v1","api_key":"test","models":{"coding":{"provider":"deepseek","model":"deepseek-reasoner"}}}}}"#).unwrap();
-        let args = CommonArgs { api_key: Some("test".into()), model: Some("west/coding".into()), provider: Some("deepseek".into()), ..Default::default() };
+        let args = CommonArgs {
+            api_key: Some("test".into()),
+            model: Some("west/coding".into()),
+            provider: Some("deepseek".into()),
+            ..Default::default()
+        };
         let (_, provider, model) = build_provider(&args, &config).unwrap();
         assert_eq!(provider, "deepseek");
         assert_eq!(model, "deepseek-reasoner");
-        let conflict = CommonArgs { provider: Some("openai".into()), ..args.clone() };
+        let conflict = CommonArgs {
+            provider: Some("openai".into()),
+            ..args.clone()
+        };
         assert!(build_provider(&conflict, &config).is_err());
-        let unknown = CommonArgs { model: Some("missing".into()), ..args };
+        let unknown = CommonArgs {
+            model: Some("missing".into()),
+            ..args
+        };
         assert!(build_provider(&unknown, &config).is_err());
     }
 
     #[test]
     fn startup_constructs_service_specific_providers() {
-        for (name, field) in [("deepseek", "reasoning_content"), ("moonshot", "reasoning_content"), ("glm", "reasoning")] {
+        for (name, field) in [
+            ("deepseek", "reasoning_content"),
+            ("moonshot", "reasoning_content"),
+            ("glm", "reasoning"),
+        ] {
             let config = serde_json::from_value(serde_json::json!({
                 "endpoints": {"west": {"base_url": "https://example.com/v1", "models": {"coding": {"provider": name, "model": "arbitrary-model"}}}}
             })).unwrap();
             let args = CommonArgs {
-                api_key: Some("key".into()), model: Some("west/coding".into()),
-                provider: Some(name.into()), base_url: Some("https://example.com/v1".into()),
+                api_key: Some("key".into()),
+                model: Some("west/coding".into()),
+                provider: Some(name.into()),
+                base_url: Some("https://example.com/v1".into()),
                 ..Default::default()
             };
             let (provider, selected, model) = build_provider(&args, &config).unwrap();
             assert_eq!(selected, name);
             assert_eq!(model, "arbitrary-model");
-            let payload = provider.build(&[gewu_core::types::Message::Assistant {
-                content: Some("answer".into()), reasoning: None, replay: None, tool_calls: None,
-            }], &[]).unwrap();
+            let payload = provider
+                .build(
+                    &[gewu_core::types::Message::Assistant {
+                        content: Some("answer".into()),
+                        reasoning: None,
+                        replay: None,
+                        tool_calls: None,
+                    }],
+                    &[],
+                )
+                .unwrap();
             assert!(payload["messages"][0].get(field).is_none());
         }
     }
 
     #[test]
     fn arbitrary_effort_is_forwarded_in_provider_native_shape() {
-        for profile in [ProviderProfile::Openai, ProviderProfile::Glm, ProviderProfile::Deepseek,
-            ProviderProfile::Moonshot, ProviderProfile::OpenaiCompatible, ProviderProfile::Anthropic] {
+        for profile in [
+            ProviderProfile::Openai,
+            ProviderProfile::Glm,
+            ProviderProfile::Deepseek,
+            ProviderProfile::Moonshot,
+            ProviderProfile::OpenaiCompatible,
+            ProviderProfile::Anthropic,
+        ] {
             for effort in ["max", "vendor-custom", ""] {
-                let provider = construct_provider(profile, "key", "https://example.com/v1", "model", None, Some(effort), None).unwrap();
+                let provider = construct_provider(
+                    profile,
+                    "key",
+                    "https://example.com/v1",
+                    "model",
+                    None,
+                    Some(effort),
+                    None,
+                )
+                .unwrap();
                 let body = provider.build(&[], &[]).unwrap();
                 let forwarded = match profile {
                     ProviderProfile::Openai => &body["reasoning"]["effort"],
@@ -524,11 +658,19 @@ mod tests {
         let (provider, _, _) = build_provider(&args, &config).unwrap();
         assert!(provider.build(&[], &[]).unwrap().get("reasoning").is_none());
         let catalog = build_model_catalog(&args, &config);
-        assert!(catalog["relay/gpt"].provider.build(&[], &[]).unwrap().get("reasoning").is_none());
+        assert!(
+            catalog["relay/gpt"]
+                .provider
+                .build(&[], &[])
+                .unwrap()
+                .get("reasoning")
+                .is_none()
+        );
         let invalid: crate::config::Config = serde_json::from_value(serde_json::json!({
             "endpoints":{"relay":{"base_url":"https://example.com/v1",
                 "models":{"chat":{"provider":"openai-compatible", "reasoning_summary":false}}}}
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(invalid.validate().is_err());
     }
 
@@ -540,10 +682,13 @@ mod tests {
                     "provider": name, "model": "test-model", "max_tokens": 2048,
                     "reasoning_effort": if name == "openai" { Some("high") } else { None }
                 }}}}
-            })).unwrap();
+            }))
+            .unwrap();
             let args = CommonArgs {
-                api_key: Some("key".into()), model: Some("west/coding".into()),
-                provider: Some(name.into()), base_url: Some("https://example.com/v1".into()),
+                api_key: Some("key".into()),
+                model: Some("west/coding".into()),
+                provider: Some(name.into()),
+                base_url: Some("https://example.com/v1".into()),
                 ..Default::default()
             };
             let (provider, _, _) = build_provider(&args, &config).unwrap();
@@ -566,7 +711,13 @@ mod tests {
                 "fast": {"provider": "openai", "max_tokens": 4096}
             }}}
         })).unwrap();
-        let args = CommonArgs { api_key: Some("shared".into()), model: Some("west/coding".into()), base_url: Some("https://example.com/v1".into()), provider: Some("deepseek".into()), ..Default::default() };
+        let args = CommonArgs {
+            api_key: Some("shared".into()),
+            model: Some("west/coding".into()),
+            base_url: Some("https://example.com/v1".into()),
+            provider: Some("deepseek".into()),
+            ..Default::default()
+        };
         let catalog = build_model_catalog(&args, &config);
         let selectors: Vec<_> = catalog.keys().cloned().collect();
         assert_eq!(selectors, vec!["west/coding", "west/fast"]);
@@ -576,8 +727,14 @@ mod tests {
         assert_eq!(catalog["west/fast"].label, "fast");
         assert_eq!(catalog["west/fast"].provider_name, "openai");
         assert_eq!(catalog["west/fast"].context_limit, DEFAULT_CONTEXT_LIMIT);
-        assert_eq!(catalog["west/coding"].provider.build(&[], &[]).unwrap()["max_tokens"], 2048);
-        assert_eq!(catalog["west/fast"].provider.build(&[], &[]).unwrap()["max_output_tokens"], 4096);
+        assert_eq!(
+            catalog["west/coding"].provider.build(&[], &[]).unwrap()["max_tokens"],
+            2048
+        );
+        assert_eq!(
+            catalog["west/fast"].provider.build(&[], &[]).unwrap()["max_output_tokens"],
+            4096
+        );
     }
 
     #[test]

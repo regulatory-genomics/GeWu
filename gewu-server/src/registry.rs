@@ -1,19 +1,22 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use gewu_core::Agent;
 use gewu_core::traits::{LlmProvider, RequestLog, Tool, ToolRegistry};
-use gewu_core::types::{PathEnforcement, ToolContext, ToolResult};
-use gewu_storage::SqliteMemory;
+use gewu_core::types::{PathEnforcement, SessionState, ToolContext, ToolResult};
+use gewu_core::{Agent, AgentTemplate};
+use gewu_storage::{SqliteMemory, SqliteSessionStateStore};
 use gewu_tools::task::AgentFactory;
 use gewu_tools::{
-    ApplyPatchTool, BashTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool,
-    ListTool, ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoItem, TodoReadTool, TodoWriteTool,
-    WebFetchTool, WebSearchTool, WriteFileTool,
+    ApplyPatchTool, BashTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool, ListTool,
+    ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoReadTool, TodoWriteTool, WebFetchTool,
+    WebSearchTool, WriteFileTool,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::sync::{Arc, Mutex};
+
+use crate::config::AgentEntry;
 
 const RESERVED_ADDITIONAL_TOOL_NAMES: &[&str] = &[
     "apply_patch",
@@ -45,6 +48,9 @@ pub struct ProfileInputs<'a> {
     pub web_fetch: Arc<gewu_tools::WebFetchPolicy>,
     pub enforcement: PathEnforcement,
     pub context_limit: Option<usize>,
+    /// User-defined agents (from the config file) resolvable as subagent
+    /// profiles alongside the built-ins.
+    pub agents: Arc<BTreeMap<String, AgentEntry>>,
     pub session_id: &'a str,
 }
 
@@ -114,10 +120,10 @@ impl ToolRegistry for ToolRegistryImpl {
 
 /// Creates sub-agents through the CLI registry for the [`TaskTool`].
 ///
-/// Stateless: everything is derived from the factory's shared wiring plus
-/// the per-call arguments. The parent conversation arrives per call (from
-/// the task tool's [`ToolContext`]) so subagent lineage is recorded without
-/// the factory holding any session state.
+/// Per-profile templates (tools, prompt, limits) are built once and cached;
+/// spawning only supplies the per-session pieces. The parent conversation
+/// arrives per call (from the task tool's [`ToolContext`]) so subagent
+/// lineage is recorded without the factory holding any session state.
 struct SqliteAgentFactory {
     model_catalog: Option<ModelCatalog>,
     provider: Arc<dyn LlmProvider>,
@@ -127,6 +133,11 @@ struct SqliteAgentFactory {
     enforcement: PathEnforcement,
     /// Model context window forwarded to subagent agents for compaction.
     context_limit: Option<usize>,
+    /// User-defined agents resolvable as subagent profiles.
+    agents: Arc<BTreeMap<String, AgentEntry>>,
+    /// Cached per-profile templates: the expensive tool-registry/prompt
+    /// build runs once per profile, spawns clone it.
+    templates: Mutex<HashMap<String, AgentTemplate>>,
 }
 
 /// How deep `task` calls may nest: a top-level session may spawn subagents,
@@ -152,41 +163,112 @@ impl AgentFactory for SqliteAgentFactory {
         let (provider, context_limit) = if let Some(catalog) = &self.model_catalog {
             let selector = match gewu_storage::session_model(&self.pool, &session_id).await? {
                 Some(selected) => selected,
-                None => gewu_storage::session_model(&self.pool, parent_session).await?
+                None => gewu_storage::session_model(&self.pool, parent_session)
+                    .await?
                     .unwrap_or_else(|| catalog.default.clone()),
             };
-            let entry = catalog.entries.get(&selector)
+            let entry = catalog
+                .entries
+                .get(&selector)
                 .ok_or_else(|| format!("unknown subagent model: {selector}"))?;
             gewu_storage::set_session_model(&self.pool, &session_id, &selector).await?;
             (entry.provider.clone(), Some(entry.context_limit))
-        } else { (self.provider.clone(), self.context_limit) };
-        gewu_storage::record_subagent_session(&self.pool, &session_id, parent_session, subagent_type).await?;
-        let working_directory = std::env::current_dir()
-            .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
-        let (agent, _registry) = create_agent(
-            ProfileInputs {
-                model_catalog: self.model_catalog.clone(),
-                name: subagent_type,
-                provider,
-                pool: self.pool.clone(),
-                working_directory,
-                additional_tools: Vec::new(),
-                skills: self.skills.clone(),
-                web_fetch: self.web_fetch.clone(),
-                enforcement: self.enforcement,
-                context_limit,
-                session_id: &session_id,
-            },
-            None,
+        } else {
+            (self.provider.clone(), self.context_limit)
+        };
+        gewu_storage::record_subagent_session(
+            &self.pool,
+            &session_id,
+            parent_session,
+            subagent_type,
         )
-        .await
-        .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
+        .await?;
+        let template = self
+            .template_for(subagent_type)
+            .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
+        let memory = SqliteMemory::new(self.pool.clone(), session_id.clone()).await?;
+        // Restore the durable reminder state; a session without one (fresh,
+        // or created before reminders were persisted) starts from the
+        // profile default. The initial state is written immediately so it
+        // is durable from the first turn.
+        let reminder = match gewu_storage::get_reminder_opt(&self.pool, &session_id).await? {
+            Some(stored) => stored,
+            None => {
+                let initial = if subagent_type == "plan" {
+                    profile_reminder(None, subagent_type)
+                } else {
+                    gewu_core::agent::Reminder::default()
+                };
+                gewu_storage::set_reminder(&self.pool, &session_id, &initial).await?;
+                initial
+            }
+        };
+        let template = match context_limit {
+            Some(limit) => template.with_context_limit(limit),
+            None => template,
+        };
+        let agent =
+            template
+                .with_llm(provider)
+                .spawn(session_id.as_str(), Box::new(memory), reminder);
         Ok((agent, session_id))
+    }
+}
+
+impl SqliteAgentFactory {
+    /// Returns a cached [`AgentTemplate`] for `profile`, building it on
+    /// first use through the regular profile pipeline.
+    ///
+    /// Templates bake in the pool-backed session state, so spawned
+    /// subagents persist their tool state (todo lists, ...) in SQLite
+    /// under their session id. The LLM and context limit stay per-spawn:
+    /// model resolution happens per `create` call.
+    fn template_for(&self, profile: &str) -> Result<AgentTemplate> {
+        if let Some(template) = self
+            .templates
+            .lock()
+            .map_err(|_| anyhow!("agent template cache is poisoned"))?
+            .get(profile)
+        {
+            return Ok(template.clone());
+        }
+        let working_directory = std::env::current_dir()?;
+        let (tools, system_prompt, _registry) = agent_profile(ProfileInputs {
+            model_catalog: self.model_catalog.clone(),
+            name: profile,
+            provider: self.provider.clone(),
+            pool: self.pool.clone(),
+            working_directory,
+            additional_tools: Vec::new(),
+            skills: self.skills.clone(),
+            web_fetch: self.web_fetch.clone(),
+            enforcement: self.enforcement,
+            context_limit: self.context_limit,
+            agents: self.agents.clone(),
+            session_id: "",
+        })?;
+        let session_state =
+            SessionState::new(Arc::new(SqliteSessionStateStore::new(self.pool.clone())));
+        let template = Agent::builder()
+            .llm(self.provider.clone())
+            .with_tools(tools)
+            .system_prompt(&system_prompt)
+            .with_enforcement(self.enforcement)
+            .with_session_state(session_state)
+            .build()?
+            .template();
+        self.templates
+            .lock()
+            .map_err(|_| anyhow!("agent template cache is poisoned"))?
+            .insert(profile.to_string(), template.clone());
+        Ok(template)
     }
 }
 
 /// Builds the task tool wired to the CLI registry. `allowed` filters which
 /// subagent types are advertised and permitted; empty means all of them.
+/// Config-defined agents are advertised alongside the built-ins (still
+/// subject to `allowed`, so restricted profiles like plan never see them).
 fn task_tool(
     model_catalog: Option<ModelCatalog>,
     provider: Arc<dyn LlmProvider>,
@@ -195,6 +277,7 @@ fn task_tool(
     web_fetch: Arc<gewu_tools::WebFetchPolicy>,
     enforcement: PathEnforcement,
     context_limit: Option<usize>,
+    agents: Arc<BTreeMap<String, AgentEntry>>,
     allowed: &[&str],
 ) -> TaskTool {
     let factory = Arc::new(SqliteAgentFactory {
@@ -205,13 +288,20 @@ fn task_tool(
         web_fetch,
         enforcement,
         context_limit,
+        agents: agents.clone(),
+        templates: Mutex::new(HashMap::new()),
     });
-    let agents = list_available_agents()
+    let mut advertised: Vec<(String, String)> = list_available_agents()
         .into_iter()
         .filter(|a| allowed.is_empty() || allowed.contains(&a.name.as_str()))
         .map(|a| (a.name, a.description))
         .collect();
-    TaskTool::new(factory, agents)
+    for (name, entry) in agents.iter() {
+        if allowed.is_empty() || allowed.contains(&name.as_str()) {
+            advertised.push((name.clone(), entry.description.clone()));
+        }
+    }
+    TaskTool::new(factory, advertised)
 }
 
 fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle> {
@@ -224,13 +314,23 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
         skills,
         enforcement,
         context_limit,
+        agents,
         ..
     } = inputs;
     let mut tools: Vec<Box<dyn Tool>> = match *name {
         "build" => {
-            let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(inputs.model_catalog.clone(), provider.clone(), pool.clone(), skills.clone(), inputs.web_fetch.clone(), *enforcement, *context_limit, &[])),
+                Box::new(task_tool(
+                    inputs.model_catalog.clone(),
+                    provider.clone(),
+                    pool.clone(),
+                    skills.clone(),
+                    inputs.web_fetch.clone(),
+                    *enforcement,
+                    *context_limit,
+                    agents.clone(),
+                    &[],
+                )),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -259,26 +359,43 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 }),
                 Box::new(CodeSearchTool),
                 Box::new(WebSearchTool),
-                Box::new(TodoWriteTool::new(todos.clone())),
-                Box::new(TodoReadTool::new(todos.clone())),
+                Box::new(TodoWriteTool::default()),
+                Box::new(TodoReadTool::default()),
             ]
         }
         "plan" => {
-            let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(inputs.model_catalog.clone(), provider.clone(), pool.clone(), skills.clone(), inputs.web_fetch.clone(), *enforcement, *context_limit, &["explore"])),
-                Box::new(ReadFileTool { working_directory: working_directory.clone() }),
-                Box::new(GlobTool { working_directory: working_directory.clone() }),
-                Box::new(GrepTool { working_directory: working_directory.clone() }),
-                Box::new(ListTool { working_directory: working_directory.clone() }),
+                Box::new(task_tool(
+                    inputs.model_catalog.clone(),
+                    provider.clone(),
+                    pool.clone(),
+                    skills.clone(),
+                    inputs.web_fetch.clone(),
+                    *enforcement,
+                    *context_limit,
+                    agents.clone(),
+                    &["explore"],
+                )),
+                Box::new(ReadFileTool {
+                    working_directory: working_directory.clone(),
+                }),
+                Box::new(GlobTool {
+                    working_directory: working_directory.clone(),
+                }),
+                Box::new(GrepTool {
+                    working_directory: working_directory.clone(),
+                }),
+                Box::new(ListTool {
+                    working_directory: working_directory.clone(),
+                }),
                 Box::new(BashTool {
                     working_directory: working_directory.clone(),
                     safe_mode: false,
                 }),
                 Box::new(WebFetchTool::with_shared_policy(inputs.web_fetch.clone())),
                 Box::new(WebSearchTool),
-                Box::new(TodoWriteTool::new(todos.clone())),
-                Box::new(TodoReadTool::new(todos.clone())),
+                Box::new(TodoWriteTool::default()),
+                Box::new(TodoReadTool::default()),
             ]
         }
         "explore" => {
@@ -305,9 +422,18 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
             ]
         }
         "general" => {
-            let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(inputs.model_catalog.clone(), provider.clone(), pool.clone(), skills.clone(), inputs.web_fetch.clone(), *enforcement, *context_limit, &[])),
+                Box::new(task_tool(
+                    inputs.model_catalog.clone(),
+                    provider.clone(),
+                    pool.clone(),
+                    skills.clone(),
+                    inputs.web_fetch.clone(),
+                    *enforcement,
+                    *context_limit,
+                    agents.clone(),
+                    &[],
+                )),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -336,11 +462,20 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 }),
                 Box::new(CodeSearchTool),
                 Box::new(WebSearchTool),
-                Box::new(TodoWriteTool::new(todos.clone())),
-                Box::new(TodoReadTool::new(todos.clone())),
+                Box::new(TodoWriteTool::default()),
+                Box::new(TodoReadTool::default()),
             ]
         }
-        _ => return Err(anyhow!("Unknown agent type: {}", name)),
+        _ => {
+            let entry = agents
+                .get(*name)
+                .ok_or_else(|| anyhow!("Unknown agent type: {}", name))?;
+            let tools_arc = build_custom_agent_tools(inputs, entry)?;
+            let registry: Arc<dyn ToolRegistry> = Arc::new(ToolRegistryImpl {
+                tools: Arc::new(tools_arc.clone()),
+            });
+            return Ok((registry, tools_arc));
+        }
     };
 
     if !skills.is_empty() {
@@ -369,13 +504,69 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
     }
     // Additional tools (including MCP) have no read-only capability contract.
     // Never expose them in Plan, even indirectly through BatchTool.
-    if *name != "plan" { tools_arc.extend(additional_tools.iter().cloned()); }
+    if *name != "plan" {
+        tools_arc.extend(additional_tools.iter().cloned());
+    }
 
     let registry: Arc<dyn ToolRegistry> = Arc::new(ToolRegistryImpl {
         tools: Arc::new(tools_arc.clone()),
     });
 
     Ok((registry, tools_arc))
+}
+
+/// Builds the tool set for a config-defined agent: the base profile's tools,
+/// optionally narrowed by the entry's allowlist. Config agents never get
+/// `task`, so delegation stays one level deep (matching the factory's
+/// subagent depth limit).
+fn build_custom_agent_tools(
+    inputs: &ProfileInputs<'_>,
+    entry: &AgentEntry,
+) -> Result<Vec<Arc<dyn Tool>>> {
+    // Rebuild the base profile's tool set to narrow against. The base name
+    // is validated at config load, so this resolves a built-in. Subagents
+    // never receive MCP/additional tools.
+    let (_, base_tools) = build_tool_registry_and_list(&ProfileInputs {
+        model_catalog: inputs.model_catalog.clone(),
+        name: &entry.base,
+        provider: inputs.provider.clone(),
+        pool: inputs.pool.clone(),
+        working_directory: inputs.working_directory.clone(),
+        additional_tools: Vec::new(),
+        skills: inputs.skills.clone(),
+        web_fetch: inputs.web_fetch.clone(),
+        enforcement: inputs.enforcement,
+        context_limit: inputs.context_limit,
+        agents: inputs.agents.clone(),
+        session_id: inputs.session_id,
+    })?;
+    let tools: Vec<Arc<dyn Tool>> = match &entry.tools {
+        None => base_tools
+            .into_iter()
+            .filter(|tool| tool.name() != "task")
+            .collect(),
+        Some(requested) => {
+            anyhow::ensure!(
+                !requested.iter().any(|tool| tool == "task"),
+                "agent tool list cannot include 'task' (subagents cannot delegate)"
+            );
+            let known: std::collections::HashSet<_> =
+                base_tools.iter().map(|tool| tool.name()).collect();
+            for tool in requested {
+                anyhow::ensure!(
+                    known.contains(&tool.as_str()),
+                    "base profile '{}' has no tool '{}' (agent tool lists narrow the base profile)",
+                    entry.base,
+                    tool
+                );
+            }
+            base_tools
+                .into_iter()
+                .filter(|tool| requested.iter().any(|name| name == tool.name()))
+                .collect()
+        }
+    };
+    Ok(tools)
 }
 
 pub async fn create_agent(
@@ -392,6 +583,7 @@ pub async fn create_agent(
         web_fetch,
         enforcement,
         context_limit,
+        agents,
         session_id,
         ..
     } = inputs;
@@ -410,6 +602,7 @@ pub async fn create_agent(
         web_fetch,
         enforcement,
         context_limit,
+        agents,
         session_id,
     })?;
     let mut builder = Agent::builder()
@@ -420,7 +613,12 @@ pub async fn create_agent(
         .with_enforcement(enforcement)
         // Tools observe the real conversation identity (e.g. the task tool
         // records subagent lineage against it), not a random UUID.
-        .session_id(session_id);
+        .session_id(session_id)
+        // Per-session tool state (todo lists, ...) persists in SQLite under
+        // the same session id, so it survives restarts and profile switches.
+        .with_session_state(SessionState::new(Arc::new(SqliteSessionStateStore::new(
+            pool.clone(),
+        ))));
     // Restore the durable reminder state; a session without one (fresh, or
     // created before reminders were persisted) starts from the profile
     // default. The initial state is written immediately so it is durable
@@ -428,7 +626,11 @@ pub async fn create_agent(
     let reminder = match gewu_storage::get_reminder_opt(&pool, session_id).await? {
         Some(stored) => stored,
         None => {
-            let initial = if name == "plan" { profile_reminder(None, name) } else { gewu_core::agent::Reminder::default() };
+            let initial = if name == "plan" {
+                profile_reminder(None, name)
+            } else {
+                gewu_core::agent::Reminder::default()
+            };
             gewu_storage::set_reminder(&pool, session_id, &initial).await?;
             initial
         }
@@ -437,7 +639,9 @@ pub async fn create_agent(
     if let Some(limit) = context_limit {
         builder = builder.context_limit(limit);
     }
-    if let Some(log) = log { builder = builder.with_log(log); }
+    if let Some(log) = log {
+        builder = builder.with_log(log);
+    }
     Ok((builder.build()?, registry))
 }
 
@@ -458,6 +662,7 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
         web_fetch,
         enforcement,
         context_limit,
+        agents,
         session_id,
     } = inputs;
     let (registry, tools_arc) = build_tool_registry_and_list(&ProfileInputs {
@@ -471,22 +676,34 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
         web_fetch,
         enforcement,
         context_limit,
+        agents: agents.clone(),
         session_id,
     })?;
 
-    let mut system_prompt = match name {
-        "build" | "plan" => include_str!("prompts/build.txt"),
-        "explore" => include_str!("prompts/explore.txt"),
-        "general" => include_str!("prompts/general.txt"),
-        _ => return Err(anyhow!("Unknown agent type: {}", name)),
-    }
-    .to_string();
+    let mut system_prompt = match agents.get(name) {
+        Some(entry) => match &entry.instructions {
+            // Config-defined instructions replace the base prompt entirely.
+            Some(instructions) => instructions.clone(),
+            None => base_profile_prompt(&entry.base)?.to_string(),
+        },
+        None => base_profile_prompt(name)?.to_string(),
+    };
     if !skills.is_empty() {
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&gewu_tools::skill::available_skills_section(&skills));
     }
 
     Ok((tools_arc, system_prompt, registry))
+}
+
+/// The built-in system prompt for a profile name.
+fn base_profile_prompt(name: &str) -> Result<&'static str> {
+    match name {
+        "build" | "plan" => Ok(include_str!("prompts/build.txt")),
+        "explore" => Ok(include_str!("prompts/explore.txt")),
+        "general" => Ok(include_str!("prompts/general.txt")),
+        _ => Err(anyhow!("Unknown agent type: {}", name)),
+    }
 }
 
 /// Mode instructions live in conversation reminders, not the base prompt.
@@ -497,9 +714,9 @@ pub fn profile_reminder(previous: Option<&str>, target: &str) -> gewu_core::agen
             include_str!("prompts/switch-to-plan.txt"),
             Some(include_str!("prompts/plan-heartbeat.txt").into()),
         ),
-        "build" if previous == Some("plan") => Reminder::switch(
-            include_str!("prompts/switch-to-build.txt"), None,
-        ),
+        "build" if previous == Some("plan") => {
+            Reminder::switch(include_str!("prompts/switch-to-build.txt"), None)
+        }
         _ => Reminder::default(),
     }
 }
@@ -527,6 +744,7 @@ mod tests {
         let factory = SqliteAgentFactory {
             model_catalog: None, provider: Arc::new(DummyLlm), pool,
             skills: vec![], web_fetch: policy, enforcement: PathEnforcement::None, context_limit: None,
+            agents: Arc::new(BTreeMap::new()), templates: Mutex::new(HashMap::new()),
         };
         let (child, _) = factory.create("explore", None, "parent").await.unwrap();
         let error = child.execute("webfetch", serde_json::json!({"url":"http://127.0.0.1:9"}), &ToolContext::new("child", "m")).await.unwrap_err();
@@ -535,23 +753,62 @@ mod tests {
 
     #[tokio::test]
     async fn subagent_inherits_current_model_and_resume_keeps_its_selection() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
-        SqliteMemory::new(pool.clone(), "parent".into()).await.unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        SqliteMemory::new(pool.clone(), "parent".into())
+            .await
+            .unwrap();
         let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
-        let entries = [ ("old", 10_000), ("new", 50_000) ].into_iter().map(|(key, context_limit)| {
-            (key.into(), crate::bootstrap::ModelEntry { provider: provider.clone(), provider_name: key.into(),
-                label: key.into(), context_limit })
-        }).collect();
-        let factory = SqliteAgentFactory { model_catalog: Some(ModelCatalog { entries: Arc::new(entries), default: "old".into() }),
-            provider, pool: pool.clone(), skills: vec![], web_fetch: Arc::default(), enforcement: PathEnforcement::None, context_limit: Some(10_000) };
-        gewu_storage::set_session_model(&pool, "parent", "new").await.unwrap();
+        let entries = [("old", 10_000), ("new", 50_000)]
+            .into_iter()
+            .map(|(key, context_limit)| {
+                (
+                    key.into(),
+                    crate::bootstrap::ModelEntry {
+                        provider: provider.clone(),
+                        provider_name: key.into(),
+                        label: key.into(),
+                        context_limit,
+                    },
+                )
+            })
+            .collect();
+        let factory = SqliteAgentFactory {
+            model_catalog: Some(ModelCatalog {
+                entries: Arc::new(entries),
+                default: "old".into(),
+            }),
+            provider,
+            pool: pool.clone(),
+            skills: vec![],
+            web_fetch: Arc::default(),
+            enforcement: PathEnforcement::None,
+            context_limit: Some(10_000),
+            agents: Arc::new(BTreeMap::new()),
+            templates: Mutex::new(HashMap::new()),
+        };
+        gewu_storage::set_session_model(&pool, "parent", "new")
+            .await
+            .unwrap();
         let (child, id) = factory.create("explore", None, "parent").await.unwrap();
         assert_eq!(child.context_limit, 50_000);
-        assert_eq!(gewu_storage::session_model(&pool, &id).await.unwrap().as_deref(), Some("new"));
-        gewu_storage::set_session_model(&pool, "parent", "old").await.unwrap();
+        assert_eq!(
+            gewu_storage::session_model(&pool, &id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new")
+        );
+        gewu_storage::set_session_model(&pool, "parent", "old")
+            .await
+            .unwrap();
         let (resumed, _) = factory.create("explore", Some(id), "parent").await.unwrap();
         assert_eq!(resumed.context_limit, 50_000);
-        gewu_storage::set_session_model(&pool, "parent", "missing").await.unwrap();
+        gewu_storage::set_session_model(&pool, "parent", "missing")
+            .await
+            .unwrap();
         assert!(factory.create("explore", None, "parent").await.is_err());
     }
 
@@ -576,7 +833,18 @@ mod tests {
             web_fetch: Arc::default(),
             enforcement: PathEnforcement::Contain,
             context_limit: None,
+            agents: Arc::new(BTreeMap::new()),
             session_id,
+        }
+    }
+
+    /// A config-defined agent entry for tests.
+    fn custom_entry(base: &str, instructions: Option<&str>, tools: Option<&[&str]>) -> AgentEntry {
+        AgentEntry {
+            base: base.to_string(),
+            description: "test agent".to_string(),
+            instructions: instructions.map(str::to_string),
+            tools: tools.map(|list| list.iter().map(|t| t.to_string()).collect()),
         }
     }
 
@@ -586,8 +854,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut prompts = Vec::new();
         for profile in ["build", "plan"] {
-            let (_, prompt, _) = agent_profile(test_inputs(profile, Arc::new(DummyLlm), pool.clone(),
-                dir.path().to_path_buf(), vec![], vec![], "session")).unwrap();
+            let (_, prompt, _) = agent_profile(test_inputs(
+                profile,
+                Arc::new(DummyLlm),
+                pool.clone(),
+                dir.path().to_path_buf(),
+                vec![],
+                vec![],
+                "session",
+            ))
+            .unwrap();
             prompts.push(prompt);
         }
         assert_eq!(prompts[0], prompts[1]);
@@ -606,9 +882,13 @@ mod tests {
             reminder.on_user_turn();
             let mut messages = vec![Message::User { content: vec![] }];
             reminder.apply(&mut messages);
-            let Message::User { content } = &messages[0] else { unreachable!() };
+            let Message::User { content } = &messages[0] else {
+                unreachable!()
+            };
             match expected {
-                Some(expected) => assert!(matches!(&content[0], ContentPart::Reminder { text } if text.contains(expected))),
+                Some(expected) => assert!(
+                    matches!(&content[0], ContentPart::Reminder { text } if text.contains(expected))
+                ),
                 None => assert!(content.is_empty()),
             }
             reminder.on_user_turn();
@@ -620,11 +900,34 @@ mod tests {
 
     #[tokio::test]
     async fn plan_has_no_editing_tools() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let (_, tools) = build_tool_registry_and_list(&test_inputs("plan", Arc::new(DummyLlm), pool, dir.path().to_path_buf(), vec![Arc::new(NamedTool("external_mutator"))], vec![], "session")).unwrap();
+        let (_, tools) = build_tool_registry_and_list(&test_inputs(
+            "plan",
+            Arc::new(DummyLlm),
+            pool,
+            dir.path().to_path_buf(),
+            vec![Arc::new(NamedTool("external_mutator"))],
+            vec![],
+            "session",
+        ))
+        .unwrap();
         let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
-        for expected in ["read_file", "glob", "grep", "list", "webfetch", "websearch", "bash", "task", "todowrite", "todoread"] {
+        for expected in [
+            "read_file",
+            "glob",
+            "grep",
+            "list",
+            "webfetch",
+            "websearch",
+            "bash",
+            "task",
+            "todowrite",
+            "todoread",
+        ] {
             assert!(names.contains(&expected), "Plan is missing {expected}");
         }
         for forbidden in ["write_file", "edit_file", "apply_patch", "external_mutator"] {
@@ -636,9 +939,18 @@ mod tests {
             .find(|tool| tool.name() == "task")
             .expect("plan should expose the task tool");
         let description = task.description();
-        assert!(description.contains("\"explore\""), "plan task tool should advertise explore");
-        assert!(!description.contains("\"build\""), "plan task tool must not advertise build");
-        assert!(!description.contains("\"general\""), "plan task tool must not advertise general");
+        assert!(
+            description.contains("\"explore\""),
+            "plan task tool should advertise explore"
+        );
+        assert!(
+            !description.contains("\"build\""),
+            "plan task tool must not advertise build"
+        );
+        assert!(
+            !description.contains("\"general\""),
+            "plan task tool must not advertise general"
+        );
         // Bash is unrestricted (prompt-restricted to read-only, like
         // opencode's plan mode): a command outside the old safe-mode
         // allow-list executes instead of being refused.
@@ -760,7 +1072,15 @@ mod tests {
         let log: RequestLog = Arc::new(Mutex::new(Box::new(Vec::<u8>::new())));
 
         let (agent, _) = create_agent(
-            test_inputs("build", provider, pool, std::env::current_dir().unwrap(), Vec::new(), Vec::new(), "session"),
+            test_inputs(
+                "build",
+                provider,
+                pool,
+                std::env::current_dir().unwrap(),
+                Vec::new(),
+                Vec::new(),
+                "session",
+            ),
             Some(log),
         )
         .await
@@ -773,16 +1093,32 @@ mod tests {
     /// pending, cadence aligned) instead of re-issuing the switch reminder.
     #[tokio::test]
     async fn create_agent_restores_persisted_reminder_state() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
         let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
 
         let stored = gewu_core::agent::Reminder::continue_at("FULL", Some("SPARSE".into()), 9);
-        gewu_storage::set_reminder(&pool, "session", &stored).await.unwrap();
+        gewu_storage::set_reminder(&pool, "session", &stored)
+            .await
+            .unwrap();
         let cwd = std::env::current_dir().unwrap();
         let (agent, _) = create_agent(
-            test_inputs("plan", provider.clone(), pool.clone(), cwd.clone(), Vec::new(), Vec::new(), "session"),
+            test_inputs(
+                "plan",
+                provider.clone(),
+                pool.clone(),
+                cwd.clone(),
+                Vec::new(),
+                Vec::new(),
+                "session",
+            ),
             None,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(agent.reminder().user_turns(), 9);
         assert!(agent.reminder().pending().is_none());
 
@@ -790,7 +1126,9 @@ mod tests {
         let (agent, _) = create_agent(
             test_inputs("plan", provider, pool, cwd, Vec::new(), Vec::new(), "fresh"),
             None,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(agent.reminder().user_turns(), 0);
         assert!(agent.reminder().pending().is_some());
     }
@@ -810,7 +1148,15 @@ mod tests {
         let skills = gewu_tools::skill::discover(&[directory.path().to_path_buf()]);
 
         let (agent, _) = create_agent(
-            test_inputs("build", provider, pool, std::env::current_dir().unwrap(), Vec::new(), skills, "session"),
+            test_inputs(
+                "build",
+                provider,
+                pool,
+                std::env::current_dir().unwrap(),
+                Vec::new(),
+                skills,
+                "session",
+            ),
             None,
         )
         .await
@@ -870,13 +1216,23 @@ mod tests {
             web_fetch: Arc::default(),
             enforcement: PathEnforcement::None,
             context_limit: None,
+            agents: Arc::new(BTreeMap::new()),
+            templates: Mutex::new(HashMap::new()),
         };
         // The parent conversation is passed per call, not held by the factory.
         let (_, subagent_id) = factory.create("explore", None, "root").await.unwrap();
         // The subagent session is recorded with its parent, so the session
         // list can hide it while task resume keeps working.
-        assert_eq!(gewu_storage::subagent_depth(&pool, "root").await.unwrap(), 0);
-        assert_eq!(gewu_storage::subagent_depth(&pool, &subagent_id).await.unwrap(), 1);
+        assert_eq!(
+            gewu_storage::subagent_depth(&pool, "root").await.unwrap(),
+            0
+        );
+        assert_eq!(
+            gewu_storage::subagent_depth(&pool, &subagent_id)
+                .await
+                .unwrap(),
+            1
+        );
 
         // A subagent cannot launch further subagents.
         let error = match factory.create("explore", None, &subagent_id).await {
@@ -884,5 +1240,302 @@ mod tests {
             Ok(_) => panic!("nested subagent spawn should be rejected"),
         };
         assert!(error.contains("depth limit"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn custom_agents_are_advertised_to_delegating_profiles_only() {
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let dir = tempdir().unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
+        let agents = Arc::new(BTreeMap::from([(
+            "reviewer".to_string(),
+            custom_entry("general", Some("Be meticulous."), None),
+        )]));
+
+        let (_, tools) = build_tool_registry_and_list(&ProfileInputs {
+            agents,
+            ..test_inputs(
+                "build",
+                provider.clone(),
+                pool.clone(),
+                dir.path().to_path_buf(),
+                vec![],
+                vec![],
+                "session",
+            )
+        })
+        .unwrap();
+        let task = tools
+            .iter()
+            .find(|tool| tool.name() == "task")
+            .expect("build exposes task");
+        assert!(
+            task.description().contains("\"reviewer\""),
+            "build's task tool should advertise config agents"
+        );
+
+        let (_, tools) = build_tool_registry_and_list(&ProfileInputs {
+            agents: Arc::new(BTreeMap::from([(
+                "reviewer".to_string(),
+                custom_entry("general", None, None),
+            )])),
+            ..test_inputs(
+                "plan",
+                provider,
+                pool,
+                dir.path().to_path_buf(),
+                vec![],
+                vec![],
+                "session",
+            )
+        })
+        .unwrap();
+        let task = tools
+            .iter()
+            .find(|tool| tool.name() == "task")
+            .expect("plan exposes task");
+        assert!(
+            !task.description().contains("\"reviewer\""),
+            "plan's task tool must not advertise config agents"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_agent_tools_narrow_the_base_profile() {
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let dir = tempdir().unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
+        let inputs = |name: &'static str, entry: AgentEntry| ProfileInputs {
+            agents: Arc::new(BTreeMap::from([(name.to_string(), entry)])),
+            ..test_inputs(
+                name,
+                provider.clone(),
+                pool.clone(),
+                dir.path().to_path_buf(),
+                vec![],
+                vec![],
+                "session",
+            )
+        };
+
+        // An explicit tool list narrows the base set.
+        let (_, tools) = build_tool_registry_and_list(&inputs(
+            "reviewer",
+            custom_entry("general", None, Some(&["read_file", "grep"])),
+        ))
+        .unwrap();
+        let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"read_file") && names.contains(&"grep"));
+        for forbidden in ["task", "bash", "write_file", "webfetch", "todowrite"] {
+            assert!(
+                !names.contains(&forbidden),
+                "custom agent exposes {forbidden}"
+            );
+        }
+
+        // Without a tool list the base set survives, minus task.
+        let (_, tools) =
+            build_tool_registry_and_list(&inputs("writer", custom_entry("general", None, None)))
+                .unwrap();
+        let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"bash"));
+        assert!(!names.contains(&"task"), "custom agents never delegate");
+
+        // Unknown tool names are rejected instead of silently dropped.
+        let error = match build_tool_registry_and_list(&inputs(
+            "bad",
+            custom_entry("general", None, Some(&["read_file", "nonexistent"])),
+        )) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("unknown tool names should be rejected"),
+        };
+        assert!(error.contains("nonexistent"), "unexpected error: {error}");
+
+        // Requesting task is rejected outright.
+        let error = match build_tool_registry_and_list(&inputs(
+            "bad",
+            custom_entry("general", None, Some(&["task"])),
+        )) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("requesting task should be rejected"),
+        };
+        assert!(
+            error.contains("cannot delegate"),
+            "unexpected error: {error}"
+        );
+
+        // Unknown agent names still fail.
+        let error = match build_tool_registry_and_list(&test_inputs(
+            "missing",
+            provider.clone(),
+            pool.clone(),
+            dir.path().to_path_buf(),
+            vec![],
+            vec![],
+            "session",
+        )) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("unknown agent names should be rejected"),
+        };
+        assert!(
+            error.contains("Unknown agent type"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_agent_instructions_replace_the_base_prompt() {
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let dir = tempdir().unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
+        let (_, general_prompt, _) = agent_profile(test_inputs(
+            "general",
+            provider.clone(),
+            pool.clone(),
+            dir.path().to_path_buf(),
+            vec![],
+            vec![],
+            "session",
+        ))
+        .unwrap();
+
+        // Instructions replace the base prompt entirely.
+        let (_, prompt, _) = agent_profile(ProfileInputs {
+            agents: Arc::new(BTreeMap::from([(
+                "reviewer".to_string(),
+                custom_entry("general", Some("Be meticulous."), None),
+            )])),
+            ..test_inputs(
+                "reviewer",
+                provider.clone(),
+                pool.clone(),
+                dir.path().to_path_buf(),
+                vec![],
+                vec![],
+                "session",
+            )
+        })
+        .unwrap();
+        assert_eq!(prompt, "Be meticulous.");
+
+        // Without instructions the base profile's prompt applies.
+        let (_, prompt, _) = agent_profile(ProfileInputs {
+            agents: Arc::new(BTreeMap::from([(
+                "reviewer".to_string(),
+                custom_entry("general", None, None),
+            )])),
+            ..test_inputs(
+                "reviewer",
+                provider,
+                pool,
+                dir.path().to_path_buf(),
+                vec![],
+                vec![],
+                "session",
+            )
+        })
+        .unwrap();
+        assert_eq!(prompt, general_prompt);
+    }
+
+    #[tokio::test]
+    async fn factory_creates_config_agents() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
+        let factory = SqliteAgentFactory {
+            model_catalog: None,
+            provider: provider.clone(),
+            pool: pool.clone(),
+            skills: Vec::new(),
+            web_fetch: Arc::default(),
+            enforcement: PathEnforcement::None,
+            context_limit: None,
+            agents: Arc::new(BTreeMap::from([(
+                "reviewer".to_string(),
+                custom_entry("general", Some("Be meticulous."), Some(&["read_file"])),
+            )])),
+            templates: Mutex::new(HashMap::new()),
+        };
+        let (agent, session_id) = factory.create("reviewer", None, "parent").await.unwrap();
+        assert!(agent.list_tools().iter().any(|name| name == "read_file"));
+        assert!(!agent.list_tools().iter().any(|name| name == "task"));
+        // Recorded as a regular subagent of the parent conversation.
+        assert_eq!(
+            gewu_storage::subagent_depth(&pool, "parent").await.unwrap(),
+            0
+        );
+        assert_eq!(
+            gewu_storage::subagent_depth(&pool, &session_id)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// Tool state written in one spawn must be visible to a later spawn of
+    /// the same session (task resume), because the template bakes in the
+    /// pool-backed session state.
+    #[tokio::test]
+    async fn resumed_subagents_recover_their_todo_state() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        SqliteMemory::new(pool.clone(), "parent".into())
+            .await
+            .unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
+        let factory = SqliteAgentFactory {
+            model_catalog: None,
+            provider,
+            pool: pool.clone(),
+            skills: Vec::new(),
+            web_fetch: Arc::default(),
+            enforcement: PathEnforcement::None,
+            context_limit: None,
+            agents: Arc::new(BTreeMap::new()),
+            templates: Mutex::new(HashMap::new()),
+        };
+
+        let (writer, session_id) = factory.create("build", None, "parent").await.unwrap();
+        let todos = vec![gewu_tools::TodoItem {
+            id: "1".into(),
+            content: "first".into(),
+            status: "pending".into(),
+            priority: None,
+        }];
+        writer
+            .session_state()
+            .write(&session_id, "todos", &todos)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let (reader, resumed_id) = factory
+            .create("build", Some(session_id.clone()), "parent")
+            .await
+            .unwrap();
+        assert_eq!(resumed_id, session_id);
+        let restored: Vec<gewu_tools::TodoItem> = reader
+            .session_state()
+            .read(&session_id, "todos")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].content, "first");
+
+        // The stateless todoread tool sees the restored list through the
+        // session state on its tool context.
+        let ctx =
+            ToolContext::new(&session_id, "m").with_session_state(reader.session_state().clone());
+        let result = reader
+            .execute("todoread", serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+        assert!(result.output.contains("first"), "{}", result.output);
     }
 }

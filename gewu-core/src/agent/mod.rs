@@ -52,8 +52,8 @@ pub use tools::execute_tool_with_panic_recovery;
 use crate::middleware::TruncationService;
 use crate::traits::{Experiences, LlmProvider, Memory, RequestLog, Tool, ToolRegistry};
 use crate::types::{
-    AgentEvent, ContentPart, Message, PathEnforcement, ProviderEvent, TokenUsage, ToolCall,
-    ToolContext, ToolResult,
+    AgentEvent, ContentPart, Message, PathEnforcement, ProviderEvent, SessionState, TokenUsage,
+    ToolCall, ToolContext, ToolResult,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -110,6 +110,8 @@ pub struct Agent {
     reminder: Reminder,
     /// Shared with every tool context of the active run.
     run_abort: Arc<AtomicBool>,
+    /// Per-session key/value state shared with tools on every [`ToolContext`].
+    session_state: SessionState,
 }
 
 /// Per-run budgets. `Default` keeps the historical behaviour.
@@ -191,6 +193,8 @@ pub struct AgentBuilder {
     log: Option<RequestLog>,
     /// File-path confinement level passed to tools (defaults to none).
     enforcement: PathEnforcement,
+    /// Per-session tool state (defaults to a fresh in-memory store).
+    session_state: Option<SessionState>,
     /// Session id surfaced to tools via [`ToolContext`]; defaults to a fresh
     /// UUID.
     session_id: Option<String>,
@@ -233,6 +237,7 @@ impl Default for AgentBuilder {
             experiences: None,
             log: None,
             enforcement: PathEnforcement::default(),
+            session_state: None,
             session_id: None,
         }
     }
@@ -241,7 +246,12 @@ impl Default for AgentBuilder {
 impl Agent {
     /// Change behavior while retaining memory and all other runtime state.
     /// The caller must ensure the agent is idle.
-    pub fn set_profile(&mut self, system_prompt: String, tools: Vec<Arc<dyn Tool>>, reminder: Reminder) {
+    pub fn set_profile(
+        &mut self,
+        system_prompt: String,
+        tools: Vec<Arc<dyn Tool>>,
+        reminder: Reminder,
+    ) {
         self.system_prompt = system_prompt;
         self.tools = Arc::new(tools);
         self.reminder = reminder;
@@ -577,6 +587,7 @@ impl Agent {
                     let session_id = self.session_id.clone();
                     let run_id = run_id.clone();
                     let abort = abort.clone();
+                    let session_state = self.session_state.clone();
                     let enforcement = self.enforcement;
                     let truncation = self.truncation.clone();
                     let semaphore = semaphore.clone();
@@ -593,7 +604,8 @@ impl Agent {
                             &call.id,
                             abort,
                         )
-                        .with_enforcement(enforcement);
+                        .with_enforcement(enforcement)
+                        .with_session_state(session_state);
                         let result = if let Some(t) = tool {
                             execute_tool_call(t, call, ctx, &truncation).await
                         } else {
@@ -708,8 +720,8 @@ impl Agent {
     /// Builds the context-usage event from the current conversation estimate
     /// plus the provider-reported token accounting for the whole session.
     fn usage_event(&self) -> AgentEvent {
-        let used_tokens: usize = crate::compaction::active_context(self.memory.messages())
-            .estimate_tokens();
+        let used_tokens: usize =
+            crate::compaction::active_context(self.memory.messages()).estimate_tokens();
         AgentEvent::Usage {
             used_tokens: used_tokens as u64,
             context_limit: self.context_limit as u64,
@@ -722,6 +734,112 @@ impl Agent {
     /// zeros until the provider reports usage.
     pub fn provider_usage(&self) -> TokenUsage {
         self.provider_usage
+    }
+
+    /// The per-session state store backing this agent's tools.
+    pub fn session_state(&self) -> &SessionState {
+        &self.session_state
+    }
+
+    /// The tools this agent can call.
+    pub fn tools(&self) -> &[Arc<dyn Tool>] {
+        &self.tools
+    }
+
+    /// Extracts an immutable template from this agent for spawning clones.
+    ///
+    /// The template captures everything that does not change per
+    /// conversation — provider, tools, prompts, limits — so new agents can
+    /// be created by supplying only the per-session pieces (memory, session
+    /// id, reminder) via [`AgentTemplate::spawn`]. This avoids rebuilding
+    /// tool registries when repeatedly spawning the same profile.
+    pub fn template(&self) -> AgentTemplate {
+        AgentTemplate {
+            llm: Arc::clone(&self.llm),
+            tools: Arc::clone(&self.tools),
+            system_prompt: self.system_prompt.clone(),
+            max_turns: self.max_turns,
+            context_limit: self.context_limit,
+            truncation: self.truncation.clone(),
+            enforcement: self.enforcement,
+            experiences: self.experiences.clone(),
+            log: self.log.clone(),
+            session_state: self.session_state.clone(),
+        }
+    }
+}
+
+/// Immutable, cloneable agent configuration extracted via
+/// [`Agent::template`].
+///
+/// A template holds everything that is shared across conversations; the
+/// per-session state (memory, session id, reminder, usage counter) is
+/// supplied fresh on [`AgentTemplate::spawn`].
+#[derive(Clone)]
+pub struct AgentTemplate {
+    llm: Arc<dyn LlmProvider>,
+    tools: Arc<Vec<Arc<dyn Tool>>>,
+    system_prompt: String,
+    max_turns: Option<usize>,
+    context_limit: usize,
+    truncation: TruncationService,
+    enforcement: PathEnforcement,
+    experiences: Option<Arc<dyn Experiences>>,
+    log: Option<RequestLog>,
+    session_state: SessionState,
+}
+
+impl AgentTemplate {
+    /// Replaces the LLM provider used by spawned agents.
+    pub fn with_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
+        self.llm = llm;
+        self
+    }
+
+    /// Replaces the tool set of spawned agents.
+    pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.tools = Arc::new(tools);
+        self
+    }
+
+    /// Replaces the context limit of spawned agents.
+    pub fn with_context_limit(mut self, context_limit: usize) -> Self {
+        self.context_limit = context_limit;
+        self
+    }
+
+    /// Replaces the per-session state store of spawned agents.
+    pub fn with_session_state(mut self, session_state: SessionState) -> Self {
+        self.session_state = session_state;
+        self
+    }
+
+    /// Creates a new agent from this template with the given per-session
+    /// state. The usage counter starts at zero and the reminder is supplied
+    /// by the caller (fresh sessions pass [`Reminder::default`]).
+    pub fn spawn(
+        self,
+        session_id: impl Into<String>,
+        memory: Box<dyn Memory>,
+        reminder: Reminder,
+    ) -> Agent {
+        Agent {
+            llm: self.llm,
+            tools: self.tools,
+            system_prompt: self.system_prompt,
+            max_turns: self.max_turns,
+            memory,
+            context_limit: self.context_limit,
+            truncation: self.truncation,
+            session_id: session_id.into(),
+            enforcement: self.enforcement,
+            experiences: self.experiences,
+            log: self.log,
+            session_state: self.session_state,
+            provider_usage: TokenUsage::default(),
+            reminder,
+            run_abort: Arc::new(AtomicBool::new(false)),
+        }
     }
 }
 
@@ -831,6 +949,13 @@ impl AgentBuilder {
         self
     }
 
+    /// Sets the per-session state store handed to tools on every
+    /// [`ToolContext`]. Defaults to a fresh in-memory store.
+    pub fn with_session_state(mut self, session_state: SessionState) -> Self {
+        self.session_state = Some(session_state);
+        self
+    }
+
     /// Sets the session id surfaced to tools via [`ToolContext`].
     ///
     /// When the agent backs a durable conversation, this should be the same
@@ -872,6 +997,7 @@ impl AgentBuilder {
             provider_usage: TokenUsage::default(),
             reminder: self.reminder,
             run_abort: Arc::new(AtomicBool::new(false)),
+            session_state: self.session_state.unwrap_or_else(SessionState::in_memory),
         };
         Ok(agent)
     }
@@ -1045,11 +1171,17 @@ mod tests {
 
     #[tokio::test]
     async fn reminders_persist_in_history_across_requests() -> Result<()> {
-        let response = vec![ProviderEvent::ContentDelta { delta: "ok".into() }, ProviderEvent::Finish { reason: None }];
+        let response = vec![
+            ProviderEvent::ContentDelta { delta: "ok".into() },
+            ProviderEvent::Finish { reason: None },
+        ];
         let provider = Arc::new(MockProvider::new(vec![response; 25]));
         let mut agent = Agent::builder()
             .llm(provider.clone())
-            .with_reminder(Reminder::switch("FULL MODE REMINDER", Some("SPARSE MODE REMINDER".into())))
+            .with_reminder(Reminder::switch(
+                "FULL MODE REMINDER",
+                Some("SPARSE MODE REMINDER".into()),
+            ))
             .build()?;
         for turn in 1..=25 {
             for event in agent.ask("hello").collect::<Vec<_>>().await {
@@ -1090,7 +1222,9 @@ mod tests {
             },
         ];
         let final_response = vec![
-            ProviderEvent::ContentDelta { delta: "done".into() },
+            ProviderEvent::ContentDelta {
+                delta: "done".into(),
+            },
             ProviderEvent::Finish { reason: None },
         ];
         let provider = Arc::new(MockProvider::new(vec![tool_call, final_response]));
@@ -1175,25 +1309,52 @@ mod tests {
 
     #[tokio::test]
     async fn profile_switch_after_compaction_uses_current_prompt_and_reminder() -> Result<()> {
-        let response = vec![ProviderEvent::ContentDelta { delta: "summary or answer".into() },
-            ProviderEvent::Finish { reason: Some("stop".into()) }];
+        let response = vec![
+            ProviderEvent::ContentDelta {
+                delta: "summary or answer".into(),
+            },
+            ProviderEvent::Finish {
+                reason: Some("stop".into()),
+            },
+        ];
         let provider = Arc::new(MockProvider::new(vec![response; 3]));
-        let mut agent = Agent::builder().llm(provider.clone()).context_limit(20_100)
-            .system_prompt("old profile").build()?;
-        let original = Message::User { content: vec![ContentPart::Text { text: "x".repeat(40_400) }] };
+        let mut agent = Agent::builder()
+            .llm(provider.clone())
+            .context_limit(20_100)
+            .system_prompt("old profile")
+            .build()?;
+        let original = Message::User {
+            content: vec![ContentPart::Text {
+                text: "x".repeat(40_400),
+            }],
+        };
         agent.memory.add_message(original.clone()).await;
         {
             let events = agent.ask("continue");
             futures::pin_mut!(events);
-            while let Some(event) = events.next().await { event?; }
+            while let Some(event) = events.next().await {
+                event?;
+            }
         }
-        assert!(agent.memory.messages().iter().any(|m| matches!(m, Message::Compaction { .. })));
+        assert!(
+            agent
+                .memory
+                .messages()
+                .iter()
+                .any(|m| matches!(m, Message::Compaction { .. }))
+        );
         let stored = agent.memory.messages().to_vec();
-        agent.set_profile("new profile".into(), vec![], Reminder::switch("NEW MODE REMINDER", None));
+        agent.set_profile(
+            "new profile".into(),
+            vec![],
+            Reminder::switch("NEW MODE REMINDER", None),
+        );
         {
             let events = agent.ask("next step");
             futures::pin_mut!(events);
-            while let Some(event) = events.next().await { event?; }
+            while let Some(event) = events.next().await {
+                event?;
+            }
         }
         assert_eq!(&agent.memory.messages()[..stored.len()], stored);
         assert!(agent.memory.messages().contains(&original));
@@ -1210,14 +1371,38 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_compaction_preserves_transcript_and_folds_prior_context() -> Result<()> {
-        let summary = || vec![ProviderEvent::ContentDelta { delta: "summary".into() }, ProviderEvent::Finish { reason: None }];
+        let summary = || {
+            vec![
+                ProviderEvent::ContentDelta {
+                    delta: "summary".into(),
+                },
+                ProviderEvent::Finish { reason: None },
+            ]
+        };
         let provider = Arc::new(MockProvider::new(vec![summary(), summary()]));
-        let mut agent = Agent::builder().llm(provider.clone()).context_limit(20_100).build()?;
-        let old = Message::User { content: vec![ContentPart::Text { text: "x".repeat(40_400) }] };
+        let mut agent = Agent::builder()
+            .llm(provider.clone())
+            .context_limit(20_100)
+            .build()?;
+        let old = Message::User {
+            content: vec![ContentPart::Text {
+                text: "x".repeat(40_400),
+            }],
+        };
         agent.memory.add_message(old.clone()).await;
-        agent.memory.add_message(Message::User { content: vec![ContentPart::Text { text: "prior tail".into() }] }).await;
+        agent
+            .memory
+            .add_message(Message::User {
+                content: vec![ContentPart::Text {
+                    text: "prior tail".into(),
+                }],
+            })
+            .await;
         assert!(agent.compact_if_needed().await?);
-        assert!(!agent.compact_if_needed().await?, "archived history must not trigger another compaction");
+        assert!(
+            !agent.compact_if_needed().await?,
+            "archived history must not trigger another compaction"
+        );
         agent.memory.add_message(old.clone()).await;
         assert!(agent.compact_if_needed().await?);
         assert_eq!(agent.memory.messages().len(), 5);
@@ -1234,9 +1419,15 @@ mod tests {
 
     #[tokio::test]
     async fn empty_summary_does_not_append_compaction() -> Result<()> {
-        let mut agent = Agent::builder().llm(Arc::new(MockProvider::single_content("")))
-            .context_limit(20_100).build()?;
-        let old = Message::User { content: vec![ContentPart::Text { text: "x".repeat(40_400) }] };
+        let mut agent = Agent::builder()
+            .llm(Arc::new(MockProvider::single_content("")))
+            .context_limit(20_100)
+            .build()?;
+        let old = Message::User {
+            content: vec![ContentPart::Text {
+                text: "x".repeat(40_400),
+            }],
+        };
         agent.memory.add_message(old.clone()).await;
         assert!(agent.compact_if_needed().await.is_err());
         assert_eq!(agent.memory.messages(), &[old]);
@@ -1286,7 +1477,11 @@ mod tests {
         assert_eq!(entries[1]["response"]["outcome"], "ok");
 
         // Stored originals survive; only model context collapses.
-        assert_eq!(agent.memory.messages().len(), 3, "originals plus checkpoint");
+        assert_eq!(
+            agent.memory.messages().len(),
+            3,
+            "originals plus checkpoint"
+        );
         let messages = crate::compaction::active_context(agent.memory.messages()).to_messages();
         assert_eq!(messages.len(), 1, "model receives only the checkpoint");
         let text = match &messages[0] {
@@ -1536,9 +1731,7 @@ mod tests {
         );
         detector.record("read_file".into(), r#"{"path":"a"}"#.into());
         assert!(
-            detector
-                .check("read_file", r#"{"path":"a"}"#)
-                .is_some(),
+            detector.check("read_file", r#"{"path":"a"}"#).is_some(),
             "third identical call must trigger"
         );
     }
@@ -1611,6 +1804,113 @@ mod tests {
         // The third identical call triggers the detector before it is
         // announced, so exactly threshold - 1 starts happen.
         assert_eq!(starts, 2);
+        Ok(())
+    }
+
+    /// A tool that appends a value to a per-session list in session state,
+    /// for asserting that tool contexts carry the agent's session state.
+    struct StateProbeTool;
+
+    #[async_trait]
+    impl Tool for StateProbeTool {
+        fn name(&self) -> &str {
+            "state_probe"
+        }
+
+        fn description(&self) -> &str {
+            "appends to session state"
+        }
+
+        fn schema(&self) -> schemars::schema::RootSchema {
+            schemars::schema_for!(serde_json::Value)
+        }
+
+        async fn execute(
+            &self,
+            args: Value,
+            ctx: &ToolContext,
+        ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+            let mut items: Vec<String> = ctx
+                .session_state
+                .read(&ctx.session_id, "probe")
+                .await
+                .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?
+                .unwrap_or_default();
+            items.push(args["value"].as_str().unwrap_or("").to_string());
+            ctx.session_state
+                .write(&ctx.session_id, "probe", &items)
+                .await
+                .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
+            Ok(ToolResult::new("state_probe", format!("{items:?}")))
+        }
+    }
+
+    /// Tool contexts must carry the agent's session state (so stateless
+    /// tools persist per session), and templates must spawn clones that
+    /// share that state handle while keeping per-session memory fresh.
+    #[tokio::test]
+    async fn tool_contexts_carry_session_state_across_spawns() -> Result<()> {
+        let provider = MockProvider::new(vec![
+            vec![
+                ProviderEvent::ToolCallStart {
+                    id: "call_1".to_string(),
+                    name: "state_probe".to_string(),
+                },
+                ProviderEvent::ToolCallDelta {
+                    id: "call_1".to_string(),
+                    delta: r#"{"value":"one"}"#.to_string(),
+                },
+                ProviderEvent::Finish {
+                    reason: Some("tool_calls".to_string()),
+                },
+            ],
+            vec![
+                ProviderEvent::ContentDelta {
+                    delta: "done".to_string(),
+                },
+                ProviderEvent::Finish {
+                    reason: Some("end_turn".to_string()),
+                },
+            ],
+        ]);
+        let mut agent = Agent::builder()
+            .llm(Arc::new(provider))
+            .with_tools(vec![Arc::new(StateProbeTool)])
+            .session_id("sess-1")
+            .build()?;
+
+        let events = agent.ask("probe please").collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()), "{events:?}");
+
+        // The tool wrote through the injected context.
+        let items: Vec<String> = agent
+            .session_state()
+            .read("sess-1", "probe")
+            .await?
+            .expect("tool must have written session state");
+        assert_eq!(items, vec!["one".to_string()]);
+
+        // A spawn sharing the state handle and session id sees the state.
+        let template = agent.template();
+        let clone = template
+            .clone()
+            .spawn("sess-1", Box::new(Vec::new()), Reminder::default());
+        let items: Vec<String> = clone
+            .session_state()
+            .read("sess-1", "probe")
+            .await?
+            .expect("spawned clone shares the state store");
+        assert_eq!(items, vec!["one".to_string()]);
+
+        // A spawn into a different session sees nothing.
+        let fresh = template.spawn("sess-2", Box::new(Vec::new()), Reminder::default());
+        assert_eq!(
+            fresh
+                .session_state()
+                .read::<Vec<String>>("sess-2", "probe")
+                .await?,
+            None
+        );
         Ok(())
     }
 }

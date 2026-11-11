@@ -59,10 +59,10 @@ impl Reminder {
 
     /// Whether any user message in `messages` carries a reminder part.
     pub fn in_history(messages: &[Message]) -> bool {
-        messages.iter().any(
-            |message| matches!(message, Message::User { content }
-                if content.iter().any(|part| matches!(part, ContentPart::Reminder { .. }))),
-        )
+        messages.iter().any(|message| {
+            matches!(message, Message::User { content }
+                if content.iter().any(|part| matches!(part, ContentPart::Reminder { .. })))
+        })
     }
 
     /// Advance once per user prompt, never once per provider/tool iteration.

@@ -42,6 +42,8 @@
     token: loadToken(),
     active: 0,
     transcriptTab: null,
+    stuck: true,
+    scrollTops: new Map(),
     busy: false,
     attempt: 0,
     reconnectTimer: null,
@@ -241,11 +243,16 @@
         el.sidebar.innerHTML = message.sidebar || "";
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
         break;
-      case "tabs":
+      case "tabs": {
         state.active = message.active;
+        const alive = new Set(message.tabs.map((tab) => tab.id));
+        for (const id of state.scrollTops.keys()) {
+          if (!alive.has(id)) state.scrollTops.delete(id);
+        }
         renderTabs(message.tabs, message.active);
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
         break;
+      }
       case "transcript":
         setTranscript(message.html, false);
         break;
@@ -365,12 +372,33 @@
     el.transcript.scrollTop = el.transcript.scrollHeight;
   }
 
+  // Stick-to-bottom: follow new content until the user scrolls away, and
+  // resume when they return. Only real scroll events move the flag, so
+  // content that grows without a scroll (tool output, late images) never
+  // unsticks; the next update re-anchors to the bottom instead. The live
+  // offset is also recorded per tab so switching back restores it.
+  el.transcript.addEventListener("scroll", () => {
+    state.stuck = nearBottom();
+    if (state.transcriptTab != null) {
+      state.scrollTops.set(state.transcriptTab, el.transcript.scrollTop);
+    }
+  });
+
   function setTranscript(html, forceScroll) {
     const switched = state.transcriptTab !== state.active;
-    const shouldScroll = forceScroll || switched || nearBottom();
+    if (!switched && state.transcriptTab != null) {
+      state.scrollTops.set(state.transcriptTab, el.transcript.scrollTop);
+    }
     state.transcriptTab = state.active;
     el.transcript.innerHTML = html;
-    if (shouldScroll) scrollToBottom();
+    if (switched && !forceScroll && state.scrollTops.has(state.active)) {
+      // Returning to a visited tab: put the viewport back where it was.
+      el.transcript.scrollTop = state.scrollTops.get(state.active);
+      state.stuck = nearBottom();
+      return;
+    }
+    if (forceScroll || switched) state.stuck = true;
+    if (state.stuck) scrollToBottom();
   }
 
   // Replace one streaming block's rendered Markdown body in place: keeping
@@ -389,9 +417,8 @@
       requestRefresh();
       return;
     }
-    const shouldScroll = nearBottom();
     block.replaceChildren(body);
-    if (shouldScroll) scrollToBottom();
+    if (state.stuck) scrollToBottom();
   }
 
   function setStatus(html) {
@@ -416,6 +443,7 @@
       return;
     }
     card.replaceChildren(...fresh.childNodes);
+    if (state.stuck) scrollToBottom();
   }
 
   // Append one rendered block (user message, streaming assistant block,
@@ -431,10 +459,10 @@
       requestRefresh();
       return;
     }
-    const shouldScroll = nearBottom();
     el.transcript.querySelector(".empty")?.remove();
+    node.classList.add("enter");
     el.transcript.appendChild(node);
-    if (shouldScroll) scrollToBottom();
+    if (state.stuck) scrollToBottom();
   }
 
   // Start of a new tool run: convert the preceding assistant block out of
@@ -459,10 +487,10 @@
       requestRefresh();
       return;
     }
-    const shouldScroll = nearBottom();
     el.transcript.querySelector(".empty")?.remove();
+    card.classList.add("enter");
     el.transcript.appendChild(card);
-    if (shouldScroll) scrollToBottom();
+    if (state.stuck) scrollToBottom();
   }
 
   // Parse trusted server-rendered HTML into the first element.
@@ -596,23 +624,23 @@
       }
       return;
     }
-    const message = event.target.closest(".block.user");
-    if (message && !event.target.closest("a, input, textarea, .message-menu") && !window.getSelection()?.toString()) {
-      const trigger = message.querySelector(".message-menu-trigger");
-      if (trigger && (!event.target.closest("button") || event.target === trigger)) {
-        const open = trigger.getAttribute("aria-expanded") !== "true";
-        closeMessageMenus();
-        if (open) {
-          trigger.setAttribute("aria-expanded", "true");
-          const menu = message.querySelector(".message-menu");
+    const trigger = event.target.closest(".message-menu-trigger");
+    if (trigger) {
+      const open = trigger.getAttribute("aria-expanded") !== "true";
+      closeMessageMenus();
+      if (open) {
+        trigger.setAttribute("aria-expanded", "true");
+        const menu = document.getElementById(trigger.getAttribute("aria-controls"));
+        if (menu) {
           menu.hidden = false;
           const item = menu.querySelector("button");
           item.disabled = state.busy;
           item.focus();
         }
-        return;
       }
+      return;
     }
+    if (!event.target.closest(".message-menu")) closeMessageMenus();
     const button = event.target.closest("[data-action]");
     if (!button) return;
     const tab = Number(button.dataset.tab);

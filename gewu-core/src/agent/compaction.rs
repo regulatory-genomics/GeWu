@@ -7,8 +7,8 @@
 //! tail. Older messages are excluded from model context, never deleted.
 
 use crate::compaction::{
-    self, build_summary_prompt, compaction_body,
-    is_overflow, serialize_messages, select_recent_tail, KEEP_TOKENS, SUMMARY_OUTPUT_TOKENS,
+    self, KEEP_TOKENS, SUMMARY_OUTPUT_TOKENS, build_summary_prompt, compaction_body, is_overflow,
+    select_recent_tail, serialize_messages,
 };
 use crate::types::{ContentPart, Message, ProviderEvent};
 use anyhow::{Result, anyhow};
@@ -40,7 +40,6 @@ impl Agent {
     }
 
     pub(super) async fn compact_with_estimate(&mut self, total_tokens: usize) -> Result<bool> {
-
         if !is_overflow(total_tokens, self.context_limit) {
             return Ok(false);
         }
@@ -102,7 +101,9 @@ impl Agent {
                 // The compaction request is a real LLM request; its usage
                 // counts toward the session's provider-reported totals.
                 ProviderEvent::Usage { usage } => self.provider_usage.add(&usage),
-                ProviderEvent::Error { error } => return Err(anyhow!("Compaction failed: {error}")),
+                ProviderEvent::Error { error } => {
+                    return Err(anyhow!("Compaction failed: {error}"));
+                }
                 _ => {}
             }
         }
@@ -113,7 +114,9 @@ impl Agent {
             return Err(anyhow!("Compaction failed: LLM returned an empty summary"));
         }
 
-        self.memory.append_compaction(summary_text.trim().to_string(), serialize_messages(recent)).await?;
+        self.memory
+            .append_compaction(summary_text.trim().to_string(), serialize_messages(recent))
+            .await?;
         Ok(true)
     }
 }

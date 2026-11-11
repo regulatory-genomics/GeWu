@@ -76,7 +76,9 @@ async fn print_session(pool: &SqlitePool, session_id: &str) -> Result<()> {
 fn format_message(message: &Message) -> (&'static str, String) {
     match message {
         Message::Compaction { summary, recent } => (
-            "COMPACTION", format!("{summary}\n\nRecent context:\n{recent}")),
+            "COMPACTION",
+            format!("{summary}\n\nRecent context:\n{recent}"),
+        ),
         Message::System { content } => ("SYSTEM", content.clone()),
         Message::User { content } => ("USER", format_content_parts(content)),
         Message::Assistant {

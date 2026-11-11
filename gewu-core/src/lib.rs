@@ -54,12 +54,12 @@ pub mod middleware;
 pub mod traits;
 pub mod types;
 
-pub use agent::{Agent, CancelHandle, RunOptions};
+pub use agent::{Agent, AgentTemplate, CancelHandle, RunOptions};
 pub use compaction::{estimate_tokens, is_overflow};
 pub use middleware::TruncationService;
-pub use traits::{Experiences, LlmProvider, Memory, Tool, ToolRegistry};
+pub use traits::{Experiences, LlmProvider, Memory, SessionStateStore, Tool, ToolRegistry};
 pub use types::{
-    AgentEvent, ContentPart, Experience, ExperienceQuery, FileAttachment, FunctionCall, Message,
-    ProviderEvent, RecalledExperience, TokenUsage, ToolCall, ToolContext, ToolResult,
-    TruncationResult,
+    AgentEvent, ContentPart, Experience, ExperienceQuery, FileAttachment, FunctionCall,
+    InMemorySessionStateStore, Message, ProviderEvent, RecalledExperience, SessionState,
+    TokenUsage, ToolCall, ToolContext, ToolResult, TruncationResult,
 };

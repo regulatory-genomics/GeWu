@@ -7,6 +7,7 @@
 //! - [`LlmProvider`] - Implement to add support for different LLM backends
 //! - [`ToolRegistry`] - Implement to provide a collection of tools to the agent
 //! - [`Memory`] - Implement to add custom conversation history storage
+//! - [`SessionStateStore`] - Implement to persist per-session tool state
 //!
 //! # Example: Implementing a Custom Tool
 //!
@@ -47,8 +48,8 @@ use crate::types::{
 };
 use async_trait::async_trait;
 use chrono::Utc;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use schemars::schema::RootSchema;
 use std::error::Error;
 use std::io::Write;
@@ -405,7 +406,8 @@ pub trait Memory: Send + Sync {
     /// Persist a completed compaction before activating its context boundary.
     /// Backends that can fail writes must override this and propagate errors.
     async fn append_compaction(&mut self, summary: String, recent: String) -> anyhow::Result<()> {
-        self.add_message(Message::Compaction { summary, recent }).await;
+        self.add_message(Message::Compaction { summary, recent })
+            .await;
         Ok(())
     }
 
@@ -471,4 +473,23 @@ pub trait Experiences: Send + Sync {
         &self,
         query: &ExperienceQuery,
     ) -> Result<Vec<RecalledExperience>, Box<dyn Error + Send + Sync>>;
+}
+
+/// Persists small per-session JSON values keyed by tool-chosen keys.
+///
+/// This is the seam for per-session tool state (todo lists, reminders,
+/// scratchpads, ...): tools stay stateless and access their state through
+/// [`ToolContext::session_state`](crate::types::ToolContext), while the
+/// backing store decides where the values live (in memory, SQLite, ...).
+///
+/// Values are JSON-encoded strings; the typed accessors on
+/// [`SessionState`](crate::types::SessionState) handle (de)serialization, so
+/// tool state types must implement `serde::Serialize`/`Deserialize`.
+#[async_trait]
+pub trait SessionStateStore: Send + Sync {
+    /// Loads the value stored for `key` in `session_id`, if any.
+    async fn load(&self, session_id: &str, key: &str) -> anyhow::Result<Option<String>>;
+
+    /// Stores `value` for `key` in `session_id`, replacing any previous value.
+    async fn save(&self, session_id: &str, key: &str, value: String) -> anyhow::Result<()>;
 }
