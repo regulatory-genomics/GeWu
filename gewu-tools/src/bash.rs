@@ -184,11 +184,32 @@ impl Tool for BashTool {
         let stderr_reader =
             tokio::spawn(async move { read_capped(stderr_pipe, MAX_CAPTURE_BYTES).await });
 
-        let wait_result = tokio::time::timeout(
-            std::time::Duration::from_millis(input.timeout),
-            child_process.wait(),
-        )
-        .await;
+        // Wait for the child, the timeout, or the run's abort flag. The abort
+        // flag is how a cancelled run reaches a tool: without this, a command
+        // keeps writing into the workspace after the UI already reported the
+        // run as stopped.
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(input.timeout);
+        let stop = loop {
+            tokio::select! {
+                biased;
+                waited = child_process.wait() => break BashStop::Exited(waited),
+                _ = tokio::time::sleep_until(deadline) => break BashStop::TimedOut,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    if ctx.is_aborted() {
+                        break BashStop::Cancelled;
+                    }
+                }
+            }
+        };
+
+        // Anything still running must die before the pipes are drained to EOF:
+        // a live child holds the pipe open, so reading first would block until
+        // the command exits on its own.
+        if !matches!(&stop, BashStop::Exited(_)) {
+            kill_process_tree(&mut child_process);
+            let _ = child_process.wait().await;
+        }
 
         let (captured_stdout, stdout_truncated) =
             stdout_reader.await.unwrap_or((Vec::new(), false));
@@ -209,8 +230,8 @@ impl Tool for BashTool {
             result
         };
 
-        match wait_result {
-            Ok(Ok(status)) => {
+        match stop {
+            BashStop::Exited(Ok(status)) => {
                 let stdout = String::from_utf8_lossy(&captured_stdout);
                 let stderr = String::from_utf8_lossy(&captured_stderr);
 
@@ -229,20 +250,21 @@ impl Tool for BashTool {
                 }
                 Ok(ToolResult::new("bash", result))
             }
-            Ok(Err(e)) => Err(anyhow::anyhow!("Failed to wait for child process: {}", e).into()),
-            Err(_) => {
-                // Kill the whole process group (or at least the direct child)
-                // and reap it, then report whatever output was captured before
-                // the timeout instead of discarding it.
-                kill_process_tree(&mut child_process);
-                let _ = child_process.wait().await;
-
+            BashStop::Exited(Err(e)) => {
+                Err(anyhow::anyhow!("Failed to wait for child process: {}", e).into())
+            }
+            interrupted => {
+                // The child was killed above; report whatever output was
+                // captured before the timeout or cancellation.
                 let stdout = String::from_utf8_lossy(&captured_stdout);
                 let stderr = String::from_utf8_lossy(&captured_stderr);
                 let captured = format_captured(&stdout, &stderr);
-                let mut result = format!("Command timed out after {} ms.", input.timeout);
+                let mut result = match interrupted {
+                    BashStop::Cancelled => "Command cancelled.".to_string(),
+                    _ => format!("Command timed out after {} ms.", input.timeout),
+                };
                 if !captured.is_empty() {
-                    result.push_str("\n--- partial output before timeout ---\n");
+                    result.push_str("\n--- partial output before it was stopped ---\n");
                     result.push_str(&captured);
                 }
                 if stdout_truncated || stderr_truncated {
@@ -252,6 +274,13 @@ impl Tool for BashTool {
             }
         }
     }
+}
+
+/// Why the tool stopped waiting for the child.
+enum BashStop {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    TimedOut,
+    Cancelled,
 }
 
 /// Reads a pipe to EOF, keeping at most `cap` bytes and flagging truncation.
@@ -343,11 +372,18 @@ mod tests {
         });
 
         let ctx = ToolContext::new("test-session", "test-msg");
+        let started = std::time::Instant::now();
         let result = tool
             .execute(args, &ctx)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains("Command timed out"));
+        // The pipes must be drained only after the child is killed; otherwise
+        // the read blocks until the command exits on its own (2 s here).
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the timeout waited for the command instead of killing it"
+        );
         Ok(())
     }
 
