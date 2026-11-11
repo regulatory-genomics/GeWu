@@ -11,11 +11,12 @@
 //! is the switch for that check; it is off by default so existing callers keep
 //! their behaviour.
 //!
-//! With `block_private_networks` enabled, `execute` resolves the host, refuses
-//! the request when any resolved address is private, loopback, link-local,
-//! unspecified, multicast or CGNAT, pins the connection to the validated
-//! address, and does not follow redirects. Refusing on *any* private address is
-//! deliberate: a host that mixes public and private answers is not trustworthy.
+//! `block_private_networks` is **on by default**: `execute` resolves the host,
+//! refuses the request when any resolved address is private, link-local,
+//! unspecified, multicast or CGNAT, and pins the connection to the validated
+//! address. Loopback stays reachable because a local docs or development server
+//! is a normal target. Refusing on *any* private address is deliberate: a host
+//! that mixes public and private answers is not trustworthy.
 
 use crate::fs_utils::into_tool_error;
 use anyhow::Result;
@@ -41,16 +42,26 @@ fn default_format() -> String {
 }
 
 /// Where `webfetch` is allowed to go.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WebFetchPolicy {
-    /// Refuse destinations that resolve to a private address and do not follow
-    /// redirects. Off by default, matching the historical behaviour.
+    /// Refuse destinations that resolve to a private address. On by default:
+    /// the model picks the URL, so an unchecked fetch reaches whatever this
+    /// process can reach, including loopback and cloud metadata endpoints.
     pub block_private_networks: bool,
     /// Host suffixes that may be fetched. Empty means "no host allowlist".
     ///
     /// This narrows, it never widens: an allowlisted host still has to pass the
     /// private-network check when that check is enabled.
     pub allowed_hosts: Vec<String>,
+}
+
+impl Default for WebFetchPolicy {
+    fn default() -> Self {
+        Self {
+            block_private_networks: true,
+            allowed_hosts: Vec::new(),
+        }
+    }
 }
 
 impl WebFetchPolicy {
@@ -100,17 +111,52 @@ impl WebFetchTool {
     }
 }
 
-/// Normalize the URL: keep `http://` for loopback (a local docs server is a
-/// normal development target), upgrade every other cleartext URL to https, and
-/// assume https when the scheme is missing.
+/// Normalize the URL: upgrade cleartext to https, except when the host is
+/// loopback (a local docs server is a normal development target), and assume
+/// https when the scheme is missing.
+///
+/// The loopback decision uses the parsed host, never the raw text: a URL like
+/// `http://127.0.0.1.example.com/` merely *contains* the address and must still
+/// be upgraded.
 fn normalize_url(raw: &str) -> String {
-    if raw.starts_with("http://") && !raw.contains("127.0.0.1") && !raw.contains("localhost") {
-        raw.replacen("http://", "https://", 1)
-    } else if !raw.starts_with("http://") && !raw.starts_with("https://") {
-        format!("https://{raw}")
-    } else {
+    let text = if raw.contains("://") {
         raw.to_string()
+    } else {
+        format!("https://{raw}")
+    };
+    match reqwest::Url::parse(&text) {
+        Ok(url) if url.scheme() == "http" && !host_is_loopback(&url) => {
+            text.replacen("http://", "https://", 1)
+        }
+        _ => text,
     }
+}
+
+/// True when the host means "this machine": `localhost`, `*.localhost`, or a
+/// loopback address.
+fn host_is_loopback(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost") || host.parse::<IpAddr>().is_ok_and(ip_is_loopback)
+}
+
+fn ip_is_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or_else(|| v6.is_loopback(), |v4| v4.is_loopback()),
+    }
+}
+
+/// Reachable by design: public, or loopback for local development servers.
+fn is_reachable(ip: IpAddr) -> bool {
+    is_public_ip(ip) || ip_is_loopback(ip)
 }
 
 /// True when the address is safe to reach from a public server.
@@ -254,7 +300,7 @@ impl WebFetchTool {
         if addrs.is_empty() {
             return Err(format!("webfetch refused: {host} did not resolve").into());
         }
-        if let Some(private) = addrs.iter().find(|addr| !is_public_ip(addr.ip())) {
+        if let Some(private) = addrs.iter().find(|addr| !is_reachable(addr.ip())) {
             return Err(format!(
                 "webfetch refused: {host} resolves to {}, which is a private address",
                 private.ip()
@@ -364,26 +410,70 @@ mod tests {
 
     #[tokio::test]
     async fn a_private_destination_is_refused_before_any_request() {
-        let mut server = mockito::Server::new_async().await;
-        // No mock is registered: reaching the server at all would fail the test
-        // differently, and the point is that no request is sent.
-        let tool = WebFetchTool::new(WebFetchPolicy {
-            block_private_networks: true,
-            allowed_hosts: Vec::new(),
-        });
-        let args = serde_json::json!({ "url": format!("{}/hello", server.url()) });
+        // A literal private address needs no DNS and no server: the point is
+        // that the request is refused before a connection is opened.
+        let tool = WebFetchTool::default();
+        let args = serde_json::json!({ "url": "http://10.1.2.3:9/hello" });
         let ctx = ToolContext::new("test", "msg");
 
         let error = tool
             .execute(args, &ctx)
             .await
             .err()
-            .expect("127.0.0.1 must be refused");
+            .expect("10.1.2.3 must be refused");
 
         assert!(
             error.to_string().contains("private address"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_default_policy_blocks_private_networks() {
+        assert!(WebFetchPolicy::default().block_private_networks);
+        assert!(WebFetchPolicy::default().allowed_hosts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn loopback_is_reachable_by_the_default_policy() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/local")
+            .with_status(200)
+            .with_header("content-type", "text/html")
+            .with_body("<html><body><h1>Local</h1></body></html>")
+            .create_async()
+            .await;
+
+        // The default policy blocks private networks but must keep a local
+        // development server usable, over plain http.
+        let tool = WebFetchTool::default();
+        let result = tool
+            .execute(
+                serde_json::json!({ "url": format!("{}/local", server.url()) }),
+                &ToolContext::new("test", "msg"),
+            )
+            .await
+            .expect("loopback must stay reachable");
+
+        assert!(result.output.contains("Local"), "{output}", output = result.output);
+    }
+
+    #[test]
+    fn only_a_real_loopback_host_keeps_cleartext() {
+        // A hostname that merely contains the address is still a public host.
+        assert_eq!(
+            normalize_url("http://127.0.0.1.example.com/x"),
+            "https://127.0.0.1.example.com/x"
+        );
+        assert_eq!(
+            normalize_url("http://example.com/?a=127.0.0.1"),
+            "https://example.com/?a=127.0.0.1"
+        );
+        assert_eq!(normalize_url("http://127.0.0.1:8406/api"), "http://127.0.0.1:8406/api");
+        assert_eq!(normalize_url("http://localhost:8406/api"), "http://localhost:8406/api");
+        assert_eq!(normalize_url("http://[::1]:8406/api"), "http://[::1]:8406/api");
+        assert_eq!(normalize_url("example.org/page"), "https://example.org/page");
     }
 
     #[tokio::test]
@@ -498,22 +588,24 @@ mod tests {
     async fn a_redirect_to_a_private_address_is_checked_on_the_next_hop() {
         let mut server = mockito::Server::new_async().await;
         let _hop = server
-            .mock("GET", "/to-loopback")
+            .mock("GET", "/to-private")
             .with_status(302)
-            .with_header("location", "http://127.0.0.1:8406/api/health")
+            .with_header("location", "http://10.1.2.3:9/api/health")
             .create_async()
             .await;
 
+        // The first hop is loopback and allowed; the redirect target is a
+        // private address and must be refused when it is checked.
         let tool = WebFetchTool::new(WebFetchPolicy {
             block_private_networks: true,
             allowed_hosts: Vec::new(),
         });
-        let start = reqwest::Url::parse(&format!("{}/to-loopback", server.url())).expect("url");
+        let start = reqwest::Url::parse(&format!("{}/to-private", server.url())).expect("url");
         let error = tool
             .fetch_following(start, true)
             .await
             .err()
-            .expect("the first hop is already private");
+            .expect("a private redirect target must be refused");
 
         assert!(error.to_string().contains("private address"), "{error}");
     }

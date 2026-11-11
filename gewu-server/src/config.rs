@@ -84,13 +84,28 @@ pub struct LoadedConfig {
     pub path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WebFetchConfig {
-    #[serde(default)]
+    /// Blocking is on unless the config says otherwise: the model chooses the
+    /// URL, so an unchecked fetch reaches whatever this process can reach.
+    #[serde(default = "default_true")]
     pub block_private_networks: bool,
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for WebFetchConfig {
+    fn default() -> Self {
+        Self {
+            block_private_networks: true,
+            allowed_hosts: Vec::new(),
+        }
+    }
 }
 
 impl WebFetchConfig {
@@ -279,6 +294,19 @@ mod tests {
             r#"{"webFetch":{"blockPrivateNetworks":true,"allowedHosts":["example.org"]}}"#,
         );
         assert!(config.is_ok(), "existing webFetch configurations must remain valid: {config:?}");
+    }
+
+    #[test]
+    fn webfetch_blocks_private_networks_unless_explicitly_disabled() {
+        let config: Config = serde_json::from_str(r#"{"webFetch":{}}"#).unwrap();
+        assert!(
+            config.web_fetch.expect("webFetch present").policy().block_private_networks,
+            "omitting the field must keep the safe default"
+        );
+
+        let config: Config =
+            serde_json::from_str(r#"{"webFetch":{"blockPrivateNetworks":false}}"#).unwrap();
+        assert!(!config.web_fetch.unwrap().policy().block_private_networks);
     }
 
     #[test]
