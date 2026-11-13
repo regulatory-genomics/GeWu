@@ -1697,9 +1697,10 @@ body {
   color: var(--error);
 }
 
-.tree-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
-.tree-root { min-width: 0; margin: 0; color: var(--text-dim); overflow-wrap: anywhere; }
-.workspace-picker { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; color: var(--text-faint); font-size: 10px; }
+.tree-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "root root" "workspace actions"; align-items: center; gap: 6px 10px; margin-bottom: 8px; }
+.tree-root { grid-area: root; min-width: 0; margin: 0; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-controls { grid-area: workspace; display: flex; align-items: center; gap: 8px; min-width: 0; }
+.workspace-picker { display: flex; align-items: center; gap: 4px; color: var(--text-faint); font-size: 10px; }
 .workspace-picker select { max-width: 120px; border: 1px solid var(--line); background: var(--bg-panel); color: var(--text); font: inherit; }
 .workspace-add { border: 0; background: transparent; color: var(--text-dim); cursor: pointer; font: inherit; }
 .workspace-add:hover { color: var(--accent); }
@@ -1726,7 +1727,7 @@ body {
 .tree-empty { padding: 3px 0; color: var(--text-faint); }
 .tree-refresh { border: 0; background: transparent; color: var(--text-dim); cursor: pointer; font: inherit; }
 .tree-refresh:hover { color: var(--accent); }
-.tree-actions { display: flex; gap: 8px; align-items: center; }
+.tree-actions { grid-area: actions; display: flex; gap: 8px; align-items: center; }
 .tree-upload { border: 0; background: transparent; color: var(--text-dim); cursor: pointer; font: inherit; }
 .tree-upload:hover { color: var(--accent); }
 #app.drag-over .file-tree-section { outline: 2px dashed var(--accent); outline-offset: -2px; }

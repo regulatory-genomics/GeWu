@@ -957,7 +957,7 @@ fn workspace_selector_html(
     workspaces: &[WorkspaceSummary],
     active: &str,
 ) -> String {
-    let mut out = String::new();
+    let mut out = String::from("<span class=\"workspace-controls\">");
     if workspaces.len() > 1 {
         out.push_str("<label class=\"workspace-picker\"><span>ROOT</span><select data-workspace-select>");
         for workspace in workspaces {
@@ -978,6 +978,7 @@ fn workspace_selector_html(
         "<button type=\"button\" class=\"workspace-add\" data-workspace-add data-workspace-browse-path=\"{}\" title=\"Add a server directory\" aria-label=\"Add a server directory\">＋</button>",
         escape(root)
     );
+    out.push_str("</span>");
     out
 }
 
