@@ -12,6 +12,8 @@ pub struct TabInfo {
     pub label: String,
     pub busy: bool,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub workspace: String,
 }
 
 /// Browser -> GUI commands.
@@ -31,6 +33,11 @@ pub enum ClientMsg {
     SwitchModel {
         tab: u64,
         model: String,
+    },
+    /// Switch the tab's active filesystem workspace root.
+    SwitchWorkspace {
+        tab: u64,
+        workspace: String,
     },
     /// First message when the GUI requires a token.
     Auth {
@@ -197,6 +204,7 @@ mod tests {
                 label: "new".to_string(),
                 busy: false,
                 session_id: None,
+                workspace: "cwd".into(),
             }],
             active: 1,
         };

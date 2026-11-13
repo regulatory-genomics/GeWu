@@ -126,12 +126,13 @@ impl Tool for BashTool {
             return Ok(ToolResult::new("bash", error));
         }
 
+        let working_directory = ctx.active_working_directory(&self.working_directory);
         let work_dir = if let Some(wd) = &input.workdir {
-            crate::fs_utils::resolve_read_path(&self.working_directory, wd, ctx.enforcement)
+            crate::fs_utils::resolve_read_path(working_directory, wd, ctx.enforcement)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?
         } else {
-            self.working_directory.clone()
+            working_directory.to_path_buf()
         };
 
         let mut child = tokio::process::Command::new("bash");

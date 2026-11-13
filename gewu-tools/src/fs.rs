@@ -191,8 +191,9 @@ impl Tool for ReadFileTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: ReadArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
+        let working_directory = ctx.active_working_directory(&self.working_directory);
         let file_path =
-            resolve_read_path(&self.working_directory, &input.file_path, ctx.enforcement)
+            resolve_read_path(working_directory, &input.file_path, ctx.enforcement)
                 .await
                 .map_err(into_tool_error)?;
 
@@ -427,8 +428,9 @@ impl Tool for WriteFileTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: WriteArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
+        let working_directory = ctx.active_working_directory(&self.working_directory);
         let file_path =
-            resolve_write_path(&self.working_directory, &input.file_path, ctx.enforcement)
+            resolve_write_path(working_directory, &input.file_path, ctx.enforcement)
                 .await
                 .map_err(into_tool_error)?;
 
@@ -463,8 +465,9 @@ impl Tool for EditFileTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: EditArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
+        let working_directory = ctx.active_working_directory(&self.working_directory);
         let file_path =
-            resolve_write_path(&self.working_directory, &input.file_path, ctx.enforcement)
+            resolve_write_path(working_directory, &input.file_path, ctx.enforcement)
                 .await
                 .map_err(into_tool_error)?;
 
@@ -514,12 +517,13 @@ impl Tool for GlobTool {
             )));
         }
 
+        let working_directory = ctx.active_working_directory(&self.working_directory);
         let search_dir = if let Some(p) = &input.path {
-            resolve_read_path(&self.working_directory, p, ctx.enforcement)
+            resolve_read_path(working_directory, p, ctx.enforcement)
                 .await
                 .map_err(into_tool_error)?
         } else {
-            self.working_directory.clone()
+            working_directory.to_path_buf()
         };
 
         if !search_dir.is_dir() {
@@ -535,7 +539,7 @@ impl Tool for GlobTool {
             input.hidden,
             input.limit,
         );
-        let workdir = self.working_directory.clone();
+        let workdir = working_directory.to_path_buf();
         let contain = ctx.enforcement != gewu_core::types::PathEnforcement::None;
         let matches = tokio::task::spawn_blocking(move || {
             let mut matches = glob_with_gitignore(&search_dir, &pattern, hidden, limit)?;
@@ -675,6 +679,25 @@ mod tests {
         assert!(result.output.contains("<path>"));
         assert!(result.output.contains("<type>file</type>"));
         assert!(result.output.contains("1: Hello from file"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_file_uses_the_context_workspace_root() -> Result<()> {
+        let fallback = tempdir()?;
+        let selected = tempdir()?;
+        fs::write(selected.path().join("selected.txt"), "from selected").await?;
+        let tool = ReadFileTool {
+            working_directory: fallback.path().to_path_buf(),
+        };
+        let ctx = ToolContext::new("test", "message")
+            .with_working_directory(selected.path().to_path_buf());
+
+        let result = tool
+            .execute(serde_json::json!({"file_path":"selected.txt"}), &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(result.output.contains("from selected"), "{}", result.output);
         Ok(())
     }
 

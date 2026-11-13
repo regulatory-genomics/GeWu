@@ -88,6 +88,8 @@ pub struct Bootstrap {
     /// Working directory all tools resolve paths against; captured once at
     /// startup so the UI can show it.
     pub working_directory: String,
+    /// Canonical named roots available to sessions; always contains `cwd`.
+    pub workspace_roots: Arc<BTreeMap<String, std::path::PathBuf>>,
     /// File-path confinement level for tools and file-tree operations.
     pub enforcement: PathEnforcement,
     /// Model context window (tokens) forwarded to agents for compaction;
@@ -418,6 +420,12 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
         info!("No config file found");
     }
     let file_config = &loaded_config.config;
+    let startup_directory = env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let workspace_roots = Arc::new(crate::config::resolve_workspace_roots(
+        file_config,
+        &startup_directory,
+    )?);
 
     let (provider, provider_name, model) = build_provider(args, file_config)?;
     info!("Using model: {}", model);
@@ -495,10 +503,8 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
         log_writer,
         model,
         provider_name,
-        working_directory: env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("/"))
-            .to_string_lossy()
-            .to_string(),
+        working_directory: workspace_roots["cwd"].to_string_lossy().to_string(),
+        workspace_roots,
         enforcement: loaded_config.config.sandbox,
         context_limit,
         models,

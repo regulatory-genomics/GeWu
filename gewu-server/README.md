@@ -82,9 +82,10 @@ echoed on every reply.
 {"id": "5", "op": "list_sessions"}      // persisted conversations, newest first
 {"id": "6", "op": "get_session", "session_id": "s1"}  // one session's messages
 {"id": "7", "op": "delete_session", "session_id": "s1"}  // remove it from the store
-{"id": "8", "op": "info"}               // model, provider and cwd the server runs with
-{"id": "9", "op": "usage", "session_id": "s1"}  // context tokens vs limit
-{"id": "10", "op": "ping"}
+{"id": "8", "op": "info", "session_id": "s1"} // model, roots and this session's active root
+{"id": "9", "op": "switch_workspace", "workspace": "frontend", "session_id": "s1"}
+{"id": "10", "op": "usage", "session_id": "s1"}  // context tokens vs limit
+{"id": "11", "op": "ping"}
 {"id": "0", "op": "auth", "token": "secret"}  // required first on token-protected servers
 ```
 
@@ -97,9 +98,10 @@ echoed on every reply.
 {"type": "result", "id": null, "request_id": "c3f1...", "session_id": "s1", "response": "Done."}
 {"type": "interrupted", "id": "2", "request_id": "c3f1..."}
 {"type": "error", "id": "1", "error": "an ask is already in progress"}
-{"type": "pong", "id": "10"}
-{"type": "info", "id": "8", "model": "gpt-4o", "provider": "openai", "working_directory": "/home/me/project"}
-{"type": "usage", "id": "9", "used_tokens": 34_000, "context_limit": 128_000, "busy": false}
+{"type": "pong", "id": "11"}
+{"type": "info", "id": "8", "model": "gpt-4o", "provider": "openai", "working_directory": "/home/me/frontend", "active_workspace": "frontend", "workspaces": [{"id": "cwd", "path": "/home/me/project"}, {"id": "frontend", "path": "/home/me/frontend"}]}
+{"type": "workspace_switched", "id": "9", "session_id": "s1", "workspace": {"id": "frontend", "path": "/home/me/frontend"}}
+{"type": "usage", "id": "10", "used_tokens": 34_000, "context_limit": 128_000, "busy": false}
 {"type": "auth", "id": "0", "ok": true}
 {"type": "tools", "id": "3", "tools": ["read_file", "bash", "..."]}
 {"type": "agents", "id": "4", "agents": ["build", "explore", "general"]}

@@ -15,6 +15,7 @@ use crate::workflow::template::{TemplateVars, render};
 use gewu_core::types::AgentEvent;
 use gewu_graph::{CompiledGraph, NodeResult, StateGraph};
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -89,6 +90,7 @@ fn compile(
     spec: &Arc<WorkflowSpec>,
     factory: Arc<dyn AgentFactory>,
     parent_session: String,
+    working_directory: Option<PathBuf>,
     budget: Arc<AtomicUsize>,
     cancel: Arc<AtomicBool>,
     state: Arc<Mutex<RunState>>,
@@ -105,6 +107,7 @@ fn compile(
         let budget = budget.clone();
         let cancel = cancel.clone();
         let state = state.clone();
+        let working_directory = working_directory.clone();
         graph.add_node(&node_id, move |graph_state: WorkflowState| {
             let node = node.clone();
             let spec = spec.clone();
@@ -113,6 +116,7 @@ fn compile(
             let budget = budget.clone();
             let cancel = cancel.clone();
             let state = state.clone();
+            let working_directory = working_directory.clone();
             async move {
                 // A canceled run unwinds through the remaining nodes
                 // without recording outcomes (they stay "skipped").
@@ -127,6 +131,7 @@ fn compile(
                     graph_state,
                     factory,
                     parent_session,
+                    working_directory,
                     budget,
                     cancel,
                     state.clone(),
@@ -180,6 +185,25 @@ pub async fn run(
     cancel: Arc<AtomicBool>,
     state: Arc<Mutex<RunState>>,
 ) {
+    run_in(
+        spec,
+        factory,
+        parent_session,
+        None,
+        cancel,
+        state,
+    )
+    .await;
+}
+
+pub async fn run_in(
+    spec: WorkflowSpec,
+    factory: Arc<dyn AgentFactory>,
+    parent_session: String,
+    working_directory: Option<PathBuf>,
+    cancel: Arc<AtomicBool>,
+    state: Arc<Mutex<RunState>>,
+) {
     let timeout = Duration::from_secs(spec.timeout_secs());
     let budget = Arc::new(AtomicUsize::new(0));
     {
@@ -196,6 +220,7 @@ pub async fn run(
         &spec,
         factory,
         parent_session,
+        working_directory,
         budget.clone(),
         cancel.clone(),
         state.clone(),
@@ -232,6 +257,7 @@ async fn run_node(
     graph_state: WorkflowState,
     factory: Arc<dyn AgentFactory>,
     parent_session: String,
+    working_directory: Option<PathBuf>,
     budget: Arc<AtomicUsize>,
     cancel: Arc<AtomicBool>,
     state: Arc<Mutex<RunState>>,
@@ -247,6 +273,7 @@ async fn run_node(
             Ok(prompt) => join_set.spawn(run_task(
                 factory.clone(),
                 parent_session.clone(),
+                working_directory.clone(),
                 base,
                 overrides,
                 prompt,
@@ -312,6 +339,7 @@ fn session_of(result: &TaskOutcome) -> String {
 async fn run_task(
     factory: Arc<dyn AgentFactory>,
     parent_session: String,
+    working_directory: Option<PathBuf>,
     base: String,
     overrides: AgentOverrides,
     prompt: String,
@@ -331,6 +359,7 @@ async fn run_task(
     let result = execute_with_review(
         &factory,
         &parent_session,
+        working_directory,
         &base,
         &overrides,
         &prompt,
@@ -354,6 +383,7 @@ async fn run_task(
 async fn execute_with_review(
     factory: &Arc<dyn AgentFactory>,
     parent_session: &str,
+    working_directory: Option<PathBuf>,
     base: &str,
     overrides: &AgentOverrides,
     prompt: &str,
@@ -382,7 +412,7 @@ async fn execute_with_review(
             return Err(("canceled".to_string(), None));
         }
         let (mut agent, session) = factory
-            .create_with(base, overrides, parent_session)
+            .create_with_in(base, overrides, parent_session, working_directory.clone())
             .await
             .map_err(|error| (format!("failed to create agent '{base}': {error}"), None))?;
         let output = drive_agent(&mut agent, &prompt)
@@ -396,7 +426,12 @@ async fn execute_with_review(
         charge(budget)?;
         let (reviewer_base, reviewer_overrides) = resolve_agent(&review.agent, spec);
         let (mut reviewer, _) = factory
-            .create_with(&reviewer_base, &reviewer_overrides, parent_session)
+            .create_with_in(
+                &reviewer_base,
+                &reviewer_overrides,
+                parent_session,
+                working_directory.clone(),
+            )
             .await
             .map_err(|error| {
                 (

@@ -131,8 +131,9 @@ impl Tool for GrepTool {
         }
 
         let search_path_str = input.path.as_deref().unwrap_or(".");
+        let working_directory = ctx.active_working_directory(&self.working_directory);
         let search_path =
-            resolve_read_path(&self.working_directory, search_path_str, ctx.enforcement)
+            resolve_read_path(working_directory, search_path_str, ctx.enforcement)
                 .await
                 .map_err(into_tool_error)?;
 

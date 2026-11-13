@@ -136,6 +136,7 @@ struct SqliteAgentFactory {
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
     skills: Vec<SkillInfo>,
+    working_directory: std::path::PathBuf,
     web_fetch: Arc<gewu_tools::WebFetchPolicy>,
     enforcement: PathEnforcement,
     /// Model context window forwarded to subagent agents for compaction.
@@ -327,13 +328,13 @@ impl SqliteAgentFactory {
         {
             return Ok(template.clone());
         }
-        let working_directory = std::env::current_dir()?;
+        let working_directory = self.working_directory.clone();
         let (tools, system_prompt, _registry) = agent_profile(ProfileInputs {
             model_catalog: self.model_catalog.clone(),
             name: profile,
             provider: self.provider.clone(),
             pool: self.pool.clone(),
-            working_directory,
+            working_directory: working_directory.clone(),
             additional_tools: Vec::new(),
             skills: self.skills.clone(),
             web_fetch: self.web_fetch.clone(),
@@ -348,6 +349,7 @@ impl SqliteAgentFactory {
             .llm(self.provider.clone())
             .with_tools(tools)
             .system_prompt(&system_prompt)
+            .working_directory(working_directory)
             .with_enforcement(self.enforcement)
             .with_session_state(session_state)
             .build()?
@@ -368,6 +370,7 @@ fn agent_factory(
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
     skills: Vec<SkillInfo>,
+    working_directory: std::path::PathBuf,
     web_fetch: Arc<gewu_tools::WebFetchPolicy>,
     enforcement: PathEnforcement,
     context_limit: Option<usize>,
@@ -378,6 +381,7 @@ fn agent_factory(
         provider,
         pool,
         skills,
+        working_directory,
         web_fetch,
         enforcement,
         context_limit,
@@ -436,6 +440,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 provider.clone(),
                 pool.clone(),
                 skills.clone(),
+                working_directory.clone(),
                 inputs.web_fetch.clone(),
                 *enforcement,
                 *context_limit,
@@ -488,6 +493,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                         provider.clone(),
                         pool.clone(),
                         skills.clone(),
+                        inputs.working_directory.clone(),
                         inputs.web_fetch.clone(),
                         *enforcement,
                         *context_limit,
@@ -547,6 +553,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 provider.clone(),
                 pool.clone(),
                 skills.clone(),
+                working_directory.clone(),
                 inputs.web_fetch.clone(),
                 *enforcement,
                 *context_limit,
@@ -872,7 +879,7 @@ mod tests {
         SqliteMemory::new(pool.clone(), "parent".into()).await.unwrap();
         let factory = SqliteAgentFactory {
             model_catalog: None, provider: Arc::new(DummyLlm), pool,
-            skills: vec![], web_fetch: policy, enforcement: PathEnforcement::None, context_limit: None,
+            skills: vec![], working_directory: std::env::current_dir().unwrap(), web_fetch: policy, enforcement: PathEnforcement::None, context_limit: None,
             agents: Arc::new(BTreeMap::new()), templates: Mutex::new(HashMap::new()),
         };
         let (child, _) = factory.create("explore", None, "parent").await.unwrap();
@@ -912,6 +919,7 @@ mod tests {
             provider,
             pool: pool.clone(),
             skills: vec![],
+            working_directory: std::env::current_dir().unwrap(),
             web_fetch: Arc::default(),
             enforcement: PathEnforcement::None,
             context_limit: Some(10_000),
@@ -1342,6 +1350,7 @@ mod tests {
             provider: provider.clone(),
             pool: pool.clone(),
             skills: Vec::new(),
+            working_directory: std::env::current_dir().unwrap(),
             web_fetch: Arc::default(),
             enforcement: PathEnforcement::None,
             context_limit: None,
@@ -1579,6 +1588,7 @@ mod tests {
             provider: provider.clone(),
             pool: pool.clone(),
             skills: Vec::new(),
+            working_directory: std::env::current_dir().unwrap(),
             web_fetch: Arc::default(),
             enforcement: PathEnforcement::None,
             context_limit: None,
@@ -1622,6 +1632,7 @@ mod tests {
             provider,
             pool: pool.clone(),
             skills: Vec::new(),
+            working_directory: std::env::current_dir().unwrap(),
             web_fetch: Arc::default(),
             enforcement: PathEnforcement::None,
             context_limit: None,
@@ -1735,6 +1746,7 @@ mod tests {
             provider,
             pool,
             Vec::new(),
+            std::path::PathBuf::from("."),
             Arc::default(),
             PathEnforcement::None,
             None,
@@ -1806,6 +1818,7 @@ mod tests {
             provider,
             pool,
             Vec::new(),
+            std::path::PathBuf::from("."),
             Arc::default(),
             PathEnforcement::None,
             None,

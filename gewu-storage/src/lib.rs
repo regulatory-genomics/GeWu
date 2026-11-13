@@ -75,6 +75,13 @@ async fn ensure_agents(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+async fn ensure_workspaces(pool: &SqlitePool) -> Result<()> {
+    sqlx::query("CREATE TABLE IF NOT EXISTS session_workspaces (session_id TEXT PRIMARY KEY, workspace TEXT NOT NULL)")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 async fn ensure_session_state(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS session_state (\
@@ -392,6 +399,29 @@ pub async fn set_session_model(pool: &SqlitePool, session_id: &str, model: &str)
     Ok(())
 }
 
+/// Session workspace metadata. `None` means a legacy session that uses `cwd`.
+pub async fn session_workspace(pool: &SqlitePool, session_id: &str) -> Result<Option<String>> {
+    ensure_workspaces(pool).await?;
+    Ok(sqlx::query_scalar("SELECT workspace FROM session_workspaces WHERE session_id = ?")
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await?)
+}
+
+pub async fn set_session_workspace(
+    pool: &SqlitePool,
+    session_id: &str,
+    workspace: &str,
+) -> Result<()> {
+    ensure_workspaces(pool).await?;
+    sqlx::query("INSERT INTO session_workspaces(session_id, workspace) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET workspace = excluded.workspace")
+        .bind(session_id)
+        .bind(workspace)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// SQLite-backed [`SessionStateStore`] for per-session tool state.
 ///
 /// Values are JSON strings keyed by `(session_id, key)`; tools access them
@@ -520,6 +550,7 @@ pub async fn delete_session(pool: &SqlitePool, session_id: &str) -> Result<u64> 
     ensure_reminders(pool).await?;
     ensure_models(pool).await?;
     ensure_agents(pool).await?;
+    ensure_workspaces(pool).await?;
     ensure_reverts(pool).await?;
     ensure_session_state(pool).await?;
     let descendants = subagent_descendants(pool, session_id).await?;
@@ -551,6 +582,7 @@ pub async fn delete_session(pool: &SqlitePool, session_id: &str) -> Result<u64> 
             "session_reminders",
             "session_models",
             "session_agents",
+            "session_workspaces",
             "chat_reverts",
             "session_state",
         ] {
@@ -848,6 +880,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_workspace_round_trips() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        assert_eq!(session_workspace(&pool, "s1").await?, None);
+        set_session_workspace(&pool, "s1", "frontend").await?;
+        assert_eq!(session_workspace(&pool, "s1").await?.as_deref(), Some("frontend"));
+        set_session_workspace(&pool, "s1", "backend").await?;
+        assert_eq!(session_workspace(&pool, "s1").await?.as_deref(), Some("backend"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn session_state_store_round_trips_and_isolates_keys() -> Result<()> {
         let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
         let store = SqliteSessionStateStore::new(pool.clone());
@@ -881,13 +924,19 @@ mod tests {
         set_reminder(&pool, "main", &gewu_core::agent::Reminder::default()).await?;
         set_session_model(&pool, "main", "east/m1").await?;
         set_session_agent(&pool, "main", "build").await?;
+        set_session_workspace(&pool, "main", "frontend").await?;
         let store = SqliteSessionStateStore::new(pool.clone());
         store.save("main", "todos", "[]".into()).await?;
         revert_chat(&pool, "main", None, false, None).await?;
 
         assert_eq!(delete_session(&pool, "main").await?, 1);
         assert!(get_reminder_opt(&pool, "main").await?.is_none());
-        for table in ["session_models", "session_agents", "chat_reverts"] {
+        for table in [
+            "session_models",
+            "session_agents",
+            "session_workspaces",
+            "chat_reverts",
+        ] {
             let count: i64 = sqlx::query_scalar(&format!(
                 "SELECT COUNT(*) FROM {table} WHERE session_id = 'main'"
             ))

@@ -14,6 +14,7 @@
 //! {"id": "3", "op": "list_tools"}
 //! {"id": "4", "op": "list_agents"}
 //! {"id": "5", "op": "ping"}
+//! {"id": "6", "op": "switch_workspace", "workspace": "frontend", "session_id": "s1"}
 //! ```
 //!
 //! `id` is a client-chosen correlation ID (any JSON value) echoed on every
@@ -40,6 +41,7 @@
 //! {"type": "steered", "id": "7", "session_id": "s", "text": "focus on tests"}
 //! {"type": "error", "id": "1", "error": "an ask is already in progress"}
 //! {"type": "pong", "id": "5"}
+//! {"type": "workspace_switched", "id": "6", "session_id": "s1", "workspace": {"id": "frontend", "path": "/work/frontend"}}
 //! {"type": "tools", "id": "3", "tools": ["read_file", "bash", "..."]}
 //! {"type": "agents", "id": "4", "agents": ["build", "explore", "general"]}
 //! {"type": "auth", "id": "0", "ok": true}
@@ -104,6 +106,10 @@ pub enum Op {
     SwitchModel {
         model: String,
     },
+    /// Switch the session's active filesystem workspace root.
+    SwitchWorkspace {
+        workspace: String,
+    },
     /// List persisted conversation sessions, newest first.
     ListSessions,
     /// Load one persisted session's messages. The session id is carried in
@@ -155,13 +161,17 @@ impl Serialize for ClientRequest {
             } else {
                 0
             }
-            + (matches!(self.op, Op::SwitchAgent { .. } | Op::SwitchModel { .. })) as usize
+            + (matches!(
+                self.op,
+                Op::SwitchAgent { .. } | Op::SwitchModel { .. } | Op::SwitchWorkspace { .. }
+            )) as usize
             + self.agent.is_some() as usize
             + matches!(
                 self.op,
                 Op::Ask { .. }
                     | Op::Auth { .. }
                     | Op::Steer { .. }
+                    | Op::SwitchWorkspace { .. }
                     | Op::ListFiles { .. }
                     | Op::ReadFile { .. }
                     | Op::WriteFile { .. }
@@ -181,6 +191,10 @@ impl Serialize for ClientRequest {
             Op::SwitchModel { model } => {
                 map.serialize_entry("op", "switch_model")?;
                 map.serialize_entry("model", model)?;
+            }
+            Op::SwitchWorkspace { workspace } => {
+                map.serialize_entry("op", "switch_workspace")?;
+                map.serialize_entry("workspace", workspace)?;
             }
             Op::Ask { prompt } => {
                 map.serialize_entry("op", "ask")?;
@@ -250,6 +264,14 @@ impl ClientRequest {
             id,
             Op::SwitchModel {
                 model: model.into(),
+            },
+        )
+    }
+    pub fn switch_workspace(id: impl Into<Value>, workspace: impl Into<String>) -> Self {
+        Self::simple(
+            id,
+            Op::SwitchWorkspace {
+                workspace: workspace.into(),
             },
         )
     }
@@ -482,6 +504,13 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
                 .ok_or_else(|| RequestError::Invalid("switch_model requires model".into()))?
                 .to_string(),
         },
+        "switch_workspace" => Op::SwitchWorkspace {
+            workspace: obj
+                .get("workspace")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RequestError::Invalid("switch_workspace requires workspace".into()))?
+                .to_string(),
+        },
         "ask" => {
             let prompt = obj
                 .get("prompt")
@@ -626,10 +655,21 @@ fn default_agent_name() -> String {
     "build".into()
 }
 
+fn default_workspace_id() -> String {
+    "cwd".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileEntry {
     pub name: String,
     pub is_dir: bool,
+}
+
+/// One configured filesystem root visible to clients.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceSummary {
+    pub id: String,
+    pub path: String,
 }
 
 /// One switchable model in the server's catalog.
@@ -674,6 +714,12 @@ pub enum ServerMessage {
         model: String,
         /// The new model's display label.
         label: String,
+    },
+    /// Reply after changing the session's active filesystem root.
+    WorkspaceSwitched {
+        id: Value,
+        session_id: String,
+        workspace: WorkspaceSummary,
     },
     /// Sent when an `ask` begins; carries the server-assigned request id
     /// and the session handling the request.
@@ -755,6 +801,13 @@ pub enum ServerMessage {
         /// The working directory the server's agent operates in (absolute).
         #[serde(default)]
         working_directory: String,
+        /// All configured roots; empty when talking to an older server.
+        #[serde(default)]
+        workspaces: Vec<WorkspaceSummary>,
+        /// The active root for the requested session, or `cwd` when no
+        /// session has been attached.
+        #[serde(default = "default_workspace_id")]
+        active_workspace: String,
     },
     /// Reply to a `usage` request: the session's context usage.
     Usage {
@@ -868,6 +921,7 @@ impl ServerMessage {
             ServerMessage::SessionSnapshot { .. } => "session_snapshot",
             ServerMessage::AgentSwitched { .. } => "agent_switched",
             ServerMessage::ModelSwitched { .. } => "model_switched",
+            ServerMessage::WorkspaceSwitched { .. } => "workspace_switched",
             ServerMessage::Ready { .. } => "ready",
             ServerMessage::Event { .. } => "event",
             ServerMessage::Result { .. } => "result",
@@ -898,6 +952,7 @@ impl ServerMessage {
         match self {
             ServerMessage::AgentSwitched { id, .. } => Some(id),
             ServerMessage::ModelSwitched { id, .. } => Some(id),
+            ServerMessage::WorkspaceSwitched { id, .. } => Some(id),
             ServerMessage::Ready { id, .. }
             | ServerMessage::Pong { id }
             | ServerMessage::Info { id, .. }
@@ -1092,6 +1147,45 @@ mod tests {
     }
 
     #[test]
+    fn workspace_switch_request_round_trips() {
+        let req = parse_request(
+            r#"{"id":"a","op":"switch_workspace","workspace":"frontend","session_id":"s1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.op,
+            Op::SwitchWorkspace {
+                workspace: "frontend".into()
+            }
+        );
+        assert_eq!(
+            ClientRequest::switch_workspace("a", "frontend")
+                .with_session("s1")
+                .to_line(),
+            r#"{"id":"a","op":"switch_workspace","workspace":"frontend","session_id":"s1"}"#
+        );
+    }
+
+    #[test]
+    fn workspace_info_is_backward_compatible() {
+        let legacy: ServerMessage = serde_json::from_str(
+            r#"{"type":"info","id":1,"model":"m","provider":"p","working_directory":"/tmp"}"#,
+        )
+        .unwrap();
+        match legacy {
+            ServerMessage::Info {
+                workspaces,
+                active_workspace,
+                ..
+            } => {
+                assert!(workspaces.is_empty());
+                assert_eq!(active_workspace, "cwd");
+            }
+            other => panic!("expected info, got {}", other.kind()),
+        }
+    }
+
+    #[test]
     fn parses_and_serializes_get_session() {
         let req = parse_request(r#"{"id": "a", "op": "get_session", "session_id": "s1"}"#).unwrap();
         assert_eq!(req.op, Op::GetSession);
@@ -1152,6 +1246,8 @@ mod tests {
             model: "gpt-4o".into(),
             provider: "openai".into(),
             working_directory: "/tmp/proj".into(),
+            workspaces: vec![],
+            active_workspace: "cwd".into(),
         };
         assert_eq!(info.kind(), "info");
         assert!(info.correlation_id().is_some());

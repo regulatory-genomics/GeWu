@@ -1699,6 +1699,8 @@ body {
 
 .tree-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
 .tree-root { min-width: 0; margin: 0; color: var(--text-dim); overflow-wrap: anywhere; }
+.workspace-picker { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; color: var(--text-faint); font-size: 10px; }
+.workspace-picker select { max-width: 120px; border: 1px solid var(--line); background: var(--bg-panel); color: var(--text); font: inherit; }
 .tree-list, .tree-children { margin: 0; padding: 0; list-style: none; }
 .tree-children { margin-left: 10px; }
 .tree-entry { margin: 1px 0; }

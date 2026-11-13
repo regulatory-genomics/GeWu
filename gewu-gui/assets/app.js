@@ -687,6 +687,12 @@
     }
     if (event.target.closest("[data-tree-refresh]")) { send({ op: "refresh_tree" }); }
   });
+  el.sidebar.addEventListener("change", (event) => {
+    const workspace = event.target.closest("[data-workspace-select]");
+    if (workspace) {
+      send({ op: "switch_workspace", tab: state.active, workspace: workspace.value });
+    }
+  });
 
   // -- file upload ---------------------------------------------------------
 

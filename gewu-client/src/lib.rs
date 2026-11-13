@@ -46,13 +46,17 @@ pub use stream::AskStream;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-use gewu_protocol::{ClientRequest, FileEntry, Message, ServerMessage, SessionSummary, TokenUsage};
+use gewu_protocol::{
+    ClientRequest, FileEntry, Message, ServerMessage, SessionSummary, TokenUsage,
+    WorkspaceSummary,
+};
 use inner::Command;
 
 /// Alias for a [`Result`](std::result::Result) with this crate's error type.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Model and provider the server was started with.
+/// Server model/provider plus the configured filesystem roots and the active
+/// root for the requested session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerInfo {
     /// Model name, e.g. `gpt-4o`.
@@ -61,6 +65,8 @@ pub struct ServerInfo {
     pub provider: String,
     /// The working directory the server's agent operates in (absolute).
     pub working_directory: String,
+    pub workspaces: Vec<WorkspaceSummary>,
+    pub active_workspace: String,
 }
 
 /// The session's context usage against the agent's context window.
@@ -209,6 +215,23 @@ impl Client {
             } => Ok((session_id, label)),
             ServerMessage::Error { error, .. } => Err(Error::Server(error)),
             other => Err(unexpected(other, "model_switched")),
+        }
+    }
+
+    /// Switch the active filesystem root on an idle session.
+    pub async fn switch_workspace(
+        &self,
+        workspace: impl Into<String>,
+    ) -> Result<(String, WorkspaceSummary)> {
+        let request = ClientRequest::switch_workspace(self.next_correlation_id(), workspace);
+        match self.request(request).await? {
+            ServerMessage::WorkspaceSwitched {
+                session_id,
+                workspace,
+                ..
+            } => Ok((session_id, workspace)),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "workspace_switched")),
         }
     }
     /// Connect over TCP (newline-delimited JSON; the server listens on
@@ -381,16 +404,30 @@ impl Client {
     /// The model, provider, and working directory the server runs with.
     pub async fn info(&self) -> Result<ServerInfo> {
         let request = ClientRequest::info(self.next_correlation_id());
+        self.info_request(request).await
+    }
+
+    /// Query server/session metadata for a particular persisted session.
+    pub async fn info_for_session(&self, session_id: &str) -> Result<ServerInfo> {
+        let request = ClientRequest::info(self.next_correlation_id()).with_session(session_id);
+        self.info_request(request).await
+    }
+
+    async fn info_request(&self, request: ClientRequest) -> Result<ServerInfo> {
         match self.request(request).await? {
             ServerMessage::Info {
                 model,
                 provider,
                 working_directory,
+                workspaces,
+                active_workspace,
                 ..
             } => Ok(ServerInfo {
                 model,
                 provider,
                 working_directory,
+                workspaces,
+                active_workspace,
             }),
             other => Err(unexpected(other, "info")),
         }

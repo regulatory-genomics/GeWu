@@ -47,7 +47,8 @@ impl Tool for ListTool {
 
         let path_str = input.path.as_deref().unwrap_or(".");
 
-        let root_path = resolve_read_path(&self.working_directory, path_str, ctx.enforcement)
+        let working_directory = ctx.active_working_directory(&self.working_directory);
+        let root_path = resolve_read_path(working_directory, path_str, ctx.enforcement)
             .await
             .map_err(into_tool_error)?;
 

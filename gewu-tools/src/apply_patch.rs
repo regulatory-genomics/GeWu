@@ -205,7 +205,8 @@ impl Tool for ApplyPatchTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let args: ApplyPatchArgs = serde_json::from_value(args).map_err(into_tool_error)?;
         let operations = parse_patch(&args.patch_text).map_err(into_tool_error)?;
-        let root = canonicalize_root(&self.working_directory)
+        let working_directory = ctx.active_working_directory(&self.working_directory);
+        let root = canonicalize_root(working_directory)
             .await
             .map_err(into_tool_error)?;
         let changes = build_plan(&root, operations, ctx.enforcement)

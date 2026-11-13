@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use gewu_client::session::{Block, Phase};
-use gewu_protocol::{FileEntry, ModelSummary};
+use gewu_protocol::{FileEntry, ModelSummary, WorkspaceSummary};
 use math_core::{LatexToMathML, MathCoreConfig, MathDisplay};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 
@@ -875,6 +875,7 @@ pub fn sidebar_tools_content_html(tools: &Result<Vec<String>, String>) -> String
 
 /// Render the sidebar's tabbed contents. FILES is intentionally first and
 /// active by default; the browser only changes the active panel locally.
+#[allow(dead_code)]
 pub fn sidebar_tabs_html(
     tools: &Result<Vec<String>, String>,
     working_directory: Option<&str>,
@@ -882,16 +883,51 @@ pub fn sidebar_tabs_html(
     expanded: &BTreeSet<String>,
     cache: &BTreeMap<String, Vec<FileEntry>>,
 ) -> String {
+    sidebar_tabs_with_workspaces_html(
+        tools,
+        root.or(working_directory),
+        &[],
+        "cwd",
+        expanded,
+        cache,
+    )
+}
+
+pub fn sidebar_tabs_with_workspaces_html(
+    tools: &Result<Vec<String>, String>,
+    working_directory: Option<&str>,
+    workspaces: &[WorkspaceSummary],
+    active_workspace: &str,
+    expanded: &BTreeSet<String>,
+    cache: &BTreeMap<String, Vec<FileEntry>>,
+) -> String {
     let tools_html = sidebar_tools_content_html(tools);
-    let files_html = file_tree_html(root.or(working_directory), expanded, cache);
+    let files_html = file_tree_with_workspaces_html(
+        working_directory,
+        workspaces,
+        active_workspace,
+        expanded,
+        cache,
+    );
 
     format!(
         "<div class=\"sidebar-tabs\" role=\"tablist\" aria-label=\"Sidebar views\"><button type=\"button\" class=\"sidebar-tab active\" role=\"tab\" aria-selected=\"true\" aria-controls=\"sidebar-files\" data-sidebar-tab=\"files\">FILES</button><button type=\"button\" class=\"sidebar-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"sidebar-tools\" data-sidebar-tab=\"tools\">TOOLS</button></div><div id=\"sidebar-files\" class=\"sidebar-panel active\" role=\"tabpanel\">{files_html}</div><div id=\"sidebar-tools\" class=\"sidebar-panel\" role=\"tabpanel\" hidden>{tools_html}</div>"
     )
 }
 
+#[allow(dead_code)]
 pub fn file_tree_html(
     root: Option<&str>,
+    expanded: &BTreeSet<String>,
+    cache: &BTreeMap<String, Vec<FileEntry>>,
+) -> String {
+    file_tree_with_workspaces_html(root, &[], "cwd", expanded, cache)
+}
+
+pub fn file_tree_with_workspaces_html(
+    root: Option<&str>,
+    workspaces: &[WorkspaceSummary],
+    active_workspace: &str,
     expanded: &BTreeSet<String>,
     cache: &BTreeMap<String, Vec<FileEntry>>,
 ) -> String {
@@ -900,9 +936,10 @@ pub fn file_tree_html(
         String::from("<section class=\"side-section file-tree-section\" id=\"file-tree\">");
     let _ = write!(
         out,
-        "<div class=\"tree-toolbar\"><p class=\"tree-root\" title=\"{}\">{}</p><span class=\"tree-actions\"><button class=\"tree-upload\" type=\"button\" data-tree-upload title=\"Upload files\" aria-label=\"Upload files\">⬆</button><button class=\"tree-refresh\" type=\"button\" data-tree-refresh title=\"Refresh files\" aria-label=\"Refresh files\">↻</button></span></div><ul class=\"tree-list\">",
+        "<div class=\"tree-toolbar\"><p class=\"tree-root\" title=\"{}\">{}</p>{}<span class=\"tree-actions\"><button class=\"tree-upload\" type=\"button\" data-tree-upload title=\"Upload files\" aria-label=\"Upload files\">⬆</button><button class=\"tree-refresh\" type=\"button\" data-tree-refresh title=\"Refresh files\" aria-label=\"Refresh files\">↻</button></span></div><ul class=\"tree-list\">",
         escape(root_label),
-        escape(root_label)
+        escape(root_label),
+        workspace_selector_html(workspaces, active_workspace)
     );
     if let Some(entries) = cache.get("") {
         for entry in entries {
@@ -912,6 +949,25 @@ pub fn file_tree_html(
         out.push_str("<li class=\"tree-empty\">loading files…</li>");
     }
     out.push_str("</ul></section>");
+    out
+}
+
+fn workspace_selector_html(workspaces: &[WorkspaceSummary], active: &str) -> String {
+    if workspaces.len() <= 1 {
+        return String::new();
+    }
+    let mut out = String::from("<label class=\"workspace-picker\"><span>ROOT</span><select data-workspace-select>");
+    for workspace in workspaces {
+        let selected = if workspace.id == active { " selected" } else { "" };
+        let _ = write!(
+            out,
+            "<option value=\"{}\"{}>{}</option>",
+            escape(&workspace.id),
+            selected,
+            escape(&workspace.id)
+        );
+    }
+    out.push_str("</select></label>");
     out
 }
 
@@ -1144,6 +1200,28 @@ mod tests {
         assert!(!html.contains("<h2 class=\"side-title\">files"), "{html}");
         assert!(!html.contains("<h2 class=\"side-title\">tools"), "{html}");
         assert!(html.contains("data-tree-refresh"), "{html}");
+    }
+
+    #[test]
+    fn file_tree_renders_configured_workspace_selector() {
+        let html = file_tree_with_workspaces_html(
+            Some("/tmp/frontend"),
+            &[
+                WorkspaceSummary {
+                    id: "cwd".into(),
+                    path: "/tmp/project".into(),
+                },
+                WorkspaceSummary {
+                    id: "frontend".into(),
+                    path: "/tmp/frontend".into(),
+                },
+            ],
+            "frontend",
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert!(html.contains("data-workspace-select"), "{html}");
+        assert!(html.contains("value=\"frontend\" selected"), "{html}");
     }
 
     #[test]

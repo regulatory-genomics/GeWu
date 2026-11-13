@@ -10,6 +10,7 @@ use crate::workflow::engine::{self, RunState, RunStatus};
 use crate::workflow::graph_state::TaskFailure;
 use crate::workflow::spec::WorkflowSpec;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -95,6 +96,18 @@ impl WorkflowManager {
         owner_session: &str,
         inbox: Option<gewu_core::Steering>,
     ) -> Result<String, String> {
+        self.start_with_inbox_at(spec_value, owner_session, inbox, None)
+            .await
+    }
+
+    /// Starts a run and binds its child agents to the selected workspace.
+    pub async fn start_with_inbox_at(
+        &self,
+        spec_value: serde_json::Value,
+        owner_session: &str,
+        inbox: Option<gewu_core::Steering>,
+        working_directory: Option<PathBuf>,
+    ) -> Result<String, String> {
         let spec: WorkflowSpec = serde_json::from_value(spec_value)
             .map_err(|error| format!("invalid workflow spec: {error}"))?;
         let builtins: Vec<&str> = self.builtin_agents.iter().map(String::as_str).collect();
@@ -131,10 +144,11 @@ impl WorkflowManager {
         let run_id = uuid::Uuid::new_v4().to_string();
         let state = Arc::new(Mutex::new(RunState::default()));
         let cancel = Arc::new(AtomicBool::new(false));
-        let run = engine::run(
+        let run = engine::run_in(
             spec.clone(),
             self.factory.clone(),
             owner_session.to_string(),
+            working_directory,
             cancel.clone(),
             state.clone(),
         );
@@ -340,7 +354,7 @@ mod tests {
         let inbox = gewu_core::Steering::new();
         let other = gewu_core::Steering::new();
         let run_id = manager
-            .start_with_inbox(spec_value(), OWNER, Some(inbox.clone()))
+            .start_with_inbox_at(spec_value(), OWNER, Some(inbox.clone()), None)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), inbox.notified())

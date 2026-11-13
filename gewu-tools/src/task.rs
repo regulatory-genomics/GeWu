@@ -22,6 +22,7 @@ use gewu_core::types::{AgentEvent, ToolContext, ToolResult};
 use schemars::schema::RootSchema;
 use serde::Deserialize;
 use std::error::Error;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gewu_core::traits::Tool;
@@ -58,6 +59,22 @@ pub trait AgentFactory: Send + Sync {
         parent_session: &str,
     ) -> Result<(Agent, String), Box<dyn Error + Send + Sync>>;
 
+    /// Creates a sub-agent with the parent's selected workspace root.
+    /// The default keeps existing factory implementations source-compatible.
+    async fn create_in(
+        &self,
+        subagent_type: &str,
+        resume: Option<String>,
+        parent_session: &str,
+        working_directory: Option<PathBuf>,
+    ) -> Result<(Agent, String), Box<dyn Error + Send + Sync>> {
+        let (mut agent, session) = self.create(subagent_type, resume, parent_session).await?;
+        if let Some(working_directory) = working_directory {
+            agent.set_working_directory(working_directory);
+        }
+        Ok((agent, session))
+    }
+
     /// Creates a sub-agent derived from `base` with per-call overrides.
     ///
     /// The default implementation forwards to [`AgentFactory::create`],
@@ -71,6 +88,20 @@ pub trait AgentFactory: Send + Sync {
     ) -> Result<(Agent, String), Box<dyn Error + Send + Sync>> {
         let _ = overrides;
         self.create(base, None, parent_session).await
+    }
+
+    async fn create_with_in(
+        &self,
+        base: &str,
+        overrides: &AgentOverrides,
+        parent_session: &str,
+        working_directory: Option<PathBuf>,
+    ) -> Result<(Agent, String), Box<dyn Error + Send + Sync>> {
+        let (mut agent, session) = self.create_with(base, overrides, parent_session).await?;
+        if let Some(working_directory) = working_directory {
+            agent.set_working_directory(working_directory);
+        }
+        Ok((agent, session))
     }
 
     /// Checks that `overrides` are applicable to `base` before any agent is
@@ -178,7 +209,12 @@ impl Tool for TaskTool {
 
         let (mut agent, session_id) = self
             .factory
-            .create(&input.subagent_type, input.task_id, &ctx.session_id)
+            .create_in(
+                &input.subagent_type,
+                input.task_id,
+                &ctx.session_id,
+                ctx.working_directory.clone(),
+            )
             .await
             .map_err(|e| format!("Failed to create agent: {}", e))?;
 

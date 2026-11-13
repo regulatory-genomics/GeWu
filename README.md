@@ -225,6 +225,11 @@ in the project directory, then `~/.gewu/config.json(c)`. If both `.json` and
   // Optional
   "log": "gewu-requests.jsonl",              // record every wire LLM request/response as JSONL
   "sandbox": "none",                         // path confinement: "none" | "contain" | "strict"
+  "workspaces": {                              // extra named roots; paths are relative to startup cwd
+    "frontend": "../frontend",
+    "backend": "/work/projects/backend",
+    "docs": "../shared-docs"
+  },
   "skills": ["skills"],                      // directories scanned for SKILL.md
   "agents": {                                // user-defined agents, spawnable via `task`
     "code-reviewer": {
@@ -243,6 +248,14 @@ in the project directory, then `~/.gewu/config.json(c)`. If both `.json` and
   }
 }
 ```
+
+The startup directory is always available as the `cwd` workspace. Each session
+can select one configured workspace from the GUI root picker; filesystem tools,
+`bash`, delegated agents, workflows, and the file tree then use that root.
+Relative paths in tool calls stay relative to the selected workspace, and the
+configured `sandbox` level is enforced separately inside it. Existing configs
+without `workspaces` keep the historical single-directory behavior. Every
+configured path must already exist and be a directory when GeWu starts.
 
 **Configuration priority (highest to lowest):**
 1. CLI arguments (`--base-url`, `--endpoint`, `--api-key`, `--model`, `--provider`, `--llm-config`)

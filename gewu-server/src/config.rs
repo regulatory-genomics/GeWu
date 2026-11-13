@@ -62,6 +62,10 @@ pub struct Config {
     /// Optional directories to scan for skills (files named `SKILL.md`).
     #[serde(default)]
     pub skills: Option<Vec<String>>,
+    /// Named filesystem roots available to sessions in addition to `cwd`.
+    /// Relative paths are resolved against the server's startup directory.
+    #[serde(default)]
+    pub workspaces: BTreeMap<String, String>,
     /// Destination policy shared by agents and their subagents.
     #[serde(rename = "webFetch", default)]
     pub web_fetch: Option<WebFetchConfig>,
@@ -151,6 +155,20 @@ impl LoadedConfig {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        for (name, path) in &self.workspaces {
+            anyhow::ensure!(
+                name != "cwd"
+                    && !name.trim().is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "workspace name '{name}' must use letters, digits, '-' or '_' and cannot be 'cwd'"
+            );
+            anyhow::ensure!(
+                !path.trim().is_empty(),
+                "workspace '{name}' path cannot be empty"
+            );
+        }
         if let Some(model) = &self.model {
             self.resolve_model(model)?;
         }
@@ -243,6 +261,46 @@ impl Config {
             .with_context(|| format!("unknown model '{selected}'"))?;
         Ok((settings, model, key.as_str()))
     }
+}
+
+/// Resolve the implicit startup root and every configured workspace root.
+/// Paths are canonicalized once so containment checks use stable roots.
+pub fn resolve_workspace_roots(
+    config: &Config,
+    startup_directory: impl AsRef<std::path::Path>,
+) -> Result<BTreeMap<String, PathBuf>> {
+    config.validate()?;
+    let startup_directory = std::fs::canonicalize(startup_directory.as_ref()).with_context(|| {
+        format!(
+            "cannot resolve startup working directory: {}",
+            startup_directory.as_ref().display()
+        )
+    })?;
+    anyhow::ensure!(
+        startup_directory.is_dir(),
+        "startup working directory is not a directory: {}",
+        startup_directory.display()
+    );
+
+    let mut roots = BTreeMap::from([(String::from("cwd"), startup_directory.clone())]);
+    for (name, configured_path) in &config.workspaces {
+        let path = PathBuf::from(configured_path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            startup_directory.join(path)
+        };
+        let path = std::fs::canonicalize(&path).with_context(|| {
+            format!("cannot resolve workspace '{name}' directory: {}", path.display())
+        })?;
+        anyhow::ensure!(
+            path.is_dir(),
+            "workspace '{name}' is not a directory: {}",
+            path.display()
+        );
+        roots.insert(name.clone(), path);
+    }
+    Ok(roots)
 }
 
 fn resolve_config_path(config_path: Option<&str>) -> Result<PathBuf> {
@@ -448,6 +506,49 @@ mod tests {
             agent.tools.as_ref().unwrap(),
             &["read_file".to_string(), "grep".to_string()]
         );
+    }
+
+    #[test]
+    fn workspace_names_are_validated() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "workspaces": {
+                "frontend": "../frontend",
+                "bad/name": "../bad"
+            }
+        }))
+        .unwrap();
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("workspace name"), "{error}");
+    }
+
+    #[test]
+    fn workspace_paths_resolve_against_startup_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let frontend = root.path().join("frontend");
+        std::fs::create_dir(&frontend).unwrap();
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "workspaces": {"frontend": "frontend"}
+        }))
+        .unwrap();
+
+        let roots = super::resolve_workspace_roots(&config, root.path()).unwrap();
+        assert_eq!(roots.get("cwd"), Some(&root.path().canonicalize().unwrap()));
+        assert_eq!(roots.get("frontend"), Some(&frontend.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn workspace_paths_must_be_existing_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "workspaces": {"missing": "does-not-exist"}
+        }))
+        .unwrap();
+
+        let error = super::resolve_workspace_roots(&config, root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("workspace 'missing'"), "{error}");
     }
 
     #[test]

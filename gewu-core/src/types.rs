@@ -16,7 +16,7 @@
 
 use crate::traits::SessionStateStore;
 use serde::de::DeserializeOwned;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -500,6 +500,9 @@ pub struct ToolContext {
     /// Per-session key/value state tools can persist across turns.
     pub session_state: SessionState,
     pub inbox: Option<crate::agent::Steering>,
+    /// The session's selected workspace root. `None` keeps compatibility with
+    /// direct tool callers, which use the tool's constructor fallback root.
+    pub working_directory: Option<PathBuf>,
 }
 
 impl ToolContext {
@@ -516,6 +519,7 @@ impl ToolContext {
             enforcement: PathEnforcement::default(),
             session_state: SessionState::in_memory(),
             inbox: None,
+            working_directory: None,
         }
     }
 
@@ -537,6 +541,7 @@ impl ToolContext {
             enforcement: PathEnforcement::default(),
             session_state: SessionState::in_memory(),
             inbox: None,
+            working_directory: None,
         }
     }
 
@@ -550,6 +555,17 @@ impl ToolContext {
     pub fn with_session_state(mut self, session_state: SessionState) -> Self {
         self.session_state = session_state;
         self
+    }
+
+    /// Selects the workspace root for this tool call.
+    pub fn with_working_directory(mut self, working_directory: impl Into<PathBuf>) -> Self {
+        self.working_directory = Some(working_directory.into());
+        self
+    }
+
+    /// Returns the selected workspace root, or the tool's legacy fallback.
+    pub fn active_working_directory<'a>(&'a self, fallback: &'a Path) -> &'a Path {
+        self.working_directory.as_deref().unwrap_or(fallback)
     }
 
     pub fn is_aborted(&self) -> bool {
@@ -614,5 +630,13 @@ mod tests {
         assert_eq!(json["type"], "reminder");
         let back: ContentPart = serde_json::from_value(json).unwrap();
         assert_eq!(back, part);
+    }
+
+    #[test]
+    fn tool_context_can_override_the_compatibility_root() {
+        let root = std::path::PathBuf::from("/tmp/selected-root");
+        let fallback = std::path::PathBuf::from("/tmp/fallback-root");
+        let ctx = ToolContext::new("session", "message").with_working_directory(root.clone());
+        assert_eq!(ctx.active_working_directory(&fallback), root.as_path());
     }
 }

@@ -18,6 +18,7 @@ const MAX_LABEL: usize = 16;
 #[derive(Debug)]
 pub struct Tab {
     pub agent: String,
+    pub workspace: String,
     /// Stable id, unaffected by closing other tabs.
     pub id: u64,
     pub model: SessionModel,
@@ -49,6 +50,7 @@ impl Tab {
     fn new(id: u64) -> Self {
         Self {
             agent: "build".into(),
+            workspace: "cwd".into(),
             id,
             model: SessionModel::new(),
             model_label: None,
@@ -73,6 +75,7 @@ impl Tab {
             label: tab_title(self),
             busy: self.busy(),
             session_id: self.model.session_id.clone(),
+            workspace: self.workspace.clone(),
         }
     }
 }
