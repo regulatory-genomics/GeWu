@@ -1065,6 +1065,137 @@ body {
   }
 }
 
+/* -- workflow graph cards ------------------------------------------------ *
+ * `workflow_start` cards draw the run's spec as a layered graph; status and
+ * wait cards reuse it, coloring each node from the snapshot's node lines. */
+.wf-card {
+  margin: 4px 0 4px 6px;
+  padding: 10px 12px 12px;
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  overflow-x: auto;
+}
+
+.wf-caption {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+
+.wf-run {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.wf-run-running {
+  color: var(--accent);
+}
+.wf-run-completed {
+  color: var(--green);
+}
+.wf-run-failed {
+  color: var(--error);
+}
+.wf-run-canceled,
+.wf-run-timed-out {
+  color: var(--warn);
+}
+
+.wf-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.wf-marker {
+  fill: var(--text-faint);
+}
+.wf-marker.route {
+  fill: var(--violet);
+}
+
+.wf-edge {
+  fill: none;
+  stroke: var(--line-strong);
+  stroke-width: 1.2;
+}
+.wf-edge.route {
+  stroke: var(--violet);
+  stroke-dasharray: 5 4;
+}
+
+.wf-edge-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  fill: var(--violet);
+  text-anchor: middle;
+}
+
+.wf-node rect {
+  fill: var(--bg-raised);
+  stroke: var(--line-strong);
+  stroke-width: 1;
+}
+.wf-node.wf-entry rect {
+  stroke: var(--accent-dim);
+}
+.wf-node.wf-ok rect {
+  stroke: var(--green);
+  fill: var(--green-soft);
+}
+.wf-node.wf-failed rect {
+  stroke: var(--error);
+  fill: var(--error-soft);
+}
+.wf-node.wf-skipped rect {
+  opacity: 0.4;
+}
+.wf-node.wf-current rect {
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  animation: wf-pulse 1.6s var(--ease) infinite;
+}
+
+@keyframes wf-pulse {
+  50% {
+    filter: drop-shadow(0 0 7px var(--accent-glow));
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .wf-node.wf-current rect {
+    animation: none;
+  }
+}
+
+.wf-id {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  fill: var(--text);
+}
+.wf-agent {
+  font-family: var(--mono);
+  font-size: 10px;
+  fill: var(--text-faint);
+}
+
+.wf-end rect {
+  fill: none;
+  stroke: var(--text-faint);
+  stroke-dasharray: 3 3;
+}
+.wf-end text {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  fill: var(--text-faint);
+  text-anchor: middle;
+}
+
 /* while any tool in a group is still running, its label pulses */
 .tool-group.running .tool-summary {
   animation: group-pulse 1.4s ease-in-out infinite;

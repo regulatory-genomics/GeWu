@@ -49,25 +49,22 @@ impl LlmProvider for MockLlm {
         let response = responses.remove(0);
 
         let s = async_stream::try_stream! {
-            match response {
-                Message::Assistant { content, reasoning, tool_calls, replay } => {
-                    if let Some(replay) = replay {
-                        yield ProviderEvent::ReasoningReplay { replay };
-                    }
-                    if let Some(delta) = reasoning {
-                        yield ProviderEvent::ReasoningDelta { delta };
-                    }
-                    if let Some(c) = content {
-                        yield ProviderEvent::ContentDelta { delta: c };
-                    }
-                    if let Some(calls) = tool_calls {
-                        for call in calls {
-                            yield ProviderEvent::ToolCallStart { id: call.id.clone(), name: call.function.name };
-                            yield ProviderEvent::ToolCallDelta { id: call.id, delta: call.function.arguments };
-                        }
+            if let Message::Assistant { content, reasoning, tool_calls, replay } = response {
+                if let Some(replay) = replay {
+                    yield ProviderEvent::ReasoningReplay { replay };
+                }
+                if let Some(delta) = reasoning {
+                    yield ProviderEvent::ReasoningDelta { delta };
+                }
+                if let Some(c) = content {
+                    yield ProviderEvent::ContentDelta { delta: c };
+                }
+                if let Some(calls) = tool_calls {
+                    for call in calls {
+                        yield ProviderEvent::ToolCallStart { id: call.id.clone(), name: call.function.name };
+                        yield ProviderEvent::ToolCallDelta { id: call.id, delta: call.function.arguments };
                     }
                 }
-                _ => {}
             }
         };
         Ok(Box::pin(s))
@@ -175,10 +172,16 @@ async fn test_agent_loop() {
     assert_eq!(metadata["kind"], serde_json::json!("mock"));
     assert_eq!(result, "Done: Tool output");
     drop(stream);
-    assert!(agent.memory.messages().iter().any(|message| matches!(message,
-        Message::Assistant { reasoning: Some(text), replay: Some(state), .. }
-        if text == "I should call the tool" && state == &replay
-    )));
+    assert!(
+        agent
+            .memory
+            .messages()
+            .iter()
+            .any(|message| matches!(message,
+                Message::Assistant { reasoning: Some(text), replay: Some(state), .. }
+                if text == "I should call the tool" && state == &replay
+            ))
+    );
 }
 
 #[tokio::test]

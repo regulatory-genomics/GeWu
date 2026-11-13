@@ -1,0 +1,6 @@
+# Background Workflows
+
+- When a job decomposes into many similar, independent steps (fan-out over files, batch review, multi-part research), use `workflow_start`: write a JSON graph spec (nodes, optional edges, optional conditional routing) and run it in the background while you keep working or end your turn. Pass `spec` as a JSON object, never as a quoted string.
+- The spec compiles onto a real state graph: nodes chain in declaration order unless you give `edges`; a node with several incoming edges waits for all of them (join); `conditional_edges` route on a node's `{{nodes.<id>.status}}` or `failed_count` — use them for retry-until-good loops and skip-on-failure.
+- Check results on demand with `workflow_status` (spot check) or `workflow_wait` (block up to N seconds); `workflow_cancel` aborts a run and returns its partial results.
+- For a single one-off subtask, prefer the task tool; for steps that need your judgement between them, do the work yourself.

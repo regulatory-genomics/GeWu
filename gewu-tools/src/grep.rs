@@ -103,10 +103,7 @@ fn truncate_line(text: &str) -> String {
 
 /// Whether the collection cap is reached, signaling the walker to quit.
 fn cap_reached(matches: &Arc<Mutex<Vec<Match>>>, limit: usize) -> bool {
-    matches
-        .lock()
-        .map(|m| m.len() > limit)
-        .unwrap_or(false)
+    matches.lock().map(|m| m.len() > limit).unwrap_or(false)
 }
 
 #[async_trait]
@@ -207,12 +204,7 @@ fn search_single_file(
 }
 
 /// Formats collected matches, grouped by file, as opencode's GrepTool does.
-fn format_matches(
-    matches_guard: &[Match],
-    total: usize,
-    truncated: bool,
-    limit: usize,
-) -> String {
+fn format_matches(matches_guard: &[Match], total: usize, truncated: bool, limit: usize) -> String {
     let mut output = format!(
         "Found {} matches{}",
         total,
@@ -237,6 +229,19 @@ fn format_matches(
         output.push_str("\n\n(Results truncated. Consider using a more specific path or pattern.)");
     }
     output
+}
+
+fn present_matches(matches: &[Match], limit: usize) -> (String, usize, bool) {
+    if matches.is_empty() {
+        return ("No files found".to_string(), 0, false);
+    }
+    let total = matches.len();
+    let truncated = total > limit;
+    (
+        format_matches(matches, total, truncated, limit),
+        total,
+        truncated,
+    )
 }
 
 /// Runs the parallel walk + search and formats results grouped by file.
@@ -269,13 +274,7 @@ fn run_search(
             .map_err(|_| into_tool_error(anyhow::anyhow!("grep match lock poisoned")))?;
         let mut sorted = guard.clone();
         sorted.sort_by_key(|m| m.line_number);
-        return if sorted.is_empty() {
-            Ok(("No files found".to_string(), 0, false))
-        } else {
-            let total = sorted.len();
-            let truncated = total > limit;
-            Ok((format_matches(&sorted, total, truncated, limit), total, truncated))
-        };
+        return Ok(present_matches(&sorted, limit));
     }
 
     let mut builder = WalkBuilder::new(search_path);
@@ -332,15 +331,7 @@ fn run_search(
         .map_err(|_| into_tool_error(anyhow::anyhow!("grep match lock poisoned")))?;
     matches_guard.sort_by(|a, b| a.path.cmp(&b.path).then(a.line_number.cmp(&b.line_number)));
 
-    if matches_guard.is_empty() {
-        return Ok(("No files found".to_string(), 0, false));
-    }
-
-    let total = matches_guard.len();
-    let truncated = total > limit;
-    let output = format_matches(&matches_guard, total, truncated, limit);
-
-    Ok((output, total, truncated))
+    Ok(present_matches(&matches_guard, limit))
 }
 
 #[cfg(test)]
@@ -349,6 +340,36 @@ mod tests {
     use anyhow::Result;
     use tempfile::tempdir;
     use tokio::fs;
+
+    #[test]
+    fn presentation_preserves_grouping_counts_and_limit() {
+        assert_eq!(present_matches(&[], 2), ("No files found".into(), 0, false));
+        let matches = vec![
+            Match {
+                path: "a.rs".into(),
+                line_number: 2,
+                line_text: "你好".into(),
+            },
+            Match {
+                path: "a.rs".into(),
+                line_number: 9,
+                line_text: "second".into(),
+            },
+            Match {
+                path: "b.rs".into(),
+                line_number: 1,
+                line_text: "third".into(),
+            },
+        ];
+        assert_eq!(present_matches(&matches, 3), ("Found 3 matches\n\na.rs:\n  Line 2: 你好\n  Line 9: second\n\nb.rs:\n  Line 1: third".into(), 3, false));
+        assert_eq!(present_matches(&matches, 2), ("Found 3 matches (more matches available)\n\na.rs:\n  Line 2: 你好\n  Line 9: second\n\n(Results truncated. Consider using a more specific path or pattern.)".into(), 3, true));
+        assert_eq!(present_matches(&matches, 4), present_matches(&matches, 3));
+        assert_eq!(
+            truncate_line(&format!("{}界 \n", "界".repeat(2000))),
+            format!("{}...", "界".repeat(2000))
+        );
+        assert_eq!(truncate_line("你好 \r\n"), "你好");
+    }
 
     #[tokio::test]
     async fn test_grep_tool() -> Result<()> {
@@ -451,7 +472,11 @@ mod tests {
 
         assert!(result.truncated);
         assert_eq!(result.metadata.get("matches"), Some(&serde_json::json!(3)));
-        assert!(result.output.contains("Found 3 matches (more matches available)"));
+        assert!(
+            result
+                .output
+                .contains("Found 3 matches (more matches available)")
+        );
         assert_eq!(result.output.matches("  Line ").count(), 2);
         Ok(())
     }

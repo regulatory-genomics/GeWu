@@ -3,7 +3,10 @@
 //! This module provides helper structs and functions used by the [`Agent::ask`](super::Agent::ask)
 //! method to modularize the main agent loop logic.
 
-use crate::types::{AgentEvent, FunctionCall, ProviderEvent, ToolCall, ToolContext, ToolResult};
+use crate::types::{
+    AgentEvent, ContentPart, FunctionCall, Message, ProviderEvent, ToolCall, ToolContext,
+    ToolResult,
+};
 use anyhow::Result;
 use std::collections::VecDeque;
 use tracing::warn;
@@ -46,23 +49,14 @@ impl DoomLoopDetector {
     ///
     /// * `tool` - The tool name
     /// * `args` - The tool arguments
-    pub(super) fn check(&mut self, tool: &str, args: &str) -> Option<String> {
-        let current_call_sig = (tool.to_string(), args.to_string());
+    pub(super) fn check(&self, tool: &str, args: &str) -> Option<String> {
         // The current call counts toward the streak: execution is stopped ON
         // the threshold-th consecutive identical call, not one call after it
         // (`record` only runs for calls that pass this check, so without
         // counting the current call the detector would need threshold + 1
         // calls to fire — contradicting the documented "3 identical calls
         // stops execution").
-        let needed = self.threshold.saturating_sub(1);
-        if self.recent_calls.len() >= needed
-            && self
-                .recent_calls
-                .iter()
-                .rev()
-                .take(needed)
-                .all(|x| x == &current_call_sig)
-        {
+        if repeats_at_threshold(&self.recent_calls, tool, args, self.threshold) {
             return Some(format!(
                 "Doom loop detected: Tool '{}' called {} times repeatedly with identical arguments. Stopping.",
                 tool, self.threshold
@@ -86,6 +80,28 @@ impl DoomLoopDetector {
             self.recent_calls.pop_front();
         }
     }
+}
+
+fn repeats_at_threshold(
+    recent_calls: &VecDeque<(String, String)>,
+    tool: &str,
+    args: &str,
+    threshold: usize,
+) -> bool {
+    let needed = threshold.saturating_sub(1);
+    recent_calls.len() >= needed
+        && recent_calls
+            .iter()
+            .rev()
+            .take(needed)
+            .all(|(name, arguments)| name == tool && arguments == args)
+}
+
+pub(super) struct AggregatedResponse {
+    pub content: String,
+    pub reasoning: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub replay: Option<crate::types::ReasoningReplay>,
 }
 
 /// Aggregates streaming LLM responses into content, reasoning, and tool calls.
@@ -173,20 +189,125 @@ impl LlmResponseAggregator {
     /// # Returns
     ///
     /// Content, display reasoning, tool calls, and native reasoning replay state.
-    pub(super) fn take_parts(
-        &mut self,
-    ) -> (
-        String,
-        String,
-        Vec<ToolCall>,
-        Option<crate::types::ReasoningReplay>,
-    ) {
-        (
-            std::mem::take(&mut self.content),
-            std::mem::take(&mut self.reasoning),
-            std::mem::take(&mut self.tool_calls),
-            self.replay.take(),
-        )
+    pub(super) fn take_parts(&mut self) -> AggregatedResponse {
+        AggregatedResponse {
+            content: std::mem::take(&mut self.content),
+            reasoning: std::mem::take(&mut self.reasoning),
+            tool_calls: std::mem::take(&mut self.tool_calls),
+            replay: self.replay.take(),
+        }
+    }
+}
+
+pub(super) enum ToolCallPlan {
+    Stop(String),
+    Reject(ToolResult),
+    Execute,
+}
+
+pub(super) fn plan_tool_call(call: &ToolCall, doom_loop: &mut DoomLoopDetector) -> ToolCallPlan {
+    let name = &call.function.name;
+    let args = &call.function.arguments;
+    if let Some(error) = doom_loop.check(name, args) {
+        return ToolCallPlan::Stop(error);
+    }
+    doom_loop.record(name.clone(), args.clone());
+    if name.is_empty() {
+        ToolCallPlan::Reject(ToolResult::new(
+            name.clone(),
+            "Error: the tool call had an empty name and was not executed.",
+        ))
+    } else {
+        ToolCallPlan::Execute
+    }
+}
+
+pub(super) struct NormalizedToolResult {
+    pub error: Option<AgentEvent>,
+    pub finish: AgentEvent,
+    pub message: Message,
+}
+
+pub(super) fn normalize_tool_result(
+    call: &ToolCall,
+    result: Option<Result<ToolResult>>,
+) -> NormalizedToolResult {
+    let tool_name = call.function.name.clone();
+    let (result, error) = match result {
+        Some(Ok(result)) => (result, None),
+        Some(Err(e)) => (
+            ToolResult::new(tool_name.clone(), format!("Error: {}", e)),
+            Some(AgentEvent::Error {
+                error: e.to_string(),
+            }),
+        ),
+        None => (
+            ToolResult::new(
+                tool_name.clone(),
+                "Error: the tool call did not produce a result (execution task failed).",
+            ),
+            None,
+        ),
+    };
+    let finish = AgentEvent::ToolFinish {
+        call_id: call.id.clone(),
+        tool: tool_name.clone(),
+        title: result.title,
+        output: result.output.clone(),
+        metadata: result.metadata,
+    };
+    let media = extract_media_parts(&result.output);
+    let content = if media.is_empty() {
+        result.output
+    } else {
+        match media.iter().find(|p| matches!(p, ContentPart::Text { .. })) {
+            Some(ContentPart::Text { text }) => text.clone(),
+            _ => "[media attached]".to_string(),
+        }
+    };
+    NormalizedToolResult {
+        error,
+        finish,
+        message: Message::Tool {
+            tool_call_id: call.id.clone(),
+            tool_name: Some(tool_name),
+            content,
+            media,
+        },
+    }
+}
+
+pub(super) fn prepare_provider_messages(history: &[Message], system_prompt: &str) -> Vec<Message> {
+    let mut messages = crate::compaction::active_context(history).to_messages();
+    if !system_prompt.is_empty() {
+        if let Some(Message::System { content }) = messages.first_mut() {
+            *content = system_prompt.to_string();
+        } else {
+            messages.insert(
+                0,
+                Message::System {
+                    content: system_prompt.to_string(),
+                },
+            );
+        }
+    }
+    messages
+}
+
+#[derive(Debug, PartialEq)]
+pub(super) enum TurnDisposition {
+    Tools,
+    Steered,
+    Finish,
+}
+
+pub(super) fn classify_turn(tool_calls: &[ToolCall], steering_pending: bool) -> TurnDisposition {
+    if !tool_calls.is_empty() {
+        TurnDisposition::Tools
+    } else if steering_pending {
+        TurnDisposition::Steered
+    } else {
+        TurnDisposition::Finish
     }
 }
 
@@ -265,5 +386,150 @@ pub(super) async fn execute_tool_call(
             warn!("Tool '{}' failed: {}", tool_name, e);
             Ok(ToolResult::new(tool_name, format!("Error: {}", e)))
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: "id".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn aggregator_returns_named_parts_and_resets() {
+        let mut aggregator = LlmResponseAggregator::new();
+        aggregator.process_event(ProviderEvent::ContentDelta { delta: "é".into() });
+        aggregator.process_event(ProviderEvent::ReasoningDelta {
+            delta: "think".into(),
+        });
+        aggregator.process_event(ProviderEvent::ToolCallStart {
+            id: "id".into(),
+            name: "tool".into(),
+        });
+        aggregator.process_event(ProviderEvent::ToolCallDelta {
+            id: "id".into(),
+            delta: "{}".into(),
+        });
+        let response = aggregator.take_parts();
+        assert_eq!(response.content, "é");
+        assert_eq!(response.reasoning, "think");
+        assert_eq!(response.tool_calls[0].function.arguments, "{}");
+        assert!(aggregator.take_parts().content.is_empty());
+    }
+
+    #[test]
+    fn turn_classification_prioritizes_tool_calls() {
+        assert_eq!(classify_turn(&[], false), TurnDisposition::Finish);
+        assert_eq!(classify_turn(&[], true), TurnDisposition::Steered);
+        assert_eq!(
+            classify_turn(&[call("tool", "{}")], true),
+            TurnDisposition::Tools
+        );
+    }
+
+    #[test]
+    fn provider_message_preparation_replaces_or_inserts_system_prompt() {
+        let history = vec![Message::User {
+            content: vec![ContentPart::Text { text: "hi".into() }],
+        }];
+        let messages = prepare_provider_messages(&history, "system");
+        assert!(matches!(&messages[0], Message::System { content } if content == "system"));
+        let history = vec![Message::System {
+            content: "old".into(),
+        }];
+        let messages = prepare_provider_messages(&history, "new");
+        assert!(matches!(&messages[0], Message::System { content } if content == "new"));
+    }
+
+    #[test]
+    fn normalization_keeps_raw_media_in_event_but_not_history_text() {
+        for (message, expected) in [
+            (Some(" reference "), "reference"),
+            (None, "[media attached]"),
+        ] {
+            let output = serde_json::json!({
+                "type": "media", "mime": "image/png", "data": "ZmFrZQ==", "message": message
+            })
+            .to_string();
+            let mut result = ToolResult::new("image title", output.clone());
+            result.metadata.insert("key".into(), serde_json::json!(1));
+            let normalized = normalize_tool_result(&call("tool", "{}"), Some(Ok(result)));
+            assert!(normalized.error.is_none());
+            assert!(
+                matches!(normalized.finish, AgentEvent::ToolFinish { tool, title, output: raw, metadata, .. }
+                if tool == "tool" && title == "image title" && raw == output && metadata["key"] == 1)
+            );
+            assert!(
+                matches!(normalized.message, Message::Tool { tool_call_id, tool_name, content, media }
+                if tool_call_id == "id" && tool_name.as_deref() == Some("tool") && content == expected
+                && matches!(media.last(), Some(ContentPart::Image { data, .. }) if data == "ZmFrZQ=="))
+            );
+        }
+    }
+
+    #[test]
+    fn normalization_answers_lost_tasks_without_an_error_event() {
+        let normalized = normalize_tool_result(&call("tool", "{}"), None);
+        assert!(normalized.error.is_none());
+        assert!(
+            matches!(normalized.message, Message::Tool { content, media, .. }
+            if content == "Error: the tool call did not produce a result (execution task failed)." && media.is_empty())
+        );
+    }
+
+    #[test]
+    fn normalization_preserves_error_and_tool_message() {
+        let normalized =
+            normalize_tool_result(&call("tool", "{}"), Some(Err(anyhow::anyhow!("failed"))));
+        assert!(matches!(normalized.error, Some(AgentEvent::Error { .. })));
+        assert!(matches!(normalized.finish, AgentEvent::ToolFinish { .. }));
+        assert!(matches!(normalized.message, Message::Tool { .. }));
+    }
+
+    #[test]
+    fn repetition_predicate_counts_current_call_and_only_matching_suffix() {
+        let recent = VecDeque::from([
+            ("other".into(), "{}".into()),
+            ("tool".into(), "{}".into()),
+            ("tool".into(), "{}".into()),
+        ]);
+        assert!(repeats_at_threshold(&recent, "tool", "{}", 3));
+        assert!(!repeats_at_threshold(&recent, "tool", "{}", 4));
+        assert!(!repeats_at_threshold(&recent, "other", "{}", 2));
+        assert!(!repeats_at_threshold(&recent, "tool", "{ }", 2));
+        assert!(!repeats_at_threshold(&VecDeque::new(), "tool", "{}", 2));
+        for threshold in [0, 1] {
+            assert!(repeats_at_threshold(
+                &VecDeque::new(),
+                "tool",
+                "{}",
+                threshold
+            ));
+        }
+    }
+
+    #[test]
+    fn tool_call_planning_records_empty_names_and_detects_streaks() {
+        let mut detector = DoomLoopDetector::new(2);
+        assert!(matches!(
+            plan_tool_call(&call("", "{}"), &mut detector),
+            ToolCallPlan::Reject(_)
+        ));
+        assert!(matches!(
+            plan_tool_call(&call("tool", "{}"), &mut detector),
+            ToolCallPlan::Execute
+        ));
+        assert!(matches!(
+            plan_tool_call(&call("tool", "{}"), &mut detector),
+            ToolCallPlan::Stop(_)
+        ));
     }
 }

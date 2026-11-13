@@ -17,6 +17,48 @@ use tracing::{info, warn};
 
 use super::Agent;
 
+struct CompactionPlan {
+    summary_request: Vec<Message>,
+    recent: String,
+}
+
+#[derive(Debug, PartialEq)]
+enum CompactionSkipReason {
+    NoHistoryToSummarize,
+    PromptWouldNotFit,
+}
+
+fn plan_compaction(
+    messages: &[Message],
+    context_limit: usize,
+) -> Result<CompactionPlan, CompactionSkipReason> {
+    let (prior_checkpoint, body) = compaction_body(messages);
+    let split = select_recent_tail(body, KEEP_TOKENS);
+    let head = &body[..split];
+    let recent = &body[split..];
+    let prior_recent = prior_checkpoint.map(|(_, recent)| recent);
+    if head.is_empty() && prior_recent.as_ref().is_none_or(|r| r.is_empty()) {
+        return Err(CompactionSkipReason::NoHistoryToSummarize);
+    }
+    let mut context = Vec::new();
+    if let Some(recent) = &prior_recent
+        && !recent.is_empty()
+    {
+        context.push((*recent).to_owned());
+    }
+    context.push(serialize_messages(head));
+    let prompt = build_summary_prompt(prior_checkpoint.map(|(summary, _)| summary), &context);
+    if compaction::estimate_tokens(&prompt) + SUMMARY_OUTPUT_TOKENS > context_limit {
+        return Err(CompactionSkipReason::PromptWouldNotFit);
+    }
+    Ok(CompactionPlan {
+        summary_request: vec![Message::User {
+            content: vec![ContentPart::Text { text: prompt }],
+        }],
+        recent: serialize_messages(recent),
+    })
+}
+
 /// Error type for compaction failures.
 #[derive(Debug)]
 pub struct CompactionError {
@@ -49,47 +91,20 @@ impl Agent {
         // Body = everything the summarizer may touch: after the system
         // prompt, and after any prior checkpoint (whose summary/recent
         // already represent the older history).
-        let (prior_checkpoint, body) = compaction_body(self.memory.messages());
-
-        // Keep the newest slice verbatim; summarize everything before it.
-        let split = select_recent_tail(body, KEEP_TOKENS);
-        let head = &body[..split];
-        let recent = &body[split..];
-
-        // Prior checkpoint's recent tail is context for the new summary too.
-        let prior_recent = prior_checkpoint.map(|(_, recent)| recent);
-
-        if head.is_empty() && prior_recent.as_ref().is_none_or(|r| r.is_empty()) {
-            // Nothing older than the tail exists to summarize (e.g. one huge
-            // message). Compaction cannot shrink this further; let the
-            // request through and surface any provider overflow directly.
-            warn!("Compaction skipped: no history older than the kept tail");
-            return Ok(false);
-        }
-
-        let mut context = Vec::new();
-        if let Some(recent) = &prior_recent
-            && !recent.is_empty()
-        {
-            context.push((*recent).to_owned());
-        }
-        context.push(serialize_messages(head));
-        let prior_summary = prior_checkpoint.map(|(summary, _)| summary);
-        let prompt = build_summary_prompt(prior_summary, &context);
-
-        // The summarizer sees a capped transcript, so the prompt is far
-        // smaller than the raw history; still, respect the window.
-        if compaction::estimate_tokens(&prompt) + SUMMARY_OUTPUT_TOKENS > self.context_limit {
-            warn!("Compaction skipped: summary prompt would not fit the context window");
-            return Ok(false);
-        }
-
-        let summary_request = vec![Message::User {
-            content: vec![ContentPart::Text { text: prompt }],
-        }];
+        let plan = match plan_compaction(self.memory.messages(), self.context_limit) {
+            Ok(plan) => plan,
+            Err(CompactionSkipReason::NoHistoryToSummarize) => {
+                warn!("Compaction skipped: no history older than the kept tail");
+                return Ok(false);
+            }
+            Err(CompactionSkipReason::PromptWouldNotFit) => {
+                warn!("Compaction skipped: summary prompt would not fit the context window");
+                return Ok(false);
+            }
+        };
         let provider = self.llm.clone();
         let mut stream = provider
-            .stream_response(&summary_request, &[], self.log.as_ref())
+            .stream_response(&plan.summary_request, &[], self.log.as_ref())
             .await
             .map_err(|e| anyhow!("Compaction failed: {}", e))?;
 
@@ -115,8 +130,51 @@ impl Agent {
         }
 
         self.memory
-            .append_compaction(summary_text.trim().to_string(), serialize_messages(recent))
+            .append_compaction(summary_text.trim().to_string(), plan.recent)
             .await?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn planner_distinguishes_skip_reasons() {
+        assert!(matches!(
+            plan_compaction(&[], 100_000),
+            Err(CompactionSkipReason::NoHistoryToSummarize)
+        ));
+        let history = vec![Message::User {
+            content: vec![ContentPart::Text {
+                text: "x".repeat(100_000),
+            }],
+        }];
+        assert!(matches!(
+            plan_compaction(&history, 1),
+            Err(CompactionSkipReason::PromptWouldNotFit)
+        ));
+    }
+
+    #[test]
+    fn planner_returns_request_and_recent_tail() {
+        let history = vec![
+            Message::User {
+                content: vec![ContentPart::Text {
+                    text: "x".repeat(40_000),
+                }],
+            },
+            Message::User {
+                content: vec![ContentPart::Text {
+                    text: "recent".into(),
+                }],
+            },
+        ];
+        let plan = plan_compaction(&history, 100_000).expect("plan");
+        assert_eq!(plan.recent, "[User]: recent");
+        assert!(
+            matches!(&plan.summary_request[0], Message::User { content } if matches!(&content[0], ContentPart::Text { text } if text.contains(&"x".repeat(40_000))))
+        );
     }
 }

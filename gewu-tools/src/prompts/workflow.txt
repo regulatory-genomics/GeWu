@@ -1,0 +1,96 @@
+Start a dynamic workflow: you write a JSON graph spec, and the engine compiles
+it into a real state graph and runs it in the background. This returns a run_id
+immediately while the run executes; check on it later with workflow_status,
+block for it with workflow_wait, or abort it with workflow_cancel.
+
+When to use this:
+- The job decomposes into many similar, independent steps: reviewing a list
+  of files, translating a batch of documents, researching several topics,
+  auditing many small units.
+- The steps have structure a straight sequence can't express: fan-out then
+  join, retry-until-good loops, or "if X failed, fix it, else finish".
+- You want the steps to keep running while you talk to the user or work on
+  something else, and results come back only when you ask for them.
+
+When NOT to use this: for a single one-off subtask use the task tool; for
+steps that need your judgement between them, do them yourself.
+
+Pass the spec as a JSON object under the `spec` argument — never as a quoted
+string.
+
+The spec:
+
+- "nodes" (required): array of {"id", "agent", "prompt", "for_each"?, "review"?}.
+  Each node runs its agent task(s) to completion; the graph state carries every
+  node's results.
+  - "agent": a predefined subagent profile (the same types the task tool
+    offers) or a key of "agents".
+  - "for_each": either a literal list like ["a.md", "b.md"], or
+    {"from": "<id of a node>"} to run one task per successful output of that
+    node (if it has not run yet, the node runs with zero tasks).
+  - "prompt": run once per item. Template variables: {{item}} and {{index}}
+    (for_each nodes only), and for nodes that already ran {{nodes.<id>.outputs}},
+    {{nodes.<id>.failed}}, {{nodes.<id>.status}} ("ok"/"failed"), and
+    {{nodes.<id>.failed_count}} (rendered as JSON where applicable).
+    Unknown references are validation errors, never empty strings; a node
+    referenced before its first run makes the task fail with a clear error.
+  - "review": {"agent", "prompt", "pass_if"?, "max_redos"?} — after each
+    attempt the reviewer sees the output ({{output}}, plus {{item}} /
+    {{index}}); if its reply does not start with pass_if (default "PASS"),
+    the task re-runs with the reviewer's feedback appended, up to max_redos
+    (default 1) times.
+- "edges" (optional): [from, to] pairs. Omitted = chain the nodes in
+  declaration order. A node fed by several edges waits for all of them
+  (true join), so fan-out-then-merge just works. Targets may be "END".
+- "conditional_edges" (optional): {"<node id>": {"path", "map"}} — routing
+  replaces that node's normal outgoing edges. "path" is
+  "{{nodes.<id>.status}}" or "{{nodes.<id>.failed_count}}"; "map" maps the
+  rendered value to a node id or "END", with "*" as the fallback for any
+  other value (no match and no "*" ends the graph). The node's own outcome
+  is always available, so retry loops route on themselves.
+- "entry" (optional): first node (default: the first declared node).
+- "agents" (optional): inline agents {"base", "instructions"?, "tools"?}.
+  "base" is a predefined profile; "instructions" are appended to its system
+  prompt; "tools" can only keep a subset of the base profile's tools, never
+  add any — unknown names are rejected.
+- "name", "timeout_secs" (default 1800, cap 7200), "max_concurrency"
+  (default 4, cap 16), "max_steps" (default 1000, cap 10000) are optional.
+
+Hard limits: 3 concurrent runs per session, 50 agent tasks per run
+(reviewer calls and redos count), and the max_steps superstep bound catches
+runaway loops (the run then fails with its partial results). One failed task
+never fails the run; it is listed as failed so later nodes can react via
+{{nodes.<id>.failed}}.
+
+Every task runs in its own subagent session; workflow_status lists each
+node with status ok/failed/pending/skipped and every session id so any
+thread can be read afterwards.
+
+Example (review, retry loop, combine):
+
+{"name": "contract-review",
+ "agents": {"reader": {"base": "explore",
+                       "instructions": "You review contracts.",
+                       "tools": ["read_file", "grep"]}},
+ "nodes": [
+   {"id": "read", "agent": "reader", "for_each": ["a.md", "b.md"],
+    "prompt": "Review {{item}}. List risky clauses.",
+    "review": {"agent": "general",
+               "prompt": "Check this review of {{item}}:\n{{output}}\nStart with PASS or FAIL.",
+               "max_redos": 1}},
+   {"id": "polish", "agent": "build",
+    "prompt": "Fix the failed reviews:\n{{nodes.read.failed}}"},
+   {"id": "combine", "agent": "general",
+    "prompt": "Combine these findings:\n{{nodes.read.outputs}}"}],
+ "conditional_edges": {"polish": {"path": "{{nodes.polish.status}}",
+                                  "map": {"ok": "combine", "failed": "polish"}}}}
+
+Here read fans out with a reviewer, polish re-runs itself until its own
+status is ok, and combine runs once polish passes (polish's routing replaced
+its chain edge to combine). To fan out and join, write two edges into one
+node — "edges": [["split","left"],["split","right"],["left","merge"],
+["right","merge"]] — merge waits for both.
+
+Write precise, self-contained task prompts: the subagents see nothing but
+the prompt. Start the run as early as possible so it works in the
+background, and keep prompts small enough that dozens of tasks stay cheap.

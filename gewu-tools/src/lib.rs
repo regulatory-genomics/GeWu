@@ -22,6 +22,10 @@
 //! | [`TodoReadTool`](todo::TodoReadTool) | `todoread` | Read the task list |
 //! | [`TodoWriteTool`](todo::TodoWriteTool) | `todowrite` | Write the task list |
 //! | [`TaskTool`](task::TaskTool) | `task` | Launch sub-agents for complex tasks |
+//! | [`WorkflowStartTool`](workflow::WorkflowStartTool) | `workflow_start` | Start a background workflow run from a JSON spec |
+//! | [`WorkflowStatusTool`](workflow::WorkflowStatusTool) | `workflow_status` | Snapshot a workflow run without waiting |
+//! | [`WorkflowWaitTool`](workflow::WorkflowWaitTool) | `workflow_wait` | Wait for a workflow run to finish |
+//! | [`WorkflowCancelTool`](workflow::WorkflowCancelTool) | `workflow_cancel` | Abort a workflow run |
 //! | [`SkillTool`](skill::SkillTool) | `skill` | Load skill instructions into the conversation |
 //!
 //! # MCP Tools
@@ -68,6 +72,7 @@ pub mod skill;
 pub mod task;
 pub mod todo;
 pub mod web_fetch;
+pub mod workflow;
 
 pub use apply_patch::ApplyPatchTool;
 pub use bash::BashTool;
@@ -77,6 +82,9 @@ pub use list::ListTool;
 pub use search::{CodeSearchTool, WebSearchTool};
 pub use shell_env::{ShellEnvironment, ShellError, ShellLimits, ShellMount, ShellOutcome};
 pub use skill::{SkillInfo, SkillTool};
-pub use task::{AgentFactory, TaskTool};
+pub use task::{AgentFactory, AgentOverrides, TaskTool};
 pub use todo::{TodoItem, TodoReadTool, TodoWriteTool};
 pub use web_fetch::{WebFetchPolicy, WebFetchTool};
+pub use workflow::{
+    WorkflowCancelTool, WorkflowManager, WorkflowStartTool, WorkflowStatusTool, WorkflowWaitTool,
+};

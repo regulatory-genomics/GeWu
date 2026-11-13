@@ -54,7 +54,10 @@ pub(crate) struct AskHandle {
 }
 
 impl AskHandle {
-    fn new(tx: tokio::sync::broadcast::Sender<Result<ServerMessage, Error>>, persistent: bool) -> Self {
+    fn new(
+        tx: tokio::sync::broadcast::Sender<Result<ServerMessage, Error>>,
+        persistent: bool,
+    ) -> Self {
         Self {
             rx: tx.subscribe(),
             done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -69,10 +72,14 @@ impl AskHandle {
         }
         match self.rx.recv().await {
             Ok(frame) => {
-                let terminal = !self.persistent && (matches!(
-                    frame.as_ref().ok(),
-                    Some(m) if m.is_ask_terminal().is_some()
-                ) || matches!(frame.as_ref().ok(), Some(ServerMessage::SessionSnapshot { busy: false, .. })));
+                let terminal = !self.persistent
+                    && (matches!(
+                        frame.as_ref().ok(),
+                        Some(m) if m.is_ask_terminal().is_some()
+                    ) || matches!(
+                        frame.as_ref().ok(),
+                        Some(ServerMessage::SessionSnapshot { busy: false, .. })
+                    ));
                 if terminal {
                     self.done.store(true, std::sync::atomic::Ordering::Release);
                 }
@@ -185,9 +192,13 @@ impl Inner {
         // Terminal frames end the in-flight ask: clear it so the next ask
         // is accepted and close the broadcast channel after the terminal
         // frame (the consumer sees it, then `None`).
-        if msg.is_ask_terminal().is_some() || matches!(&msg, ServerMessage::SessionSnapshot { busy: false, .. }) {
+        if msg.is_ask_terminal().is_some()
+            || matches!(&msg, ServerMessage::SessionSnapshot { busy: false, .. })
+        {
             if self.active_ask.as_ref().is_some_and(|ask| ask.persistent) {
-                if let Some(ask) = &self.active_ask { let _ = ask.tx.send(Ok(msg)); }
+                if let Some(ask) = &self.active_ask {
+                    let _ = ask.tx.send(Ok(msg));
+                }
                 return;
             }
             if let Some(ask) = self.active_ask.take() {
@@ -202,7 +213,9 @@ impl Inner {
         match &mut self.active_ask {
             Some(ask) => {
                 // Sanity: the server tags ask frames with the ask's request id.
-                if let ServerMessage::Event { request_id, .. } = &msg && !ask.persistent {
+                if let ServerMessage::Event { request_id, .. } = &msg
+                    && !ask.persistent
+                {
                     debug_assert_eq!(
                         request_id, &ask.request_id,
                         "event request id should match the active ask"
@@ -308,7 +321,11 @@ pub(crate) async fn run(mut inner: Inner) {
 impl Inner {
     /// Begin an ask: send the request, await `ready`, and hand back a stream
     /// handle for the subsequent frames.
-    async fn start_ask(&mut self, request: ClientRequest, persistent: bool) -> Result<AskHandle, Error> {
+    async fn start_ask(
+        &mut self,
+        request: ClientRequest,
+        persistent: bool,
+    ) -> Result<AskHandle, Error> {
         if self.active_ask.is_some() {
             return Err(Error::Busy);
         }
@@ -340,7 +357,11 @@ impl Inner {
                             self.session_id = Some(session_id);
                             let (tx, _) = tokio::sync::broadcast::channel(1024);
                             let handle = AskHandle::new(tx.clone(), persistent);
-                            self.active_ask = Some(ActiveAsk { request_id, persistent, tx });
+                            self.active_ask = Some(ActiveAsk {
+                                request_id,
+                                persistent,
+                                tx,
+                            });
                             return Ok(handle);
                         }
                         ServerMessage::Error { error, .. } => {

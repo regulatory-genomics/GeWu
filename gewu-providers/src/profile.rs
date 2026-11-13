@@ -43,7 +43,6 @@ impl ProviderProfile {
             Self::Openai | Self::OpenaiCompatible => "OPENAI_API_KEY",
         }
     }
-
 }
 
 impl std::str::FromStr for ProviderProfile {
@@ -61,7 +60,14 @@ mod tests {
 
     #[test]
     fn provider_ids_round_trip() {
-        for profile in [ProviderProfile::Deepseek, ProviderProfile::Moonshot, ProviderProfile::Glm, ProviderProfile::Openai, ProviderProfile::OpenaiCompatible, ProviderProfile::Anthropic] {
+        for profile in [
+            ProviderProfile::Deepseek,
+            ProviderProfile::Moonshot,
+            ProviderProfile::Glm,
+            ProviderProfile::Openai,
+            ProviderProfile::OpenaiCompatible,
+            ProviderProfile::Anthropic,
+        ] {
             assert_eq!(profile.id().parse::<ProviderProfile>().unwrap(), profile);
         }
         assert!("unknown".parse::<ProviderProfile>().is_err());

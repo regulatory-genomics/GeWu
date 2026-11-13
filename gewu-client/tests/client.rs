@@ -289,6 +289,74 @@ async fn interrupt_aborts_running_ask() {
 }
 
 #[tokio::test]
+async fn steer_injects_message_into_running_ask() {
+    // Server: ready, one event, then — in reply to the steer request — the
+    // `steered` ack on the steer's own correlation id plus the remaining
+    // ask-stream frames (steered agent event, final result).
+    let server = fake::spawn(|| {
+        VecDeque::from([
+            Step::Reply(vec![
+                fake::ready_line("1", "req-1", "sess-1"),
+                fake::event_line(
+                    "req-1",
+                    serde_json::json!({"type": "content_delta", "delta": "working..."}),
+                ),
+            ]),
+            Step::Reply(vec![
+                serde_json::json!({
+                    "type": "steered",
+                    "id": 2,
+                    "session_id": "sess-1",
+                    "text": "focus on tests",
+                })
+                .to_string(),
+                fake::event_line(
+                    "req-1",
+                    serde_json::json!({"type": "steered", "text": "focus on tests"}),
+                ),
+                fake::event_line(
+                    "req-1",
+                    serde_json::json!({"type": "content_delta", "delta": "steered"}),
+                ),
+                fake::result_line("req-1", "sess-1", "steered"),
+            ]),
+        ])
+    })
+    .await;
+    let client = connect(&server).await;
+
+    let mut ask = client.ask("long running").send().await.unwrap();
+    let first = ask.next_frame().await.unwrap().unwrap();
+    assert!(matches!(first, ServerMessage::Event { .. }));
+
+    client.steer("focus on tests").await.expect("steered");
+
+    // The steered message rides the ask stream and the run completes.
+    let mut saw_steered_event = false;
+    let mut saw_result = false;
+    while let Some(frame) = ask.next_frame().await {
+        match frame.unwrap() {
+            ServerMessage::Event { event, .. } => {
+                if event["type"] == "steered" {
+                    assert_eq!(event["text"], "focus on tests");
+                    saw_steered_event = true;
+                }
+            }
+            ServerMessage::Result { .. } => {
+                saw_result = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_steered_event, "expected a steered agent event");
+    assert!(saw_result, "expected the ask to finish");
+
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn second_ask_while_running_is_busy() {
     // Server only answers the first ask; the second ask should be rejected
     // client-side without hitting the wire.

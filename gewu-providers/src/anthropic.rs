@@ -14,6 +14,9 @@
 //!
 //! Some models support extended thinking via beta headers.
 
+/// Stream- and request-level failure type for the Anthropic provider.
+pub(crate) type Failure = Box<dyn std::error::Error + Send + Sync>;
+
 use bytes::Bytes;
 use futures::Stream;
 use reqwest::Client as HttpClient;
@@ -40,6 +43,16 @@ pub enum AnthropicError {
     /// API returned an error response.
     #[error("API error: {0}")]
     Api(String),
+    /// An error event inside a streaming response. `transient` marks
+    /// provider-side outages (`overloaded_error`, `api_error`,
+    /// `rate_limit_error`, `timeout_error`) that a fresh request can
+    /// plausibly survive; anything else is permanent.
+    #[error("provider stream error: {message}")]
+    Stream {
+        transient: bool,
+        message: String,
+        retry_after: Option<std::time::Duration>,
+    },
     /// A known SSE event could not be parsed.
     #[error("SSE parse error: {0}")]
     SseParse(String),
@@ -55,7 +68,10 @@ pub(crate) fn rate_limit_error(
     body: &str,
 ) -> AnthropicError {
     let message = crate::http::rate_limit_message(body);
-    AnthropicError::RateLimit { message, retry_after }
+    AnthropicError::RateLimit {
+        message,
+        retry_after,
+    }
 }
 
 /// Configuration for the Anthropic API client.
@@ -153,8 +169,13 @@ pub struct AssistantMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Thinking { thinking: String, signature: String },
-    RedactedThinking { data: String },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    RedactedThinking {
+        data: String,
+    },
     Text {
         text: String,
     },
@@ -331,7 +352,10 @@ where
             // Terminal marker events carry no data payload.
             "content_block_stop" => Some(Ok(AnthropicChunk::ContentBlockStop(()))),
             "message_stop" => Some(Ok(AnthropicChunk::MessageStop)),
-            "message_start" | "content_block_start" | "content_block_delta" | "message_delta"
+            "message_start"
+            | "content_block_start"
+            | "content_block_delta"
+            | "message_delta"
             | "error" => {
                 if data.is_empty() {
                     return None;
@@ -345,9 +369,7 @@ where
                         .map(AnthropicChunk::ContentBlockDelta),
                     "message_delta" => serde_json::from_str::<MessageDeltaChunk>(&data)
                         .map(AnthropicChunk::MessageDelta),
-                    "error" => {
-                        serde_json::from_str::<ErrorChunk>(&data).map(AnthropicChunk::Error)
-                    }
+                    "error" => serde_json::from_str::<ErrorChunk>(&data).map(AnthropicChunk::Error),
                     _ => unreachable!("event type filtered above"),
                 };
                 match parsed {
@@ -471,7 +493,9 @@ pub enum ContentBlockStart {
         thinking: String,
         signature: String,
     },
-    RedactedThinking { data: String },
+    RedactedThinking {
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -486,17 +510,11 @@ pub enum ContentDelta {
     #[serde(rename = "signature_delta")]
     Signature { signature: String },
     #[serde(rename = "text_delta")]
-    Text {
-        text: String,
-    },
+    Text { text: String },
     #[serde(rename = "input_json_delta")]
-    InputJson {
-        partial_json: String,
-    },
+    InputJson { partial_json: String },
     #[serde(rename = "thinking_delta")]
-    Thinking {
-        thinking: String,
-    },
+    Thinking { thinking: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -539,8 +557,26 @@ pub struct ErrorChunk {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ErrorDetail {
     #[serde(rename = "type")]
-    pub _error_type: String,
+    pub error_type: String,
     pub message: String,
+}
+
+/// Classifies an in-stream error event's payload.
+///
+/// Provider-side outages (`overloaded_error` — Anthropic's 529, `api_error`,
+/// in-stream rate limits, timeouts) are marked transient so the retry layer
+/// restarts the request after the backoff wait; everything else (invalid
+/// request, auth, permissions) is permanent and surfaces to the user.
+pub(crate) fn stream_error(detail: &ErrorDetail) -> AnthropicError {
+    let transient = matches!(
+        detail.error_type.as_str(),
+        "overloaded_error" | "api_error" | "rate_limit_error" | "timeout_error"
+    );
+    AnthropicError::Stream {
+        transient,
+        message: format!("{}: {}", detail.error_type, detail.message),
+        retry_after: None,
+    }
 }
 
 pub struct Models<'a> {
@@ -666,10 +702,7 @@ mod tests {
 
     #[tokio::test]
     async fn data_field_without_space_is_accepted() {
-        let sse = concat!(
-            "event:content_block_stop\n",
-            "event: message_stop\n",
-        );
+        let sse = concat!("event:content_block_stop\n", "event: message_stop\n",);
         let events = collect(vec![Bytes::from_static(sse.as_bytes())]).await;
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], AnthropicChunk::ContentBlockStop(())));

@@ -116,6 +116,60 @@ pub struct GlobTool {
     pub working_directory: PathBuf,
 }
 
+fn truncate_read_line(text: &str) -> String {
+    if text.len() > MAX_LINE_LENGTH {
+        let mut cut = MAX_LINE_LENGTH;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}{}", &text[..cut], MAX_LINE_SUFFIX)
+    } else {
+        text.to_string()
+    }
+}
+
+fn render_read_text(
+    input: &ReadArgs,
+    lines: &[String],
+    total_lines: usize,
+    truncated_by_bytes: bool,
+    has_more_lines: bool,
+) -> String {
+    if total_lines < input.offset && !(total_lines == 0 && input.offset == 1) {
+        return format!(
+            "Offset {} is out of range for this file ({} lines)",
+            input.offset, total_lines
+        );
+    }
+    let start = input.offset.saturating_sub(1);
+    let content: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{}: {}", start + i + 1, line))
+        .collect();
+    let last_read_line = start + lines.len().max(1);
+    let next_offset = last_read_line + 1;
+    let mut output = format!(
+        "<path>{}</path>\n<type>file</type>\n<content>\n{}\n</content>",
+        input.file_path,
+        content.join("\n")
+    );
+    if truncated_by_bytes {
+        output.push_str(&format!(
+            "\n\n(Output capped at {}. Showing lines {}-{}. Use offset={} to continue.)",
+            MAX_BYTES_LABEL, input.offset, last_read_line, next_offset
+        ));
+    } else if has_more_lines {
+        output.push_str(&format!(
+            "\n\n(Showing lines {}-{} of {}. Use offset={} to continue.)",
+            input.offset, last_read_line, total_lines, next_offset
+        ));
+    } else {
+        output.push_str(&format!("\n\n(End of file - total {} lines)", total_lines));
+    }
+    output
+}
+
 #[async_trait]
 impl Tool for ReadFileTool {
     fn name(&self) -> &str {
@@ -137,9 +191,10 @@ impl Tool for ReadFileTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: ReadArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_read_path(&self.working_directory, &input.file_path, ctx.enforcement)
-            .await
-            .map_err(into_tool_error)?;
+        let file_path =
+            resolve_read_path(&self.working_directory, &input.file_path, ctx.enforcement)
+                .await
+                .map_err(into_tool_error)?;
 
         let metadata = tokio::fs::metadata(&file_path).await;
 
@@ -259,7 +314,9 @@ impl Tool for ReadFileTool {
                     "read_file",
                     format!(
                         "Cannot read file: {} is {} bytes, which exceeds the {} byte media read cap",
-                        input.file_path, meta.len(), MAX_MEDIA_BYTES
+                        input.file_path,
+                        meta.len(),
+                        MAX_MEDIA_BYTES
                     ),
                 ));
             }
@@ -323,17 +380,7 @@ impl Tool for ReadFileTool {
                 continue;
             }
 
-            let truncated_line = if text.len() > MAX_LINE_LENGTH {
-                // Cut at a char boundary: byte 2000 can land mid-character
-                // in multi-byte input.
-                let mut cut = MAX_LINE_LENGTH;
-                while cut > 0 && !text.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                format!("{}{}", &text[..cut], MAX_LINE_SUFFIX)
-            } else {
-                text.clone()
-            };
+            let truncated_line = truncate_read_line(&text);
 
             let line_size = truncated_line.len() + 1;
             if bytes + line_size > MAX_BYTES {
@@ -346,53 +393,16 @@ impl Tool for ReadFileTool {
             bytes += line_size;
         }
 
-        if total_lines < input.offset && !(total_lines == 0 && input.offset == 1) {
-            return Ok(ToolResult::new(
-                "read_file",
-                format!(
-                    "Offset {} is out of range for this file ({} lines)",
-                    input.offset, total_lines
-                ),
-            ));
-        }
-
-        let content: Vec<String> = lines
-            .iter()
-            .enumerate()
-            .map(|(i, line)| format!("{}: {}", start + i + 1, line))
-            .collect();
-
-        let total_lines_count = total_lines;
-        // `lines` is empty when the file is empty (or the offset starts past
-        // EOF); saturating arithmetic avoids the `0 + 0 - 1` underflow.
-        let last_read_line = input.offset.saturating_sub(1) + lines.len().max(1);
-        let next_offset = last_read_line + 1;
-        let has_more_lines = has_more_lines || truncated_by_bytes;
-
-        let mut output = format!(
-            "<path>{}</path>\n<type>file</type>\n<content>\n{}\n</content>",
-            input.file_path,
-            content.join("\n")
-        );
-
-        if truncated_by_bytes {
-            output.push_str(&format!(
-                "\n\n(Output capped at {}. Showing lines {}-{}. Use offset={} to continue.)",
-                MAX_BYTES_LABEL, input.offset, last_read_line, next_offset
-            ));
-        } else if has_more_lines {
-            output.push_str(&format!(
-                "\n\n(Showing lines {}-{} of {}. Use offset={} to continue.)",
-                input.offset, last_read_line, total_lines_count, next_offset
-            ));
-        } else {
-            output.push_str(&format!(
-                "\n\n(End of file - total {} lines)",
-                total_lines_count
-            ));
-        }
-
-        Ok(ToolResult::new("read_file", output))
+        Ok(ToolResult::new(
+            "read_file",
+            render_read_text(
+                &input,
+                &lines,
+                total_lines,
+                truncated_by_bytes,
+                has_more_lines,
+            ),
+        ))
     }
 }
 
@@ -527,21 +537,20 @@ impl Tool for GlobTool {
         );
         let workdir = self.working_directory.clone();
         let contain = ctx.enforcement != gewu_core::types::PathEnforcement::None;
-        let matches =
-            tokio::task::spawn_blocking(move || {
-                let mut matches = glob_with_gitignore(&search_dir, &pattern, hidden, limit)?;
-                if contain {
-                    // The walker follows symlinks, so drop entries that
-                    // resolve (lexically) outside the working directory.
-                    matches.entries.retain(|(path, _)| {
-                        crate::fs_utils::normalize_path(path).starts_with(&workdir)
-                    });
-                }
-                Ok::<_, anyhow::Error>(matches)
-            })
-            .await
-            .map_err(into_tool_error)?
-            .map_err(into_tool_error)?;
+        let matches = tokio::task::spawn_blocking(move || {
+            let mut matches = glob_with_gitignore(&search_dir, &pattern, hidden, limit)?;
+            if contain {
+                // The walker follows symlinks, so drop entries that
+                // resolve (lexically) outside the working directory.
+                matches.entries.retain(|(path, _)| {
+                    crate::fs_utils::normalize_path(path).starts_with(&workdir)
+                });
+            }
+            Ok::<_, anyhow::Error>(matches)
+        })
+        .await
+        .map_err(into_tool_error)?
+        .map_err(into_tool_error)?;
 
         let truncated = matches.truncated;
         let count = matches.entries.len();
@@ -578,6 +587,67 @@ impl Tool for GlobTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_line_truncation_preserves_byte_limit_and_utf8() {
+        assert_eq!(truncate_read_line("你好"), "你好");
+        assert_eq!(truncate_read_line(&"a".repeat(2000)), "a".repeat(2000));
+        assert_eq!(
+            truncate_read_line(&format!("{}界", "a".repeat(1999))),
+            format!("{}{}", "a".repeat(1999), MAX_LINE_SUFFIX)
+        );
+        assert_eq!(
+            truncate_read_line(&"界".repeat(667)),
+            format!("{}{}", "界".repeat(666), MAX_LINE_SUFFIX)
+        );
+    }
+
+    #[test]
+    fn read_text_rendering_characterization() {
+        let mut input = ReadArgs {
+            file_path: "file.txt".into(),
+            limit: 2,
+            offset: 1,
+        };
+        let header = "<path>file.txt</path>\n<type>file</type>\n<content>\n";
+        assert_eq!(
+            render_read_text(&input, &[], 0, false, false),
+            format!("{header}\n</content>\n\n(End of file - total 0 lines)")
+        );
+        let lines = vec!["你好".into(), "".into()];
+        assert_eq!(
+            render_read_text(&input, &lines, 2, false, false),
+            format!("{header}1: 你好\n2: \n</content>\n\n(End of file - total 2 lines)")
+        );
+        input.offset = 3;
+        assert_eq!(
+            render_read_text(&input, &lines, 8, false, true),
+            format!(
+                "{header}3: 你好\n4: \n</content>\n\n(Showing lines 3-4 of 8. Use offset=5 to continue.)"
+            )
+        );
+        assert_eq!(
+            render_read_text(&input, &lines, 5, true, false),
+            format!(
+                "{header}3: 你好\n4: \n</content>\n\n(Output capped at 50 KB. Showing lines 3-4. Use offset=5 to continue.)"
+            )
+        );
+        assert_eq!(
+            render_read_text(&input, &[], 2, false, false),
+            "Offset 3 is out of range for this file (2 lines)"
+        );
+        input.offset = 0;
+        assert_eq!(
+            render_read_text(&input, &[], 1, false, true),
+            format!("{header}\n</content>\n\n(Showing lines 0-1 of 1. Use offset=2 to continue.)")
+        );
+        input.offset = 1;
+        input.limit = 0;
+        assert_eq!(
+            render_read_text(&input, &[], 3, false, true),
+            format!("{header}\n</content>\n\n(Showing lines 1-1 of 3. Use offset=2 to continue.)")
+        );
+    }
     use anyhow::Result;
     use gewu_core::types::PathEnforcement;
     use tempfile::tempdir;
@@ -671,8 +741,13 @@ mod tests {
         assert!(!result.truncated);
         let lines: Vec<&str> = result.output.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].ends_with("a.txt"), "{}", result.output);
-        assert!(lines[1].ends_with("b.txt"), "{}", result.output);
+        // Walker order is filesystem-dependent; only membership is stable.
+        let names: Vec<&str> = lines
+            .iter()
+            .map(|line| line.rsplit('/').next().expect("non-empty path"))
+            .collect();
+        assert!(names.contains(&"a.txt"), "{}", result.output);
+        assert!(names.contains(&"b.txt"), "{}", result.output);
         Ok(())
     }
 
@@ -788,7 +863,10 @@ mod tests {
         assert_eq!(result.metadata.get("count"), Some(&serde_json::json!(1)));
 
         let result = tool
-            .execute(serde_json::json!({ "pattern": "*.txt", "hidden": true }), &ctx)
+            .execute(
+                serde_json::json!({ "pattern": "*.txt", "hidden": true }),
+                &ctx,
+            )
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains(".hidden.txt"));
@@ -873,7 +951,11 @@ mod tests {
             )
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        assert!(result.output.contains("outside content"), "{}", result.output);
+        assert!(
+            result.output.contains("outside content"),
+            "{}",
+            result.output
+        );
 
         // With containment on, the same request is rejected.
         let ctx = ToolContext::new("test", "msg").with_enforcement(PathEnforcement::Contain);

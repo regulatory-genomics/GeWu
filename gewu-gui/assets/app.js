@@ -512,10 +512,10 @@
   // -- composer -----------------------------------------------------------
 
   function updateComposer() {
-    el.send.disabled = !state.connected || !state.ready || state.busy;
+    el.send.disabled = !state.connected || !state.ready;
     el.interrupt.classList.toggle("hidden", !state.busy);
     el.interrupt.disabled = !state.connected;
-    el.prompt.classList.toggle("locked", state.busy);
+    el.prompt.classList.toggle("locked", false);
   }
 
   function autosize() {
@@ -526,10 +526,6 @@
   function submitPrompt() {
     const text = el.prompt.value.trim();
     if (!text) return;
-    if (state.busy) {
-      toast("Wait for the current reply to finish, or press Esc to interrupt");
-      return;
-    }
     if (!state.ready) {
       toast("Still loading the session; try again in a moment");
       return;

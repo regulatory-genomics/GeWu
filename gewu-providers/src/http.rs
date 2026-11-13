@@ -8,6 +8,7 @@
 //! limits) with capped waits, so transient stalls and short quota windows
 //! self-heal.
 
+use futures::StreamExt;
 use reqwest::Client;
 use std::future::Future;
 use std::time::Duration;
@@ -35,8 +36,7 @@ pub(crate) const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 /// indefinitely, but never sleep longer than this per attempt: a provider
 /// suggesting an hour-long `Retry-After` is retried every 5 minutes instead,
 /// and the backoff sequence clamps at the same ceiling. A turn stuck in this
-/// loop is still bounded from the outside by the turn runtime limit or an
-/// explicit interrupt.
+/// loop is still bounded by an explicit interrupt.
 pub(crate) const MAX_RETRY_WAIT: Duration = Duration::from_secs(300);
 
 /// Whether an error should be retried, and optionally how long to wait first.
@@ -111,6 +111,83 @@ where
                     tokio::time::sleep(delay).await;
                 }
             },
+        }
+    }
+}
+
+/// A stream that restarts its underlying request from scratch while the
+/// failure is retryable and nothing has been yielded yet.
+///
+/// Mid-stream failures — an in-flight `error` SSE event (a provider
+/// overload, say) or a dropped connection — would otherwise kill the turn.
+/// Restarting is only safe before any visible output: once content or
+/// reasoning deltas reached the consumer, a fresh request would duplicate
+/// them, so late failures surface as-is.
+///
+/// Waits follow the same policy as [`with_retries_capped`]: the provider's
+/// hint when present, else the exponential backoff sequence, both clamped to
+/// `max_wait`; retrying is unbounded and bounded externally by an explicit
+/// interrupt.
+pub(crate) fn retrying_stream<T, E, F, S>(
+    mut make_stream: F,
+    is_retryable: fn(&E) -> RetryDecision,
+    notify: Option<StatusSink>,
+    backoff: Duration,
+    max_wait: Duration,
+) -> impl futures::Stream<Item = Result<T, E>>
+where
+    F: FnMut() -> S,
+    S: futures::Stream<Item = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    async_stream::try_stream! {
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let mut inner = Box::pin(make_stream());
+            let mut forwarded = 0usize;
+            let mut restart = false;
+            while let Some(item) = inner.next().await {
+                match item {
+                    Ok(event) => {
+                        forwarded += 1;
+                        yield event;
+                    }
+                    Err(error) => match is_retryable(&error) {
+                        RetryDecision::No => Err::<(), E>(error)?,
+                        // Retryable, but output already went out: a restart
+                        // would duplicate what the consumer has seen.
+                        RetryDecision::Yes { .. } if forwarded > 0 => Err::<(), E>(error)?,
+                        RetryDecision::Yes { after } => {
+                            let delay = match after {
+                                Some(hint) => hint.min(max_wait),
+                                None => backoff
+                                    .saturating_mul(4u32.saturating_pow(attempt - 1))
+                                    .min(max_wait),
+                            };
+                            tracing::warn!(
+                                attempt,
+                                delay_secs = delay.as_secs(),
+                                capped = after.is_some_and(|hint| hint > max_wait),
+                                error = %error,
+                                "retryable LLM stream failure; restarting"
+                            );
+                            if let Some(notify) = &notify {
+                                notify(format!(
+                                    "LLM request failed: {error}; retrying in {}s (attempt {attempt})",
+                                    delay.as_secs()
+                                ));
+                            }
+                            tokio::time::sleep(delay).await;
+                            restart = true;
+                            break;
+                        }
+                    },
+                }
+            }
+            if !restart {
+                break;
+            }
         }
     }
 }
@@ -309,7 +386,9 @@ mod tests {
             },
             |e| {
                 if e.contains("rate limited") {
-                    RetryDecision::Yes { after: Some(Duration::from_millis(1)) }
+                    RetryDecision::Yes {
+                        after: Some(Duration::from_millis(1)),
+                    }
                 } else {
                     RetryDecision::No
                 }
@@ -342,7 +421,9 @@ mod tests {
             },
             |e| {
                 if e.contains("quota") {
-                    RetryDecision::Yes { after: Some(Duration::from_secs(3600)) }
+                    RetryDecision::Yes {
+                        after: Some(Duration::from_secs(3600)),
+                    }
                 } else {
                     RetryDecision::No
                 }
@@ -350,7 +431,11 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(result.unwrap(), 2, "a hint beyond the cap must clamp, not fail");
+        assert_eq!(
+            result.unwrap(),
+            2,
+            "a hint beyond the cap must clamp, not fail"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -405,5 +490,119 @@ mod tests {
         assert!(!message.contains('\n'));
         assert!(message.chars().count() <= 201);
         assert_eq!(rate_limit_message(""), "no response body");
+    }
+
+    // -- retrying_stream ----------------------------------------------------
+
+    type StreamError = Box<dyn std::error::Error + Send + Sync>;
+
+    /// Serves one canned attempt stream per call, counting invocations.
+    fn canned_streams(
+        attempts: Vec<Vec<Result<u32, StreamError>>>,
+    ) -> (
+        impl FnMut() -> futures::stream::BoxStream<'static, Result<u32, StreamError>>,
+        Arc<AtomicUsize>,
+    ) {
+        let mut attempts = std::collections::VecDeque::from(attempts);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let make = move || {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+            futures::stream::iter(attempts.pop_front().unwrap_or_default()).boxed()
+        };
+        (make, calls)
+    }
+
+    fn retry_on_overloaded(error: &StreamError) -> RetryDecision {
+        if error.to_string().contains("overloaded") {
+            RetryDecision::Yes { after: None }
+        } else {
+            RetryDecision::No
+        }
+    }
+
+    #[tokio::test]
+    async fn retrying_stream_restarts_transient_failures_before_output() {
+        let (make, calls) = canned_streams(vec![
+            vec![Err("server overloaded".into())],
+            vec![Ok(1), Ok(2)],
+        ]);
+        let events: Vec<_> = Box::pin(retrying_stream(
+            make,
+            retry_on_overloaded,
+            None,
+            TEST_BACKOFF,
+            MAX_RETRY_WAIT,
+        ))
+        .collect()
+        .await;
+        assert!(matches!(events.as_slice(), [Ok(1), Ok(2)]), "{events:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retrying_stream_surfaces_permanent_failures_without_restart() {
+        let (make, calls) = canned_streams(vec![vec![Err("fatal: bad request".into())]]);
+        let events: Vec<_> = Box::pin(retrying_stream(
+            make,
+            retry_on_overloaded,
+            None,
+            TEST_BACKOFF,
+            MAX_RETRY_WAIT,
+        ))
+        .collect()
+        .await;
+        assert!(matches!(events.as_slice(), [Err(e)] if e.to_string() == "fatal: bad request"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retrying_stream_never_restarts_after_visible_output() {
+        // A failure that arrives after events were yielded must surface:
+        // a restart would duplicate what the consumer already saw.
+        let (make, calls) = canned_streams(vec![vec![
+            Ok(1),
+            Err("server overloaded mid-stream".into()),
+        ]]);
+        let events: Vec<_> = Box::pin(retrying_stream(
+            make,
+            retry_on_overloaded,
+            None,
+            TEST_BACKOFF,
+            MAX_RETRY_WAIT,
+        ))
+        .collect()
+        .await;
+        assert!(
+            matches!(events.as_slice(), [Ok(1), Err(e)] if e.to_string().contains("overloaded")),
+            "{events:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retrying_stream_reports_the_backoff_to_the_status_sink() {
+        let (make, calls) =
+            canned_streams(vec![vec![Err("server overloaded".into())], vec![Ok(7)]]);
+        let statuses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_statuses = statuses.clone();
+        let sink: StatusSink = Arc::new(move |message: String| {
+            sink_statuses.lock().unwrap().push(message);
+        });
+        let events: Vec<_> = Box::pin(retrying_stream(
+            make,
+            retry_on_overloaded,
+            Some(sink),
+            TEST_BACKOFF,
+            MAX_RETRY_WAIT,
+        ))
+        .collect()
+        .await;
+        assert!(matches!(events.as_slice(), [Ok(7)]), "{events:?}");
+        let reported = statuses.lock().unwrap();
+        assert_eq!(reported.len(), 1);
+        assert!(reported[0].contains("overloaded"), "{}", reported[0]);
+        assert!(reported[0].contains("attempt 1"), "{}", reported[0]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

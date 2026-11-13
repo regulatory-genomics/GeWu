@@ -46,9 +46,7 @@ pub use stream::AskStream;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-use gewu_protocol::{
-    ClientRequest, FileEntry, Message, ServerMessage, SessionSummary, TokenUsage,
-};
+use gewu_protocol::{ClientRequest, FileEntry, Message, ServerMessage, SessionSummary, TokenUsage};
 use inner::Command;
 
 /// Alias for a [`Result`](std::result::Result) with this crate's error type.
@@ -133,21 +131,50 @@ impl Client {
     pub async fn watch_session(&self, session_id: impl Into<String>) -> Result<AskStream> {
         let request = ClientRequest::subscribe_session(self.next_correlation_id(), session_id);
         let (tx, rx) = oneshot::channel();
-        self.commands.send(Command::Subscribe { request, stream: tx }).await
+        self.commands
+            .send(Command::Subscribe {
+                request,
+                stream: tx,
+            })
+            .await
             .map_err(|_| Error::Connection("connection closed".into()))?;
-        Ok(AskStream::new(rx.await.map_err(|_| Error::Connection("connection closed".into()))??))
+        Ok(AskStream::new(rx.await.map_err(|_| {
+            Error::Connection("connection closed".into())
+        })??))
     }
     /// Restore a session's current transcript and attach to its active turn.
     pub async fn subscribe_session(&self, session_id: impl Into<String>) -> Result<AskStream> {
         let request = ClientRequest::subscribe_session(self.next_correlation_id(), session_id);
         let (tx, rx) = oneshot::channel();
-        self.commands.send(Command::Ask { request, stream: tx }).await
+        self.commands
+            .send(Command::Ask {
+                request,
+                stream: tx,
+            })
+            .await
             .map_err(|_| Error::Connection("connection closed".into()))?;
-        Ok(AskStream::new(rx.await.map_err(|_| Error::Connection("connection closed".into()))??))
+        Ok(AskStream::new(rx.await.map_err(|_| {
+            Error::Connection("connection closed".into())
+        })??))
     }
-    pub async fn revert_chat(&self, turn: Option<usize>, undo: bool) -> Result<(String, Vec<Message>)> {
-        match self.request(ClientRequest::revert_chat(self.next_correlation_id(), turn, undo)).await? {
-            ServerMessage::Session { session_id, messages, .. } => Ok((session_id, messages)),
+    pub async fn revert_chat(
+        &self,
+        turn: Option<usize>,
+        undo: bool,
+    ) -> Result<(String, Vec<Message>)> {
+        match self
+            .request(ClientRequest::revert_chat(
+                self.next_correlation_id(),
+                turn,
+                undo,
+            ))
+            .await?
+        {
+            ServerMessage::Session {
+                session_id,
+                messages,
+                ..
+            } => Ok((session_id, messages)),
             ServerMessage::Error { error, .. } => Err(Error::Server(error)),
             other => Err(unexpected(other, "session")),
         }
@@ -156,7 +183,9 @@ impl Client {
     pub async fn switch_agent(&self, agent: impl Into<String>) -> Result<(String, Vec<String>)> {
         let request = ClientRequest::switch_agent(self.next_correlation_id(), agent);
         match self.request(request).await? {
-            ServerMessage::AgentSwitched { session_id, tools, .. } => Ok((session_id, tools)),
+            ServerMessage::AgentSwitched {
+                session_id, tools, ..
+            } => Ok((session_id, tools)),
             ServerMessage::Error { error, .. } => Err(Error::Server(error)),
             other => Err(unexpected(other, "agent_switched")),
         }
@@ -175,7 +204,9 @@ impl Client {
     pub async fn switch_model(&self, model: impl Into<String>) -> Result<(String, String)> {
         let request = ClientRequest::switch_model(self.next_correlation_id(), model);
         match self.request(request).await? {
-            ServerMessage::ModelSwitched { session_id, label, .. } => Ok((session_id, label)),
+            ServerMessage::ModelSwitched {
+                session_id, label, ..
+            } => Ok((session_id, label)),
             ServerMessage::Error { error, .. } => Err(Error::Server(error)),
             other => Err(unexpected(other, "model_switched")),
         }
@@ -250,6 +281,19 @@ impl Client {
         self.request(request).await.map(|_| ())
     }
 
+    /// Inject a steering message into this connection's running ask.
+    ///
+    /// The message joins the conversation at the agent's next round
+    /// boundary and also arrives as a `steered` agent event on the ask's
+    /// stream. Fails when no ask is running.
+    pub async fn steer(&self, text: impl Into<String>) -> Result<()> {
+        let request = ClientRequest::steer(self.next_correlation_id(), text);
+        match self.request(request).await? {
+            ServerMessage::Steered { .. } => Ok(()),
+            other => Err(unexpected(other, "steered")),
+        }
+    }
+
     /// List the tool names available to this connection's agent.
     pub async fn list_tools(&self) -> Result<Vec<String>> {
         let request = ClientRequest::list_tools(self.next_correlation_id());
@@ -282,11 +326,7 @@ impl Client {
     /// Write (create or overwrite) a file in the server's working-directory
     /// root. `path` must be a bare file name; returns the name used and the
     /// number of bytes written.
-    pub async fn write_file(
-        &self,
-        path: impl Into<String>,
-        bytes: &[u8],
-    ) -> Result<(String, u64)> {
+    pub async fn write_file(&self, path: impl Into<String>, bytes: &[u8]) -> Result<(String, u64)> {
         use base64::Engine as _;
         let content_base64 = base64::engine::general_purpose::STANDARD.encode(bytes);
         let request = ClientRequest::write_file(self.next_correlation_id(), path, content_base64);

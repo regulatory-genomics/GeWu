@@ -362,10 +362,10 @@ impl<'a> ActiveContext<'a> {
                     if index < boundary && !matches!(message, Message::System { .. }) {
                         return None;
                     }
-                    if index == boundary {
-                        if let Message::Compaction { summary, recent } = message {
-                            return Some(ContextMessage::Checkpoint(summary, recent));
-                        }
+                    if index == boundary
+                        && let Message::Compaction { summary, recent } = message
+                    {
+                        return Some(ContextMessage::Checkpoint(summary, recent));
                     }
                 }
                 Some(ContextMessage::Borrowed(message))

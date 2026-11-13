@@ -437,10 +437,8 @@ fn test_agent_event_usage_round_trip() {
     // Provider usage is optional: older event payloads (or providers that
     // report nothing) decode with `provider: None` and round-trip without
     // the field on the wire.
-    let legacy: AgentEvent = serde_json::from_str(
-        r#"{"type":"usage","used_tokens":10,"context_limit":100}"#,
-    )
-    .unwrap();
+    let legacy: AgentEvent =
+        serde_json::from_str(r#"{"type":"usage","used_tokens":10,"context_limit":100}"#).unwrap();
     assert_eq!(
         legacy,
         AgentEvent::Usage {

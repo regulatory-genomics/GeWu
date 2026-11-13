@@ -26,12 +26,12 @@
 mod anthropic;
 mod http;
 mod openai;
-mod providers;
 mod profile;
-mod services;
+mod providers;
 mod responses;
+mod services;
 
+pub use profile::ProviderProfile;
 pub use providers::{AnthropicProvider, ChatCompletionsProvider};
 pub use responses::OpenAIProvider;
-pub use profile::ProviderProfile;
 pub use services::{DeepSeekProvider, GlmProvider, MoonshotProvider};

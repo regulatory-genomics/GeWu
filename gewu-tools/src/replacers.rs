@@ -83,10 +83,8 @@ fn line_trimmed_replace(content: &str, search: &str) -> Option<(usize, usize)> {
         }
 
         if matches_line {
-            let match_start_index: usize = original_lines[..i]
-                .iter()
-                .map(|line| line.len() + 1)
-                .sum();
+            let match_start_index: usize =
+                original_lines[..i].iter().map(|line| line.len() + 1).sum();
 
             let mut match_end_index = match_start_index;
             for k in 0..search_lines.len() {
@@ -191,7 +189,6 @@ fn block_anchor_replace(content: &str, search: &str) -> Option<(usize, usize)> {
         let actual_block_size = cand.end_line - cand.start_line + 1;
 
         let lines_to_check = (search_block_size - 2).min(actual_block_size.saturating_sub(2));
-        
 
         let similarity = if lines_to_check > 0 {
             // Average similarity across ALL middle lines of the candidate
@@ -200,7 +197,12 @@ fn block_anchor_replace(content: &str, search: &str) -> Option<(usize, usize)> {
             // lines have Levenshtein similarity > 0), allowing wildly
             // different blocks to match and corrupting the file.
             let mut total = 0.0;
-            for (j, raw_search_line) in search_lines.iter().enumerate().take(search_block_size - 1).skip(1) {
+            for (j, raw_search_line) in search_lines
+                .iter()
+                .enumerate()
+                .take(search_block_size - 1)
+                .skip(1)
+            {
                 let orig_idx = cand.start_line + j;
                 if orig_idx >= original_lines.len() {
                     break;
@@ -250,7 +252,12 @@ fn block_anchor_replace(content: &str, search: &str) -> Option<(usize, usize)> {
         let lines_to_check = (search_block_size - 2).min(actual_block_size.saturating_sub(2));
 
         if lines_to_check > 0 {
-            for (j, raw_search_line) in search_lines.iter().enumerate().take(search_block_size - 1).skip(1) {
+            for (j, raw_search_line) in search_lines
+                .iter()
+                .enumerate()
+                .take(search_block_size - 1)
+                .skip(1)
+            {
                 let orig_idx = cand.start_line + j;
                 if orig_idx >= original_lines.len() {
                     continue;
@@ -276,25 +283,26 @@ fn block_anchor_replace(content: &str, search: &str) -> Option<(usize, usize)> {
     }
 
     if max_similarity >= MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD
-        && let Some(best) = best_match {
-            let match_start_index: usize = original_lines[..best.start_line]
-                .iter()
-                .map(|line| line.len() + 1)
-                .sum();
-            let mut match_end_index = match_start_index;
-            for (k, line) in original_lines
-                .iter()
-                .enumerate()
-                .take(best.end_line + 1)
-                .skip(best.start_line)
-            {
-                match_end_index += line.len();
-                if k < best.end_line {
-                    match_end_index += 1;
-                }
+        && let Some(best) = best_match
+    {
+        let match_start_index: usize = original_lines[..best.start_line]
+            .iter()
+            .map(|line| line.len() + 1)
+            .sum();
+        let mut match_end_index = match_start_index;
+        for (k, line) in original_lines
+            .iter()
+            .enumerate()
+            .take(best.end_line + 1)
+            .skip(best.start_line)
+        {
+            match_end_index += line.len();
+            if k < best.end_line {
+                match_end_index += 1;
             }
-            return Some((match_start_index, match_end_index));
         }
+        return Some((match_start_index, match_end_index));
+    }
 
     None
 }
@@ -330,10 +338,7 @@ fn indentation_flexible_replace(content: &str, search: &str) -> Option<(usize, u
         let block = content_lines[i..i + find_lines.len()].join("\n");
         let (normalized_block, _) = remove_indentation(&block);
         if normalized_block == normalized_find {
-            let start: usize = content_lines[..i]
-                .iter()
-                .map(|line| line.len() + 1)
-                .sum();
+            let start: usize = content_lines[..i].iter().map(|line| line.len() + 1).sum();
             let end = start + block.len();
             return Some((start, end));
         }
@@ -456,10 +461,8 @@ fn context_aware_replace(content: &str, search: &str) -> Option<(usize, usize)> 
                     };
 
                     if ratio >= 0.5 {
-                        let start: usize = content_lines[..i]
-                            .iter()
-                            .map(|line| line.len() + 1)
-                            .sum();
+                        let start: usize =
+                            content_lines[..i].iter().map(|line| line.len() + 1).sum();
                         let end = start + block.len();
                         return Some((start, end));
                     }

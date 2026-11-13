@@ -300,10 +300,13 @@ pub async fn is_binary_file(path: impl AsRef<Path>, file_size: u64) -> Result<bo
     // Binary extensions list (same as legacy). `Path::extension()` yields the
     // name WITHOUT the leading dot, so the patterns must not include one.
     if let Some(
-            "zip" | "tar" | "gz" | "exe" | "dll" | "so" | "class" | "jar" | "war" | "7z"
-            | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp"
-            | "bin" | "dat" | "obj" | "o" | "a" | "lib" | "wasm" | "pyc" | "pyo",
-        ) = ext.as_deref() { return Ok(true) }
+        "zip" | "tar" | "gz" | "exe" | "dll" | "so" | "class" | "jar" | "war" | "7z" | "doc"
+        | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp" | "bin" | "dat" | "obj"
+        | "o" | "a" | "lib" | "wasm" | "pyc" | "pyo",
+    ) = ext.as_deref()
+    {
+        return Ok(true);
+    }
 
     if file_size == 0 {
         return Ok(false);
@@ -605,10 +608,7 @@ mod tests {
             dir.path().parent().unwrap().join("sibling.txt")
         );
         let written = resolve_write_path(dir.path(), "../new.txt", PathEnforcement::None).await?;
-        assert_eq!(
-            written,
-            dir.path().parent().unwrap().join("new.txt")
-        );
+        assert_eq!(written, dir.path().parent().unwrap().join("new.txt"));
 
         // Contain: outside absolutes and traversal rejected.
         assert!(

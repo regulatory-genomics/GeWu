@@ -43,10 +43,12 @@ pub use reminder::Reminder;
 mod execution;
 mod experiences;
 mod media;
+mod steering;
 mod tools;
 
 pub use compaction::CompactionError;
 pub use experiences::SearchExperiencesTool;
+pub use steering::{BackgroundNotification, InboxMessage, Steering};
 pub use tools::execute_tool_with_panic_recovery;
 
 use crate::middleware::TruncationService;
@@ -66,8 +68,10 @@ use tokio::sync::mpsc;
 use tracing::{info, trace, warn};
 use uuid::Uuid;
 
-use self::execution::{DoomLoopDetector, LlmResponseAggregator, execute_tool_call};
-use crate::agent::media::extract_media_parts;
+use self::execution::{
+    DoomLoopDetector, LlmResponseAggregator, ToolCallPlan, TurnDisposition, classify_turn,
+    execute_tool_call, normalize_tool_result, plan_tool_call, prepare_provider_messages,
+};
 
 /// Maximum number of tool calls from a single LLM turn that execute at the
 /// same time. Extra calls queue behind the semaphore until a slot frees up.
@@ -112,6 +116,8 @@ pub struct Agent {
     run_abort: Arc<AtomicBool>,
     /// Per-session key/value state shared with tools on every [`ToolContext`].
     session_state: SessionState,
+    /// Buffer for steering messages injected while the agent runs.
+    steering: Steering,
 }
 
 /// Per-run budgets. `Default` keeps the historical behaviour.
@@ -324,7 +330,13 @@ impl Agent {
         &'a mut self,
         user_message: &'a str,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
-        self.ask_with(user_message, RunOptions::default())
+        self.run(Some(user_message), RunOptions::default())
+    }
+
+    /// Continues the conversation without a new prompt, delivering steering
+    /// messages queued while the agent was idle.
+    pub fn resume(&mut self) -> impl Stream<Item = Result<AgentEvent>> + '_ {
+        self.run(None, RunOptions::default())
     }
 
     /// Runs one turn with explicit budgets and cancellation.
@@ -333,26 +345,39 @@ impl Agent {
         user_message: &'a str,
         options: RunOptions,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
-        self.ask_with(user_message, options)
+        self.run(Some(user_message), options)
     }
 
-    fn ask_with<'a>(
+    fn run<'a>(
         &'a mut self,
-        user_message: &'a str,
+        user_message: Option<&'a str>,
         options: RunOptions,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
         async_stream::try_stream! {
+            // A cancel that arrived while no run was in flight must not
+            // poison this one.
             self.run_abort.store(false, Ordering::SeqCst);
             let abort = self.run_abort.clone();
             let deadline = options.deadline.map(|limit| tokio::time::Instant::now() + limit);
             let stop = wait_for_run_stop(&abort, deadline);
             tokio::pin!(stop);
+            if user_message.is_some() {
+                self.steering.unpause();
+            }
             if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
                 self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
             }
 
-            self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await;
-            self.reminder.on_user_turn();
+            // Messages steered while the agent was idle join the transcript
+            // ahead of this run's own prompt, preserving send order.
+            for event in self.ingest_steered().await {
+                yield event;
+            }
+
+            if let Some(user_message) = user_message {
+                self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await;
+                self.reminder.on_user_turn();
+            }
             // Due mode reminders become part of conversation history, so
             // every request in this turn — and later turns — still carries
             // them instead of only the first provider call.
@@ -379,6 +404,16 @@ impl Agent {
                     yield event;
                     break;
                 }
+
+                // Inject messages steered mid-run before the context
+                // estimate so they count toward compaction. This point is
+                // the only safe spot: all tool results of the previous
+                // round are in history, so a user message never lands
+                // between an assistant turn and its tool results.
+                for event in self.ingest_steered().await {
+                    yield event;
+                }
+
                 let context_tokens = crate::compaction::active_context(self.memory.messages())
                     .estimate_tokens();
                 let compacting = crate::compaction::is_overflow(context_tokens, self.context_limit);
@@ -410,17 +445,7 @@ impl Agent {
                 turn += 1;
 
                 let mut aggregator = LlmResponseAggregator::new();
-                let mut messages = crate::compaction::active_context(self.memory.messages()).to_messages();
-                // Persisted history may belong to a different agent profile.
-                // Replace its base system prompt for this provider request,
-                // without rewriting conversation history.
-                if !self.system_prompt.is_empty() {
-                    if let Some(Message::System { content }) = messages.first_mut() {
-                        *content = self.system_prompt.clone();
-                    } else {
-                        messages.insert(0, Message::System { content: self.system_prompt.clone() });
-                    }
-                }
+                let messages = prepare_provider_messages(self.memory.messages(), &self.system_prompt);
                 trace!("LLM request messages: {:?}", messages);
                 let tools_clone = self.tools.clone();
 
@@ -481,7 +506,11 @@ impl Agent {
                     break;
                 }
 
-                let (content, reasoning, tool_calls, replay) = aggregator.take_parts();
+                let aggregated = aggregator.take_parts();
+                let content = aggregated.content;
+                let reasoning = aggregated.reasoning;
+                let tool_calls = aggregated.tool_calls;
+                let replay = aggregated.replay;
 
                 // Reasoning models spend thinking tokens from the same
                 // `max_tokens` budget; when it runs out the turn can end with
@@ -506,7 +535,14 @@ impl Agent {
                     tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
                 }).await;
 
-                if tool_calls.is_empty() {
+                let turn_disposition = classify_turn(&tool_calls, self.steering.is_pending());
+                if turn_disposition != TurnDisposition::Tools {
+                    // A steer arriving while the model streams its final
+                    // answer must still be answered in this run: continue
+                    // instead of finishing. `max_turns` still bounds this.
+                    if turn_disposition == TurnDisposition::Steered {
+                        continue;
+                    }
                     // Report the running context estimate at the turn boundary
                     // (frontends update the usage gauge from these events).
                     yield self.usage_event();
@@ -530,7 +566,6 @@ impl Agent {
                 let mut pending: Vec<(usize, ToolCall, String)> = Vec::new();
                 let mut announced = vec![false; tool_calls.len()];
                 let mut terminal = None;
-                let mut tool_errors = Vec::new();
                 for (index, call) in tool_calls.iter().enumerate() {
                     let tool_name = call.function.name.clone();
                     let args = call.function.arguments.clone();
@@ -540,36 +575,67 @@ impl Agent {
                         pending.clear();
                         break;
                     }
-                    if let Some(max) = max_tool_calls {
-                        if tool_calls_made >= max {
-                            let error = format!("Tool call budget of {max} exhausted.");
-                            results[index] = Some(Ok(ToolResult::new(
-                                tool_name, format!("Error: {error} Not executed."),
-                            )));
-                            terminal = Some(AgentEvent::Error { error });
-                            continue;
-                        }
+                    if let Some(max) = max_tool_calls
+                        && tool_calls_made >= max
+                    {
+                        let error = format!("Tool call budget of {max} exhausted.");
+                        results[index] = Some(Ok(ToolResult::new(
+                            tool_name,
+                            format!("Error: {error} Not executed."),
+                        )));
+                        terminal = Some(AgentEvent::Error { error });
+                        continue;
                     }
                     tool_calls_made += 1;
 
-                    if let Some(error) = doom_loop.check(&tool_name, &args) {
-                        terminal = Some(AgentEvent::Error { error });
-                        pending.clear();
-                        break;
-                    }
-                    doom_loop.record(tool_name.clone(), args.clone());
-
-                    if tool_name.is_empty() {
-                        tool_errors.push("Tool name is empty, skipping execution".to_string());
-                        results[index] = Some(Ok(ToolResult::new(
-                            tool_name.clone(),
-                            "Error: the tool call had an empty name and was not executed.",
-                        )));
-                        continue;
+                    match plan_tool_call(call, &mut doom_loop) {
+                        ToolCallPlan::Stop(error) => {
+                            yield AgentEvent::Error { error };
+                            // Close out every announced call of this turn so
+                            // the UI has no eternally "running" tool cards.
+                            let not_executed = "Error: not executed because a doom loop was \
+                                                detected and the run was stopped."
+                                .to_string();
+                            for (announced_index, announced_call) in tool_calls.iter().enumerate() {
+                                if announced[announced_index] {
+                                    yield AgentEvent::ToolFinish {
+                                        call_id: announced_call.id.clone(),
+                                        tool: announced_call.function.name.clone(),
+                                        title: announced_call.function.name.clone(),
+                                        output: not_executed.clone(),
+                                        metadata: Default::default(),
+                                    };
+                                }
+                            }
+                            // Close out every tool call of this turn so the
+                            // persisted history has no dangling tool_calls.
+                            for call in &tool_calls {
+                                self.memory.add_message(Message::Tool {
+                                    tool_call_id: call.id.clone(),
+                                    tool_name: Some(call.function.name.clone()),
+                                    content: not_executed.clone(),
+                                    media: Vec::new(),
+                                })
+                                .await;
+                            }
+                            return;
+                        }
+                        ToolCallPlan::Reject(result) => {
+                            yield AgentEvent::Error {
+                                error: "Tool name is empty, skipping execution".to_string(),
+                            };
+                            results[index] = Some(Ok(result));
+                            continue;
+                        }
+                        ToolCallPlan::Execute => {}
                     }
 
                     announced[index] = true;
-                    yield AgentEvent::ToolStart { call_id: call.id.clone(), tool: tool_name.clone(), input: args.clone() };
+                    yield AgentEvent::ToolStart {
+                        call_id: call.id.clone(),
+                        tool: tool_name.clone(),
+                        input: args.clone(),
+                    };
                     pending.push((index, call.clone(), Uuid::new_v4().to_string()));
                 }
 
@@ -591,13 +657,14 @@ impl Agent {
                     let enforcement = self.enforcement;
                     let truncation = self.truncation.clone();
                     let semaphore = semaphore.clone();
+                    let inbox = self.steering.clone();
                     join_set.spawn(async move {
                         let _permit = semaphore.acquire_owned().await.ok();
                         let tool_name = call.function.name.clone();
                         if let Some(event) = run_stop_reason(&abort, deadline) {
                             return (index, Ok(ToolResult::new(tool_name, format!("Error: not executed: {event:?}"))));
                         }
-                        let ctx = ToolContext::with_call(
+                        let mut ctx = ToolContext::with_call(
                             &session_id,
                             &run_id,
                             &message_id,
@@ -606,6 +673,7 @@ impl Agent {
                         )
                         .with_enforcement(enforcement)
                         .with_session_state(session_state);
+                        ctx.inbox = Some(inbox);
                         let result = if let Some(t) = tool {
                             execute_tool_call(t, call, ctx, &truncation).await
                         } else {
@@ -650,64 +718,29 @@ impl Agent {
                 // conversation history stays deterministic regardless of
                 // completion order.
                 for (index, (call, result)) in tool_calls.iter().zip(results).enumerate() {
-                    let tool_name = call.function.name.clone();
-                    let result = match result {
-                        Some(Ok(result)) => result,
-                        Some(Err(e)) => {
-                            tool_errors.push(e.to_string());
-                            ToolResult::new(tool_name.clone(), format!("Error: {}", e))
-                        }
-                        // The call's task panicked or was lost; still answer
-                        // the tool_call so history stays consistent.
-                        None => ToolResult::new(
-                            tool_name.clone(),
-                            match &terminal {
-                                Some(event) => format!("Error: tool execution stopped: {event:?}"),
-                                None => "Error: the tool call did not produce a result (execution task failed).".into(),
-                            },
-                        ),
-                    };
-
-                    let finished = AgentEvent::ToolFinish {
-                        call_id: call.id.clone(),
-                        tool: tool_name.clone(),
-                        title: result.title.clone(),
-                        output: result.output.clone(),
-                        metadata: result.metadata.clone(),
-                    };
-
-                    let media_parts = extract_media_parts(&result.output);
-                    // The media payload is forwarded via `media` parts; keep
-                    // only a short text reference in the tool-message content
-                    // so the base64 blob is not sent to the provider twice
-                    // (and not counted twice by the token estimator).
-                    let content = if media_parts.is_empty() {
-                        result.output
-                    } else {
-                        match media_parts.iter().find(|p| {
-                            matches!(p, ContentPart::Text { .. })
-                        }) {
-                            Some(ContentPart::Text { text }) => text.clone(),
-                            _ => "[media attached]".to_string(),
-                        }
-                    };
-                    self.memory.add_message(Message::Tool {
-                        tool_call_id: call.id.clone(),
-                        tool_name: Some(tool_name),
-                        content,
-                        media: media_parts,
-                    }).await;
-                    if announced[index] || call.function.name.is_empty() {
-                        yield finished;
+                    // A call whose task was stopped or lost still needs an
+                    // answer, or the next provider request is rejected.
+                    let result = result.or_else(|| {
+                        terminal.as_ref().map(|event| {
+                            Ok(ToolResult::new(
+                                call.function.name.clone(),
+                                format!("Error: tool execution stopped: {event:?}"),
+                            ))
+                        })
+                    });
+                    let normalized = normalize_tool_result(call, result);
+                    if let Some(error) = normalized.error {
+                        yield error;
                     }
+                    if announced[index] || call.function.name.is_empty() {
+                        yield normalized.finish;
+                    }
+                    self.memory.add_message(normalized.message).await;
                 }
 
                 if let Some(event) = terminal.or_else(|| run_stop_reason(&abort, deadline)) {
                     yield event;
                     break;
-                }
-                for error in tool_errors {
-                    yield AgentEvent::Error { error };
                 }
                 // Report usage AFTER the tool results are in history: the
                 // next LLM request will carry them, and emitting before would
@@ -739,6 +772,53 @@ impl Agent {
     /// The per-session state store backing this agent's tools.
     pub fn session_state(&self) -> &SessionState {
         &self.session_state
+    }
+
+    /// Handle for queuing steering messages into this agent's runs.
+    ///
+    /// Clone it before calling [`ask`](Agent::ask) (the ask stream borrows
+    /// the agent exclusively) and send from any task while the run is in
+    /// progress. Messages queued while the agent is idle are delivered at
+    /// the start of the next ask.
+    pub fn steering(&self) -> &Steering {
+        &self.steering
+    }
+
+    /// Drains queued steering messages into conversation history as user
+    /// messages, applying the same reminder treatment as an ordinary prompt.
+    async fn ingest_steered(&mut self) -> Vec<AgentEvent> {
+        let messages = self.steering.drain_messages();
+        let mut events = Vec::new();
+        let mut user_turn = false;
+        for message in messages {
+            match message {
+                InboxMessage::User(text) => {
+                    self.memory
+                        .add_message(Message::User {
+                            content: vec![ContentPart::Text { text: text.clone() }],
+                        })
+                        .await;
+                    events.push(AgentEvent::Steered { text });
+                    user_turn = true;
+                }
+                InboxMessage::Background(notification) => {
+                    let message = notification.text();
+                    self.memory
+                        .add_message(Message::User {
+                            content: vec![ContentPart::Text {
+                                text: message.clone(),
+                            }],
+                        })
+                        .await;
+                    events.push(AgentEvent::Status { message });
+                }
+            }
+        }
+        if user_turn {
+            self.reminder.on_user_turn();
+            self.reminder.apply(self.memory.messages_mut());
+        }
+        events
     }
 
     /// The tools this agent can call.
@@ -790,6 +870,16 @@ pub struct AgentTemplate {
 }
 
 impl AgentTemplate {
+    /// The tools spawned agents can call.
+    pub fn tools(&self) -> &[Arc<dyn Tool>] {
+        &self.tools
+    }
+
+    /// The system prompt spawned agents run with.
+    pub fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+
     /// Replaces the LLM provider used by spawned agents.
     pub fn with_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
         self.llm = llm;
@@ -799,6 +889,12 @@ impl AgentTemplate {
     /// Replaces the tool set of spawned agents.
     pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = Arc::new(tools);
+        self
+    }
+
+    /// Replaces the system prompt of spawned agents.
+    pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
+        self.system_prompt = system_prompt.into();
         self
     }
 
@@ -839,6 +935,7 @@ impl AgentTemplate {
             provider_usage: TokenUsage::default(),
             reminder,
             run_abort: Arc::new(AtomicBool::new(false)),
+            steering: Steering::new(),
         }
     }
 }
@@ -998,6 +1095,7 @@ impl AgentBuilder {
             reminder: self.reminder,
             run_abort: Arc::new(AtomicBool::new(false)),
             session_state: self.session_state.unwrap_or_else(SessionState::in_memory),
+            steering: Steering::new(),
         };
         Ok(agent)
     }

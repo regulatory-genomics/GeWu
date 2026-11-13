@@ -35,9 +35,14 @@ macro_rules! chat_service {
 
             pub fn new_with_endpoint(api_key: &str, base_url: &str, model: &str) -> Self {
                 Self {
-                    chat: OpenAIProvider::for_service(api_key, base_url, model, ChatPolicy {
-                        reasoning_field: $field,
-                    }),
+                    chat: OpenAIProvider::for_service(
+                        api_key,
+                        base_url,
+                        model,
+                        ChatPolicy {
+                            reasoning_field: $field,
+                        },
+                    ),
                 }
             }
 
@@ -54,13 +59,21 @@ macro_rules! chat_service {
 
         #[async_trait]
         impl LlmProvider for $name {
-            fn build(&self, messages: &[Message], tools: &[Arc<dyn Tool>])
-                -> Result<Value, Box<dyn Error + Send + Sync>> {
+            fn build(
+                &self,
+                messages: &[Message],
+                tools: &[Arc<dyn Tool>],
+            ) -> Result<Value, Box<dyn Error + Send + Sync>> {
                 self.chat.build(messages, tools)
             }
 
-            async fn send<'a>(&'a self, request: Value)
-                -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
+            async fn send<'a>(
+                &'a self,
+                request: Value,
+            ) -> Result<
+                BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+                Box<dyn Error + Send + Sync>,
+            > {
                 self.chat.send(request).await
             }
 
@@ -75,9 +88,21 @@ macro_rules! chat_service {
     };
 }
 
-chat_service!(DeepSeekProvider, "https://api.deepseek.com/v1", "reasoning_content");
-chat_service!(MoonshotProvider, "https://api.moonshot.ai/v1", "reasoning_content");
-chat_service!(GlmProvider, "https://open.bigmodel.cn/api/paas/v4", "reasoning");
+chat_service!(
+    DeepSeekProvider,
+    "https://api.deepseek.com/v1",
+    "reasoning_content"
+);
+chat_service!(
+    MoonshotProvider,
+    "https://api.moonshot.ai/v1",
+    "reasoning_content"
+);
+chat_service!(
+    GlmProvider,
+    "https://open.bigmodel.cn/api/paas/v4",
+    "reasoning"
+);
 
 #[cfg(test)]
 mod tests {
@@ -88,12 +113,21 @@ mod tests {
     fn mixed_model_history_is_normalized_per_message_across_switches() {
         let endpoint = "https://relay.example/v1";
         let assistant = |model: &str, origin: &str| Message::Assistant {
-            content: Some(format!("{model} answer")), reasoning: Some(format!("{model} thought")),
-            replay: Some(ReasoningReplay { origin: format!("chat:{origin}"), model: model.into(),
-                field: Some("reasoning_content".into()), blocks: vec![] }), tool_calls: None,
+            content: Some(format!("{model} answer")),
+            reasoning: Some(format!("{model} thought")),
+            replay: Some(ReasoningReplay {
+                origin: format!("chat:{origin}"),
+                model: model.into(),
+                field: Some("reasoning_content".into()),
+                blocks: vec![],
+            }),
+            tool_calls: None,
         };
-        let history = vec![assistant("glm", endpoint), assistant("deepseek", endpoint),
-            assistant("deepseek", "https://other.example/v1")];
+        let history = vec![
+            assistant("glm", endpoint),
+            assistant("deepseek", endpoint),
+            assistant("deepseek", "https://other.example/v1"),
+        ];
         for model in ["deepseek", "glm", "deepseek"] {
             let provider = DeepSeekProvider::new_with_endpoint("key", endpoint, model);
             let payload = provider.build(&history, &[]).unwrap();
@@ -103,7 +137,12 @@ mod tests {
                     assert_eq!(message["reasoning_content"], format!("{source} thought"));
                 } else {
                     assert!(message.get("reasoning_content").is_none());
-                    assert!(message["content"].as_str().unwrap().contains(&format!("{source} thought")));
+                    assert!(
+                        message["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains(&format!("{source} thought"))
+                    );
                 }
             }
         }
@@ -113,22 +152,43 @@ mod tests {
     fn service_providers_apply_fixed_rules_through_trait_objects() {
         let endpoint = "https://example.com/v1";
         let providers: Vec<(Box<dyn LlmProvider>, &str)> = vec![
-            (Box::new(DeepSeekProvider::new_with_endpoint("key", endpoint, "model")), "reasoning_content"),
-            (Box::new(MoonshotProvider::new_with_endpoint("key", endpoint, "model")), "reasoning_content"),
-            (Box::new(GlmProvider::new_with_endpoint("key", endpoint, "model")), "reasoning"),
+            (
+                Box::new(DeepSeekProvider::new_with_endpoint(
+                    "key", endpoint, "model",
+                )),
+                "reasoning_content",
+            ),
+            (
+                Box::new(MoonshotProvider::new_with_endpoint(
+                    "key", endpoint, "model",
+                )),
+                "reasoning_content",
+            ),
+            (
+                Box::new(GlmProvider::new_with_endpoint("key", endpoint, "model")),
+                "reasoning",
+            ),
         ];
         for (provider, field) in providers {
-            let messages = [Message::Assistant {
-                content: None,
-                reasoning: Some("consider tools".into()),
-                replay: Some(ReasoningReplay {
-                    origin: format!("chat:{endpoint}"), model: "model".into(),
-                    field: Some("reasoning_text".into()), blocks: vec![],
-                }),
-                tool_calls: None,
-            }, Message::Assistant {
-                content: Some("done".into()), reasoning: None, replay: None, tool_calls: None,
-            }];
+            let messages = [
+                Message::Assistant {
+                    content: None,
+                    reasoning: Some("consider tools".into()),
+                    replay: Some(ReasoningReplay {
+                        origin: format!("chat:{endpoint}"),
+                        model: "model".into(),
+                        field: Some("reasoning_text".into()),
+                        blocks: vec![],
+                    }),
+                    tool_calls: None,
+                },
+                Message::Assistant {
+                    content: Some("done".into()),
+                    reasoning: None,
+                    replay: None,
+                    tool_calls: None,
+                },
+            ];
             let payload = provider.build(&messages, &[]).unwrap();
             assert_eq!(payload["messages"][0][field], "consider tools");
             assert!(payload["messages"][1].get(field).is_none());
@@ -136,9 +196,17 @@ mod tests {
         }
         // A model name must never change the OpenAI provider's service rules.
         let openai = OpenAIProvider::new("key", "deepseek-reasoner");
-        let payload = openai.build(&[Message::Assistant {
-            content: Some("done".into()), reasoning: None, replay: None, tool_calls: None,
-        }], &[]).unwrap();
+        let payload = openai
+            .build(
+                &[Message::Assistant {
+                    content: Some("done".into()),
+                    reasoning: None,
+                    replay: None,
+                    tool_calls: None,
+                }],
+                &[],
+            )
+            .unwrap();
         assert!(payload["messages"][0].get("reasoning_content").is_none());
     }
 }

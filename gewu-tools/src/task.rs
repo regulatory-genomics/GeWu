@@ -26,6 +26,20 @@ use std::sync::Arc;
 
 use gewu_core::traits::Tool;
 
+/// Optional per-call overrides applied on top of a base profile, used by
+/// [`AgentFactory::create_with`] for dynamically composed agents (workflow
+/// inline agents). Overrides can only narrow: the tool list filters the
+/// base profile's tools, it never adds any.
+#[derive(Debug, Clone, Default)]
+pub struct AgentOverrides {
+    /// Extra instructions appended to the base profile's system prompt.
+    pub instructions: Option<String>,
+    /// Tool names to keep from the base profile. Names that the base
+    /// profile does not have are rejected by implementations that support
+    /// overrides.
+    pub tools: Option<Vec<String>>,
+}
+
 /// Creates sub-agents for the [`TaskTool`].
 ///
 /// Implement this trait to wire the task tool into an agent registry.
@@ -43,6 +57,34 @@ pub trait AgentFactory: Send + Sync {
         resume: Option<String>,
         parent_session: &str,
     ) -> Result<(Agent, String), Box<dyn Error + Send + Sync>>;
+
+    /// Creates a sub-agent derived from `base` with per-call overrides.
+    ///
+    /// The default implementation forwards to [`AgentFactory::create`],
+    /// ignoring the overrides; implement it to honor `instructions` and the
+    /// `tools` allowlist (the CLI registry does, via cached templates).
+    async fn create_with(
+        &self,
+        base: &str,
+        overrides: &AgentOverrides,
+        parent_session: &str,
+    ) -> Result<(Agent, String), Box<dyn Error + Send + Sync>> {
+        let _ = overrides;
+        self.create(base, None, parent_session).await
+    }
+
+    /// Checks that `overrides` are applicable to `base` before any agent is
+    /// spawned (unknown base profile, or a tool the base does not have).
+    /// The default accepts everything; implementations supporting
+    /// overrides should validate against their real tool sets.
+    async fn validate_overrides(
+        &self,
+        base: &str,
+        overrides: &AgentOverrides,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let _ = (base, overrides);
+        Ok(())
+    }
 }
 
 pub struct TaskTool {
@@ -255,10 +297,11 @@ mod tests {
             if self.fail_create {
                 return Err("unknown agent type".into());
             }
-            self.requests
-                .lock()
-                .unwrap()
-                .push((subagent_type.to_string(), resume.clone(), parent_session.to_string()));
+            self.requests.lock().unwrap().push((
+                subagent_type.to_string(),
+                resume.clone(),
+                parent_session.to_string(),
+            ));
             let agent = Agent::builder()
                 .llm(Arc::new(MockLlm {
                     events: self.events.clone(),

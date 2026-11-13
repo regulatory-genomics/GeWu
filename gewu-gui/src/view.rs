@@ -72,7 +72,11 @@ pub fn transcript_html(tab: &Tab) -> String {
 /// Render one non-tool transcript block.
 fn render_block(out: &mut String, tab: &Tab, block: &Block, index: usize, streaming: bool) {
     if let Block::Compaction { summary } = block {
-        let _ = writeln!(out, "<div class=\"block compaction\" data-block=\"{index}\"><details><summary>Context compacted</summary><div class=\"body markdown\">{}</div></details></div>", markdown_to_html(summary));
+        let _ = writeln!(
+            out,
+            "<div class=\"block compaction\" data-block=\"{index}\"><details><summary>Context compacted</summary><div class=\"body markdown\">{}</div></details></div>",
+            markdown_to_html(summary)
+        );
         return;
     }
     let class = match block {
@@ -87,7 +91,10 @@ fn render_block(out: &mut String, tab: &Tab, block: &Block, index: usize, stream
     let _ = writeln!(out, "<div class=\"block {class}\" data-block=\"{index}\">");
     write_block_body(out, tab, block, index, streaming);
     if matches!(block, Block::User(_)) {
-        let _ = write!(out, "<button type=\"button\" class=\"message-menu-trigger\" aria-label=\"Message actions\" aria-haspopup=\"menu\" aria-expanded=\"false\" aria-controls=\"message-menu-{index}\"></button><div id=\"message-menu-{index}\" class=\"message-menu\" role=\"menu\" hidden><button type=\"button\" role=\"menuitem\" class=\"chat-revert\" data-revert-block=\"{index}\" title=\"Revert conversation from here; files are not undone\">Revert chat</button></div>");
+        let _ = write!(
+            out,
+            "<button type=\"button\" class=\"message-menu-trigger\" aria-label=\"Message actions\" aria-haspopup=\"menu\" aria-expanded=\"false\" aria-controls=\"message-menu-{index}\"></button><div id=\"message-menu-{index}\" class=\"message-menu\" role=\"menu\" hidden><button type=\"button\" role=\"menuitem\" class=\"chat-revert\" data-revert-block=\"{index}\" title=\"Revert conversation from here; files are not undone\">Revert chat</button></div>"
+        );
     }
     out.push_str("</div>\n");
 }
@@ -219,7 +226,13 @@ fn render_tool_run(out: &mut String, tab: &Tab, run: &[Block], first: usize) {
         let (tool, input, output) = tools[0];
         render_tool(out, tab, tool, input, output, first, 0);
     } else {
-        let expanded = tab.expanded_groups.contains(&first);
+        // Workflow runs default to expanded so their graphs stay visible,
+        // but an explicit collapse (collapsed_groups) wins.
+        let expanded = if is_workflow_run(run) {
+            !tab.collapsed_groups.contains(&first)
+        } else {
+            tab.expanded_groups.contains(&first)
+        };
         let glyph = if expanded { "−" } else { "+" };
         let running = run
             .iter()
@@ -241,6 +254,13 @@ fn render_tool_run(out: &mut String, tab: &Tab, run: &[Block], first: usize) {
         out.push_str("</div>\n");
     }
     out.push_str("</div>\n");
+}
+
+/// Whether a tool run contains workflow calls. The view and the
+/// `ToggleGroup` handler both use this so they classify runs identically.
+pub(crate) fn is_workflow_run(run: &[Block]) -> bool {
+    run.iter()
+        .any(|block| matches!(block, Block::Tool { tool, .. } if tool.starts_with("workflow_")))
 }
 
 /// One tool row plus its output.
@@ -273,6 +293,11 @@ fn render_tool(
         },
         escape(&title)
     );
+
+    // Workflow cards draw the run's graph between the row and the output.
+    if let Some(graph) = crate::workflow::card_graph(tab, tool, input, output, index) {
+        out.push_str(&graph);
+    }
 
     let Some(output) = output else {
         out.push_str("</div>\n");
@@ -324,15 +349,21 @@ fn tool_name(tool: &str) -> &str {
         "webfetch" | "web_fetch" => "fetch",
         "websearch" | "web_search" => "search",
         "shell" => "bash",
+        "workflow_start" => "wf·start",
+        "workflow_status" => "wf·status",
+        "workflow_wait" => "wf·wait",
+        "workflow_cancel" => "wf·cancel",
         other => other,
     }
 }
 
 fn tool_row<'a>(tool: &'a str, input: &str) -> (&'a str, String) {
-    let title = if input.is_empty() {
-        tool.to_string()
-    } else {
-        input.to_string()
+    let title = match tool {
+        "workflow_start" => crate::workflow::spec_title(input).unwrap_or_else(|| input.to_string()),
+        // Status/wait/cancel inputs are already just the run_id.
+        "workflow_status" | "workflow_wait" | "workflow_cancel" => input.to_string(),
+        _ if input.is_empty() => tool.to_string(),
+        _ => input.to_string(),
     };
     (tool_name(tool), title)
 }
@@ -563,9 +594,7 @@ fn find_unprotected(
     let mut search = from;
     while search <= text.len() {
         let found = text[search..].find(needle)? + search;
-        let inside = protected
-            .iter()
-            .any(|&(s, e)| found >= s && found < e);
+        let inside = protected.iter().any(|&(s, e)| found >= s && found < e);
         if !inside {
             return Some(found);
         }
@@ -625,10 +654,7 @@ fn protected_ranges(text: &str) -> Vec<(usize, usize)> {
                     continue;
                 }
                 if bytes[search] == b'`' {
-                    let close_len = bytes[search..]
-                        .iter()
-                        .take_while(|&&c| c == b'`')
-                        .count();
+                    let close_len = bytes[search..].iter().take_while(|&&c| c == b'`').count();
                     if close_len == run_len {
                         close_end = Some(search + close_len);
                         break;
@@ -721,36 +747,22 @@ pub fn status_html(tab: &Tab, models: &[ModelSummary]) -> String {
     // Mode controls are rendered with status updates, including busy changes.
     let mut out = String::from("<div class=\"status-inner\">");
     for mode in ["build", "plan"] {
-        let _ = write!(out, "<button type=\"button\" class=\"mode-button\" data-mode=\"{mode}\" aria-pressed=\"{}\" {}>{mode}</button>", tab.agent == mode, if tab.busy() { "disabled" } else { "" });
-    }
-    match (&tab.model.phase, tab.model.status.as_deref()) {
-        (Phase::Idle, _) => out.push_str("<span class=\"phase\"><i class=\"dot\"></i>idle</span>"),
-        // A transient status (e.g. LLM retry backoff) replaces the plain
-        // "thinking…" so a rate-limit wait is visible in the browser.
-        (Phase::Busy, Some(status)) => {
-            let label = if status == "Compacting context…" {
-                "COMPACTING...".to_string()
-            } else {
-                format!("thinking… {}", escape(status))
-            };
-            let _ = write!(out, "<span class=\"phase busy\"><i class=\"dot\"></i>{label}</span>");
-        }
-        (Phase::Busy, None) => {
-            out.push_str("<span class=\"phase busy\"><i class=\"dot\"></i>thinking…</span>");
-        }
+        let _ = write!(
+            out,
+            "<button type=\"button\" class=\"mode-button\" data-mode=\"{mode}\" aria-pressed=\"{}\" {}>{mode}</button>",
+            tab.agent == mode,
+            if tab.busy() { "disabled" } else { "" }
+        );
     }
     if models.len() > 1 {
         // The tab's current selection: its known selector, or the catalog
         // entry matching the server-reported default label.
-        let selected = tab
-            .model_selector
-            .clone()
-            .or_else(|| {
-                models
-                    .iter()
-                    .find(|model| Some(&model.label) == tab.model_label.as_ref())
-                    .map(|model| model.selector.clone())
-            });
+        let selected = tab.model_selector.clone().or_else(|| {
+            models
+                .iter()
+                .find(|model| Some(&model.label) == tab.model_label.as_ref())
+                .map(|model| model.selector.clone())
+        });
         let _ = write!(
             out,
             "<label class=\"kv\"><span class=\"k\">model</span><select class=\"model-picker\" data-model-picker data-tab=\"{}\" aria-label=\"switch model\"{}>",
@@ -762,7 +774,11 @@ pub fn status_html(tab: &Tab, models: &[ModelSummary]) -> String {
                 out,
                 "<option value=\"{}\"{}>{}</option>",
                 escape(&model.selector),
-                if selected.as_deref() == Some(model.selector.as_str()) { " selected" } else { "" },
+                if selected.as_deref() == Some(model.selector.as_str()) {
+                    " selected"
+                } else {
+                    ""
+                },
                 escape(&model.label)
             );
         }
@@ -774,12 +790,33 @@ pub fn status_html(tab: &Tab, models: &[ModelSummary]) -> String {
             escape(label)
         );
     }
-    let keys = if tab.model.phase == Phase::Busy {
-        "Esc interrupt"
-    } else {
-        "Enter send · Shift+Enter newline"
-    };
-    let _ = write!(out, "<span class=\"hint\">{keys}</span>");
+    match (&tab.model.phase, tab.model.status.as_deref()) {
+        (Phase::Idle, _) => out.push_str("<span class=\"phase\"><i class=\"dot\"></i>idle</span>"),
+        // A transient status (e.g. LLM retry backoff) replaces the plain
+        // "thinking…" so a rate-limit wait is visible in the browser.
+        (Phase::Busy, Some(status)) => {
+            let label = if status == "Compacting context…" {
+                "COMPACTING...".to_string()
+            } else {
+                format!("thinking… {}", escape(status))
+            };
+            let _ = write!(
+                out,
+                "<span class=\"phase busy\"><i class=\"dot\"></i>{label}</span>"
+            );
+        }
+        (Phase::Busy, None) => {
+            out.push_str("<span class=\"phase busy\"><i class=\"dot\"></i>thinking…</span>");
+        }
+    }
+    // The idle key hints live in the composer placeholder; only the busy
+    // hint needs its own spot in the status strip.
+    if tab.model.phase == Phase::Busy {
+        let _ = write!(
+            out,
+            "<span class=\"hint\">Enter steer · Esc interrupt</span>"
+        );
+    }
 
     if let Some((used, limit)) = tab.context.filter(|(used, limit)| *used > 0 && *limit > 0) {
         let pct = (used * 100 / limit).min(100);
@@ -939,8 +976,8 @@ pub fn file_preview_html(path: &str, content: &str, truncated: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gewu_protocol::AgentEvent;
     use crate::workspace::Workspace;
+    use gewu_protocol::AgentEvent;
     use gewu_protocol::TokenUsage;
 
     fn tab_with_blocks(blocks: Vec<Block>) -> (Workspace, u64) {
@@ -1022,7 +1059,10 @@ mod tests {
     fn malformed_tex_falls_back_to_escaped_source() {
         let html = markdown_to_html("$\\notacommand{x}$");
         assert!(html.contains("math-source"), "{html}");
-        assert!(html.contains("&lt;") || html.contains("notacommand"), "{html}");
+        assert!(
+            html.contains("&lt;") || html.contains("notacommand"),
+            "{html}"
+        );
     }
 
     #[test]
@@ -1048,10 +1088,7 @@ mod tests {
     #[test]
     fn sidebar_lists_escaped_tool_names() {
         let html = sidebar_tools_content_html(&Ok(vec!["read".into(), "<bad>".into()]));
-        assert!(
-            html.contains("2 available"),
-            "{html}"
-        );
+        assert!(html.contains("2 available"), "{html}");
         assert!(html.contains("<li>read</li>"), "{html}");
         assert!(html.contains("<li>&lt;bad&gt;</li>"), "{html}");
         assert!(!html.contains("side-cwd"), "{html}");
@@ -1112,14 +1149,20 @@ mod tests {
     #[test]
     fn compaction_renders_as_a_divider_between_original_messages() {
         let (ws, id) = tab_with_blocks(vec![
-            Block::User("original question".into()), Block::Compaction { summary: "## Objective\n- **Continue** safely <script>alert(1)</script>".into() },
+            Block::User("original question".into()),
+            Block::Compaction {
+                summary: "## Objective\n- **Continue** safely <script>alert(1)</script>".into(),
+            },
             Block::Assistant("continued answer".into()),
         ]);
         let html = transcript_html(ws.tab(id).unwrap());
         assert!(html.contains("<details><summary>Context compacted</summary>"));
         assert!(html.contains("<strong>Continue</strong>"));
         assert!(!html.contains("<script>"));
-        assert_eq!(html.matches("<summary>Context compacted</summary>").count(), 1);
+        assert_eq!(
+            html.matches("<summary>Context compacted</summary>").count(),
+            1
+        );
         assert!(html.find("original question").unwrap() < html.find("Context compacted").unwrap());
         assert!(html.find("Context compacted").unwrap() < html.find("continued answer").unwrap());
     }
@@ -1243,6 +1286,94 @@ mod tests {
         assert!(html.contains("line 10"), "expanded lines: {html}");
         assert!(!html.contains("first"), "only the requested run: {html}");
         assert!(!html.contains("between"), "{html}");
+    }
+
+    #[test]
+    fn workflow_cards_draw_the_run_graph() {
+        let spec = r#"{"name":"docs","nodes":[
+            {"id":"read","agent":"reader","prompt":"p"},
+            {"id":"polish","agent":"writer","prompt":"p"}],
+            "conditional_edges":{"polish":{"path":"{{nodes.polish.status}}",
+            "map":{"ok":"END","failed":"polish"}}}}"#;
+        let start = "Started workflow run r-77. It executes in the background; check on it with \
+             workflow_status or workflow_wait (run_id: \"r-77\").";
+        let snapshot = "run r-77 (docs): running, 1 task(s) done, 0 failed, 1 attempted\n\
+             current node: polish\n\
+             node read: ok, 1 done, 0 failed\n\
+             node polish: pending, 0 done, 0 failed";
+        let (ws, id) = tab_with_blocks(vec![
+            Block::Tool {
+                tool: "workflow_start".into(),
+                input: spec.into(),
+                output: Some(start.into()),
+            },
+            Block::Tool {
+                tool: "workflow_status".into(),
+                input: "r-77".into(),
+                output: Some(snapshot.into()),
+            },
+        ]);
+        let tab = ws.tab(id).unwrap();
+
+        // Start and status share one group card; only the status row gets a
+        // graph — the start row stays plain (title + output).
+        let html = tool_card_html(tab, 0).expect("start card");
+        assert_eq!(html.matches("wf-card").count(), 1, "{html}");
+        assert!(html.contains("docs · 2 nodes"), "{html}");
+
+        // The status card finds the spec via the matching run_id and draws
+        // the graph with the snapshot's node statuses.
+        let html = tool_card_html(tab, 1).expect("status card");
+        assert!(html.contains("wf-card"), "{html}");
+        assert!(html.contains("wf-ok"), "{html}");
+        assert!(html.contains("wf-run-running"), "{html}");
+        assert!(html.contains("current: polish"), "{html}");
+        // its row title is just the run id
+        assert!(html.contains(">r-77</span>"), "{html}");
+    }
+
+    #[test]
+    fn workflow_groups_collapse_on_user_toggle() {
+        let snapshot = "run r-77 (docs): completed, 1 task(s) done, 0 failed, 1 attempted\n\
+             node read: ok, 1 done, 0 failed";
+        let start = "Started workflow run r-77. It executes in the background.";
+        let (mut ws, id) = tab_with_blocks(vec![
+            Block::Tool {
+                tool: "workflow_start".into(),
+                input: r#"{"name":"docs","nodes":[{"id":"read","agent":"reader","prompt":"p"}]}"#
+                    .into(),
+                output: Some(start.into()),
+            },
+            Block::Tool {
+                tool: "workflow_status".into(),
+                input: "r-77".into(),
+                output: Some(snapshot.into()),
+            },
+            Block::Tool {
+                tool: "workflow_status".into(),
+                input: "r-77".into(),
+                output: Some(snapshot.into()),
+            },
+        ]);
+        // Defaults to expanded: the graphs are visible.
+        let html = tool_card_html(ws.tab(id).unwrap(), 0).expect("group card");
+        assert!(html.contains("wf-card"), "{html}");
+        assert!(html.contains("−"), "{html}");
+
+        // An explicit collapse (the ToggleGroup path) closes it.
+        ws.tab_mut(id).unwrap().collapsed_groups.insert(0);
+        let html = tool_card_html(ws.tab(id).unwrap(), 0).expect("group card");
+        assert!(!html.contains("wf-card"), "{html}");
+        assert!(html.contains(">+ Explored"), "{html}");
+
+        // …and the classifier agrees with what the view rendered.
+        let tab = ws.tab(id).unwrap();
+        assert!(is_workflow_run(&tab.model.blocks[0..2]));
+        assert!(!is_workflow_run(&[Block::Tool {
+            tool: "bash".into(),
+            input: String::new(),
+            output: None,
+        }]));
     }
 
     #[test]
@@ -1494,24 +1625,45 @@ mod tests {
     #[test]
     fn status_renders_model_picker_when_multiple_models() {
         let models = vec![
-            ModelSummary { selector: "west/big".into(), label: "big-model".into() },
-            ModelSummary { selector: "west/small".into(), label: "small-model".into() },
+            ModelSummary {
+                selector: "west/big".into(),
+                label: "big-model".into(),
+            },
+            ModelSummary {
+                selector: "west/small".into(),
+                label: "small-model".into(),
+            },
         ];
         let (mut ws, id) = tab_with_blocks(vec![]);
         ws.tab_mut(id).unwrap().model_selector = Some("west/small".into());
         let html = status_html(ws.tab(id).unwrap(), &models);
-        assert!(html.contains("<select class=\"model-picker\" data-model-picker data-tab="), "{html}");
-        assert!(html.contains("<option value=\"west/big\">big-model</option>"), "{html}");
-        assert!(html.contains("<option value=\"west/small\" selected>small-model</option>"), "{html}");
+        assert!(
+            html.contains("<select class=\"model-picker\" data-model-picker data-tab="),
+            "{html}"
+        );
+        assert!(
+            html.contains("<option value=\"west/big\">big-model</option>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<option value=\"west/small\" selected>small-model</option>"),
+            "{html}"
+        );
 
         // Without a selector, the default label picks the selected option.
         let (mut ws, id) = tab_with_blocks(vec![]);
         ws.tab_mut(id).unwrap().model_label = Some("big-model".into());
         let html = status_html(ws.tab(id).unwrap(), &models);
-        assert!(html.contains("<option value=\"west/big\" selected>big-model</option>"), "{html}");
+        assert!(
+            html.contains("<option value=\"west/big\" selected>big-model</option>"),
+            "{html}"
+        );
 
         // A single catalog entry stays a plain label.
-        let solo = vec![ModelSummary { selector: "west/big".into(), label: "big-model".into() }];
+        let solo = vec![ModelSummary {
+            selector: "west/big".into(),
+            label: "big-model".into(),
+        }];
         let (mut ws, id) = tab_with_blocks(vec![]);
         ws.tab_mut(id).unwrap().model_label = Some("big-model".into());
         let html = status_html(ws.tab(id).unwrap(), &solo);
@@ -1614,9 +1766,8 @@ mod tests {
         {
             let tab = ws.tab_mut(id).unwrap();
             tab.model.submit("go".into()); // busy; adds a second user block
-            tab.model.apply_event(&AgentEvent::ReasoningDelta {
-                delta: "hm".into(),
-            });
+            tab.model
+                .apply_event(&AgentEvent::ReasoningDelta { delta: "hm".into() });
         }
         // Blocks: user, user (from submit), thought.
         let html = block_html(ws.tab(id).unwrap(), 2).expect("thought block renders");
@@ -1642,9 +1793,8 @@ mod tests {
         let (mut ws, id) = tab_with_blocks(vec![Block::User("hi".into())]);
         let tab = ws.tab_mut(id).unwrap();
         tab.model.submit("go".into());
-        tab.model.apply_event(&AgentEvent::ReasoningDelta {
-            delta: "hm".into(),
-        });
+        tab.model
+            .apply_event(&AgentEvent::ReasoningDelta { delta: "hm".into() });
 
         // Blocks: user, user (from submit), thought.
         let html = assistant_body_html(ws.tab(id).unwrap(), 2, true).expect("thought body");

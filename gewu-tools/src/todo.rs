@@ -50,6 +50,21 @@ impl TodoReadTool {
     }
 }
 
+fn non_completed_count(todos: &[TodoItem]) -> usize {
+    todos
+        .iter()
+        .filter(|todo| todo.status != "completed")
+        .count()
+}
+
+fn render_todo_summary(todos: &[TodoItem]) -> Result<String, serde_json::Error> {
+    Ok(format!(
+        "{} todos\n\n{}",
+        non_completed_count(todos),
+        serde_json::to_string_pretty(todos)?
+    ))
+}
+
 #[async_trait]
 impl Tool for TodoWriteTool {
     fn name(&self) -> &str {
@@ -76,14 +91,9 @@ impl Tool for TodoWriteTool {
             .await
             .map_err(into_tool_error)?;
 
-        let non_completed = input
-            .todos
-            .iter()
-            .filter(|t| t.status != "completed")
-            .count();
         Ok(ToolResult::new(
             "todowrite",
-            format!("{} todos", non_completed),
+            format!("{} todos", non_completed_count(&input.todos)),
         ))
     }
 }
@@ -114,14 +124,9 @@ impl Tool for TodoReadTool {
             .map_err(into_tool_error)?
             .unwrap_or_default();
 
-        let non_completed = todos.iter().filter(|t| t.status != "completed").count();
         Ok(ToolResult::new(
             "todoread",
-            format!(
-                "{} todos\n\n{}",
-                non_completed,
-                serde_json::to_string_pretty(&todos).map_err(into_tool_error)?
-            ),
+            render_todo_summary(&todos).map_err(into_tool_error)?,
         ))
     }
 }
@@ -130,6 +135,26 @@ impl Tool for TodoReadTool {
 mod tests {
     use super::*;
     use gewu_core::types::SessionState;
+
+    #[test]
+    fn summary_preserves_status_semantics_and_serialization() {
+        assert_eq!(render_todo_summary(&[]).unwrap(), "0 todos\n\n[]");
+        let todos: Vec<TodoItem> = serde_json::from_value(serde_json::json!([
+            {"id":"2", "content":"你好", "status":"completed", "priority":null},
+            {"id":"1", "content":"next\nstep", "status":"Completed", "priority":1},
+            {"id":"3", "content":"", "status":"", "priority":null}
+        ]))
+        .unwrap();
+        assert_eq!(non_completed_count(&todos), 2);
+        assert_eq!(
+            render_todo_summary(&todos).unwrap(),
+            format!(
+                "2 todos\n\n{}",
+                serde_json::to_string_pretty(&todos).unwrap()
+            )
+        );
+        assert_eq!(non_completed_count(&todos[..1]), 0);
+    }
 
     #[tokio::test]
     async fn test_todo_write_and_read() {

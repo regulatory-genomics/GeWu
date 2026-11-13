@@ -82,6 +82,91 @@ fn tool_update(blocks: &[Block], affected: Option<usize>, appended: bool) -> Tab
     }
 }
 
+/// Whether pending steer entries form a contiguous run of blocks that ends
+/// at the transcript's tail — i.e. each rendered block already sits where
+/// the agent ingested it, so the confirming `steered` event needs no move.
+fn steers_in_place(group: &[(String, usize)], block_count: usize) -> bool {
+    let Some((_, index)) = group.first() else {
+        return true;
+    };
+    let mut expected = *index;
+    for (_, index) in &group[1..] {
+        expected += 1;
+        if *index != expected {
+            return false;
+        }
+    }
+    expected + 1 == block_count
+}
+
+/// Reconcile a live `steered` event against the steers this session already
+/// displayed at submit time, returning the targeted transcript update plus
+/// any thought block the event settled.
+fn confirm_steered(
+    model: &mut gewu_client::SessionModel,
+    pending: &mut Vec<(String, usize)>,
+    text: String,
+) -> (TabUpdate, Option<usize>) {
+    let Some(pos) = pending.iter().position(|(t, _)| *t == text) else {
+        // Not rendered here (another connection steered, or a snapshot
+        // rebuilt the transcript): append at the event's position as usual.
+        let affected = model.apply_event(&AgentEvent::Steered { text });
+        let collapsed = model.take_collapsed();
+        return (
+            affected.map_or(TabUpdate::Full, TabUpdate::BlockAppend),
+            collapsed,
+        );
+    };
+    if steers_in_place(&pending[pos..], model.blocks.len()) {
+        // Only later pending steers follow the block: it already sits at
+        // the position where the agent injected it.
+        pending.remove(pos);
+        return (TabUpdate::None, None);
+    }
+    // Blocks landed between the submit and the ingestion (the steer raced
+    // ahead of the ask's first events): re-anchor the unconfirmed group at
+    // the transcript's end, where the agent actually injected them,
+    // preserving submit order.
+    let mut group = pending.split_off(pos);
+    group.sort_by_key(|(_, index)| *index);
+    let intact = group.iter().all(|(pending, index)| {
+        matches!(
+            model.blocks.get(*index),
+            Some(Block::User(rendered)) if rendered == pending
+        )
+    });
+    if !intact {
+        // The transcript no longer matches the record; stop tracking and
+        // let the event append as usual.
+        pending.clear();
+        let affected = model.apply_event(&AgentEvent::Steered { text });
+        let collapsed = model.take_collapsed();
+        return (
+            affected.map_or(TabUpdate::Full, TabUpdate::BlockAppend),
+            collapsed,
+        );
+    }
+    // Remove highest index first so the stored positions stay valid.
+    for (_, index) in group.iter().rev() {
+        model.blocks.remove(*index);
+    }
+    let mut kept = Vec::new();
+    for (k, (pending, _)) in group.iter().enumerate() {
+        let appended = model
+            .apply_event(&AgentEvent::Steered {
+                text: pending.clone(),
+            })
+            .unwrap_or_else(|| model.blocks.len().saturating_sub(1));
+        if k > 0 {
+            // The first entry is the one being confirmed here.
+            kept.push((pending.clone(), appended));
+        }
+    }
+    let collapsed = model.take_collapsed();
+    pending.extend(kept);
+    (TabUpdate::Full, collapsed)
+}
+
 /// The display label for a model selector within the catalog.
 fn label_for(models: &[gewu_protocol::ModelSummary], selector: &str) -> Option<String> {
     models
@@ -91,7 +176,8 @@ fn label_for(models: &[gewu_protocol::ModelSummary], selector: &str) -> Option<S
 }
 
 /// One browser's isolated GUI session.
-pub struct GuiSession {    endpoint: Endpoint,
+pub struct GuiSession {
+    endpoint: Endpoint,
     server_token: Option<String>,
     admin: Client,
     workspace: Workspace,
@@ -235,7 +321,12 @@ impl GuiSession {
         // tab's upstream connection.
         self.activate_active(&mut sender).await?;
 
-        let ids: Vec<_> = self.workspace.tabs.iter().filter_map(|tab| tab.model.session_id.clone().map(|s| (tab.id, s))).collect();
+        let ids: Vec<_> = self
+            .workspace
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.model.session_id.clone().map(|s| (tab.id, s)))
+            .collect();
         for (id, session_id) in ids {
             // One bad stored session must not prevent the browser session
             // from starting; log and continue with the remaining tabs.
@@ -358,7 +449,12 @@ impl GuiSession {
     /// Send just a thought block's body, so toggling its reasoning does not
     /// re-render the whole transcript. Falls back to a full transcript when
     /// the block cannot be located.
-    async fn send_thought_body(&self, tab_id: u64, block: usize, sender: &mut Sender) -> Result<()> {
+    async fn send_thought_body(
+        &self,
+        tab_id: u64,
+        block: usize,
+        sender: &mut Sender,
+    ) -> Result<()> {
         if let Some(tab) = self.workspace.tab(tab_id)
             && let Some(html) = view::assistant_body_html(tab, block, false)
         {
@@ -470,7 +566,10 @@ impl GuiSession {
     }
 
     async fn observe(&mut self, tab_id: u64, session_id: String, restore: bool) -> Result<()> {
-        let observer = self.endpoint.connect_with_token(self.server_token.as_deref()).await?;
+        let observer = self
+            .endpoint
+            .connect_with_token(self.server_token.as_deref())
+            .await?;
         let mut stream = observer.watch_session(session_id).await?;
         let tx = self.tab_tx.clone().expect("running event loop");
         let task = tokio::spawn(async move {
@@ -479,16 +578,34 @@ impl GuiSession {
                 // After our own turn finishes, the local model already has
                 // every event. Do not replace it with an idle snapshot and
                 // shift block indices by discarding connection-local notes.
-                let skip = first && !restore && matches!(&frame,
-                    Ok(ServerMessage::SessionSnapshot { busy: false, .. }));
+                let skip = first
+                    && !restore
+                    && matches!(
+                        &frame,
+                        Ok(ServerMessage::SessionSnapshot { busy: false, .. })
+                    );
                 first = false;
-                if skip { continue; }
-                if tx.send(TabEvent { tab_id, frame: Some(frame) }).is_err() { return; }
+                if skip {
+                    continue;
+                }
+                if tx
+                    .send(TabEvent {
+                        tab_id,
+                        frame: Some(frame),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
             }
         });
         let conn = self.conns.entry(tab_id).or_default();
-        if let Some(previous) = conn.task.replace(task) { previous.abort(); }
-        if let Some(previous) = conn.observer.replace(observer) { previous.close().await; }
+        if let Some(previous) = conn.task.replace(task) {
+            previous.abort();
+        }
+        if let Some(previous) = conn.observer.replace(observer) {
+            previous.close().await;
+        }
         conn.observing = true;
         Ok(())
     }
@@ -565,39 +682,78 @@ impl GuiSession {
     ) -> Result<()> {
         match msg {
             ClientMsg::RevertChat { tab, block, undo } => {
-                let Some(tab_state) = self.workspace.tab(tab) else { return self.send_error(sender, "unknown tab").await; };
-                if tab_state.busy() { return self.send_error(sender, "wait for the current turn to finish").await; }
+                let Some(tab_state) = self.workspace.tab(tab) else {
+                    return self.send_error(sender, "unknown tab").await;
+                };
+                if tab_state.busy() {
+                    return self
+                        .send_error(sender, "wait for the current turn to finish")
+                        .await;
+                }
                 let turn = if let Some(index) = block {
-                    if !matches!(tab_state.model.blocks.get(index), Some(Block::User(_))) { return self.send_error(sender, "not a user message").await; }
-                    Some(tab_state.model.blocks[..index].iter().filter(|b| matches!(b, Block::User(_))).count())
-                } else { None };
+                    if !matches!(tab_state.model.blocks.get(index), Some(Block::User(_))) {
+                        return self.send_error(sender, "not a user message").await;
+                    }
+                    Some(
+                        tab_state.model.blocks[..index]
+                            .iter()
+                            .filter(|b| matches!(b, Block::User(_)))
+                            .count(),
+                    )
+                } else {
+                    None
+                };
                 let session_id = tab_state.model.session_id.clone();
-                if session_id.is_none() { return self.send_error(sender, "no conversation to revert").await; }
-                if let Err(e) = self.ensure_client(tab).await { return self.send_error(sender, e.to_string()).await; }
+                if session_id.is_none() {
+                    return self.send_error(sender, "no conversation to revert").await;
+                }
+                if let Err(e) = self.ensure_client(tab).await {
+                    return self.send_error(sender, e.to_string()).await;
+                }
                 let client = self.client(tab).expect("ensured");
-                if let Err(e) = client.usage(session_id.as_deref()).await { return self.send_error(sender, e.to_string()).await; }
+                if let Err(e) = client.usage(session_id.as_deref()).await {
+                    return self.send_error(sender, e.to_string()).await;
+                }
                 match client.revert_chat(turn, undo).await {
                     Ok((id, messages)) => {
                         let tab_state = self.workspace.tab_mut(tab).expect("known");
                         tab_state.model.load_history(&messages);
                         tab_state.model.set_session(Some(id));
-                        tab_state.model.note("Conversation updated. Workspace files were NOT undone.");
+                        tab_state
+                            .model
+                            .note("Conversation updated. Workspace files were NOT undone.");
                         tab_state.expanded_groups.clear();
                         tab_state.expanded_outputs.clear();
                         tab_state.context = None;
-                        if self.workspace.active_id() == tab { self.send_active_full(sender).await?; }
+                        if self.workspace.active_id() == tab {
+                            self.send_active_full(sender).await?;
+                        }
                     }
                     Err(e) => self.send_error(sender, e.to_string()).await?,
                 }
             }
             ClientMsg::SwitchAgent { tab, agent } => {
-                if !["build", "plan"].contains(&agent.as_str()) { return self.send_error(sender, "unknown mode").await; }
-                if self.workspace.tab(tab).is_none_or(|tab| tab.busy()) { return self.send_error(sender, "wait for the current turn to finish").await; }
-                if let Err(e) = self.ensure_client(tab).await { return self.send_error(sender, e.to_string()).await; }
+                if !["build", "plan"].contains(&agent.as_str()) {
+                    return self.send_error(sender, "unknown mode").await;
+                }
+                if self.workspace.tab(tab).is_none_or(|tab| tab.busy()) {
+                    return self
+                        .send_error(sender, "wait for the current turn to finish")
+                        .await;
+                }
+                if let Err(e) = self.ensure_client(tab).await {
+                    return self.send_error(sender, e.to_string()).await;
+                }
                 let client = self.client(tab).expect("ensured");
                 // Bind resumed tabs before switching so their conversation is retained.
-                if let Some(id) = self.workspace.tab(tab).and_then(|tab| tab.model.session_id.clone())
-                    && let Err(e) = client.usage(Some(&id)).await { return self.send_error(sender, e.to_string()).await; }
+                if let Some(id) = self
+                    .workspace
+                    .tab(tab)
+                    .and_then(|tab| tab.model.session_id.clone())
+                    && let Err(e) = client.usage(Some(&id)).await
+                {
+                    return self.send_error(sender, e.to_string()).await;
+                }
                 match client.switch_agent(agent.clone()).await {
                     Ok((id, tools)) => {
                         let tab_state = self.workspace.tab_mut(tab).expect("known tab");
@@ -606,21 +762,37 @@ impl GuiSession {
                         self.tools = Ok(tools);
                         if self.workspace.active_id() == tab {
                             self.send_status(sender).await?;
-                            send_msg(sender, &ServerMsg::Tools {
-                                html: view::sidebar_tools_content_html(&self.tools),
-                            }).await?;
+                            send_msg(
+                                sender,
+                                &ServerMsg::Tools {
+                                    html: view::sidebar_tools_content_html(&self.tools),
+                                },
+                            )
+                            .await?;
                         }
                     }
                     Err(e) => self.send_error(sender, e.to_string()).await?,
                 }
             }
             ClientMsg::SwitchModel { tab, model } => {
-                if self.workspace.tab(tab).is_none_or(|tab| tab.busy()) { return self.send_error(sender, "wait for the current turn to finish").await; }
-                if let Err(e) = self.ensure_client(tab).await { return self.send_error(sender, e.to_string()).await; }
+                if self.workspace.tab(tab).is_none_or(|tab| tab.busy()) {
+                    return self
+                        .send_error(sender, "wait for the current turn to finish")
+                        .await;
+                }
+                if let Err(e) = self.ensure_client(tab).await {
+                    return self.send_error(sender, e.to_string()).await;
+                }
                 let client = self.client(tab).expect("ensured");
                 // Bind resumed tabs before switching so their conversation is retained.
-                if let Some(id) = self.workspace.tab(tab).and_then(|tab| tab.model.session_id.clone())
-                    && let Err(e) = client.usage(Some(&id)).await { return self.send_error(sender, e.to_string()).await; }
+                if let Some(id) = self
+                    .workspace
+                    .tab(tab)
+                    .and_then(|tab| tab.model.session_id.clone())
+                    && let Err(e) = client.usage(Some(&id)).await
+                {
+                    return self.send_error(sender, e.to_string()).await;
+                }
                 match client.switch_model(model.clone()).await {
                     Ok((id, label)) => {
                         let tab_state = self.workspace.tab_mut(tab).expect("known tab");
@@ -635,7 +807,8 @@ impl GuiSession {
                 }
             }
             // Auth is consumed by the transport before the session starts.
-            ClientMsg::Auth { .. } => {}            ClientMsg::Ask { tab, prompt } => {
+            ClientMsg::Auth { .. } => {}
+            ClientMsg::Ask { tab, prompt } => {
                 self.handle_ask(tab, prompt, sender, tab_tx).await?;
             }
             ClientMsg::Interrupt { tab } => {
@@ -672,7 +845,20 @@ impl GuiSession {
             }
             ClientMsg::ToggleGroup { tab, block } => {
                 if let Some(tab) = self.workspace.tab_mut(tab) {
-                    toggle(&mut tab.expanded_groups, block);
+                    // Workflow runs default to expanded, so their toggle
+                    // collapses; other runs toggle expansion as before.
+                    let run_len = tab.model.blocks.get(block..).map_or(0, |rest| {
+                        rest.iter()
+                            .take_while(|b| matches!(b, Block::Tool { .. }))
+                            .count()
+                    });
+                    let workflow = block < tab.model.blocks.len()
+                        && crate::view::is_workflow_run(&tab.model.blocks[block..block + run_len]);
+                    if workflow {
+                        toggle(&mut tab.collapsed_groups, block);
+                    } else {
+                        toggle(&mut tab.expanded_groups, block);
+                    }
                 }
                 if self.workspace.active_id() == tab {
                     self.send_tool_card(tab, block, sender).await?;
@@ -703,11 +889,8 @@ impl GuiSession {
                             }
                             Err(e) => {
                                 self.expanded_dirs.remove(&path);
-                                self.send_error(
-                                    sender,
-                                    format!("failed to list '{}': {e}", path),
-                                )
-                                .await?;
+                                self.send_error(sender, format!("failed to list '{}': {e}", path))
+                                    .await?;
                             }
                         }
                     }
@@ -746,10 +929,9 @@ impl GuiSession {
                         }
                     };
                     match self.admin.write_file(name.clone(), &bytes).await {
-                        Ok((_, bytes_written)) => uploaded.push(format!(
-                            "{name} ({} kB)",
-                            bytes_written / 1024
-                        )),
+                        Ok((_, bytes_written)) => {
+                            uploaded.push(format!("{name} ({} kB)", bytes_written / 1024))
+                        }
                         Err(e) => failures.push(format!("could not upload '{name}': {e}")),
                     }
                 }
@@ -798,13 +980,51 @@ impl GuiSession {
                 .send_error(sender, format!("unknown tab {tab_id}"))
                 .await;
         };
+        // While a turn runs, a submit steers the running agent instead of
+        // starting a new ask: the message is injected at the agent's next
+        // round boundary. It is rendered immediately at the transcript's
+        // end — the position where it will be ingested, since every event
+        // the running turn can still emit (deltas, tool results) updates
+        // existing blocks in place. The pending entry lets the later
+        // `steered` event confirm the block instead of duplicating it.
         if tab.model.phase != Phase::Idle {
-            return self
-                .send_error(
-                    sender,
-                    "wait for the current reply to finish or interrupt it",
-                )
-                .await;
+            if let Err(e) = self.ensure_client(tab_id).await {
+                return self
+                    .send_error(sender, format!("could not connect: {e}"))
+                    .await;
+            }
+            let client = self.client(tab_id).expect("just ensured");
+            return match client.steer(prompt.clone()).await {
+                Ok(()) => {
+                    let (index, collapsed) = {
+                        let tab = self.workspace.tab_mut(tab_id).expect("tab exists");
+                        let index = tab
+                            .model
+                            .apply_event(&AgentEvent::Steered {
+                                text: prompt.clone(),
+                            })
+                            .expect("a steered event appends a user block");
+                        tab.pending_steers.push((prompt, index));
+                        (index, tab.model.take_collapsed())
+                    };
+                    if self.workspace.active_id() == tab_id {
+                        if let Some(collapsed) = collapsed {
+                            self.send_thought_body(tab_id, collapsed, sender).await?;
+                        }
+                        let html = self
+                            .workspace
+                            .tab(tab_id)
+                            .and_then(|tab| view::block_html(tab, index))
+                            .expect("the appended block renders");
+                        send_msg(sender, &ServerMsg::BlockAppend { index, html }).await?;
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    self.send_error(sender, format!("could not steer: {e}"))
+                        .await
+                }
+            };
         }
 
         if let Err(e) = self.ensure_client(tab_id).await {
@@ -897,13 +1117,17 @@ impl GuiSession {
                 if let Some(client) = &conn.client {
                     let _ = client.interrupt().await;
                 }
-                if conn.observing { task.abort(); }
+                if conn.observing {
+                    task.abort();
+                }
                 let _ = task.await;
             }
             if let Some(client) = conn.client.take() {
                 client.close().await;
             }
-            if let Some(observer) = conn.observer.take() { observer.close().await; }
+            if let Some(observer) = conn.observer.take() {
+                observer.close().await;
+            }
         }
 
         let session_id = self
@@ -954,23 +1178,45 @@ impl GuiSession {
             let before = tab.model.blocks.len();
 
             match event.frame {
-                Some(Ok(ServerMessage::SessionSnapshot { session_id, messages, frames, busy, model: snapshot_model, .. })) => {
+                Some(Ok(ServerMessage::SessionSnapshot {
+                    session_id,
+                    messages,
+                    frames,
+                    busy,
+                    model: snapshot_model,
+                    ..
+                })) => {
                     let mut model = gewu_client::SessionModel::new();
                     model.set_session(Some(session_id));
-                    for message in &messages { model.apply_message(message); }
+                    for message in &messages {
+                        model.apply_message(message);
+                    }
                     for frame in frames {
                         if let ServerMessage::Event { event, .. } = frame
-                            && let Ok(event) = serde_json::from_value::<AgentEvent>(event) { model.apply_event(&event); }
+                            && let Ok(event) = serde_json::from_value::<AgentEvent>(event)
+                        {
+                            model.apply_event(&event);
+                        }
                     }
                     model.phase = if busy { Phase::Busy } else { Phase::Idle };
-                    let changed = tab.model.blocks != model.blocks || tab.model.phase != model.phase;
+                    let changed =
+                        tab.model.blocks != model.blocks || tab.model.phase != model.phase;
                     tab.model = model;
+                    // The snapshot is authoritative: an ingested steer is
+                    // already in its frames/messages, and one still queued
+                    // upstream re-arrives as a live `steered` event.
+                    tab.pending_steers.clear();
                     if let Some(selector) = snapshot_model {
                         tab.model_selector = Some(selector.clone());
-                        tab.model_label = Some(label_for(&self.models, &selector).unwrap_or(selector));
+                        tab.model_label =
+                            Some(label_for(&self.models, &selector).unwrap_or(selector));
                     }
                     terminal = !busy;
-                    update = if changed { TabUpdate::Full } else { TabUpdate::None };
+                    update = if changed {
+                        TabUpdate::Full
+                    } else {
+                        TabUpdate::None
+                    };
                 }
                 None => {
                     terminal = true;
@@ -1029,6 +1275,15 @@ impl GuiSession {
                             collapsed = tab.model.take_collapsed();
                             update = affected.map_or(TabUpdate::Full, TabUpdate::BlockAppend);
                         }
+                        Ok(AgentEvent::Steered { text }) => {
+                            // The message was already rendered when its
+                            // submit was routed to `steer`; this event only
+                            // confirms the agent ingested it.
+                            let (steer_update, steer_collapsed) =
+                                confirm_steered(&mut tab.model, &mut tab.pending_steers, text);
+                            update = steer_update;
+                            collapsed = steer_collapsed;
+                        }
                         Ok(agent_event) => {
                             // ToolStart / ToolFinish: update just the run's card.
                             let affected = tab.model.apply_event(&agent_event);
@@ -1067,11 +1322,16 @@ impl GuiSession {
 
             if terminal {
                 tab.model.finish_ask();
+                // A steer queued upstream but dropped before ingestion (turn
+                // ended first) must not suppress a future identical steer.
+                tab.pending_steers.clear();
             }
         }
 
         if terminal && let Some(conn) = self.conns.get_mut(&event.tab_id) {
-            if !conn.observing { conn.task = None; }
+            if !conn.observing {
+                conn.task = None;
+            }
             conn.last_stream_render = None;
         }
 
@@ -1079,9 +1339,18 @@ impl GuiSession {
         // the terminal status is rendered.
         if terminal {
             self.refresh_usage(event.tab_id).await;
-            let session_id = self.workspace.tab(event.tab_id).and_then(|tab| tab.model.session_id.clone());
-            if !self.conns.get(&event.tab_id).is_some_and(|conn| conn.observing)
-                && let Some(session_id) = session_id { self.observe(event.tab_id, session_id, false).await?; }
+            let session_id = self
+                .workspace
+                .tab(event.tab_id)
+                .and_then(|tab| tab.model.session_id.clone());
+            if !self
+                .conns
+                .get(&event.tab_id)
+                .is_some_and(|conn| conn.observing)
+                && let Some(session_id) = session_id
+            {
+                self.observe(event.tab_id, session_id, false).await?;
+            }
         }
 
         let active = active_id == event.tab_id;
@@ -1176,7 +1445,9 @@ impl GuiSession {
             if let Some(client) = conn.client.take() {
                 client.close().await;
             }
-            if let Some(observer) = conn.observer.take() { observer.close().await; }
+            if let Some(observer) = conn.observer.take() {
+                observer.close().await;
+            }
         }
         self.admin.close().await;
     }
@@ -1211,9 +1482,10 @@ fn spawn_ask_forwarder(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(frame) = stream.next_frame().await {
-            let terminal = frame.as_ref().is_ok_and(|message| message.is_ask_terminal().is_some()
-                || matches!(message, ServerMessage::SessionSnapshot { busy: false, .. }))
-                || frame.is_err();
+            let terminal = frame.as_ref().is_ok_and(|message| {
+                message.is_ask_terminal().is_some()
+                    || matches!(message, ServerMessage::SessionSnapshot { busy: false, .. })
+            }) || frame.is_err();
             if tx
                 .send(TabEvent {
                     tab_id,
@@ -1223,7 +1495,9 @@ fn spawn_ask_forwarder(
             {
                 return; // event loop gone
             }
-            if terminal { return; }
+            if terminal {
+                return;
+            }
         }
         let _ = tx.send(TabEvent {
             tab_id,
@@ -1265,9 +1539,15 @@ mod tests {
 
     #[test]
     fn sanitize_upload_name_strips_components_and_rejects_dots() {
-        assert_eq!(sanitize_upload_name("notes.bin").as_deref(), Some("notes.bin"));
+        assert_eq!(
+            sanitize_upload_name("notes.bin").as_deref(),
+            Some("notes.bin")
+        );
         // Only the final component survives traversal attempts.
-        assert_eq!(sanitize_upload_name("../evil.txt").as_deref(), Some("evil.txt"));
+        assert_eq!(
+            sanitize_upload_name("../evil.txt").as_deref(),
+            Some("evil.txt")
+        );
         assert_eq!(
             sanitize_upload_name("some/dir/file.md").as_deref(),
             Some("file.md")
@@ -1332,6 +1612,21 @@ mod tests {
     }
 
     #[test]
+    fn tool_update_resolves_the_card_behind_a_steered_user_block() {
+        // A steer split the run: the finished tool sits before the user
+        // block, so the affected index must still locate its own card.
+        let blocks = vec![
+            Block::User("hi".into()),
+            tool("bash", Some("out")),
+            Block::User("focus on tests".into()),
+        ];
+        assert!(matches!(
+            tool_update(&blocks, Some(1), false),
+            TabUpdate::ToolCard(1)
+        ));
+    }
+
+    #[test]
     fn tool_update_falls_back_to_full_render_on_unexpected_shapes() {
         let blocks = vec![Block::User("hi".into())];
         assert!(matches!(tool_update(&blocks, None, true), TabUpdate::Full));
@@ -1340,5 +1635,91 @@ mod tests {
             tool_update(&blocks, Some(0), false),
             TabUpdate::Full
         ));
+    }
+
+    #[test]
+    fn steers_in_place_requires_a_contiguous_tail() {
+        assert!(steers_in_place(&[("a".into(), 2)], 3));
+        assert!(steers_in_place(&[("a".into(), 2), ("b".into(), 3)], 4));
+        assert!(steers_in_place(&[], 3));
+        // A non-steer block after the group breaks the tail.
+        assert!(!steers_in_place(&[("a".into(), 2)], 4));
+        // A gap between steers breaks contiguity.
+        assert!(!steers_in_place(&[("a".into(), 2), ("b".into(), 4)], 5));
+    }
+
+    fn user_texts(model: &gewu_client::SessionModel) -> Vec<String> {
+        model
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::User(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn confirm_steered_drops_pending_when_already_in_place() {
+        let mut model = gewu_client::SessionModel::new();
+        model.submit("hi".into());
+        model.apply_event(&AgentEvent::ContentDelta {
+            delta: "working".into(),
+        });
+        let index = model
+            .apply_event(&AgentEvent::Steered {
+                text: "focus".into(),
+            })
+            .expect("steered appends a block");
+        let mut pending = vec![("focus".to_string(), index)];
+
+        let (update, collapsed) = confirm_steered(&mut model, &mut pending, "focus".into());
+
+        assert!(matches!(update, TabUpdate::None));
+        assert_eq!(collapsed, None);
+        assert!(pending.is_empty());
+        assert_eq!(user_texts(&model), ["hi", "focus"]);
+        assert_eq!(model.blocks.len(), 3);
+    }
+
+    #[test]
+    fn confirm_steered_relocates_group_after_race_blocks() {
+        // The steers were displayed before the ask's first block arrived.
+        let mut model = gewu_client::SessionModel::new();
+        model.submit("hi".into());
+        let a = model
+            .apply_event(&AgentEvent::Steered { text: "a".into() })
+            .expect("steered appends a block");
+        let b = model
+            .apply_event(&AgentEvent::Steered { text: "b".into() })
+            .expect("steered appends a block");
+        model.apply_event(&AgentEvent::ContentDelta {
+            delta: "working".into(),
+        });
+        let mut pending = vec![("a".to_string(), a), ("b".to_string(), b)];
+
+        let (update, _) = confirm_steered(&mut model, &mut pending, "a".into());
+
+        // The group moved below the late assistant block; `b` stays pending
+        // at its new index.
+        assert!(matches!(update, TabUpdate::Full));
+        assert_eq!(pending, vec![("b".to_string(), 3)]);
+
+        let (update, _) = confirm_steered(&mut model, &mut pending, "b".into());
+        assert!(matches!(update, TabUpdate::None));
+        assert_eq!(user_texts(&model), ["hi", "a", "b"]);
+        assert!(matches!(model.blocks[1], Block::Assistant(_)));
+    }
+
+    #[test]
+    fn confirm_steered_appends_when_not_tracked_locally() {
+        let mut model = gewu_client::SessionModel::new();
+        model.submit("hi".into());
+        let mut pending = Vec::new();
+
+        let (update, _) = confirm_steered(&mut model, &mut pending, "from elsewhere".into());
+
+        assert!(matches!(update, TabUpdate::BlockAppend(1)));
+        assert_eq!(user_texts(&model), ["hi", "from elsewhere"]);
     }
 }

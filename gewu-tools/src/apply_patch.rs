@@ -1630,9 +1630,10 @@ async fn cleanup_backups(journal: &[JournalEntry]) {
             JournalEntry::Created { .. } => None,
         };
         if let Some(backup) = backup
-            && let Err(error) = remove_if_exists(backup).await {
-                tracing::warn!(path = ?backup, %error, "failed to remove apply_patch backup");
-            }
+            && let Err(error) = remove_if_exists(backup).await
+        {
+            tracing::warn!(path = ?backup, %error, "failed to remove apply_patch backup");
+        }
     }
 }
 
@@ -2106,7 +2107,9 @@ mod tests {
             "*** Begin Patch\n*** Update File: first.txt\n@@\n-first\n+changed first\n*** Update File: second.txt\n@@\n-second\n+changed second\n*** End Patch",
         )
         .unwrap();
-        let mut changes = build_plan(&root, operations, PathEnforcement::Strict).await.unwrap();
+        let mut changes = build_plan(&root, operations, PathEnforcement::Strict)
+            .await
+            .unwrap();
 
         let error = commit_changes(
             &root,
@@ -2461,7 +2464,9 @@ mod tests {
             "*** Begin Patch\n*** Add File: nested/new.txt\n+created\n*** Update File: existing.txt\n@@\n-before\n+after\n*** End Patch",
         )
         .unwrap();
-        let mut changes = build_plan(&root, operations, PathEnforcement::Strict).await.unwrap();
+        let mut changes = build_plan(&root, operations, PathEnforcement::Strict)
+            .await
+            .unwrap();
 
         commit_changes(
             &root,
@@ -2496,7 +2501,9 @@ mod tests {
             "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+after\n*** End Patch",
         )
         .unwrap();
-        let mut changes = build_plan(&root, operations, PathEnforcement::Strict).await.unwrap();
+        let mut changes = build_plan(&root, operations, PathEnforcement::Strict)
+            .await
+            .unwrap();
         fs::write(dir.path().join("file.txt"), "external change\n")
             .await
             .unwrap();
@@ -2723,7 +2730,9 @@ mod tests {
             "*** Begin Patch\n*** Update File: file.txt\n@@\n-before\n+after\n*** End Patch",
         )
         .unwrap();
-        let mut changes = build_plan(&root, operations, PathEnforcement::Strict).await.unwrap();
+        let mut changes = build_plan(&root, operations, PathEnforcement::Strict)
+            .await
+            .unwrap();
         let ctx = ToolContext::new("test", "message");
         ctx.abort();
 
@@ -2945,7 +2954,9 @@ mod tests {
             "*** Begin Patch\n*** Update File: file.txt\n@@\n-same\n+changed\n*** End Patch",
         )
         .unwrap();
-        let mut changes = build_plan(&root, operations, PathEnforcement::Strict).await.unwrap();
+        let mut changes = build_plan(&root, operations, PathEnforcement::Strict)
+            .await
+            .unwrap();
         fs::rename(&path, &original).await.unwrap();
         fs::write(&path, "same\n").await.unwrap();
 
@@ -2970,7 +2981,9 @@ mod tests {
         let root = canonicalize_root(dir.path()).await.unwrap();
         let operations =
             parse_patch("*** Begin Patch\n*** Add File: new.txt\n+planned\n*** End Patch").unwrap();
-        let mut changes = build_plan(&root, operations, PathEnforcement::Strict).await.unwrap();
+        let mut changes = build_plan(&root, operations, PathEnforcement::Strict)
+            .await
+            .unwrap();
         fs::write(dir.path().join("new.txt"), "external\n")
             .await
             .unwrap();
@@ -3041,12 +3054,19 @@ mod tests {
             "*** Begin Patch\n*** Update File: private.txt\n@@\n-before\n+after\n*** End Patch",
         )
         .unwrap();
-        let mut changes = build_plan(&root, operations, PathEnforcement::Strict).await.unwrap();
-        let mut directories = Vec::new();
-
-        stage_changes(&root, &mut changes, &mut directories, PathEnforcement::Strict)
+        let mut changes = build_plan(&root, operations, PathEnforcement::Strict)
             .await
             .unwrap();
+        let mut directories = Vec::new();
+
+        stage_changes(
+            &root,
+            &mut changes,
+            &mut directories,
+            PathEnforcement::Strict,
+        )
+        .await
+        .unwrap();
         let staged = changes[0].staged.as_ref().unwrap();
         let mode = fs::metadata(staged).await.unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);

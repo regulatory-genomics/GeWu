@@ -71,13 +71,15 @@ The server provides pre-configured agent profiles, selected with `--agent`:
 
 | Agent | Description | Tools |
 |-------|-------------|-------|
-| **build** | Default agent for software engineering tasks | All tools, bash without safe mode, `task` (all agents) |
+| **build** | Default agent for software engineering tasks | All tools, bash without safe mode, `task` (all agents), `workflow_*` |
 | **explore** | Fast read-only agent for exploring codebases | Read-only tools, bash restricted to safe mode |
 | **plan** | Read-only planning agent for discussing implementation plans | Read-only tools, full bash (prompt-restricted to read-only), `task` (explore only); no MCP/additional tools |
-| **general** | General-purpose agent for research and multi-step tasks | All tools, bash without safe mode, `task` (all agents) |
+| **general** | General-purpose agent for research and multi-step tasks | All tools, bash without safe mode, `task` (all agents), `workflow_*` |
 
 Subagents launched via `task` run as fresh `Agent` instances with their own
-memory and cannot spawn further subagents (depth limit 1).
+memory and cannot spawn further subagents (depth limit 1). Workflow agents
+(the inline agents of a workflow spec) are composed the same way: they never
+receive `task` or the `workflow_*` tools.
 
 You can define additional agents in the config file's `agents` block (see
 [Configuration](#configuration)). They derive from a built-in profile and are
@@ -101,6 +103,10 @@ the primary agent.
 | Code Search | `codesearch` | Semantic code search with library/API context (Exa) |
 | Todo Read/Write | `todoread` / `todowrite` | Maintain the conversation's task list (persisted per session, survives restarts) |
 | Task | `task` | Launch sub-agents (build/explore/general/plan plus config-defined agents) for complex tasks; resumable via `task_id` |
+| Workflow Start | `workflow_start` | Start a background workflow from a JSON graph spec (nodes, edges/joins, conditional routing, review/redo); returns a `run_id` immediately |
+| Workflow Status | `workflow_status` | Snapshot a workflow run: current node, per-node status, done/failed counts, agent session ids |
+| Workflow Wait | `workflow_wait` | Wait up to N seconds for a workflow run to finish, then return its result or status |
+| Workflow Cancel | `workflow_cancel` | Abort a workflow run and return its partial results |
 | Skill | `skill` | Load skill instructions from config-declared `SKILL.md` directories into the conversation |
 | MCP tools | varies | Tools loaded from configured MCP servers (stdio or SSE) |
 

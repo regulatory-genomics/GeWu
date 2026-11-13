@@ -18,39 +18,75 @@ pub struct TabInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ClientMsg {
-    RevertChat { tab: u64, block: Option<usize>, undo: bool },
-    SwitchAgent { tab: u64, agent: String },
+    RevertChat {
+        tab: u64,
+        block: Option<usize>,
+        undo: bool,
+    },
+    SwitchAgent {
+        tab: u64,
+        agent: String,
+    },
     /// Switch the tab's LLM model (an `endpoint/model` selector).
-    SwitchModel { tab: u64, model: String },
+    SwitchModel {
+        tab: u64,
+        model: String,
+    },
     /// First message when the GUI requires a token.
-    Auth { token: String },
+    Auth {
+        token: String,
+    },
     /// Send a prompt to a tab.
-    Ask { tab: u64, prompt: String },
+    Ask {
+        tab: u64,
+        prompt: String,
+    },
     /// Interrupt the running ask on a tab.
-    Interrupt { tab: u64 },
+    Interrupt {
+        tab: u64,
+    },
     /// Open a fresh session in a new tab.
     OpenTab,
     /// Close a tab and delete its stored session.
-    CloseTab { tab: u64 },
+    CloseTab {
+        tab: u64,
+    },
     /// Focus a tab.
-    SwitchTab { tab: u64 },
+    SwitchTab {
+        tab: u64,
+    },
     /// Show or hide one tool call's full output.
-    ToggleTool { tab: u64, block: usize },
+    ToggleTool {
+        tab: u64,
+        block: usize,
+    },
     /// Show or hide a run of consecutive tool calls.
-    ToggleGroup { tab: u64, block: usize },
+    ToggleGroup {
+        tab: u64,
+        block: usize,
+    },
     /// Show or hide a thought block's reasoning text.
-    ToggleThought { tab: u64, block: usize },
+    ToggleThought {
+        tab: u64,
+        block: usize,
+    },
     /// Ask for a fresh snapshot (e.g. after a transient UI error).
     Refresh,
     /// Expand or collapse a directory in the file tree.
-    ToggleDir { path: String },
+    ToggleDir {
+        path: String,
+    },
     /// Open a file preview.
-    ReadFile { path: String },
+    ReadFile {
+        path: String,
+    },
     /// Refresh the file tree.
     RefreshTree,
     /// Upload files into the working-directory root. Names are sanitized
     /// server-side; contents are base64-encoded.
-    UploadFiles { files: Vec<UploadedFile> },
+    UploadFiles {
+        files: Vec<UploadedFile>,
+    },
     /// Close the file preview.
     ClosePreview,
 }
@@ -240,9 +276,11 @@ mod tests {
             }
         );
         assert!(serde_json::from_str::<ClientMsg>(r#"{"op":"upload_files"}"#).is_err());
-        assert!(serde_json::from_str::<ClientMsg>(
-            r#"{"op":"upload_files","files":[{"name":"a.txt"}]}"#
-        )
-        .is_err());
+        assert!(
+            serde_json::from_str::<ClientMsg>(
+                r#"{"op":"upload_files","files":[{"name":"a.txt"}]}"#
+            )
+            .is_err()
+        );
     }
 }

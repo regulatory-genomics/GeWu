@@ -307,7 +307,7 @@ async fn main() -> Result<()> {
     println!("Research tool created: {}\n", research_tool.tool_name());
     println!("Running research queries...\n");
 
-    let test_queries = vec!["What are the benefits of Rust for systems programming?"];
+    let test_queries = ["What are the benefits of Rust for systems programming?"];
 
     for (i, query) in test_queries.iter().enumerate() {
         println!("========================================");

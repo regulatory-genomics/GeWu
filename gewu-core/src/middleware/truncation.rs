@@ -15,6 +15,43 @@ pub const MAX_BYTES: usize = 50 * 1024;
 /// Directory name for storing truncated output files.
 pub const TRUNCATION_DIR: &str = "truncation";
 
+struct TruncationPlan {
+    preview: String,
+    removed: usize,
+    unit: &'static str,
+}
+
+fn plan_truncation(text: &str, max_lines: usize, max_bytes: usize) -> Option<TruncationPlan> {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let lines: Vec<&str> = body.lines().collect();
+    let total_bytes = body.len();
+    let total_lines = lines.len();
+    if total_lines <= max_lines && total_bytes <= max_bytes {
+        return None;
+    }
+    let mut out_lines = Vec::new();
+    let mut bytes = 0;
+    let mut hit_bytes = false;
+    for (i, line) in lines.iter().enumerate().take(lines.len().min(max_lines)) {
+        let line_size = line.len() + if i > 0 { 1 } else { 0 };
+        if bytes + line_size > max_bytes {
+            hit_bytes = true;
+            break;
+        }
+        out_lines.push(*line);
+        bytes += line_size;
+    }
+    Some(TruncationPlan {
+        preview: out_lines.join("\n"),
+        removed: if hit_bytes {
+            total_bytes - bytes
+        } else {
+            total_lines - out_lines.len()
+        },
+        unit: if hit_bytes { "bytes" } else { "lines" },
+    })
+}
+
 /// Service for truncating long tool outputs.
 ///
 /// The `TruncationService` limits the size of tool outputs by truncating
@@ -82,45 +119,13 @@ impl TruncationService {
         // Measure against the body without the trailing newline: otherwise a
         // text over the byte limit only by its final newline triggers a
         // "...1 bytes truncated..." notice that removes nothing meaningful.
-        let body = text.strip_suffix('\n').unwrap_or(text);
-        let lines: Vec<&str> = body.lines().collect();
-        let total_bytes = body.len();
-        let total_lines = lines.len();
-
-        if total_lines <= self.max_lines && total_bytes <= self.max_bytes {
+        let Some(plan) = plan_truncation(text, self.max_lines, self.max_bytes) else {
             return TruncationResult {
                 content: text.to_string(),
                 truncated: false,
                 output_path: None,
             };
-        }
-
-        let mut out_lines: Vec<&str> = Vec::new();
-        let mut bytes = 0;
-        let mut hit_bytes = false;
-
-        for (i, line) in lines
-            .iter()
-            .enumerate()
-            .take(lines.len().min(self.max_lines))
-        {
-            let line_size = line.len() + if i > 0 { 1 } else { 0 };
-            if bytes + line_size > self.max_bytes {
-                hit_bytes = true;
-                break;
-            }
-            out_lines.push(line);
-            bytes += line_size;
-        }
-
-        let removed = if hit_bytes {
-            total_bytes - bytes
-        } else {
-            total_lines - out_lines.len()
         };
-        let unit = if hit_bytes { "bytes" } else { "lines" };
-
-        let preview = out_lines.join("\n");
         let file_name = format!("tool_{}.txt", uuid::Uuid::new_v4());
         let file_path = self.truncation_dir.join(&file_name);
 
@@ -130,7 +135,7 @@ impl TruncationService {
 
         let truncated_content = format!(
             "{}\n\n...{} {} truncated...\n\n{}",
-            preview, removed, unit, hint
+            plan.preview, plan.removed, plan.unit, hint
         );
 
         let dir_created = std::fs::create_dir_all(&self.truncation_dir).is_ok();
@@ -151,6 +156,38 @@ impl TruncationService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planner_returns_none_within_limits() {
+        assert!(plan_truncation("hello", 1, 5).is_none());
+        assert!(plan_truncation("hello\n", 1, 5).is_none());
+        assert!(plan_truncation("", 0, 0).is_none());
+    }
+
+    #[test]
+    fn planner_preserves_line_and_byte_limit_precedence() {
+        for (max_lines, max_bytes, preview, removed, unit) in [
+            (1, 100, "aa", 2, "lines"),
+            (3, 4, "aa", 6, "bytes"),
+            (1, 2, "aa", 2, "lines"),
+            (0, 100, "", 3, "lines"),
+            (3, 0, "", 8, "bytes"),
+        ] {
+            let plan = plan_truncation("aa\nbb\ncc\n", max_lines, max_bytes).unwrap();
+            assert_eq!(
+                (plan.preview.as_str(), plan.removed, plan.unit),
+                (preview, removed, unit)
+            );
+        }
+    }
+
+    #[test]
+    fn planner_counts_bytes_without_splitting_utf8() {
+        let plan = plan_truncation("ééé", 10, 3).expect("truncation plan");
+        assert_eq!(plan.preview, "");
+        assert_eq!(plan.removed, 6);
+        assert_eq!(plan.unit, "bytes");
+    }
 
     #[test]
     fn test_no_truncation_small_output() {

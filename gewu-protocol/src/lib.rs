@@ -37,6 +37,7 @@
 //! {"type": "event", "id": "1", "request_id": "c3f1...", "event": {"type": "tool_start", "tool": "bash", "input": "{...}"}}
 //! {"type": "result", "id": "1", "request_id": "c3f1...", "session_id": "s1", "response": "Done."}
 //! {"type": "interrupted", "id": "1", "request_id": "c3f1..."}
+//! {"type": "steered", "id": "7", "session_id": "s", "text": "focus on tests"}
 //! {"type": "error", "id": "1", "error": "an ask is already in progress"}
 //! {"type": "pong", "id": "5"}
 //! {"type": "tools", "id": "3", "tools": ["read_file", "bash", "..."]}
@@ -51,38 +52,58 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use gewu_core::types::{
-    AgentEvent, ContentPart, FunctionCall, Message, TokenUsage, ToolCall,
-};
+pub use gewu_core::types::{AgentEvent, ContentPart, FunctionCall, Message, TokenUsage, ToolCall};
 
 /// Operations a client can request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
-    RevertChat { turn: Option<usize>, undo: bool },
+    RevertChat {
+        turn: Option<usize>,
+        undo: bool,
+    },
     /// Run an agent turn with the given prompt; events stream back.
-    Ask { prompt: String },
+    Ask {
+        prompt: String,
+    },
     /// Attach to a session, restoring its live turn if one is running.
     SubscribeSession,
     /// Interrupt the currently running `ask` on this connection, if any.
     Interrupt,
+    /// Inject a user message into the currently running `ask` (steering).
+    /// The message joins the conversation at the next round boundary; it
+    /// fails when no ask is running on the session.
+    Steer {
+        text: String,
+    },
     /// List the tool names available to the agent.
     ListTools,
     /// Explicitly change the active profile without replacing the conversation.
-    SwitchAgent { agent: String },
+    SwitchAgent {
+        agent: String,
+    },
     /// List visible files and directories directly within a working-directory path.
-    ListFiles { path: String },
+    ListFiles {
+        path: String,
+    },
     /// Read a bounded text file within the working directory.
-    ReadFile { path: String },
+    ReadFile {
+        path: String,
+    },
     /// Write a base64-encoded file into the working-directory root. The
     /// path must be a bare file name; existing files are overwritten.
-    WriteFile { path: String, content_base64: String },
+    WriteFile {
+        path: String,
+        content_base64: String,
+    },
     /// List the available agent profiles (build/explore/general).
     ListAgents,
     /// List the model selectors available for [`Op::SwitchModel`].
     ListModels,
     /// Switch the connection session's LLM model without replacing the
     /// conversation. `model` is a catalog selector (`endpoint/model`).
-    SwitchModel { model: String },
+    SwitchModel {
+        model: String,
+    },
     /// List persisted conversation sessions, newest first.
     ListSessions,
     /// Load one persisted session's messages. The session id is carried in
@@ -100,7 +121,9 @@ pub enum Op {
     Ping,
     /// Authenticate the connection with the server's shared token. Required
     /// before any other operation when the server runs with `--token`.
-    Auth { token: String },
+    Auth {
+        token: String,
+    },
 }
 
 /// A request sent by a client, or received by the server.
@@ -127,13 +150,18 @@ impl Serialize for ClientRequest {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let extra = self.session_id.is_some() as usize
-            + if matches!(self.op, Op::RevertChat { .. }) { 2 } else { 0 }
+            + if matches!(self.op, Op::RevertChat { .. }) {
+                2
+            } else {
+                0
+            }
             + (matches!(self.op, Op::SwitchAgent { .. } | Op::SwitchModel { .. })) as usize
             + self.agent.is_some() as usize
             + matches!(
                 self.op,
                 Op::Ask { .. }
                     | Op::Auth { .. }
+                    | Op::Steer { .. }
                     | Op::ListFiles { .. }
                     | Op::ReadFile { .. }
                     | Op::WriteFile { .. }
@@ -179,6 +207,10 @@ impl Serialize for ClientRequest {
                 map.serialize_entry("content_base64", content_base64)?;
             }
             Op::Interrupt => map.serialize_entry("op", "interrupt")?,
+            Op::Steer { text } => {
+                map.serialize_entry("op", "steer")?;
+                map.serialize_entry("text", text)?;
+            }
             Op::SubscribeSession => map.serialize_entry("op", "subscribe_session")?,
             Op::ListTools => map.serialize_entry("op", "list_tools")?,
             Op::ListAgents => map.serialize_entry("op", "list_agents")?,
@@ -205,11 +237,21 @@ impl ClientRequest {
         Self::simple(id, Op::RevertChat { turn, undo })
     }
     pub fn switch_agent(id: impl Into<Value>, agent: impl Into<String>) -> Self {
-        Self::simple(id, Op::SwitchAgent { agent: agent.into() })
+        Self::simple(
+            id,
+            Op::SwitchAgent {
+                agent: agent.into(),
+            },
+        )
     }
     /// Build a `switch_model` request (a configured `endpoint/model` selector).
     pub fn switch_model(id: impl Into<Value>, model: impl Into<String>) -> Self {
-        Self::simple(id, Op::SwitchModel { model: model.into() })
+        Self::simple(
+            id,
+            Op::SwitchModel {
+                model: model.into(),
+            },
+        )
     }
     /// Build an `ask` request.
     pub fn ask(id: impl Into<Value>, prompt: impl Into<String>) -> Self {
@@ -240,6 +282,11 @@ impl ClientRequest {
     /// Build an `interrupt` request.
     pub fn interrupt(id: impl Into<Value>) -> Self {
         Self::simple(id, Op::Interrupt)
+    }
+
+    /// Build a `steer` request: inject `text` into the running ask.
+    pub fn steer(id: impl Into<Value>, text: impl Into<String>) -> Self {
+        Self::simple(id, Op::Steer { text: text.into() })
     }
 
     pub fn subscribe_session(id: impl Into<Value>, session_id: impl Into<String>) -> Self {
@@ -404,16 +451,36 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
         "revert_chat" => {
             let turn = match obj.get("turn") {
                 None | Some(Value::Null) => None,
-                Some(value) => Some(value.as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(|| RequestError::Invalid("turn must be a nonnegative integer".into()))?),
+                Some(value) => Some(
+                    value
+                        .as_u64()
+                        .and_then(|n| usize::try_from(n).ok())
+                        .ok_or_else(|| {
+                            RequestError::Invalid("turn must be a nonnegative integer".into())
+                        })?,
+                ),
             };
-            let undo = match obj.get("undo") { None => false, Some(value) => value.as_bool().ok_or_else(|| RequestError::Invalid("undo must be boolean".into()))? };
+            let undo = match obj.get("undo") {
+                None => false,
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| RequestError::Invalid("undo must be boolean".into()))?,
+            };
             Op::RevertChat { turn, undo }
         }
         "switch_agent" => Op::SwitchAgent {
-            agent: obj.get("target_agent").and_then(Value::as_str).ok_or_else(|| RequestError::Invalid("switch_agent requires target_agent".into()))?.to_string(),
+            agent: obj
+                .get("target_agent")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RequestError::Invalid("switch_agent requires target_agent".into()))?
+                .to_string(),
         },
         "switch_model" => Op::SwitchModel {
-            model: obj.get("model").and_then(Value::as_str).ok_or_else(|| RequestError::Invalid("switch_model requires model".into()))?.to_string(),
+            model: obj
+                .get("model")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RequestError::Invalid("switch_model requires model".into()))?
+                .to_string(),
         },
         "ask" => {
             let prompt = obj
@@ -426,6 +493,15 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
             Op::Ask { prompt }
         }
         "interrupt" => Op::Interrupt,
+        "steer" => Op::Steer {
+            text: obj
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RequestError::Invalid("op 'steer' requires a 'text' string".to_string())
+                })?
+                .to_string(),
+        },
         "list_tools" => Op::ListTools,
         "list_files" | "read_file" => {
             let path = obj
@@ -460,7 +536,10 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
                     )
                 })?
                 .to_string();
-            Op::WriteFile { path, content_base64 }
+            Op::WriteFile {
+                path,
+                content_base64,
+            }
         }
         "list_sessions" => Op::ListSessions,
         "get_session" => {
@@ -543,7 +622,9 @@ pub struct SessionSummary {
     pub updated_at: String,
 }
 
-fn default_agent_name() -> String { "build".into() }
+fn default_agent_name() -> String {
+    "build".into()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileEntry {
@@ -577,7 +658,12 @@ pub enum ServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
     },
-    AgentSwitched { id: Value, session_id: String, agent: String, tools: Vec<String> },
+    AgentSwitched {
+        id: Value,
+        session_id: String,
+        agent: String,
+        tools: Vec<String>,
+    },
     /// Reply to a `switch_model` request: the session now runs the model.
     ModelSwitched {
         /// Echo of the client request id.
@@ -633,6 +719,17 @@ pub enum ServerMessage {
         /// Request id of the interrupted ask, when one was running.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
+    },
+    /// Reply to a `steer` request: the message was queued into the
+    /// running ask. The steered message itself also arrives as a `steered`
+    /// agent event on the ask's stream.
+    Steered {
+        /// Echo of the client request id.
+        id: Value,
+        /// Session the message was injected into.
+        session_id: String,
+        /// The injected text.
+        text: String,
     },
     /// An error occurred while handling the request.
     Error {
@@ -775,6 +872,7 @@ impl ServerMessage {
             ServerMessage::Event { .. } => "event",
             ServerMessage::Result { .. } => "result",
             ServerMessage::Interrupted { .. } => "interrupted",
+            ServerMessage::Steered { .. } => "steered",
             ServerMessage::Error { .. } => "error",
             ServerMessage::Pong { .. } => "pong",
             ServerMessage::Info { .. } => "info",
@@ -815,7 +913,9 @@ impl ServerMessage {
             | ServerMessage::Session { id, .. }
             | ServerMessage::Deleted { id, .. } => Some(id),
             ServerMessage::Interrupted { id, .. } | ServerMessage::Error { id, .. } => id.as_ref(),
-            ServerMessage::Event { .. } | ServerMessage::Result { .. }
+            ServerMessage::Steered { id, .. } => Some(id),
+            ServerMessage::Event { .. }
+            | ServerMessage::Result { .. }
             | ServerMessage::SessionSnapshot { .. } => None,
         }
     }
@@ -850,14 +950,41 @@ mod tests {
     }
 
     #[test]
+    fn steer_request_and_reply_round_trip() {
+        let request = ClientRequest::steer(9, "focus on tests").with_session("s");
+        assert_eq!(parse_request(&request.to_line()).unwrap(), request);
+        assert!(parse_request(r#"{"id":1,"op":"steer"}"#).is_err());
+
+        let reply = ServerMessage::Steered {
+            id: 9.into(),
+            session_id: "s".into(),
+            text: "focus on tests".into(),
+        };
+        let decoded: ServerMessage = serde_json::from_str(&reply.to_line()).unwrap();
+        assert_eq!(decoded, reply);
+        assert_eq!(reply.kind(), "steered");
+        assert_eq!(reply.correlation_id(), Some(&9.into()));
+        // Steering never terminates the ask it injects into.
+        assert_eq!(reply.is_ask_terminal(), None);
+    }
+
+    #[test]
     fn switch_agent_round_trip() {
         let request = ClientRequest::switch_agent(7, "plan");
         assert_eq!(parse_request(&request.to_line()).unwrap(), request);
         assert!(parse_request(r#"{"id":1,"op":"switch_agent"}"#).is_err());
-        let reply = ServerMessage::AgentSwitched { id: 7.into(), session_id: "s".into(), agent: "plan".into(), tools: vec![] };
+        let reply = ServerMessage::AgentSwitched {
+            id: 7.into(),
+            session_id: "s".into(),
+            agent: "plan".into(),
+            tools: vec![],
+        };
         assert_eq!(reply.kind(), "agent_switched");
         assert_eq!(reply.correlation_id(), Some(&Value::from(7)));
-        assert_eq!(serde_json::from_str::<ServerMessage>(&reply.to_line()).unwrap(), reply);
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&reply.to_line()).unwrap(),
+            reply
+        );
     }
 
     #[test]
@@ -878,7 +1005,10 @@ mod tests {
         assert_eq!(reply.kind(), "model_switched");
         assert_eq!(reply.correlation_id(), Some(&Value::from(7)));
         assert_eq!(reply.is_ask_terminal(), None);
-        assert_eq!(serde_json::from_str::<ServerMessage>(&reply.to_line()).unwrap(), reply);
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&reply.to_line()).unwrap(),
+            reply
+        );
     }
 
     #[test]
@@ -888,7 +1018,10 @@ mod tests {
         assert_eq!(parse_request(&request.to_line()).unwrap(), request);
         let reply = ServerMessage::Models {
             id: 3.into(),
-            models: vec![ModelSummary { selector: "west/coding".into(), label: "deepseek-reasoner".into() }],
+            models: vec![ModelSummary {
+                selector: "west/coding".into(),
+                label: "deepseek-reasoner".into(),
+            }],
         };
         assert_eq!(reply.kind(), "models");
         assert_eq!(reply.correlation_id(), Some(&Value::from(3)));
@@ -1064,7 +1197,11 @@ mod tests {
             serde_json::from_str(r#"{"type":"usage","id":1,"used_tokens":5,"context_limit":6}"#)
                 .unwrap();
         match legacy {
-            ServerMessage::Usage { busy, provider_usage, .. } => {
+            ServerMessage::Usage {
+                busy,
+                provider_usage,
+                ..
+            } => {
                 assert!(!busy);
                 assert!(provider_usage.is_none());
             }
@@ -1179,7 +1316,10 @@ mod tests {
         assert_eq!(line, r#"{"id":"4","op":"list_agents"}"#);
 
         let line = ClientRequest::write_file("9", "data.bin", "aGk=").to_line();
-        assert_eq!(line, r#"{"id":"9","op":"write_file","path":"data.bin","content_base64":"aGk="}"#);
+        assert_eq!(
+            line,
+            r#"{"id":"9","op":"write_file","path":"data.bin","content_base64":"aGk="}"#
+        );
     }
 
     #[test]
@@ -1254,7 +1394,10 @@ mod tests {
         };
         let value = agent_event_to_value(&agent_event);
         assert_eq!(value["type"], "status");
-        assert_eq!(value["message"], "LLM request failed: rate limited; retrying in 4s (attempt 1)");
+        assert_eq!(
+            value["message"],
+            "LLM request failed: rate limited; retrying in 4s (attempt 1)"
+        );
 
         let decoded: AgentEvent = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, agent_event);

@@ -15,6 +15,7 @@ mod protocol;
 mod server;
 mod session;
 mod view;
+mod workflow;
 mod workspace;
 
 pub use cli::Cli;

@@ -4,7 +4,10 @@ use gewu_core::traits::{LlmProvider, RequestLog, Tool, ToolRegistry};
 use gewu_core::types::{PathEnforcement, SessionState, ToolContext, ToolResult};
 use gewu_core::{Agent, AgentTemplate};
 use gewu_storage::{SqliteMemory, SqliteSessionStateStore};
-use gewu_tools::task::AgentFactory;
+use gewu_tools::task::{AgentFactory, AgentOverrides};
+use gewu_tools::workflow::{
+    WorkflowCancelTool, WorkflowManager, WorkflowStartTool, WorkflowStatusTool, WorkflowWaitTool,
+};
 use gewu_tools::{
     ApplyPatchTool, BashTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool, ListTool,
     ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoReadTool, TodoWriteTool, WebFetchTool,
@@ -26,6 +29,10 @@ const RESERVED_ADDITIONAL_TOOL_NAMES: &[&str] = &[
     "skill",
     "todowrite",
     "todoread",
+    "workflow_start",
+    "workflow_status",
+    "workflow_wait",
+    "workflow_cancel",
 ];
 
 pub struct AgentConfig {
@@ -144,6 +151,16 @@ struct SqliteAgentFactory {
 /// but a subagent cannot spawn further ones.
 const MAX_SUBAGENT_DEPTH: usize = 1;
 
+/// Tools a dynamically composed (workflow) agent must never receive, so
+/// delegation stays one level deep even when its base profile has them.
+const COMPOSED_AGENT_FORBIDDEN_TOOLS: &[&str] = &[
+    "task",
+    "workflow_start",
+    "workflow_status",
+    "workflow_wait",
+    "workflow_cancel",
+];
+
 #[async_trait]
 impl AgentFactory for SqliteAgentFactory {
     async fn create(
@@ -151,6 +168,89 @@ impl AgentFactory for SqliteAgentFactory {
         subagent_type: &str,
         resume: Option<String>,
         parent_session: &str,
+    ) -> Result<(Agent, String), Box<dyn Error + Send + Sync>> {
+        self.spawn_agent(subagent_type, resume, parent_session, Ok)
+            .await
+    }
+
+    async fn create_with(
+        &self,
+        base: &str,
+        overrides: &AgentOverrides,
+        parent_session: &str,
+    ) -> Result<(Agent, String), Box<dyn Error + Send + Sync>> {
+        self.spawn_agent(base, None, parent_session, |template| {
+            apply_overrides(base, template, overrides)
+        })
+        .await
+    }
+
+    async fn validate_overrides(
+        &self,
+        base: &str,
+        overrides: &AgentOverrides,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let template = self
+            .template_for(base)
+            .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
+        apply_overrides(base, template, overrides)
+            .map(|_| ())
+            .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })
+    }
+}
+
+/// Applies [`AgentOverrides`] to a base template: strips delegation tools,
+/// narrows the tool allowlist (base tools only), and appends instructions.
+fn apply_overrides(
+    base: &str,
+    template: AgentTemplate,
+    overrides: &AgentOverrides,
+) -> Result<AgentTemplate> {
+    let base_tools: Vec<Arc<dyn Tool>> = template
+        .tools()
+        .iter()
+        .filter(|tool| !COMPOSED_AGENT_FORBIDDEN_TOOLS.contains(&tool.name()))
+        .cloned()
+        .collect();
+    let mut template = template.with_tools(base_tools);
+
+    if let Some(allowlist) = &overrides.tools {
+        let known: std::collections::HashSet<_> =
+            template.tools().iter().map(|tool| tool.name()).collect();
+        for name in allowlist {
+            anyhow::ensure!(
+                known.contains(&name.as_str()),
+                "base profile '{}' has no tool '{}' (workflow agent tool lists narrow the base profile)",
+                base,
+                name
+            );
+        }
+        let tools: Vec<Arc<dyn Tool>> = template
+            .tools()
+            .iter()
+            .filter(|tool| allowlist.iter().any(|name| name == tool.name()))
+            .cloned()
+            .collect();
+        template = template.with_tools(tools);
+    }
+
+    if let Some(instructions) = &overrides.instructions {
+        let prompt = format!("{}\n\n{}", template.system_prompt(), instructions);
+        template = template.with_system_prompt(prompt);
+    }
+    Ok(template)
+}
+
+impl SqliteAgentFactory {
+    /// Shared spawn path for `create` and `create_with`: depth check,
+    /// model resolution, session bookkeeping, reminder restore, then
+    /// spawning the profile template with `adjust` applied to it.
+    async fn spawn_agent(
+        &self,
+        profile: &str,
+        resume: Option<String>,
+        parent_session: &str,
+        adjust: impl FnOnce(AgentTemplate) -> Result<AgentTemplate>,
     ) -> Result<(Agent, String), Box<dyn Error + Send + Sync>> {
         let depth = gewu_storage::subagent_depth(&self.pool, parent_session).await?;
         if depth >= MAX_SUBAGENT_DEPTH {
@@ -176,15 +276,12 @@ impl AgentFactory for SqliteAgentFactory {
         } else {
             (self.provider.clone(), self.context_limit)
         };
-        gewu_storage::record_subagent_session(
-            &self.pool,
-            &session_id,
-            parent_session,
-            subagent_type,
-        )
-        .await?;
+        gewu_storage::record_subagent_session(&self.pool, &session_id, parent_session, profile)
+            .await?;
         let template = self
-            .template_for(subagent_type)
+            .template_for(profile)
+            .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
+        let template = adjust(template)
             .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
         let memory = SqliteMemory::new(self.pool.clone(), session_id.clone()).await?;
         // Restore the durable reminder state; a session without one (fresh,
@@ -194,8 +291,8 @@ impl AgentFactory for SqliteAgentFactory {
         let reminder = match gewu_storage::get_reminder_opt(&self.pool, &session_id).await? {
             Some(stored) => stored,
             None => {
-                let initial = if subagent_type == "plan" {
-                    profile_reminder(None, subagent_type)
+                let initial = if profile == "plan" {
+                    profile_reminder(None, profile)
                 } else {
                     gewu_core::agent::Reminder::default()
                 };
@@ -213,9 +310,7 @@ impl AgentFactory for SqliteAgentFactory {
                 .spawn(session_id.as_str(), Box::new(memory), reminder);
         Ok((agent, session_id))
     }
-}
 
-impl SqliteAgentFactory {
     /// Returns a cached [`AgentTemplate`] for `profile`, building it on
     /// first use through the regular profile pipeline.
     ///
@@ -265,11 +360,10 @@ impl SqliteAgentFactory {
     }
 }
 
-/// Builds the task tool wired to the CLI registry. `allowed` filters which
-/// subagent types are advertised and permitted; empty means all of them.
-/// Config-defined agents are advertised alongside the built-ins (still
-/// subject to `allowed`, so restricted profiles like plan never see them).
-fn task_tool(
+/// Builds the agent factory shared by the task tool and the workflow
+/// manager: both spawn subagents through the same registry pipeline.
+#[allow(clippy::too_many_arguments)]
+fn agent_factory(
     model_catalog: Option<ModelCatalog>,
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
@@ -278,9 +372,8 @@ fn task_tool(
     enforcement: PathEnforcement,
     context_limit: Option<usize>,
     agents: Arc<BTreeMap<String, AgentEntry>>,
-    allowed: &[&str],
-) -> TaskTool {
-    let factory = Arc::new(SqliteAgentFactory {
+) -> Arc<SqliteAgentFactory> {
+    Arc::new(SqliteAgentFactory {
         model_catalog,
         provider,
         pool,
@@ -290,7 +383,18 @@ fn task_tool(
         context_limit,
         agents: agents.clone(),
         templates: Mutex::new(HashMap::new()),
-    });
+    })
+}
+
+/// Builds the task tool wired to the CLI registry. `allowed` filters which
+/// subagent types are advertised and permitted; empty means all of them.
+/// Config-defined agents are advertised alongside the built-ins (still
+/// subject to `allowed`, so restricted profiles like plan never see them).
+fn task_tool(
+    factory: Arc<SqliteAgentFactory>,
+    agents: Arc<BTreeMap<String, AgentEntry>>,
+    allowed: &[&str],
+) -> TaskTool {
     let mut advertised: Vec<(String, String)> = list_available_agents()
         .into_iter()
         .filter(|a| allowed.is_empty() || allowed.contains(&a.name.as_str()))
@@ -302,6 +406,14 @@ fn task_tool(
         }
     }
     TaskTool::new(factory, advertised)
+}
+
+/// One workflow manager per profile: it validates specs, spawns runs, and
+/// answers status/wait/cancel for the four workflow tools. Agents derive
+/// from the same factory the task tool uses, so delegation stays one level
+/// deep (composed agents never receive `task` or `workflow_*` tools).
+fn workflow_manager(factory: Arc<SqliteAgentFactory>) -> Arc<WorkflowManager> {
+    Arc::new(WorkflowManager::new(factory, list_agent_names()))
 }
 
 fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle> {
@@ -319,18 +431,23 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
     } = inputs;
     let mut tools: Vec<Box<dyn Tool>> = match *name {
         "build" => {
+            let factory = agent_factory(
+                inputs.model_catalog.clone(),
+                provider.clone(),
+                pool.clone(),
+                skills.clone(),
+                inputs.web_fetch.clone(),
+                *enforcement,
+                *context_limit,
+                agents.clone(),
+            );
+            let workflows = workflow_manager(factory.clone());
             vec![
-                Box::new(task_tool(
-                    inputs.model_catalog.clone(),
-                    provider.clone(),
-                    pool.clone(),
-                    skills.clone(),
-                    inputs.web_fetch.clone(),
-                    *enforcement,
-                    *context_limit,
-                    agents.clone(),
-                    &[],
-                )),
+                Box::new(task_tool(factory, agents.clone(), &[])),
+                Box::new(WorkflowStartTool::new(workflows.clone())),
+                Box::new(WorkflowStatusTool::new(workflows.clone())),
+                Box::new(WorkflowWaitTool::new(workflows.clone())),
+                Box::new(WorkflowCancelTool::new(workflows)),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -359,20 +476,23 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 }),
                 Box::new(CodeSearchTool),
                 Box::new(WebSearchTool),
-                Box::new(TodoWriteTool::default()),
-                Box::new(TodoReadTool::default()),
+                Box::new(TodoWriteTool),
+                Box::new(TodoReadTool),
             ]
         }
         "plan" => {
             vec![
                 Box::new(task_tool(
-                    inputs.model_catalog.clone(),
-                    provider.clone(),
-                    pool.clone(),
-                    skills.clone(),
-                    inputs.web_fetch.clone(),
-                    *enforcement,
-                    *context_limit,
+                    agent_factory(
+                        inputs.model_catalog.clone(),
+                        provider.clone(),
+                        pool.clone(),
+                        skills.clone(),
+                        inputs.web_fetch.clone(),
+                        *enforcement,
+                        *context_limit,
+                        agents.clone(),
+                    ),
                     agents.clone(),
                     &["explore"],
                 )),
@@ -394,8 +514,8 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 }),
                 Box::new(WebFetchTool::with_shared_policy(inputs.web_fetch.clone())),
                 Box::new(WebSearchTool),
-                Box::new(TodoWriteTool::default()),
-                Box::new(TodoReadTool::default()),
+                Box::new(TodoWriteTool),
+                Box::new(TodoReadTool),
             ]
         }
         "explore" => {
@@ -422,18 +542,23 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
             ]
         }
         "general" => {
+            let factory = agent_factory(
+                inputs.model_catalog.clone(),
+                provider.clone(),
+                pool.clone(),
+                skills.clone(),
+                inputs.web_fetch.clone(),
+                *enforcement,
+                *context_limit,
+                agents.clone(),
+            );
+            let workflows = workflow_manager(factory.clone());
             vec![
-                Box::new(task_tool(
-                    inputs.model_catalog.clone(),
-                    provider.clone(),
-                    pool.clone(),
-                    skills.clone(),
-                    inputs.web_fetch.clone(),
-                    *enforcement,
-                    *context_limit,
-                    agents.clone(),
-                    &[],
-                )),
+                Box::new(task_tool(factory, agents.clone(), &[])),
+                Box::new(WorkflowStartTool::new(workflows.clone())),
+                Box::new(WorkflowStatusTool::new(workflows.clone())),
+                Box::new(WorkflowWaitTool::new(workflows.clone())),
+                Box::new(WorkflowCancelTool::new(workflows)),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -462,8 +587,8 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 }),
                 Box::new(CodeSearchTool),
                 Box::new(WebSearchTool),
-                Box::new(TodoWriteTool::default()),
-                Box::new(TodoReadTool::default()),
+                Box::new(TodoWriteTool),
+                Box::new(TodoReadTool),
             ]
         }
         _ => {
@@ -684,9 +809,9 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
         Some(entry) => match &entry.instructions {
             // Config-defined instructions replace the base prompt entirely.
             Some(instructions) => instructions.clone(),
-            None => base_profile_prompt(&entry.base)?.to_string(),
+            None => base_profile_prompt(&entry.base)?,
         },
-        None => base_profile_prompt(name)?.to_string(),
+        None => base_profile_prompt(name)?,
     };
     if !skills.is_empty() {
         system_prompt.push_str("\n\n");
@@ -696,14 +821,18 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
     Ok((tools_arc, system_prompt, registry))
 }
 
-/// The built-in system prompt for a profile name.
-fn base_profile_prompt(name: &str) -> Result<&'static str> {
-    match name {
-        "build" | "plan" => Ok(include_str!("prompts/build.txt")),
-        "explore" => Ok(include_str!("prompts/explore.txt")),
-        "general" => Ok(include_str!("prompts/general.txt")),
-        _ => Err(anyhow!("Unknown agent type: {}", name)),
-    }
+/// The built-in system prompt for a profile name. `build` and `general`
+/// extend the shared base with the background-workflow note (their profiles
+/// carry the workflow tools; `plan` does not).
+fn base_profile_prompt(name: &str) -> Result<String> {
+    const WORKFLOW_NOTE: &str = include_str!("prompts/workflow-note.txt");
+    Ok(match name {
+        "build" => format!("{}\n\n{WORKFLOW_NOTE}", include_str!("prompts/build.txt")),
+        "plan" => include_str!("prompts/build.txt").to_string(),
+        "explore" => include_str!("prompts/explore.txt").to_string(),
+        "general" => format!("{}\n\n{WORKFLOW_NOTE}", include_str!("prompts/general.txt")),
+        _ => return Err(anyhow!("Unknown agent type: {}", name)),
+    })
 }
 
 /// Mode instructions live in conversation reminders, not the base prompt.
@@ -866,7 +995,7 @@ mod tests {
             .unwrap();
             prompts.push(prompt);
         }
-        assert_eq!(prompts[0], prompts[1]);
+        assert!(prompts[0].starts_with(prompts[1].as_str()));
     }
 
     #[test]
@@ -1537,5 +1666,164 @@ mod tests {
             .await
             .unwrap();
         assert!(result.output.contains("first"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn workflow_tools_are_only_in_delegating_profiles() {
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let dir = tempdir().unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
+
+        for profile in ["build", "general"] {
+            let (_, tools) = build_tool_registry_and_list(&test_inputs(
+                profile,
+                provider.clone(),
+                pool.clone(),
+                dir.path().to_path_buf(),
+                vec![],
+                vec![],
+                "session",
+            ))
+            .unwrap();
+            for expected in [
+                "workflow_start",
+                "workflow_status",
+                "workflow_wait",
+                "workflow_cancel",
+            ] {
+                assert!(
+                    tools.iter().any(|tool| tool.name() == expected),
+                    "{profile} is missing {expected}"
+                );
+            }
+        }
+
+        for profile in ["explore", "plan"] {
+            let (_, tools) = build_tool_registry_and_list(&test_inputs(
+                profile,
+                provider.clone(),
+                pool.clone(),
+                dir.path().to_path_buf(),
+                vec![],
+                vec![],
+                "session",
+            ))
+            .unwrap();
+            for forbidden in [
+                "workflow_start",
+                "workflow_status",
+                "workflow_wait",
+                "workflow_cancel",
+            ] {
+                assert!(
+                    !tools.iter().any(|tool| tool.name() == forbidden),
+                    "{profile} exposes {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_composed_agents_lack_delegation_tools() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
+        let factory = agent_factory(
+            None,
+            provider,
+            pool,
+            Vec::new(),
+            Arc::default(),
+            PathEnforcement::None,
+            None,
+            Arc::new(BTreeMap::new()),
+        );
+
+        // A workflow agent derived from build never carries the delegation
+        // tools, so delegation stays one level deep.
+        let (agent, _) = factory
+            .create_with("build", &AgentOverrides::default(), "root")
+            .await
+            .unwrap();
+        let names = agent.list_tools();
+        for forbidden in COMPOSED_AGENT_FORBIDDEN_TOOLS {
+            assert!(
+                !names.iter().any(|name| name == forbidden),
+                "workflow agent exposes {forbidden}"
+            );
+        }
+        assert!(
+            names.iter().any(|name| name == "read_file"),
+            "the base profile's tools survive the strip"
+        );
+
+        // Inline tool lists narrow the (stripped) base: a tool the base
+        // profile lacks — including forbidden delegation tools — is
+        // rejected before anything spawns.
+        let error = factory
+            .validate_overrides(
+                "explore",
+                &AgentOverrides {
+                    tools: Some(vec!["write_file".to_string()]),
+                    instructions: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no tool 'write_file'"),
+            "{error}"
+        );
+
+        let error = match factory
+            .create_with(
+                "build",
+                &AgentOverrides {
+                    tools: Some(vec!["task".to_string()]),
+                    instructions: None,
+                },
+                "root",
+            )
+            .await
+        {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("requesting a forbidden tool should be rejected"),
+        };
+        assert!(error.contains("no tool 'task'"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn workflow_inline_instructions_extend_the_base_prompt() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
+        let factory = agent_factory(
+            None,
+            provider,
+            pool,
+            Vec::new(),
+            Arc::default(),
+            PathEnforcement::None,
+            None,
+            Arc::new(BTreeMap::new()),
+        );
+
+        let (agent, _) = factory
+            .create_with(
+                "explore",
+                &AgentOverrides {
+                    instructions: Some("Be terse.".to_string()),
+                    tools: None,
+                },
+                "root",
+            )
+            .await
+            .unwrap();
+        let expected = format!("{}\n\nBe terse.", base_profile_prompt("explore").unwrap());
+        assert_eq!(agent.template().system_prompt(), expected);
     }
 }

@@ -33,10 +33,16 @@ pub struct Tab {
     pub cache: Option<TokenUsage>,
     /// Tool runs the user expanded (keyed by the run's first block index).
     pub expanded_groups: HashSet<usize>,
+    /// Workflow tool runs the user collapsed; workflow runs default to
+    /// expanded, so collapse is the explicit state worth remembering.
+    pub collapsed_groups: HashSet<usize>,
     /// Tool calls whose full output the user expanded (block index).
     pub expanded_outputs: HashSet<usize>,
     /// Thought blocks whose reasoning text the user expanded (block index).
     pub expanded_thoughts: HashSet<usize>,
+    /// Steered messages displayed at submit time and not yet confirmed by
+    /// the agent's `steered` event: `(text, block index)` in submit order.
+    pub pending_steers: Vec<(String, usize)>,
 }
 
 impl Tab {
@@ -50,8 +56,10 @@ impl Tab {
             context: None,
             cache: None,
             expanded_groups: HashSet::new(),
+            collapsed_groups: HashSet::new(),
             expanded_outputs: HashSet::new(),
             expanded_thoughts: HashSet::new(),
+            pending_steers: Vec::new(),
         }
     }
 

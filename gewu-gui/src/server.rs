@@ -626,9 +626,11 @@ mod tests {
         let snapshot = next_json(&mut ws).await;
         assert_eq!(snapshot["type"], "snapshot");
 
-        ws.send(WsMessage::text(r#"{"op":"upload_files","files":[{"name":"..","content_base64":"aGVsbG8="}]}"#))
-            .await
-            .unwrap();
+        ws.send(WsMessage::text(
+            r#"{"op":"upload_files","files":[{"name":"..","content_base64":"aGVsbG8="}]}"#,
+        ))
+        .await
+        .unwrap();
 
         let error = loop {
             let value = next_json(&mut ws).await;
@@ -638,7 +640,10 @@ mod tests {
         };
         assert_eq!(error["type"], "error");
         assert!(
-            error["message"].as_str().unwrap().contains("not a valid file name"),
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("not a valid file name"),
             "{}",
             error
         );
@@ -804,9 +809,11 @@ mod tests {
             "{status}"
         );
 
-        ws.send(WsMessage::text(r#"{"op":"switch_model","tab":1,"model":"fake/two"}"#))
-            .await
-            .unwrap();
+        ws.send(WsMessage::text(
+            r#"{"op":"switch_model","tab":1,"model":"fake/two"}"#,
+        ))
+        .await
+        .unwrap();
         // Interim status updates (ping notes, usage refreshes) may precede
         // the switch's own status; drain until the new selection appears.
         let mut switched = None;
@@ -950,8 +957,7 @@ mod tests {
                     let html = value["assistant"][1].as_str().expect("assistant html");
                     assert!(html.contains("Thought "), "{html}");
                     assert!(!html.contains("Thinking"), "{html}");
-                    second_thought =
-                        Some(value["first"].as_u64().expect("run start") as usize + 1);
+                    second_thought = Some(value["first"].as_u64().expect("run start") as usize + 1);
                 }
                 "streaming_body" => {
                     let index = value["index"].as_u64().expect("body index") as usize;

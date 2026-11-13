@@ -118,6 +118,14 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                                 std::io::stdout().flush()?;
                             }
                         }
+                        // A steering message injected mid-run; rendered like
+                        // the user turn it is, so the next content starts
+                        // fresh.
+                        AgentEvent::Steered { text } => {
+                            stop_spinner(&mut spinner_active, is_tty)?;
+                            content_started = false;
+                            println!("\n{DIM}[steered] you:{RESET} {text}");
+                        }
                         AgentEvent::Error { error } => {
                             stop_spinner(&mut spinner_active, is_tty)?;
                             error!("Error from agent: {}", error);

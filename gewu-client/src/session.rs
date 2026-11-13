@@ -146,7 +146,9 @@ impl SessionModel {
         match event {
             AgentEvent::Compacted { summary } => {
                 self.end_thought();
-                self.blocks.push(Block::Compaction { summary: summary.clone() });
+                self.blocks.push(Block::Compaction {
+                    summary: summary.clone(),
+                });
                 Some(self.blocks.len() - 1)
             }
             AgentEvent::Status { message } => {
@@ -172,33 +174,15 @@ impl SessionModel {
                 Some(self.blocks.len() - 1)
             }
             AgentEvent::ToolFinish { tool, output, .. } => {
-                if !self.fill_open_tool(Some(tool), output) {
-                    self.blocks.push(Block::Tool {
-                        tool: tool.clone(),
-                        input: String::new(),
-                        output: Some(tool_output(output)),
-                    });
-                    return Some(self.blocks.len() - 1);
+                if let Some(index) = self.fill_open_tool(Some(tool), output) {
+                    return Some(index);
                 }
-                // `fill_open_tool` filled a block inside the trailing run; a
-                // run renders as one card, so any index inside it identifies
-                // the same card.
-                let start = self
-                    .blocks
-                    .iter()
-                    .rposition(|b| !matches!(b, Block::Tool { .. }))
-                    .map_or(0, |i| i + 1);
-                (start..self.blocks.len())
-                    .find(|&i| {
-                        matches!(
-                            &self.blocks[i],
-                            Block::Tool {
-                                output: Some(_),
-                                ..
-                            }
-                        )
-                    })
-                    .or(Some(self.blocks.len() - 1))
+                self.blocks.push(Block::Tool {
+                    tool: tool.clone(),
+                    input: String::new(),
+                    output: Some(tool_output(output)),
+                });
+                Some(self.blocks.len() - 1)
             }
             AgentEvent::Finish { response: _ } => {
                 self.end_thought();
@@ -217,6 +201,13 @@ impl SessionModel {
             AgentEvent::Error { error } => {
                 self.end_thought();
                 self.blocks.push(Block::Error(error.clone()));
+                Some(self.blocks.len() - 1)
+            }
+            AgentEvent::Steered { text } => {
+                // A user message injected mid-run renders like any other
+                // user turn, at the point of the transcript where it landed.
+                self.end_thought();
+                self.blocks.push(Block::User(text.clone()));
                 Some(self.blocks.len() - 1)
             }
         }
@@ -271,7 +262,9 @@ impl SessionModel {
     pub fn apply_message(&mut self, message: &Message) {
         match message {
             Message::System { .. } => {}
-            Message::Compaction { summary, .. } => self.blocks.push(Block::Compaction { summary: summary.clone() }),
+            Message::Compaction { summary, .. } => self.blocks.push(Block::Compaction {
+                summary: summary.clone(),
+            }),
             Message::User { content } => {
                 let text = parts_text(content);
                 if !text.is_empty() {
@@ -318,7 +311,7 @@ impl SessionModel {
                     }
                     output.push_str(&media_text);
                 }
-                if !self.fill_open_tool(tool_name.as_deref(), &output) {
+                if self.fill_open_tool(tool_name.as_deref(), &output).is_none() {
                     self.blocks.push(Block::Tool {
                         tool: tool_name.clone().unwrap_or_else(|| "tool".to_string()),
                         input: String::new(),
@@ -340,16 +333,18 @@ impl SessionModel {
         }
     }
 
-    /// Fill the first still-open tool block (within the trailing run of tool
-    /// blocks) so historical tool results line up with their calls.
-    fn fill_open_tool(&mut self, tool_name: Option<&str>, output: &str) -> bool {
-        let start = self
-            .blocks
-            .iter()
-            .rposition(|b| !matches!(b, Block::Tool { .. }))
-            .map_or(0, |i| i + 1);
+    /// Fill the first still-open tool block matching the name (FIFO, with
+    /// an any-name fallback) so tool results line up with their calls.
+    ///
+    /// The search spans the whole transcript, not just the trailing run of
+    /// tool blocks: a steered user message can be inserted while a tool is
+    /// still running, splitting the run — the finish must still land in the
+    /// original block instead of duplicating it below the message. Safe
+    /// because completed tools are skipped and results arrive in start
+    /// order. Returns the filled block's index.
+    fn fill_open_tool(&mut self, tool_name: Option<&str>, output: &str) -> Option<usize> {
         let mut fallback = None;
-        for i in start..self.blocks.len() {
+        for i in 0..self.blocks.len() {
             if let Block::Tool {
                 tool, output: out, ..
             } = &mut self.blocks[i]
@@ -362,17 +357,18 @@ impl SessionModel {
                 }
                 if tool_name.is_none_or(|name| name == tool) {
                     *out = Some(tool_output(output));
-                    return true;
+                    return Some(i);
                 }
             }
         }
-        if let Some(i) = fallback
-            && let Block::Tool { output: out, .. } = &mut self.blocks[i]
-        {
-            *out = Some(tool_output(output));
-            return true;
-        }
-        false
+        fallback.and_then(|i| {
+            if let Block::Tool { output: out, .. } = &mut self.blocks[i] {
+                *out = Some(tool_output(output));
+                Some(i)
+            } else {
+                None
+            }
+        })
     }
 
     // -- lifecycle ----------------------------------------------------------
@@ -452,6 +448,12 @@ pub fn summarize_tool_input(tool: &str, input: &str) -> String {
             .get("url")
             .and_then(|u| u.as_str())
             .map(str::to_string),
+        // The GUI renders the workflow graph from the spec, so keep it whole.
+        "workflow_start" => value.get("spec").map(|spec| spec.to_string()),
+        "workflow_status" | "workflow_wait" | "workflow_cancel" => value
+            .get("run_id")
+            .and_then(|id| id.as_str())
+            .map(str::to_string),
         _ => None,
     };
     summary.unwrap_or_else(|| truncate(&value.to_string(), 80))
@@ -476,24 +478,48 @@ mod tests {
     #[test]
     fn compaction_live_and_reloaded_summaries_match_without_recent_context() {
         let mut live = SessionModel::default();
-        live.apply_event(&AgentEvent::Status { message: "Compacting context…".into() });
+        live.apply_event(&AgentEvent::Status {
+            message: "Compacting context…".into(),
+        });
         assert!(live.status.is_some());
-        assert_eq!(live.apply_event(&AgentEvent::Compacted { summary: "summary".into() }), Some(0));
+        assert_eq!(
+            live.apply_event(&AgentEvent::Compacted {
+                summary: "summary".into()
+            }),
+            Some(0)
+        );
         assert!(live.status.is_none());
         let mut loaded = SessionModel::default();
-        loaded.apply_message(&Message::Compaction { summary: "summary".into(), recent: "serialized context".into() });
+        loaded.apply_message(&Message::Compaction {
+            summary: "summary".into(),
+            recent: "serialized context".into(),
+        });
         assert_eq!(live.blocks, loaded.blocks);
-        assert_eq!(live.blocks, vec![Block::Compaction { summary: "summary".into() }]);
+        assert_eq!(
+            live.blocks,
+            vec![Block::Compaction {
+                summary: "summary".into()
+            }]
+        );
         assert_eq!(live.blocks[0].text(), "summary");
     }
 
     #[test]
     fn failed_compaction_clears_status_without_success_marker() {
         let mut model = SessionModel::default();
-        model.apply_event(&AgentEvent::Status { message: "Compacting context…".into() });
-        model.apply_event(&AgentEvent::Error { error: "summary failed".into() });
+        model.apply_event(&AgentEvent::Status {
+            message: "Compacting context…".into(),
+        });
+        model.apply_event(&AgentEvent::Error {
+            error: "summary failed".into(),
+        });
         assert!(model.status.is_none());
-        assert!(!model.blocks.iter().any(|block| matches!(block, Block::Compaction { .. })));
+        assert!(
+            !model
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Compaction { .. }))
+        );
     }
     use super::*;
     use gewu_protocol::FunctionCall;
@@ -561,6 +587,87 @@ mod tests {
                 output: Some("file.rs".into()),
             }]
         );
+    }
+
+    #[test]
+    fn tool_finish_fills_across_a_steered_user_block() {
+        // The steer inserts a user block after the still-running tool, so
+        // the tool being finished is no longer in the trailing run. Its
+        // output must land in the original block, not in a duplicate.
+        let mut m = model();
+        let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: "call_ls".into(),
+            tool: "bash".into(),
+            input: r#"{"command":"ls"}"#.into(),
+        });
+        let _ = m.apply_event(&AgentEvent::Steered {
+            text: "focus on tests".into(),
+        });
+        let affected = m.apply_event(&AgentEvent::ToolFinish {
+            call_id: "call_ls".into(),
+            tool: "bash".into(),
+            title: String::new(),
+            output: "file.rs".into(),
+            metadata: Default::default(),
+        });
+        // The filled block is the original tool block, right below the
+        // steered message; nothing else was appended.
+        assert_eq!(affected, Some(0));
+        assert_eq!(m.blocks.len(), 2);
+        assert_eq!(
+            m.blocks[0],
+            Block::Tool {
+                tool: "bash".into(),
+                input: "ls".into(),
+                output: Some("file.rs".into()),
+            }
+        );
+        assert!(matches!(m.blocks[1], Block::User(_)));
+    }
+
+    #[test]
+    fn parallel_tool_finishes_fill_in_order_across_a_steer() {
+        let mut m = model();
+        for index in 0..2 {
+            let _ = m.apply_event(&AgentEvent::ToolStart {
+                call_id: format!("call_{index}"),
+                tool: "bash".into(),
+                input: "{}".into(),
+            });
+        }
+        let _ = m.apply_event(&AgentEvent::Steered { text: "go".into() });
+        assert_eq!(
+            m.apply_event(&AgentEvent::ToolFinish {
+                call_id: "call_0".into(),
+                tool: "bash".into(),
+                title: String::new(),
+                output: "first".into(),
+                metadata: Default::default(),
+            }),
+            Some(0)
+        );
+        assert_eq!(
+            m.apply_event(&AgentEvent::ToolFinish {
+                call_id: "call_1".into(),
+                tool: "bash".into(),
+                title: String::new(),
+                output: "second".into(),
+                metadata: Default::default(),
+            }),
+            Some(1)
+        );
+        // Exactly the two original tool blocks carry the outputs.
+        let outputs: Vec<Option<String>> = m
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Tool { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].as_deref(), Some("first"));
+        assert_eq!(outputs[1].as_deref(), Some("second"));
     }
 
     #[test]
@@ -662,7 +769,9 @@ mod tests {
         let first = m.apply_event(&AgentEvent::ReasoningDelta { delta: "hm".into() });
         assert_eq!(first, Some(1));
         match &m.blocks[1] {
-            Block::Thought { started, reasoning, .. } => {
+            Block::Thought {
+                started, reasoning, ..
+            } => {
                 assert!(started.is_some());
                 assert_eq!(reasoning, "hm");
             }
@@ -688,7 +797,9 @@ mod tests {
         m.apply_event(&AgentEvent::ReasoningDelta { delta: "hm".into() });
 
         // Content ends the thought and opens the assistant block.
-        let content_idx = m.apply_event(&AgentEvent::ContentDelta { delta: "answer".into() });
+        let content_idx = m.apply_event(&AgentEvent::ContentDelta {
+            delta: "answer".into(),
+        });
         assert_eq!(content_idx, Some(2));
         match &m.blocks[1] {
             Block::Thought { text, started, .. } => {
@@ -758,7 +869,9 @@ mod tests {
         m.submit("hi".into());
         m.apply_event(&AgentEvent::ReasoningDelta { delta: "hm".into() });
 
-        m.apply_event(&AgentEvent::ContentDelta { delta: "answer".into() });
+        m.apply_event(&AgentEvent::ContentDelta {
+            delta: "answer".into(),
+        });
         assert_eq!(m.take_collapsed(), Some(1));
     }
 
@@ -779,7 +892,9 @@ mod tests {
     fn no_reasoning_produces_no_thought_block() {
         let mut m = model();
         m.submit("hi".into());
-        m.apply_event(&AgentEvent::ContentDelta { delta: "plain".into() });
+        m.apply_event(&AgentEvent::ContentDelta {
+            delta: "plain".into(),
+        });
         assert_eq!(m.blocks.len(), 2);
         assert!(m.blocks.iter().all(|b| !matches!(b, Block::Thought { .. })));
     }
@@ -980,4 +1095,24 @@ mod tests {
             ]
         );
     }
+}
+
+#[test]
+fn workflow_tool_inputs_are_summarized_for_the_gui() {
+    let spec = r#"{"name":"demo","nodes":[{"id":"a","agent":"read","prompt":"p"}]}"#;
+    let start = summarize_tool_input("workflow_start", &format!(r#"{{"spec":{spec}}}"#));
+    // Keys are re-ordered (BTreeMap) but the spec must survive verbatim.
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&start).unwrap(),
+        serde_json::from_str::<serde_json::Value>(spec).unwrap()
+    );
+
+    assert_eq!(
+        summarize_tool_input("workflow_status", r#"{"run_id":"r-1"}"#),
+        "r-1"
+    );
+    assert_eq!(
+        summarize_tool_input("workflow_wait", r#"{"run_id":"r-2","wait_secs":5}"#),
+        "r-2"
+    );
 }
