@@ -334,8 +334,10 @@ impl GuiSession {
             if let Some(client) = self.client(id)
                 && let Ok(info) = client.info_for_session(&session_id).await
             {
-                if self.workspaces.is_empty() {
-                    self.workspaces = info.workspaces;
+                for workspace in info.workspaces {
+                    if !self.workspaces.iter().any(|root| root.id == workspace.id) {
+                        self.workspaces.push(workspace);
+                    }
                 }
                 if let Some(tab) = self.workspace.tab_mut(id) {
                     tab.workspace = info.active_workspace;
@@ -895,6 +897,57 @@ impl GuiSession {
                     }
                     Err(e) => self.send_error(sender, e.to_string()).await?,
                 }
+            }
+            ClientMsg::BrowseWorkspace { path } => {
+                match self.admin.browse_workspace(path).await {
+                    Ok((path, parent, entries)) => {
+                        send_msg(
+                            sender,
+                            &ServerMsg::WorkspaceBrowser {
+                                html: view::workspace_browser_html(
+                                    &path,
+                                    parent.as_deref(),
+                                    &entries,
+                                ),
+                            },
+                        )
+                        .await?;
+                    }
+                    Err(e) => self.send_error(sender, format!("could not browse directory: {e}"))
+                        .await?,
+                }
+            }
+            ClientMsg::AddWorkspace { tab, path } => {
+                if self.workspace.tab(tab).is_none_or(|tab| tab.busy()) {
+                    return self
+                        .send_error(sender, "wait for the current turn to finish")
+                        .await;
+                }
+                if let Err(e) = self.ensure_client(tab).await {
+                    return self.send_error(sender, e.to_string()).await;
+                }
+                let client = self.client(tab).expect("ensured");
+                match client.add_workspace(path).await {
+                    Ok((session_id, workspace)) => {
+                        if !self.workspaces.iter().any(|root| root.id == workspace.id) {
+                            self.workspaces.push(workspace.clone());
+                        }
+                        let tab_state = self.workspace.tab_mut(tab).expect("known tab");
+                        tab_state.workspace = workspace.id;
+                        tab_state.model.set_session(Some(session_id));
+                        if self.workspace.active_id() == tab {
+                            self.expanded_dirs.clear();
+                            self.file_cache.clear();
+                            send_msg(sender, &ServerMsg::CloseWorkspaceBrowser).await?;
+                            self.send_active_full(sender).await?;
+                            self.send_refreshed_tree(sender).await?;
+                        }
+                    }
+                    Err(e) => self.send_error(sender, format!("could not add directory: {e}")).await?,
+                }
+            }
+            ClientMsg::CloseWorkspaceBrowser => {
+                send_msg(sender, &ServerMsg::CloseWorkspaceBrowser).await?;
             }
             // Auth is consumed by the transport before the session starts.
             ClientMsg::Auth { .. } => {}

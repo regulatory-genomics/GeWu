@@ -32,7 +32,7 @@ use futures::{SinkExt, StreamExt};
 use gewu_core::ToolRegistry;
 use gewu_core::types::{AgentEvent, Message, PathEnforcement};
 pub use gewu_protocol as protocol;
-use gewu_protocol::{FileEntry, WorkspaceSummary};
+use gewu_protocol::{DirectoryEntry, FileEntry, WorkspaceSummary};
 use registry::create_agent;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -373,15 +373,79 @@ impl ServerState {
     }
 
     fn workspace(&self, id: &str) -> Result<WorkspaceSummary> {
-        let path = self
-            .bootstrap
-            .workspace_roots
-            .get(id)
-            .ok_or_else(|| anyhow::anyhow!("unknown workspace '{id}'"))?;
+        if let Some(path) = self.bootstrap.workspace_roots.get(id) {
+            return Ok(WorkspaceSummary {
+                id: id.to_string(),
+                path: path.to_string_lossy().to_string(),
+            });
+        }
+        let Some(path) = id.strip_prefix("runtime:") else {
+            anyhow::bail!("unknown workspace '{id}'")
+        };
+        let path = std::fs::canonicalize(path)
+            .with_context(|| format!("cannot resolve runtime workspace '{path}'"))?;
+        anyhow::ensure!(path.is_dir(), "workspace is not a directory: {}", path.display());
         Ok(WorkspaceSummary {
             id: id.to_string(),
             path: path.to_string_lossy().to_string(),
         })
+    }
+
+    fn workspace_for_path(&self, path: impl AsRef<std::path::Path>) -> Result<WorkspaceSummary> {
+        let path = std::fs::canonicalize(path.as_ref())
+            .with_context(|| format!("cannot resolve directory: {}", path.as_ref().display()))?;
+        anyhow::ensure!(path.is_dir(), "path is not a directory: {}", path.display());
+        if let Some((id, _)) = self
+            .bootstrap
+            .workspace_roots
+            .iter()
+            .find(|(_, root)| root.as_path() == path.as_path())
+        {
+            return self.workspace(id);
+        }
+        Ok(WorkspaceSummary {
+            id: format!("runtime:{}", path.display()),
+            path: path.to_string_lossy().to_string(),
+        })
+    }
+
+    fn browse_workspace(&self, requested: &str) -> Result<(String, Option<String>, Vec<DirectoryEntry>)> {
+        let cwd = self
+            .bootstrap
+            .workspace_roots
+            .get("cwd")
+            .expect("cwd workspace is always configured");
+        let requested_path = if requested.trim().is_empty() {
+            cwd.clone()
+        } else {
+            let path = std::path::PathBuf::from(requested);
+            if path.is_absolute() { path } else { cwd.join(path) }
+        };
+        let directory = std::fs::canonicalize(&requested_path)
+            .with_context(|| format!("cannot resolve directory: {}", requested_path.display()))?;
+        anyhow::ensure!(directory.is_dir(), "path is not a directory: {}", directory.display());
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&directory)
+            .with_context(|| format!("cannot list directory: {}", directory.display()))?
+        {
+            let entry = entry?;
+            let metadata = std::fs::symlink_metadata(entry.path())
+                .with_context(|| format!("cannot inspect entry: {}", entry.path().display()))?;
+            if !metadata.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            entries.push(DirectoryEntry {
+                name,
+                path: path.to_string_lossy().to_string(),
+            });
+        }
+        entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        let parent = directory.parent().map(|path| path.to_string_lossy().to_string());
+        Ok((directory.to_string_lossy().to_string(), parent, entries))
     }
 
     /// Get or create the per-connection session.
@@ -893,6 +957,70 @@ async fn handle_request(
             state.busy_sessions.lock().await.remove(&current.session_id);
             result
         }
+        Op::BrowseWorkspace { path } => {
+            let (path, parent, entries) = state
+                .browse_workspace(&path)
+                .map_err(|e| RequestError::Invalid(e.to_string()))?;
+            Ok(Handled::Reply(ServerMessage::Directories {
+                id: request.id,
+                path,
+                parent,
+                entries,
+            }))
+        }
+        Op::AddWorkspace { path } => {
+            if running.is_some() {
+                return Err(RequestError::Failed(
+                    "cannot add a workspace while a turn is running".into(),
+                ));
+            }
+            let current = state
+                .get_or_create_session(session, request.session_id, None)
+                .await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            if !state.claim_session(&current.session_id).await {
+                return Err(RequestError::Failed(
+                    "session is busy on another connection".into(),
+                ));
+            }
+            let result = match state.workspace_for_path(path) {
+                Ok(workspace) => {
+                    if let Err(error) = gewu_storage::set_session_workspace(
+                        &state.bootstrap.pool,
+                        &current.session_id,
+                        &workspace.id,
+                    )
+                    .await
+                    {
+                        Err(RequestError::Failed(error.to_string()))
+                    } else {
+                        current
+                            .agent
+                            .lock()
+                            .await
+                            .set_working_directory(std::path::PathBuf::from(&workspace.path));
+                        let replacement = ConnectionSession {
+                            workspace: workspace.clone(),
+                            ..current.clone()
+                        };
+                        *session = Some(replacement.clone());
+                        state
+                            .sessions
+                            .lock()
+                            .await
+                            .insert(current.session_id.clone(), replacement);
+                        Ok(Handled::Reply(ServerMessage::WorkspaceAdded {
+                            id: request.id,
+                            session_id: current.session_id.clone(),
+                            workspace,
+                        }))
+                    }
+                }
+                Err(error) => Err(RequestError::Invalid(error.to_string())),
+            };
+            state.busy_sessions.lock().await.remove(&current.session_id);
+            result
+        }
         Op::SwitchWorkspace { workspace: target } => {
             if running.is_some() {
                 return Err(RequestError::Failed(
@@ -1037,12 +1165,16 @@ async fn handle_request(
             } else {
                 state.workspace("cwd").map_err(|e| RequestError::Failed(e.to_string()))?
             };
+            let mut workspaces = state.workspace_summaries();
+            if !workspaces.iter().any(|workspace| workspace.id == active.id) {
+                workspaces.push(active.clone());
+            }
             Ok(Handled::Reply(ServerMessage::Info {
                 id: request.id,
                 model: state.bootstrap.model.clone(),
                 provider: state.bootstrap.provider_name.clone(),
                 working_directory: active.path.clone(),
-                workspaces: state.workspace_summaries(),
+                workspaces,
                 active_workspace: active.id,
             }))
         }
@@ -3345,6 +3477,47 @@ mod tests {
             Handled::Reply(ServerMessage::FileContent { ref content, .. })
                 if content == "frontend root"
         ));
+    }
+
+    #[tokio::test]
+    async fn adding_runtime_workspace_selects_and_persists_it() {
+        let cwd = tempfile::tempdir().unwrap();
+        let added = tempfile::tempdir().unwrap();
+        let mut state = server_state_with(TestLlm::plain());
+        {
+            let bootstrap = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            bootstrap.working_directory = cwd.path().to_string_lossy().to_string();
+            bootstrap.workspace_roots = Arc::new(BTreeMap::from([(
+                "cwd".into(),
+                cwd.path().to_path_buf(),
+            )]));
+        }
+        let mut session = None;
+        let mut running = None;
+        let result = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::add_workspace(1, added.path().to_string_lossy().to_string()),
+        )
+        .await
+        .unwrap();
+        let workspace = match result {
+            Handled::Reply(ServerMessage::WorkspaceAdded { workspace, .. }) => workspace,
+            _ => panic!("expected workspace_added"),
+        };
+        assert!(workspace.id.starts_with("runtime:"));
+        assert_eq!(workspace.path, added.path().canonicalize().unwrap().to_string_lossy());
+        assert_eq!(
+            gewu_storage::session_workspace(
+                &state.bootstrap.pool,
+                &session.as_ref().unwrap().session_id,
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some(workspace.id.as_str())
+        );
     }
 
     #[tokio::test]

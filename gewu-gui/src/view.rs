@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use gewu_client::session::{Block, Phase};
-use gewu_protocol::{FileEntry, ModelSummary, WorkspaceSummary};
+use gewu_protocol::{DirectoryEntry, FileEntry, ModelSummary, WorkspaceSummary};
 use math_core::{LatexToMathML, MathCoreConfig, MathDisplay};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 
@@ -939,7 +939,7 @@ pub fn file_tree_with_workspaces_html(
         "<div class=\"tree-toolbar\"><p class=\"tree-root\" title=\"{}\">{}</p>{}<span class=\"tree-actions\"><button class=\"tree-upload\" type=\"button\" data-tree-upload title=\"Upload files\" aria-label=\"Upload files\">⬆</button><button class=\"tree-refresh\" type=\"button\" data-tree-refresh title=\"Refresh files\" aria-label=\"Refresh files\">↻</button></span></div><ul class=\"tree-list\">",
         escape(root_label),
         escape(root_label),
-        workspace_selector_html(workspaces, active_workspace)
+        workspace_selector_html(root_label, workspaces, active_workspace)
     );
     if let Some(entries) = cache.get("") {
         for entry in entries {
@@ -952,22 +952,85 @@ pub fn file_tree_with_workspaces_html(
     out
 }
 
-fn workspace_selector_html(workspaces: &[WorkspaceSummary], active: &str) -> String {
-    if workspaces.len() <= 1 {
-        return String::new();
+fn workspace_selector_html(
+    root: &str,
+    workspaces: &[WorkspaceSummary],
+    active: &str,
+) -> String {
+    let mut out = String::new();
+    if workspaces.len() > 1 {
+        out.push_str("<label class=\"workspace-picker\"><span>ROOT</span><select data-workspace-select>");
+        for workspace in workspaces {
+            let selected = if workspace.id == active { " selected" } else { "" };
+            let label = workspace_label(workspace);
+            let _ = write!(
+                out,
+                "<option value=\"{}\"{}>{}</option>",
+                escape(&workspace.id),
+                selected,
+                escape(&label)
+            );
+        }
+        out.push_str("</select></label>");
     }
-    let mut out = String::from("<label class=\"workspace-picker\"><span>ROOT</span><select data-workspace-select>");
-    for workspace in workspaces {
-        let selected = if workspace.id == active { " selected" } else { "" };
+    let _ = write!(
+        out,
+        "<button type=\"button\" class=\"workspace-add\" data-workspace-add data-workspace-browse-path=\"{}\" title=\"Add a server directory\" aria-label=\"Add a server directory\">＋</button>",
+        escape(root)
+    );
+    out
+}
+
+fn workspace_label(workspace: &WorkspaceSummary) -> String {
+    if workspace.id.starts_with("runtime:") {
+        std::path::Path::new(&workspace.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&workspace.id)
+            .to_string()
+    } else {
+        workspace.id.clone()
+    }
+}
+
+pub fn workspace_browser_html(
+    path: &str,
+    parent: Option<&str>,
+    entries: &[DirectoryEntry],
+) -> String {
+    let mut out = String::from(
+        "<section id=\"workspace-browser\" class=\"workspace-browser\" role=\"dialog\" aria-label=\"Choose workspace directory\"><div class=\"workspace-browser-card\"><header><strong>Choose server directory</strong><button type=\"button\" data-workspace-browser-close aria-label=\"Close\">×</button></header>",
+    );
+    let _ = write!(
+        out,
+        "<p class=\"workspace-browser-path\" title=\"{}\">{}</p><div class=\"workspace-browser-actions\">",
+        escape(path),
+        escape(path)
+    );
+    if let Some(parent) = parent {
         let _ = write!(
             out,
-            "<option value=\"{}\"{}>{}</option>",
-            escape(&workspace.id),
-            selected,
-            escape(&workspace.id)
+            "<button type=\"button\" data-workspace-browse-path=\"{}\">← parent</button>",
+            escape(parent)
         );
     }
-    out.push_str("</select></label>");
+    let _ = write!(
+        out,
+        "<button type=\"button\" data-workspace-add-path=\"{}\">Use this directory</button></div><ul class=\"workspace-browser-list\">",
+        escape(path)
+    );
+    for entry in entries {
+        let _ = write!(
+            out,
+            "<li><button type=\"button\" data-workspace-browse-path=\"{}\">📁 {}</button></li>",
+            escape(&entry.path),
+            escape(&entry.name)
+        );
+    }
+    if entries.is_empty() {
+        out.push_str("<li class=\"workspace-browser-empty\">No child directories</li>");
+    }
+    out.push_str("</ul></div></section>");
     out
 }
 
@@ -1222,6 +1285,32 @@ mod tests {
         );
         assert!(html.contains("data-workspace-select"), "{html}");
         assert!(html.contains("value=\"frontend\" selected"), "{html}");
+    }
+
+    #[test]
+    fn workspace_toolbar_always_has_add_directory_action() {
+        let html = file_tree_with_workspaces_html(
+            Some("/tmp/project"),
+            &[],
+            "cwd",
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert!(html.contains("data-workspace-add"), "{html}");
+    }
+
+    #[test]
+    fn workspace_browser_renders_server_directory_choices() {
+        let html = workspace_browser_html(
+            "/tmp",
+            Some("/"),
+            &[DirectoryEntry {
+                name: "project".into(),
+                path: "/tmp/project".into(),
+            }],
+        );
+        assert!(html.contains("data-workspace-browse-path=\"/tmp/project\""), "{html}");
+        assert!(html.contains("data-workspace-add-path=\"/tmp\""), "{html}");
     }
 
     #[test]

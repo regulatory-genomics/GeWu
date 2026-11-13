@@ -285,6 +285,14 @@
         const tree = document.getElementById("file-tree");
         if (tree) tree.outerHTML = message.html;
         break;
+      case "workspace_browser": {
+        document.getElementById("workspace-browser")?.remove();
+        if (message.html) el.app.insertAdjacentHTML("beforeend", message.html);
+        break;
+      }
+      case "close_workspace_browser":
+        document.getElementById("workspace-browser")?.remove();
+        break;
       case "tools": {
         const panel = document.getElementById("sidebar-tools");
         if (panel) panel.innerHTML = message.html;
@@ -681,6 +689,14 @@
     if (dir) { send({ op: "toggle_dir", path: dir.dataset.path }); return; }
     const file = event.target.closest("[data-path].tree-file");
     if (file) { send({ op: "read_file", path: file.dataset.path }); return; }
+    const addWorkspace = event.target.closest("[data-workspace-add]");
+    if (addWorkspace) {
+      send({
+        op: "browse_workspace",
+        path: addWorkspace.dataset.workspaceBrowsePath || "",
+      });
+      return;
+    }
     if (event.target.closest("[data-tree-upload]")) {
       el.fileUpload.click();
       return;
@@ -750,6 +766,23 @@
       return;
     }
     uploadFiles(event.dataTransfer.files);
+  });
+
+  el.app.addEventListener("click", (event) => {
+    const close = event.target.closest("[data-workspace-browser-close]");
+    if (close) {
+      send({ op: "close_workspace_browser" });
+      return;
+    }
+    const add = event.target.closest("[data-workspace-add-path]");
+    if (add) {
+      send({ op: "add_workspace", tab: state.active, path: add.dataset.workspaceAddPath });
+      return;
+    }
+    const browse = event.target.closest("[data-workspace-browse-path]");
+    if (browse) {
+      send({ op: "browse_workspace", path: browse.dataset.workspaceBrowsePath });
+    }
   });
 
   function setSidebarTab(name) {

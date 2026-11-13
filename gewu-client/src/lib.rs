@@ -47,7 +47,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use gewu_protocol::{
-    ClientRequest, FileEntry, Message, ServerMessage, SessionSummary, TokenUsage,
+    ClientRequest, DirectoryEntry, FileEntry, Message, ServerMessage, SessionSummary, TokenUsage,
     WorkspaceSummary,
 };
 use inner::Command;
@@ -232,6 +232,41 @@ impl Client {
             } => Ok((session_id, workspace)),
             ServerMessage::Error { error, .. } => Err(Error::Server(error)),
             other => Err(unexpected(other, "workspace_switched")),
+        }
+    }
+
+    /// Browse direct directories on the GeWu server host.
+    pub async fn browse_workspace(
+        &self,
+        path: impl Into<String>,
+    ) -> Result<(String, Option<String>, Vec<DirectoryEntry>)> {
+        let request = ClientRequest::browse_workspace(self.next_correlation_id(), path);
+        match self.request(request).await? {
+            ServerMessage::Directories {
+                path,
+                parent,
+                entries,
+                ..
+            } => Ok((path, parent, entries)),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "directories")),
+        }
+    }
+
+    /// Add and select a server-host directory for this session.
+    pub async fn add_workspace(
+        &self,
+        path: impl Into<String>,
+    ) -> Result<(String, WorkspaceSummary)> {
+        let request = ClientRequest::add_workspace(self.next_correlation_id(), path);
+        match self.request(request).await? {
+            ServerMessage::WorkspaceAdded {
+                session_id,
+                workspace,
+                ..
+            } => Ok((session_id, workspace)),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "workspace_added")),
         }
     }
     /// Connect over TCP (newline-delimited JSON; the server listens on

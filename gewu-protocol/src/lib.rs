@@ -110,6 +110,14 @@ pub enum Op {
     SwitchWorkspace {
         workspace: String,
     },
+    /// Browse direct child directories on the GeWu server host.
+    BrowseWorkspace {
+        path: String,
+    },
+    /// Add and select a server-host directory for the current session.
+    AddWorkspace {
+        path: String,
+    },
     /// List persisted conversation sessions, newest first.
     ListSessions,
     /// Load one persisted session's messages. The session id is carried in
@@ -163,7 +171,11 @@ impl Serialize for ClientRequest {
             }
             + (matches!(
                 self.op,
-                Op::SwitchAgent { .. } | Op::SwitchModel { .. } | Op::SwitchWorkspace { .. }
+                Op::SwitchAgent { .. }
+                    | Op::SwitchModel { .. }
+                    | Op::SwitchWorkspace { .. }
+                    | Op::BrowseWorkspace { .. }
+                    | Op::AddWorkspace { .. }
             )) as usize
             + self.agent.is_some() as usize
             + matches!(
@@ -172,6 +184,8 @@ impl Serialize for ClientRequest {
                     | Op::Auth { .. }
                     | Op::Steer { .. }
                     | Op::SwitchWorkspace { .. }
+                    | Op::BrowseWorkspace { .. }
+                    | Op::AddWorkspace { .. }
                     | Op::ListFiles { .. }
                     | Op::ReadFile { .. }
                     | Op::WriteFile { .. }
@@ -195,6 +209,14 @@ impl Serialize for ClientRequest {
             Op::SwitchWorkspace { workspace } => {
                 map.serialize_entry("op", "switch_workspace")?;
                 map.serialize_entry("workspace", workspace)?;
+            }
+            Op::BrowseWorkspace { path } => {
+                map.serialize_entry("op", "browse_workspace")?;
+                map.serialize_entry("path", path)?;
+            }
+            Op::AddWorkspace { path } => {
+                map.serialize_entry("op", "add_workspace")?;
+                map.serialize_entry("path", path)?;
             }
             Op::Ask { prompt } => {
                 map.serialize_entry("op", "ask")?;
@@ -274,6 +296,15 @@ impl ClientRequest {
                 workspace: workspace.into(),
             },
         )
+    }
+    pub fn browse_workspace(id: impl Into<Value>, path: impl Into<String>) -> Self {
+        Self::simple(
+            id,
+            Op::BrowseWorkspace { path: path.into() },
+        )
+    }
+    pub fn add_workspace(id: impl Into<Value>, path: impl Into<String>) -> Self {
+        Self::simple(id, Op::AddWorkspace { path: path.into() })
     }
     /// Build an `ask` request.
     pub fn ask(id: impl Into<Value>, prompt: impl Into<String>) -> Self {
@@ -511,6 +542,20 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
                 .ok_or_else(|| RequestError::Invalid("switch_workspace requires workspace".into()))?
                 .to_string(),
         },
+        "browse_workspace" => Op::BrowseWorkspace {
+            path: obj
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RequestError::Invalid("browse_workspace requires path".into()))?
+                .to_string(),
+        },
+        "add_workspace" => Op::AddWorkspace {
+            path: obj
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RequestError::Invalid("add_workspace requires path".into()))?
+                .to_string(),
+        },
         "ask" => {
             let prompt = obj
                 .get("prompt")
@@ -672,6 +717,12 @@ pub struct WorkspaceSummary {
     pub path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub path: String,
+}
+
 /// One switchable model in the server's catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelSummary {
@@ -717,6 +768,19 @@ pub enum ServerMessage {
     },
     /// Reply after changing the session's active filesystem root.
     WorkspaceSwitched {
+        id: Value,
+        session_id: String,
+        workspace: WorkspaceSummary,
+    },
+    /// Direct child directories on the GeWu server host.
+    Directories {
+        id: Value,
+        path: String,
+        parent: Option<String>,
+        entries: Vec<DirectoryEntry>,
+    },
+    /// A runtime directory was added and selected for a session.
+    WorkspaceAdded {
         id: Value,
         session_id: String,
         workspace: WorkspaceSummary,
@@ -922,6 +986,8 @@ impl ServerMessage {
             ServerMessage::AgentSwitched { .. } => "agent_switched",
             ServerMessage::ModelSwitched { .. } => "model_switched",
             ServerMessage::WorkspaceSwitched { .. } => "workspace_switched",
+            ServerMessage::Directories { .. } => "directories",
+            ServerMessage::WorkspaceAdded { .. } => "workspace_added",
             ServerMessage::Ready { .. } => "ready",
             ServerMessage::Event { .. } => "event",
             ServerMessage::Result { .. } => "result",
@@ -953,6 +1019,8 @@ impl ServerMessage {
             ServerMessage::AgentSwitched { id, .. } => Some(id),
             ServerMessage::ModelSwitched { id, .. } => Some(id),
             ServerMessage::WorkspaceSwitched { id, .. } => Some(id),
+            ServerMessage::Directories { id, .. } => Some(id),
+            ServerMessage::WorkspaceAdded { id, .. } => Some(id),
             ServerMessage::Ready { id, .. }
             | ServerMessage::Pong { id }
             | ServerMessage::Info { id, .. }
@@ -1163,6 +1231,26 @@ mod tests {
                 .with_session("s1")
                 .to_line(),
             r#"{"id":"a","op":"switch_workspace","workspace":"frontend","session_id":"s1"}"#
+        );
+    }
+
+    #[test]
+    fn runtime_workspace_requests_round_trip() {
+        let browse = parse_request(
+            r#"{"id":"a","op":"browse_workspace","path":"/tmp"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            browse.op,
+            Op::BrowseWorkspace {
+                path: "/tmp".into()
+            }
+        );
+        assert_eq!(
+            ClientRequest::add_workspace("b", "/tmp/project")
+                .with_session("s1")
+                .to_line(),
+            r#"{"id":"b","op":"add_workspace","path":"/tmp/project","session_id":"s1"}"#
         );
     }
 

@@ -39,6 +39,17 @@ pub enum ClientMsg {
         tab: u64,
         workspace: String,
     },
+    /// Browse server-side directories for the runtime workspace picker.
+    BrowseWorkspace {
+        path: String,
+    },
+    /// Add and select a server-side directory for a tab.
+    AddWorkspace {
+        tab: u64,
+        path: String,
+    },
+    /// Close the runtime workspace picker.
+    CloseWorkspaceBrowser,
     /// First message when the GUI requires a token.
     Auth {
         token: String,
@@ -148,6 +159,10 @@ pub enum ServerMsg {
     Notice { message: String },
     /// Replace the rendered file tree.
     FileTree { html: String },
+    /// Show or replace the server-side workspace browser.
+    WorkspaceBrowser { html: String },
+    /// Close the server-side workspace browser.
+    CloseWorkspaceBrowser,
     /// Show the requested file preview.
     FilePreview { html: String },
     /// Close the file preview overlay.
