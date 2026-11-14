@@ -46,6 +46,17 @@ checksum, and the new version takes effect on the next launch. Set
 `GEWU_NO_UPDATE_CHECK=1` or pass `--no-update-check` to disable the startup
 check.
 
+## Build and test
+
+`rust-toolchain.toml` pins Rust 1.96.0, required by the GUI math renderer.
+
+```bash
+cargo test --workspace
+```
+
+This includes client/server transport tests and the run lifecycle regressions
+(cancellation, deadlines, tool-call budgets and resumable tool history).
+
 ## Configure
 
 GeWu needs one LLM endpoint. Either export credentials:
