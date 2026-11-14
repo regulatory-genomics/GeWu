@@ -423,6 +423,11 @@ impl GuiSession {
                 &self.expanded_dirs,
                 &self.file_cache,
             ),
+            session_sidebar: view::session_sidebar_html(
+                &self.workspace.infos(),
+                &self.workspaces,
+                active,
+            ),
         }
     }
 
@@ -443,6 +448,17 @@ impl GuiSession {
             &ServerMsg::Tabs {
                 tabs: self.workspace.infos(),
                 active: self.workspace.active_id(),
+            },
+        )
+        .await?;
+        send_msg(
+            sender,
+            &ServerMsg::SessionSidebar {
+                html: view::session_sidebar_html(
+                    &self.workspace.infos(),
+                    &self.workspaces,
+                    self.workspace.active_id(),
+                ),
             },
         )
         .await?;

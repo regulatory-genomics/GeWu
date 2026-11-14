@@ -30,6 +30,7 @@
     loginError: document.getElementById("login-error"),
     token: document.getElementById("token"),
     sidebar: document.getElementById("sidebar"),
+    sessionSidebar: document.getElementById("session-sidebar"),
     sidebarToggle: document.getElementById("sidebar-toggle"),
     filePreview: document.getElementById("file-preview"),
   };
@@ -241,6 +242,7 @@
         setTranscript(message.transcript, true);
         setStatus(message.status);
         el.sidebar.innerHTML = message.sidebar || "";
+        el.sessionSidebar.innerHTML = message.session_sidebar || "";
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
         break;
       case "tabs": {
@@ -253,6 +255,9 @@
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
         break;
       }
+      case "session_sidebar":
+        el.sessionSidebar.innerHTML = message.html || "";
+        break;
       case "transcript":
         setTranscript(message.html, false);
         break;
@@ -626,6 +631,29 @@
     const tab = event.target.closest("[data-tab]");
     if (tab) {
       const id = Number(tab.dataset.tab);
+      if (id !== state.active) send({ op: "switch_tab", tab: id });
+    }
+  });
+
+  el.sessionSidebar.addEventListener("click", (event) => {
+    const close = event.target.closest("[data-session-close]");
+    if (close) {
+      event.stopPropagation();
+      send({ op: "close_tab", tab: Number(close.dataset.sessionClose) });
+      return;
+    }
+    const create = event.target.closest("[data-session-new-workspace]");
+    if (create) {
+      send({
+        op: "create_tab",
+        workspace: create.dataset.sessionNewWorkspace,
+        path: create.dataset.sessionNewPath,
+      });
+      return;
+    }
+    const tab = event.target.closest("[data-session-tab]");
+    if (tab) {
+      const id = Number(tab.dataset.sessionTab);
       if (id !== state.active) send({ op: "switch_tab", tab: id });
     }
   });

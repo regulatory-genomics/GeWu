@@ -11,6 +11,7 @@ use gewu_protocol::{DirectoryEntry, FileEntry, ModelSummary, WorkspaceSummary};
 use math_core::{LatexToMathML, MathCoreConfig, MathDisplay};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 
+use crate::protocol::TabInfo;
 use crate::workspace::Tab;
 
 /// Lines of tool output shown before collapsing.
@@ -915,6 +916,69 @@ pub fn sidebar_tabs_with_workspaces_html(
     )
 }
 
+/// Render the left session manager: workspace groups with their sessions.
+pub fn session_sidebar_html(
+    tabs: &[TabInfo],
+    workspaces: &[WorkspaceSummary],
+    active: u64,
+) -> String {
+    let mut workspace_ids: Vec<String> = workspaces.iter().map(|workspace| workspace.id.clone()).collect();
+    for tab in tabs {
+        if !workspace_ids.iter().any(|id| id == &tab.workspace) {
+            workspace_ids.push(tab.workspace.clone());
+        }
+    }
+
+    let mut out = String::from(
+        "<aside class=\"session-sidebar\" aria-label=\"Sessions by workspace\"><header class=\"session-sidebar-header\"><strong>SESSIONS</strong></header><div class=\"session-workspace-groups\">",
+    );
+    for workspace_id in workspace_ids {
+        let summary = workspaces.iter().find(|workspace| workspace.id == workspace_id);
+        let path = summary
+            .map(|workspace| workspace.path.clone())
+            .unwrap_or_else(|| workspace_id.strip_prefix("runtime:").unwrap_or(&workspace_id).to_string());
+        let label = summary
+            .map(workspace_label)
+            .unwrap_or_else(|| workspace_id.clone());
+        let _ = write!(
+            out,
+            "<section class=\"session-workspace-group\"><header class=\"session-workspace-header\"><div class=\"session-workspace-heading\"><strong>{}</strong><code title=\"{}\">{}</code></div><button type=\"button\" class=\"session-new\" data-session-new-workspace=\"{}\" data-session-new-path=\"{}\" title=\"New session in {}\" aria-label=\"New session in {}\">＋</button></header><div class=\"session-list\">",
+            escape(&label),
+            escape(&path),
+            escape(&path),
+            escape(&workspace_id),
+            escape(&path),
+            escape(&label),
+            escape(&label),
+        );
+        let group_tabs: Vec<&TabInfo> = tabs
+            .iter()
+            .filter(|tab| tab.workspace == workspace_id)
+            .collect();
+        if group_tabs.is_empty() {
+            out.push_str("<p class=\"session-empty\">No sessions</p>");
+        } else {
+            for tab in group_tabs {
+                let active_class = if tab.id == active { " active" } else { "" };
+                let busy = if tab.busy { " busy" } else { "" };
+                let _ = write!(
+                    out,
+                    "<div class=\"session-row{active_class}{busy}\"><button type=\"button\" class=\"session-select\" data-session-tab=\"{}\" title=\"{}\"><span class=\"session-status\"></span><span class=\"session-label\">{}</span>{}</button><button type=\"button\" class=\"session-close\" data-session-close=\"{}\" title=\"Close session\" aria-label=\"Close {}\">×</button></div>",
+                    tab.id,
+                    escape(&tab.label),
+                    escape(&tab.label),
+                    if tab.busy { "<span class=\"session-spinner\" aria-label=\"working\"></span>" } else { "" },
+                    tab.id,
+                    escape(&tab.label),
+                );
+            }
+        }
+        out.push_str("</div></section>");
+    }
+    out.push_str("</div></aside>");
+    out
+}
+
 #[allow(dead_code)]
 pub fn file_tree_html(
     root: Option<&str>,
@@ -1167,6 +1231,7 @@ pub fn file_preview_html(path: &str, content: &str, truncated: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::TabInfo;
     use crate::workspace::Workspace;
     use gewu_protocol::AgentEvent;
     use gewu_protocol::TokenUsage;
@@ -1424,6 +1489,45 @@ mod tests {
             html.contains("data-new-session-browse-path=\"/data3/litian/projects/tachyon_project\""),
             "{html}"
         );
+    }
+
+    #[test]
+    fn session_sidebar_groups_sessions_by_workspace() {
+        let html = session_sidebar_html(
+            &[
+                TabInfo {
+                    id: 1,
+                    label: "tachyon work".into(),
+                    busy: false,
+                    session_id: Some("session-1".into()),
+                    workspace: "tachyon".into(),
+                },
+                TabInfo {
+                    id: 2,
+                    label: "wiki notes".into(),
+                    busy: true,
+                    session_id: Some("session-2".into()),
+                    workspace: "wiki".into(),
+                },
+            ],
+            &[
+                WorkspaceSummary {
+                    id: "tachyon".into(),
+                    path: "/data3/litian/projects/tachyon_project".into(),
+                },
+                WorkspaceSummary {
+                    id: "wiki".into(),
+                    path: "/data/litian/my-wiki".into(),
+                },
+            ],
+            2,
+        );
+        assert!(html.contains("class=\"session-sidebar\""), "{html}");
+        assert!(html.contains("data-session-tab=\"1\""), "{html}");
+        assert!(html.contains("data-session-tab=\"2\""), "{html}");
+        assert!(html.contains("data-session-new-workspace=\"tachyon\""), "{html}");
+        assert!(html.contains("session-row active"), "{html}");
+        assert!(html.contains("data-session-close=\"2\""), "{html}");
     }
 
     #[test]

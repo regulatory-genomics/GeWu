@@ -139,9 +139,12 @@ pub enum ServerMsg {
         transcript: String,
         status: String,
         sidebar: String,
+        session_sidebar: String,
     },
     /// Tab bar state changed (open/close/switch/busy marker).
     Tabs { tabs: Vec<TabInfo>, active: u64 },
+    /// Replace the workspace-grouped session sidebar.
+    SessionSidebar { html: String },
     /// Replace the active transcript with freshly rendered HTML.
     Transcript { html: String },
     /// Replace one tool card in the active transcript (`first` is its run's
@@ -263,10 +266,18 @@ mod tests {
             transcript: String::new(),
             status: String::new(),
             sidebar: "<section></section>".to_string(),
+            session_sidebar: "<aside></aside>".to_string(),
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "snapshot");
         assert_eq!(json["sidebar"], "<section></section>");
+        assert_eq!(json["session_sidebar"], "<aside></aside>");
+
+        let msg = ServerMsg::SessionSidebar {
+            html: "<aside class=\"session-sidebar\"></aside>".to_string(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "session_sidebar");
 
         let msg = ServerMsg::ToolCard {
             first: 4,
