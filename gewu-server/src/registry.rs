@@ -717,9 +717,8 @@ pub async fn create_agent(
         context_limit,
         agents,
         session_id,
-        ..
+        working_directory,
     } = inputs;
-    let working_directory = std::env::current_dir()?;
 
     let memory = SqliteMemory::new(pool.clone(), session_id.to_string()).await?;
 
@@ -885,6 +884,38 @@ mod tests {
         let (child, _) = factory.create("explore", None, "parent").await.unwrap();
         let error = child.execute("webfetch", serde_json::json!({"url":"http://127.0.0.1:9"}), &ToolContext::new("child", "m")).await.unwrap_err();
         assert!(error.to_string().contains("not in the allowed hosts list"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn create_agent_uses_the_profile_workspace_directory() {
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (agent, _) = create_agent(
+            test_inputs(
+                "build",
+                Arc::new(DummyLlm),
+                pool,
+                directory.path().to_path_buf(),
+                vec![],
+                vec![],
+                "workspace-test",
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        let result = agent
+            .execute(
+                "bash",
+                serde_json::json!({"command": "pwd"}),
+                &ToolContext::new("workspace-test", "message"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(result.output.trim()),
+            directory.path().canonicalize().unwrap()
+        );
     }
 
     #[tokio::test]
