@@ -1035,6 +1035,77 @@ pub fn workspace_browser_html(
     out
 }
 
+/// Render the workdir choice shown before a new session tab is created.
+pub fn session_workspace_picker_html(
+    workspaces: &[WorkspaceSummary],
+    browse_path: &str,
+) -> String {
+    let mut out = String::from(
+        "<section id=\"session-workspace-picker\" class=\"workspace-browser\" role=\"dialog\" aria-label=\"Choose workspace for new session\"><div class=\"workspace-browser-card session-picker-card\"><header><strong>New session · choose workdir</strong><button type=\"button\" data-new-session-close aria-label=\"Close\">×</button></header><p class=\"workspace-picker-note\">The session will start in the selected server directory.</p><ul class=\"workspace-browser-list session-workspace-list\">",
+    );
+    for workspace in workspaces {
+        let _ = write!(
+            out,
+            "<li><button type=\"button\" class=\"session-workspace-option\" data-new-session-create data-new-session-workspace=\"{}\" data-new-session-path=\"{}\"><span class=\"session-workspace-name\">{}</span><code>{}</code></button></li>",
+            escape(&workspace.id),
+            escape(&workspace.path),
+            escape(&workspace_label(workspace)),
+            escape(&workspace.path),
+        );
+    }
+    let _ = write!(
+        out,
+        "<li><button type=\"button\" class=\"session-workspace-browse\" data-new-session-browse-path=\"{}\">＋ Browse server directories…</button></li></ul></div></section>",
+        escape(browse_path)
+    );
+    out
+}
+
+/// Render the directory browser used by the new-session picker. Its choose
+/// buttons create a tab without creating an upstream session yet.
+pub fn new_session_browser_html(
+    path: &str,
+    parent: Option<&str>,
+    entries: &[DirectoryEntry],
+) -> String {
+    let mut out = String::from(
+        "<section id=\"session-workspace-picker\" class=\"workspace-browser\" role=\"dialog\" aria-label=\"Choose workspace for new session\"><div class=\"workspace-browser-card session-picker-card\"><header><strong>New session · choose workdir</strong><button type=\"button\" data-new-session-close aria-label=\"Close\">×</button></header>",
+    );
+    let _ = write!(
+        out,
+        "<p class=\"workspace-browser-path\" title=\"{}\">{}</p><div class=\"workspace-browser-actions\">",
+        escape(path),
+        escape(path)
+    );
+    if let Some(parent) = parent {
+        let _ = write!(
+            out,
+            "<button type=\"button\" data-new-session-browse-path=\"{}\">← parent</button>",
+            escape(parent)
+        );
+    }
+    let workspace_id = format!("runtime:{path}");
+    let _ = write!(
+        out,
+        "<button type=\"button\" data-new-session-create data-new-session-workspace=\"{}\" data-new-session-path=\"{}\">Use this directory</button></div><ul class=\"workspace-browser-list\">",
+        escape(&workspace_id),
+        escape(path)
+    );
+    for entry in entries {
+        let _ = write!(
+            out,
+            "<li><button type=\"button\" data-new-session-browse-path=\"{}\">📁 {}</button></li>",
+            escape(&entry.path),
+            escape(&entry.name)
+        );
+    }
+    if entries.is_empty() {
+        out.push_str("<li class=\"workspace-browser-empty\">No child directories</li>");
+    }
+    out.push_str("</ul></div></section>");
+    out
+}
+
 fn render_tree_entry(
     out: &mut String,
     entry: &FileEntry,
@@ -1312,6 +1383,47 @@ mod tests {
         );
         assert!(html.contains("data-workspace-browse-path=\"/tmp/project\""), "{html}");
         assert!(html.contains("data-workspace-add-path=\"/tmp\""), "{html}");
+    }
+
+    #[test]
+    fn new_session_picker_lists_workspaces_and_browse_action() {
+        let html = session_workspace_picker_html(
+            &[
+                WorkspaceSummary {
+                    id: "cwd".into(),
+                    path: "/data3/litian/projects/GeWu".into(),
+                },
+                WorkspaceSummary {
+                    id: "tachyon".into(),
+                    path: "/data3/litian/projects/tachyon_project".into(),
+                },
+            ],
+            "/data3/litian/projects/GeWu",
+        );
+        assert!(html.contains("id=\"session-workspace-picker\""), "{html}");
+        assert!(html.contains("data-new-session-workspace=\"tachyon\""), "{html}");
+        assert!(html.contains("data-new-session-browse-path"), "{html}");
+    }
+
+    #[test]
+    fn new_session_browser_selects_a_runtime_workspace() {
+        let html = new_session_browser_html(
+            "/data3/litian/projects",
+            Some("/data3/litian"),
+            &[DirectoryEntry {
+                name: "tachyon_project".into(),
+                path: "/data3/litian/projects/tachyon_project".into(),
+            }],
+        );
+        assert!(
+            html.contains("data-new-session-workspace=\"runtime:/data3/litian/projects\""),
+            "{html}"
+        );
+        assert!(html.contains("data-new-session-create"), "{html}");
+        assert!(
+            html.contains("data-new-session-browse-path=\"/data3/litian/projects/tachyon_project\""),
+            "{html}"
+        );
     }
 
     #[test]

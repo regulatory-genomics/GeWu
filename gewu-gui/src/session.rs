@@ -559,6 +559,15 @@ impl GuiSession {
     }
 
     async fn refresh_tree_cache(&mut self) -> Result<()> {
+        if self
+            .workspace
+            .tab(self.workspace.active_id())
+            .and_then(|tab| tab.model.session_id.as_ref())
+            .is_none()
+        {
+            self.file_cache.clear();
+            return Ok(());
+        }
         let client = self.file_client().await?;
         let paths: Vec<String> = std::iter::once(String::new())
             .chain(self.expanded_dirs.iter().cloned())
@@ -917,6 +926,46 @@ impl GuiSession {
                         .await?,
                 }
             }
+            ClientMsg::BrowseNewSession { path } => {
+                match self.admin.browse_workspace(path).await {
+                    Ok((path, parent, entries)) => {
+                        send_msg(
+                            sender,
+                            &ServerMsg::WorkspacePicker {
+                                html: view::new_session_browser_html(
+                                    &path,
+                                    parent.as_deref(),
+                                    &entries,
+                                ),
+                            },
+                        )
+                        .await?;
+                    }
+                    Err(e) => self
+                        .send_error(sender, format!("could not browse directory: {e}"))
+                        .await?,
+                }
+            }
+            ClientMsg::CreateTab { workspace, path } => {
+                let known = self.workspaces.iter().any(|root| root.id == workspace)
+                    || workspace.starts_with("runtime:");
+                if !known || path.trim().is_empty() {
+                    return self.send_error(sender, "invalid session workspace").await;
+                }
+                if !self.workspaces.iter().any(|root| root.id == workspace) {
+                    self.workspaces.push(WorkspaceSummary {
+                        id: workspace.clone(),
+                        path,
+                    });
+                }
+                let id = self.workspace.open_blank_in_workspace(workspace);
+                self.workspace.tab_mut(id).expect("just added").model_label = self.model_label.clone();
+                self.expanded_dirs.clear();
+                self.file_cache.clear();
+                send_msg(sender, &ServerMsg::CloseWorkspaceBrowser).await?;
+                self.send_active_full(sender).await?;
+                self.send_refreshed_tree(sender).await?;
+            }
             ClientMsg::AddWorkspace { tab, path } => {
                 if self.workspace.tab(tab).is_none_or(|tab| tab.busy()) {
                     return self
@@ -963,10 +1012,18 @@ impl GuiSession {
                 }
             }
             ClientMsg::OpenTab => {
-                let id = self.workspace.open_blank();
-                self.workspace.tab_mut(id).expect("just added").model_label =
-                    self.model_label.clone();
-                self.send_active_full(sender).await?;
+                let browse_path = self
+                    .working_directory
+                    .clone()
+                    .or_else(|| self.workspaces.first().map(|workspace| workspace.path.clone()))
+                    .unwrap_or_default();
+                send_msg(
+                    sender,
+                    &ServerMsg::WorkspacePicker {
+                        html: view::session_workspace_picker_html(&self.workspaces, &browse_path),
+                    },
+                )
+                .await?;
             }
             ClientMsg::CloseTab { tab } => {
                 self.close_tab(tab).await;
@@ -1190,10 +1247,17 @@ impl GuiSession {
             .workspace
             .tab(tab_id)
             .and_then(|tab| tab.model.session_id.clone());
+        let workspace = self
+            .workspace
+            .tab(tab_id)
+            .map(|tab| tab.workspace.clone());
         let client = self.client(tab_id).expect("just ensured");
         let mut builder = client.ask(prompt.clone());
         if let Some(session_id) = session_id {
             builder = builder.session_id(session_id);
+        }
+        if let Some(workspace) = workspace {
+            builder = builder.workspace(workspace);
         }
 
         match builder.send().await {
@@ -1500,6 +1564,9 @@ impl GuiSession {
                 && let Some(session_id) = session_id
             {
                 self.observe(event.tab_id, session_id, false).await?;
+            }
+            if active_id == event.tab_id && !self.file_cache.contains_key("") {
+                self.send_refreshed_tree(sender).await?;
             }
         }
 

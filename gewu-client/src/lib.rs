@@ -130,6 +130,7 @@ pub struct AskBuilder<'a> {
     prompt: String,
     session_id: Option<String>,
     agent: Option<String>,
+    workspace: Option<String>,
 }
 
 impl Client {
@@ -327,6 +328,7 @@ impl Client {
             prompt: prompt.into(),
             session_id: None,
             agent: None,
+            workspace: None,
         }
     }
 
@@ -551,12 +553,19 @@ impl AskBuilder<'_> {
         self
     }
 
+    /// Use a workspace when this ask creates the connection's session.
+    pub fn workspace(mut self, workspace: impl Into<String>) -> Self {
+        self.workspace = Some(workspace.into());
+        self
+    }
+
     /// Start the ask and return its event stream.
     pub async fn send(self) -> Result<AskStream> {
         let request = ClientRequest::ask(self.client.next_correlation_id(), self.prompt);
         let request = ClientRequest {
             session_id: self.session_id,
             agent: self.agent,
+            workspace: self.workspace,
             ..request
         };
         let (tx, rx) = oneshot::channel();

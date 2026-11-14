@@ -43,6 +43,16 @@ pub enum ClientMsg {
     BrowseWorkspace {
         path: String,
     },
+    /// Browse server-side directories while creating a new session.
+    BrowseNewSession {
+        path: String,
+    },
+    /// Create a local session tab with its workspace selected before the
+    /// upstream session is created on the first ask.
+    CreateTab {
+        workspace: String,
+        path: String,
+    },
     /// Add and select a server-side directory for a tab.
     AddWorkspace {
         tab: u64,
@@ -161,6 +171,8 @@ pub enum ServerMsg {
     FileTree { html: String },
     /// Show or replace the server-side workspace browser.
     WorkspaceBrowser { html: String },
+    /// Show the workspace picker used before creating a new session tab.
+    WorkspacePicker { html: String },
     /// Close the server-side workspace browser.
     CloseWorkspaceBrowser,
     /// Show the requested file preview.
@@ -194,6 +206,23 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ClientMsg>(r#"{"op":"open_tab"}"#).unwrap(),
             ClientMsg::OpenTab
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(
+                r#"{"op":"create_tab","workspace":"tachyon","path":"/tmp/tachyon"}"#,
+            )
+            .unwrap(),
+            ClientMsg::CreateTab {
+                workspace: "tachyon".into(),
+                path: "/tmp/tachyon".into(),
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(
+                r#"{"op":"browse_new_session","path":"/tmp"}"#,
+            )
+            .unwrap(),
+            ClientMsg::BrowseNewSession { path: "/tmp".into() }
         );
     }
 

@@ -460,6 +460,19 @@ impl ServerState {
         session_id: Option<String>,
         agent_name: Option<String>,
     ) -> Result<ConnectionSession> {
+        self.get_or_create_session_with_workspace(current, session_id, agent_name, None)
+            .await
+    }
+
+    /// Get or create a session, optionally selecting its workspace at creation
+    /// time. The workspace hint is ignored once the session already exists.
+    async fn get_or_create_session_with_workspace(
+        &self,
+        current: &mut Option<ConnectionSession>,
+        session_id: Option<String>,
+        agent_name: Option<String>,
+        requested_workspace: Option<String>,
+    ) -> Result<ConnectionSession> {
         if let Some(existing) = current {
             if let Some(requested) = &session_id
                 && requested != &existing.session_id
@@ -504,13 +517,21 @@ impl ServerState {
         if !registry::list_agent_names().contains(&agent_name) {
             anyhow::bail!("Unknown agent profile: {}", agent_name);
         }
-        let workspace_id = gewu_storage::session_workspace(&self.bootstrap.pool, &session_id)
-            .await?
-            .unwrap_or_else(|| "cwd".into());
-        let workspace = self.workspace(&workspace_id).unwrap_or_else(|error| {
-            warn!("session {} has invalid workspace '{}': {}; using cwd", session_id, workspace_id, error);
-            self.workspace("cwd").expect("cwd workspace is always configured")
-        });
+        let stored_id = gewu_storage::session_workspace(&self.bootstrap.pool, &session_id).await?;
+        let use_requested_workspace = requested_workspace.is_some() && stored_id.is_none();
+        let workspace_id = if use_requested_workspace {
+            requested_workspace.expect("checked above")
+        } else {
+            stored_id.clone().unwrap_or_else(|| "cwd".into())
+        };
+        let workspace = if use_requested_workspace {
+            self.workspace(&workspace_id)?
+        } else {
+            self.workspace(&workspace_id).unwrap_or_else(|error| {
+                warn!("session {} has invalid workspace '{}': {}; using cwd", session_id, workspace_id, error);
+                self.workspace("cwd").expect("cwd workspace is always configured")
+            })
+        };
         let workspace_path = std::path::PathBuf::from(&workspace.path);
 
         // Resolve the session's model: the persisted selector when it still
@@ -564,6 +585,14 @@ impl ServerState {
         {
             let mut agent = agent.lock().await;
             patch_dangling_tool_calls(&mut agent).await;
+        }
+        if use_requested_workspace {
+            gewu_storage::set_session_workspace(
+                &self.bootstrap.pool,
+                &session_id,
+                &workspace_id,
+            )
+            .await?;
         }
         gewu_storage::set_session_agent(&self.bootstrap.pool, &session_id, &agent_name).await?;
         // Snapshot the tool list once; it never changes for this session.
@@ -1549,7 +1578,12 @@ async fn handle_request(
                 ));
             }
             let session = state
-                .get_or_create_session(session, request.session_id, request.agent)
+                .get_or_create_session_with_workspace(
+                    session,
+                    request.session_id,
+                    request.agent,
+                    request.workspace,
+                )
                 .await
                 .map_err(|e| RequestError::Failed(e.to_string()))?;
             // Claim the session across connections so two connections cannot
@@ -3517,6 +3551,42 @@ mod tests {
             .unwrap()
             .as_deref(),
             Some(workspace.id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn first_ask_workspace_is_used_when_creating_a_session() {
+        let cwd = tempfile::tempdir().unwrap();
+        let tachyon = tempfile::tempdir().unwrap();
+        let mut state = server_state_with(TestLlm::plain());
+        {
+            let bootstrap = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            bootstrap.working_directory = cwd.path().to_string_lossy().to_string();
+            bootstrap.workspace_roots = Arc::new(BTreeMap::from([
+                ("cwd".into(), cwd.path().to_path_buf()),
+                ("tachyon".into(), tachyon.path().to_path_buf()),
+            ]));
+        }
+        let mut session = None;
+        let mut running = None;
+        let result = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::ask(1, "pwd").with_workspace("tachyon"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Handled::Ask { .. }));
+        let current = session.as_ref().unwrap();
+        assert_eq!(current.workspace.id, "tachyon");
+        assert_eq!(current.workspace.path, tachyon.path().canonicalize().unwrap().to_string_lossy());
+        assert_eq!(
+            gewu_storage::session_workspace(&state.bootstrap.pool, &current.session_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tachyon")
         );
     }
 

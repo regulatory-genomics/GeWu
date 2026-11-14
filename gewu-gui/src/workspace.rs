@@ -101,6 +101,13 @@ impl Workspace {
         id
     }
 
+    /// Append an empty tab with its workspace selected and focus it.
+    pub fn open_blank_in_workspace(&mut self, workspace: impl Into<String>) -> u64 {
+        let id = self.open_blank();
+        self.tab_mut(id).expect("just added").workspace = workspace.into();
+        id
+    }
+
     /// Append a tab replaying a stored session and focus it.
     pub fn open_session(&mut self, session_id: &str, messages: &[Message]) -> u64 {
         let id = self.open_blank();
@@ -224,6 +231,14 @@ mod tests {
         assert_eq!(ws.active, 1);
         assert_eq!(ws.active_id(), second);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn open_blank_in_workspace_starts_a_tab_with_that_root() {
+        let mut ws = Workspace::new();
+        let id = ws.open_blank_in_workspace("tachyon");
+        assert_eq!(ws.tab(id).unwrap().workspace, "tachyon");
+        assert_eq!(ws.active_id(), id);
     }
 
     #[test]

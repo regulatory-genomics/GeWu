@@ -290,8 +290,13 @@
         if (message.html) el.app.insertAdjacentHTML("beforeend", message.html);
         break;
       }
+      case "workspace_picker":
+        document.getElementById("session-workspace-picker")?.remove();
+        if (message.html) el.app.insertAdjacentHTML("beforeend", message.html);
+        break;
       case "close_workspace_browser":
         document.getElementById("workspace-browser")?.remove();
+        document.getElementById("session-workspace-picker")?.remove();
         break;
       case "tools": {
         const panel = document.getElementById("sidebar-tools");
@@ -334,14 +339,20 @@
       button.dataset.tab = String(tab.id);
       if (tab.id === active) button.classList.add("active");
       if (tab.busy) button.classList.add("busy");
-      button.title = tab.session_id
-        ? `Session ${tab.session_id}`
-        : "New session";
+      const workspace = tab.workspace || "cwd";
+      button.title = `${tab.session_id ? `Session ${tab.session_id}` : "New session"} · ${workspace}`;
 
       const label = document.createElement("span");
       label.className = "tab-label";
       label.textContent = tab.label;
       button.appendChild(label);
+
+      const root = document.createElement("span");
+      root.className = "tab-workspace";
+      root.textContent = workspace.startsWith("runtime:")
+        ? workspace.slice("runtime:".length).split("/").filter(Boolean).pop() || "root"
+        : workspace;
+      button.appendChild(root);
 
       if (tab.busy) {
         const spinner = document.createElement("span");
@@ -769,6 +780,25 @@
   });
 
   el.app.addEventListener("click", (event) => {
+    const closeNewSession = event.target.closest("[data-new-session-close]");
+    if (closeNewSession) {
+      send({ op: "close_workspace_browser" });
+      return;
+    }
+    const createTab = event.target.closest("[data-new-session-create]");
+    if (createTab) {
+      send({
+        op: "create_tab",
+        workspace: createTab.dataset.newSessionWorkspace,
+        path: createTab.dataset.newSessionPath,
+      });
+      return;
+    }
+    const browseNewSession = event.target.closest("[data-new-session-browse-path]");
+    if (browseNewSession) {
+      send({ op: "browse_new_session", path: browseNewSession.dataset.newSessionBrowsePath });
+      return;
+    }
     const close = event.target.closest("[data-workspace-browser-close]");
     if (close) {
       send({ op: "close_workspace_browser" });

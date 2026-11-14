@@ -156,6 +156,9 @@ pub struct ClientRequest {
     /// Optional agent profile name, honored when the connection session is
     /// created (defaults to `build`).
     pub agent: Option<String>,
+    /// Optional workspace id, honored only when the connection creates a new
+    /// session. Existing sessions keep their persisted workspace.
+    pub workspace: Option<String>,
 }
 
 /// Serialize in the protocol's wire format, e.g.
@@ -178,6 +181,7 @@ impl Serialize for ClientRequest {
                     | Op::AddWorkspace { .. }
             )) as usize
             + self.agent.is_some() as usize
+            + self.workspace.is_some() as usize
             + matches!(
                 self.op,
                 Op::Ask { .. }
@@ -264,6 +268,9 @@ impl Serialize for ClientRequest {
         if let Some(agent) = &self.agent {
             map.serialize_entry("agent", agent)?;
         }
+        if let Some(workspace) = &self.workspace {
+            map.serialize_entry("workspace", workspace)?;
+        }
         map.end()
     }
 }
@@ -315,6 +322,7 @@ impl ClientRequest {
             },
             session_id: None,
             agent: None,
+            workspace: None,
         }
     }
 
@@ -329,6 +337,12 @@ impl ClientRequest {
     /// session is first created; defaults to `build`).
     pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
         self.agent = Some(agent.into());
+        self
+    }
+
+    /// Attach a workspace id for creation of a new session.
+    pub fn with_workspace(mut self, workspace: impl Into<String>) -> Self {
+        self.workspace = Some(workspace.into());
         self
     }
 
@@ -357,6 +371,7 @@ impl ClientRequest {
             op: Op::ListFiles { path: path.into() },
             session_id: None,
             agent: None,
+            workspace: None,
         }
     }
 
@@ -366,6 +381,7 @@ impl ClientRequest {
             op: Op::ReadFile { path: path.into() },
             session_id: None,
             agent: None,
+            workspace: None,
         }
     }
 
@@ -385,6 +401,7 @@ impl ClientRequest {
             },
             session_id: None,
             agent: None,
+            workspace: None,
         }
     }
 
@@ -441,6 +458,7 @@ impl ClientRequest {
             },
             session_id: None,
             agent: None,
+            workspace: None,
         }
     }
 
@@ -450,6 +468,7 @@ impl ClientRequest {
             op,
             session_id: None,
             agent: None,
+            workspace: None,
         }
     }
 
@@ -656,12 +675,17 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
         .and_then(Value::as_str)
         .map(str::to_string);
     let agent = obj.get("agent").and_then(Value::as_str).map(str::to_string);
+    let workspace = obj
+        .get("workspace")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     Ok(ClientRequest {
         id,
         op,
         session_id,
         agent,
+        workspace,
     })
 }
 
@@ -1253,6 +1277,18 @@ mod tests {
             r#"{"id":"b","op":"add_workspace","path":"/tmp/project","session_id":"s1"}"#
         );
     }
+
+    #[test]
+    fn creation_workspace_round_trips_on_first_ask() {
+        let request = ClientRequest::ask("a", "pwd").with_workspace("tachyon");
+        assert_eq!(
+            request.to_line(),
+            r#"{"id":"a","op":"ask","prompt":"pwd","workspace":"tachyon"}"#
+        );
+        let parsed = parse_request(&request.to_line()).unwrap();
+        assert_eq!(parsed.workspace.as_deref(), Some("tachyon"));
+    }
+
 
     #[test]
     fn workspace_info_is_backward_compatible() {
