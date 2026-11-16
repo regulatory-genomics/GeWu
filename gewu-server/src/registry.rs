@@ -524,7 +524,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 Box::new(GrepTool {
                     working_directory: working_directory.clone(),
                 }),
-                Box::new(WebFetchTool),
+                Box::new(WebFetchTool::default()),
                 Box::new(ListTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -569,7 +569,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                     working_directory: working_directory.clone(),
                     safe_mode: false,
                 }),
-                Box::new(WebFetchTool),
+                Box::new(WebFetchTool::default()),
                 Box::new(WebSearchTool),
                 Box::new(TodoWriteTool),
                 Box::new(TodoReadTool),
@@ -591,7 +591,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 Box::new(GrepTool {
                     working_directory: working_directory.clone(),
                 }),
-                Box::new(WebFetchTool),
+                Box::new(WebFetchTool::default()),
                 Box::new(ListTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -641,7 +641,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 Box::new(GrepTool {
                     working_directory: working_directory.clone(),
                 }),
-                Box::new(WebFetchTool),
+                Box::new(WebFetchTool::default()),
                 Box::new(ListTool {
                     working_directory: working_directory.clone(),
                 }),
