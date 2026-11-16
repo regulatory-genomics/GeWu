@@ -1174,6 +1174,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "gewu-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "futures",
+ "gewu-core",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "gewu-server"
 version = "0.1.1"
 dependencies = [

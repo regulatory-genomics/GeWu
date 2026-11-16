@@ -1596,10 +1596,12 @@ mod tests {
     fn tool_finish_keeps_image_media_out_of_the_output_text() {
         let mut m = model();
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: String::new(),
             tool: "read_file".into(),
             input: r#"{"file_path":"shot.png"}"#.into(),
         });
         let _ = m.apply_event(&AgentEvent::ToolFinish {
+            call_id: String::new(),
             tool: "read_file".into(),
             title: "read_file".into(),
             output: IMAGE_PAYLOAD.into(),
@@ -1694,10 +1696,12 @@ mod tests {
     fn non_media_tool_output_is_unchanged() {
         let mut m = model();
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: String::new(),
             tool: "bash".into(),
             input: r#"{"command":"ls"}"#.into(),
         });
         let _ = m.apply_event(&AgentEvent::ToolFinish {
+            call_id: String::new(),
             tool: "bash".into(),
             title: String::new(),
             output: r#"{"type":"media-ish"}"#.into(),
