@@ -852,6 +852,7 @@ mod tests {
     fn question_events_attach_to_the_question_card_and_resolve() {
         let mut m = model();
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: String::new(),
             tool: "question".into(),
             input: r#"{"questions":[{"question":"Which database?","header":"Database"}]}"#.into(),
         });
@@ -887,6 +888,7 @@ mod tests {
 
         // The tool result still lands in the same card.
         let _ = m.apply_event(&AgentEvent::ToolFinish {
+            call_id: String::new(),
             tool: "question".into(),
             title: "question".into(),
             output: "answered".into(),
@@ -908,6 +910,7 @@ mod tests {
         let mut m = model();
         for _ in 0..2 {
             let _ = m.apply_event(&AgentEvent::ToolStart {
+                call_id: String::new(),
                 tool: "question".into(),
                 input: "{}".into(),
             });
@@ -945,6 +948,7 @@ mod tests {
     fn finishing_an_ask_settles_a_still_pending_question() {
         let mut m = model();
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: String::new(),
             tool: "question".into(),
             input: "{}".into(),
         });
@@ -967,6 +971,7 @@ mod tests {
         let mut m = model();
         for header in ["First", "Second"] {
             let _ = m.apply_event(&AgentEvent::ToolStart {
+                call_id: String::new(),
                 tool: "question".into(),
                 input: format!(r#"{{"questions":[{{"question":"?","header":"{header}"}}]}}"#),
             });
@@ -1004,6 +1009,7 @@ mod tests {
     fn finishing_an_ask_closes_a_question_announced_without_a_form() {
         let mut m = model();
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: String::new(),
             tool: "question".into(),
             input: r#"{"questions":[{"question":"?","header":"Stale"}]}"#.into(),
         });
@@ -1019,6 +1025,7 @@ mod tests {
 
         // A later turn's form attaches to its own card, not the stale one.
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: String::new(),
             tool: "question".into(),
             input: r#"{"questions":[{"question":"?","header":"Fresh"}]}"#.into(),
         });
@@ -1043,6 +1050,7 @@ mod tests {
     fn dismissed_questions_keep_their_questions_for_the_summary() {
         let mut m = model();
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: String::new(),
             tool: "question".into(),
             input: "{}".into(),
         });
