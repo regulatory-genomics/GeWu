@@ -3157,3 +3157,29 @@ body {
     transition-delay: 0s !important;
   }
 }
+.plugin-toggle {
+  position: fixed; top: .6rem; right: .8rem; z-index: 20;
+  padding: .35rem .7rem; border: 1px solid #455267; border-radius: .45rem;
+  background: #172032; color: #eef3fb;
+}
+.plugin-host {
+  position: fixed; z-index: 19; top: 2.85rem; right: .8rem; bottom: .8rem;
+  width: min(28rem, calc(100vw - 1.6rem)); overflow: auto;
+  padding: .8rem; border: 1px solid #39485e; border-radius: .65rem;
+  background: #131b2a; color: #eef3fb; box-shadow: 0 .5rem 2rem #0008;
+}
+.plugin-host.plugin-main, .plugin-host.panel-prefers-main { width: min(64vw, 75rem); }
+.plugin-host [hidden] { display: none; }
+.plugin-host button, .plugin-host textarea { font: inherit; color: inherit; }
+.plugin-host button { border: 1px solid #455267; margin: .2rem; padding: .3rem .55rem; background: #1e2b40; border-radius: .3rem; }
+.plugin-host button[aria-pressed="true"] { border-color: #92b8f3; }
+.plugin-host :focus-visible, .plugin-toggle:focus-visible { outline: 2px solid #92b8f3; outline-offset: 2px; }
+.plugin-host nav { margin-block: .4rem; }
+.plugin-toolbar { display: flex; justify-content: flex-end; flex-wrap: wrap; }
+.plugin-panel textarea { width: 100%; min-height: 15rem; background: #0d1420; }
+.plugin-panel iframe { width: 100%; height: calc(100vh - 12rem); border: 0; background: #101927; }
+.plugin-panel pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.plugin-panel img, .plugin-panel video { max-width: 100%; }
+@media (max-width: 720px) {
+  .plugin-host.plugin-main, .plugin-host.panel-prefers-main { width: calc(100vw - 1.6rem); }
+}

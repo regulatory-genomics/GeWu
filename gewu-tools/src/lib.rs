@@ -66,6 +66,7 @@ pub mod grep;
 pub mod list;
 pub mod mcp;
 mod media;
+pub mod process;
 pub mod question;
 pub mod replacers;
 pub mod search;

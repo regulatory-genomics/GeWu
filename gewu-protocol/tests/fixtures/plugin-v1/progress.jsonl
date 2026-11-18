@@ -1,0 +1,6 @@
+{"id":"r1","op":"call","params":{"tool":"render","args":{},"context":{"instanceId":"i1","generation":1,"workspaceId":"w1","callId":"c1"}}}
+{"type":"event","id":"r1","event":{"type":"progress","callId":"c1","message":"Rendering Intro"}}
+{"type":"event","id":"r1","event":{"type":"process.started","pid":500,"pgid":500}}
+{"type":"process.accepted","id":"r1","pid":500,"pgid":500}
+{"type":"event","id":"r1","event":{"type":"process.exited","pid":500,"pgid":500}}
+{"type":"result","id":"r1","result":{"ok":true,"data":{},"resources":[]}}

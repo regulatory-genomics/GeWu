@@ -1,0 +1,513 @@
+mod actions;
+mod changes;
+pub mod package;
+pub mod resources;
+pub mod stdio;
+pub mod tools;
+
+use anyhow::{Context, Result, bail, ensure};
+use gewu_protocol::plugin::*;
+use package::{Package, PluginEntry, contained, relative, validate, validator};
+use serde_json::Value;
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+use stdio::{Adapter, Limits};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
+
+#[derive(Default)]
+pub struct PluginHost {
+    entries: RwLock<BTreeMap<String, (PluginEntry, Option<Package>)>>,
+    slots: Mutex<HashMap<InstanceKey, Arc<AsyncMutex<Slot>>>>,
+    next_generation: AtomicU64,
+    limits: Limits,
+    resources: Arc<resources::Resources>,
+    calls: Arc<Mutex<actions::Calls>>,
+    editor: changes::Editor,
+    store: Option<gewu_core::types::SessionState>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct InstanceKey {
+    plugin: String,
+    root: PathBuf,
+    resource: Option<String>,
+}
+
+#[derive(Default)]
+struct Slot {
+    instance: Option<Arc<Instance>>,
+    blocked: bool,
+}
+
+pub struct Instance {
+    pub package: Package,
+    pub activation: Activation,
+    pub services: Vec<ServiceEndpoint>,
+    tools: BTreeMap<String, RegisteredTool>,
+    pub adapter: Adapter,
+    service_origins: Vec<String>,
+}
+
+struct RegisteredTool {
+    definition: ToolDefinition,
+    input: jsonschema::Validator,
+    output: jsonschema::Validator,
+}
+
+impl PluginHost {
+    pub fn with_store(mut self, pool: sqlx::SqlitePool) -> Self {
+        self.store = Some(gewu_core::types::SessionState::new(Arc::new(
+            gewu_storage::SqliteSessionStateStore::new(pool),
+        )));
+        self
+    }
+    pub fn data_router(&self) -> axum::Router {
+        self.resources.router()
+    }
+
+    pub fn from_config(
+        entries: &BTreeMap<String, PluginEntry>,
+        config_path: Option<&Path>,
+        limits: Limits,
+    ) -> Result<Self> {
+        ensure!(
+            (1..=1024 * 1024).contains(&limits.stderr_bytes),
+            "pluginHost.stderrBytes must be 1–1048576"
+        );
+        let mut host = Self {
+            limits,
+            ..Self::default()
+        };
+        let base = config_path
+            .and_then(Path::parent)
+            .unwrap_or_else(|| Path::new("."));
+        for (id, entry) in entries {
+            let mut entry = entry.clone();
+            entry.package = base.join(&entry.package);
+            let package = if entry.enabled {
+                Some(load_entry(id, &entry)?)
+            } else {
+                None
+            };
+            host.entries
+                .get_mut()
+                .unwrap()
+                .insert(id.clone(), (entry, package));
+        }
+        Ok(host)
+    }
+
+    pub fn catalog(&self) -> Vec<Value> {
+        self.entries.read().unwrap().iter().map(|(id, (_, package))| serde_json::json!({
+            "id":id, "enabled":package.is_some(), "title":package.as_ref().map(|p| &p.manifest.title),
+            "scope":package.as_ref().map(|p| p.manifest.scope), "views":package.as_ref().map(|p| &p.manifest.views),
+        })).collect()
+    }
+
+    pub fn has_enabled(&self) -> bool {
+        self.entries
+            .read()
+            .unwrap()
+            .values()
+            .any(|(_, package)| package.is_some())
+    }
+
+    async fn set_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        {
+            let mut entries = self.entries.write().unwrap();
+            let (entry, package) = entries.get_mut(id).context("unknown configured plugin")?;
+            if enabled == package.is_some() {
+                return Ok(());
+            }
+            *package = if enabled {
+                Some(load_entry(id, entry)?)
+            } else {
+                None
+            };
+        }
+        if !enabled {
+            let slots: Vec<_> = self
+                .slots
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(key, _)| key.plugin == id)
+                .map(|(_, slot)| slot.clone())
+                .collect();
+            let mut failure = None;
+            for slot in slots {
+                let mut state = slot.lock().await;
+                if let Err(error) = Self::shutdown(&mut state).await {
+                    failure = Some(error);
+                }
+            }
+            if let Some(error) = failure {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn open(
+        &self,
+        id: &str,
+        workspace: &str,
+        root: &Path,
+        binding_resource: Option<ResourceRef>,
+    ) -> Result<Arc<Instance>> {
+        let (entry, package) = self
+            .entries
+            .read()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .context("unknown plugin")?;
+        let package = package.context("plugin is disabled")?;
+        let root = root.canonicalize()?;
+        ensure!(root.is_dir(), "workspace root is not a directory");
+        let binding_resource = match (package.manifest.scope, binding_resource) {
+            (Scope::Resource, Some(mut resource)) => {
+                package::validate(
+                    &package::wire_validator("ResourceRef")?,
+                    &serde_json::to_value(&resource)?,
+                )?;
+                let path = workspace_path(&root, &resource.uri)?;
+                let relative = path
+                    .strip_prefix(&root)?
+                    .to_str()
+                    .context("resource path is not UTF-8")?;
+                ensure!(
+                    !relative.is_empty(),
+                    "binding resource must be within the workspace"
+                );
+                resource.uri = format!(
+                    "workspace:///{}",
+                    percent_encoding::utf8_percent_encode(relative, &URI_ESCAPE)
+                );
+                resource.revision = None;
+                Some(resource)
+            }
+            (Scope::Workspace, None) => None,
+            _ => bail!("binding resource does not match plugin scope"),
+        };
+        let key = InstanceKey {
+            plugin: id.into(),
+            root: root.clone(),
+            resource: binding_resource.as_ref().map(|r| r.uri.clone()),
+        };
+        let slot = self.slots.lock().unwrap().entry(key).or_default().clone();
+        let mut state = slot.lock().await;
+        ensure!(
+            self.entries
+                .read()
+                .unwrap()
+                .get(id)
+                .is_some_and(|(_, p)| p.is_some()),
+            "plugin is disabled"
+        );
+        ensure!(
+            !state.blocked,
+            "CLEANUP_INCOMPLETE: plugin instance requires administrator attention"
+        );
+        if let Some(instance) = &state.instance {
+            ensure!(
+                instance.activation.workspace_id == workspace,
+                "workspace aliases for one root are not interchangeable"
+            );
+            ensure!(
+                !instance.adapter.is_closed(),
+                "adapter disconnected; close the instance before reopening"
+            );
+            return Ok(instance.clone());
+        }
+        let activation = Activation {
+            api_version: ApiVersion::V1,
+            instance_id: uuid::Uuid::new_v4().to_string(),
+            generation: self.next_generation.fetch_add(1, Ordering::Relaxed) + 1,
+            workspace_id: workspace.into(),
+            workspace_root: root.to_str().context("workspace root is not UTF-8")?.into(),
+            binding_resource,
+            settings: entry
+                .workspace_settings
+                .get(workspace)
+                .unwrap_or(&entry.settings)
+                .clone(),
+        };
+        package.validate_settings(&activation.settings)?;
+        let result = Adapter::start(
+            package.command(&root),
+            activation.clone(),
+            self.limits.clone(),
+        )
+        .await;
+        let (adapter, catalog) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                state.blocked = error.to_string().starts_with("CLEANUP_INCOMPLETE");
+                return Err(error);
+            }
+        };
+        let instance = match Instance::register(
+            package.clone(),
+            activation,
+            adapter.clone(),
+            catalog,
+            entry.service_origins.clone(),
+        ) {
+            Ok(instance) => Arc::new(instance),
+            Err(err) => {
+                if let Err(cleanup) = adapter.close().await {
+                    state.blocked = true;
+                    return Err(cleanup);
+                }
+                return Err(err);
+            }
+        };
+        state.instance = Some(instance.clone());
+        Ok(instance)
+    }
+
+    pub async fn active(&self, workspace: &str, root: &Path) -> Vec<Arc<Instance>> {
+        let Ok(root) = root.canonicalize() else {
+            return vec![];
+        };
+        let slots: Vec<_> = self
+            .slots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key.root == root)
+            .map(|(_, slot)| slot.clone())
+            .collect();
+        let mut instances = Vec::new();
+        for slot in slots {
+            if let Ok(state) = slot.try_lock()
+                && let Some(instance) = &state.instance
+                && instance.activation.workspace_id == workspace
+                && !instance.adapter.is_closed()
+            {
+                instances.push(instance.clone());
+            }
+        }
+        instances.sort_by(|a, b| {
+            a.package
+                .manifest
+                .id
+                .cmp(&b.package.manifest.id)
+                .then(a.activation.instance_id.cmp(&b.activation.instance_id))
+        });
+        instances
+    }
+
+    pub async fn close(&self, workspace: &str, root: &Path, id: &str) -> Result<()> {
+        let root = root.canonicalize()?;
+        let slots: Vec<_> = self
+            .slots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key.root == root)
+            .map(|(_, s)| s.clone())
+            .collect();
+        for slot in slots {
+            let mut state = slot.lock().await;
+            if state.instance.as_ref().is_some_and(|i| {
+                i.activation.instance_id == id && i.activation.workspace_id == workspace
+            }) {
+                return Self::shutdown(&mut state).await;
+            }
+        }
+        bail!("plugin instance was not found in the workspace")
+    }
+
+    pub async fn close_all(&self) -> Result<()> {
+        let slots: Vec<_> = self.slots.lock().unwrap().values().cloned().collect();
+        let mut failure = None;
+        for slot in slots {
+            let mut state = slot.lock().await;
+            if let Err(error) = Self::shutdown(&mut state).await {
+                failure = Some(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    async fn shutdown(state: &mut Slot) -> Result<()> {
+        let Some(instance) = state.instance.take() else {
+            return Ok(());
+        };
+        let result = if instance.adapter.is_closed() {
+            instance.adapter.close().await
+        } else {
+            instance.adapter.shutdown("closed").await
+        };
+        state.blocked = result
+            .as_ref()
+            .is_err_and(|err| err.to_string().starts_with("CLEANUP_INCOMPLETE"));
+        result
+    }
+}
+
+fn load_entry(id: &str, entry: &PluginEntry) -> Result<Package> {
+    let package = Package::read(&entry.package).with_context(|| format!("plugin {id}"))?;
+    ensure!(
+        package.manifest.id == id,
+        "plugin id does not match its config key"
+    );
+    if entry.workspace_settings.is_empty() || !entry.settings.is_empty() {
+        package.validate_settings(&entry.settings)?;
+    }
+    for settings in entry.workspace_settings.values() {
+        package.validate_settings(settings)?;
+    }
+    Ok(package)
+}
+
+const URI_ESCAPE: percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC
+    .remove(b'/')
+    .remove(b'.')
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'~');
+
+pub fn workspace_path(root: &Path, uri: &str) -> Result<PathBuf> {
+    let path = uri
+        .strip_prefix("workspace:///")
+        .context("expected a workspace:/// resource URI")?;
+    let path = percent_encoding::percent_decode_str(path).decode_utf8()?;
+    ensure!(
+        !path.contains('\\') && !path.contains('\0'),
+        "invalid workspace URI"
+    );
+    contained(root, relative(&path)?)
+}
+
+impl Instance {
+    fn register(
+        package: Package,
+        activation: Activation,
+        adapter: Adapter,
+        catalog: Activated,
+        service_origins: Vec<String>,
+    ) -> Result<Self> {
+        validate(
+            &package::wire_validator("Activated")?,
+            &serde_json::to_value(&catalog)?,
+        )?;
+        let mut tools = BTreeMap::new();
+        for definition in catalog.tools {
+            ensure!(!tools.contains_key(&definition.name), "duplicate tool name");
+            ensure!(
+                !matches!(definition.name.as_str(), "view.attach" | "view.detach")
+                    || !definition.expose_to_agent,
+                "view binding tools are private"
+            );
+            let input = validator(&Value::Object(definition.input_schema.clone()))?;
+            let output = validator(&Value::Object(definition.output_schema.clone()))?;
+            tools.insert(
+                definition.name.clone(),
+                RegisteredTool {
+                    definition,
+                    input,
+                    output,
+                },
+            );
+        }
+        let mut ids = std::collections::HashSet::new();
+        ensure!(
+            catalog.service_endpoints.iter().all(|s| ids.insert(&s.id)),
+            "duplicate service id"
+        );
+        Ok(Self {
+            package,
+            activation,
+            services: catalog.service_endpoints,
+            tools,
+            adapter,
+            service_origins,
+        })
+    }
+
+    pub fn definitions(&self) -> impl Iterator<Item = &ToolDefinition> {
+        self.tools.values().map(|t| &t.definition)
+    }
+
+    pub fn public_info(&self) -> Value {
+        serde_json::json!({
+            "id": self.activation.instance_id, "pluginId": self.package.manifest.id, "generation":self.activation.generation,
+            "bindingResource":self.activation.binding_resource, "title":self.package.manifest.title,
+            "views":self.package.manifest.views,
+            "tools":self.definitions().filter(|t| !matches!(t.name.as_str(), "view.attach" | "view.detach")).collect::<Vec<_>>(),
+        })
+    }
+
+    pub fn context(&self, call: String, session: Option<String>) -> CallContext {
+        CallContext {
+            instance_id: self.activation.instance_id.clone(),
+            generation: self.activation.generation,
+            workspace_id: self.activation.workspace_id.clone(),
+            call_id: call,
+            session_id: session,
+            run_id: None,
+            binding_resource: self.activation.binding_resource.clone(),
+            resource: None,
+            view_id: None,
+            view_epoch: None,
+        }
+    }
+
+    pub async fn invoke(
+        &self,
+        name: &str,
+        args: Object,
+        context: CallContext,
+        progress: Option<mpsc::Sender<Event>>,
+        agent: bool,
+        private: bool,
+    ) -> Result<ToolOutput> {
+        ensure!(
+            !self.adapter.is_closed(),
+            "adapter generation is no longer ready"
+        );
+        let tool = self.tools.get(name).context("unknown plugin tool")?;
+        ensure!(
+            !agent || tool.definition.expose_to_agent,
+            "tool is not exposed to the agent"
+        );
+        ensure!(
+            private || !matches!(name, "view.attach" | "view.detach"),
+            "view bind tool is private"
+        );
+        ensure!(
+            tool.definition.target != Target::View
+                || context.view_id.is_some() && context.view_epoch.is_some(),
+            "VIEW_NOT_READY: explicit live view required"
+        );
+        validate(&tool.input, &Value::Object(args.clone()))?;
+        let response = self
+            .adapter
+            .request(
+                Operation::Call {
+                    tool: name.into(),
+                    args,
+                    context: Box::new(context),
+                },
+                progress,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{}: {}", e.code, e.message))?;
+        let Response::Called(output) = response else {
+            bail!("invalid call response");
+        };
+        if let ToolOutput::Success { data, .. } = &output {
+            validate(&tool.output, &Value::Object(data.clone()))?;
+        }
+        Ok(output)
+    }
+}

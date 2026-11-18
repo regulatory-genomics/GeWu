@@ -442,7 +442,7 @@ pub async fn serve(
         Transport::Tcp,
         conn_tx.clone(),
     ));
-    let http_router = download::router(state.clone());
+    let http_router = download::router(state.clone()).merge(state.bootstrap.plugins.data_router());
     tasks.spawn(async move {
         if let Err(error) = axum::serve(http_listener, http_router).await {
             warn!("HTTP listener failed: {error}");
@@ -483,6 +483,7 @@ pub async fn serve(
     connections.abort_all();
     while connections.join_next().await.is_some() {}
     state.shutdown_turns().await;
+    state.bootstrap.plugins.close_all().await?;
     Ok(())
 }
 
@@ -1028,6 +1029,78 @@ async fn handle_request(
             .map_err(|e| RequestError::Failed(e.to_string()))?;
     }
     match request.op {
+        Op::Plugin(action) => {
+            let current = state
+                .get_or_create_session_with_workspace(
+                    session,
+                    request.session_id,
+                    request.agent,
+                    request.workspace,
+                )
+                .await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            if let gewu_protocol::plugin::HostAction::AgentResult { result_id } = &action {
+                use gewu_core::traits::SessionStateStore;
+                let id = uuid::Uuid::parse_str(result_id)
+                    .map_err(|_| RequestError::Invalid("invalid plugin result id".into()))?;
+                let storage =
+                    gewu_storage::SqliteSessionStateStore::new(state.bootstrap.pool.clone());
+                let result = storage
+                    .load(&current.session_id, &format!("gewu.plugin.result.{id}"))
+                    .await
+                    .map_err(|e| RequestError::Failed(e.to_string()))?
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    .filter(|value| value["workspaceId"] == current.workspace.id)
+                    .ok_or_else(|| {
+                        RequestError::Failed(
+                            "recorded result not found in this workspace and session".into(),
+                        )
+                    })?;
+                return Ok(Handled::Reply(ServerMessage::Plugin {
+                    id: request.id,
+                    result,
+                }));
+            }
+            let mark_session = matches!(
+                &action,
+                gewu_protocol::plugin::HostAction::Open { .. }
+                    | gewu_protocol::plugin::HostAction::SaveText { .. }
+            );
+            let result = state
+                .bootstrap
+                .plugins
+                .action(
+                    &current.workspace.id,
+                    Path::new(&current.workspace.path),
+                    &current.session_id,
+                    action,
+                )
+                .await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            if mark_session {
+                use gewu_core::traits::SessionStateStore;
+                let store =
+                    gewu_storage::SqliteSessionStateStore::new(state.bootstrap.pool.clone());
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if let Err(error) = store
+                    .save(
+                        &current.session_id,
+                        "gewu.plugin.session",
+                        timestamp.to_string(),
+                    )
+                    .await
+                {
+                    tracing::warn!("could not register plugin session for restore: {error}");
+                }
+            }
+            Ok(Handled::Reply(ServerMessage::Plugin {
+                id: request.id,
+                result,
+            }))
+        }
         Op::SubscribeSession => {
             let current = state
                 .get_or_create_session(session, request.session_id, request.agent)
@@ -2120,8 +2193,40 @@ async fn start_session_turn(
     subscriber: Option<Subscriber>,
     handoff_ordinary: bool,
 ) {
-    let mut messages = session.agent.lock().await.memory.messages().to_vec();
+    let (mut messages, original_tools) = {
+        let mut agent = session.agent.lock().await;
+        let plugin_tools = if session.agent_name == "build" {
+            state
+                .bootstrap
+                .plugins
+                .tools(
+                    &session.workspace.id,
+                    PathBuf::from(&session.workspace.path),
+                    agent.tools(),
+                )
+                .await
+        } else {
+            Vec::new()
+        };
+        let previous = if plugin_tools.is_empty() {
+            None
+        } else {
+            let mut tools = agent.tools().to_vec();
+            tools.extend(plugin_tools);
+            Some(agent.replace_tools(Arc::new(tools)))
+        };
+        (agent.memory.messages().to_vec(), previous)
+    };
+    let mut prompt = prompt;
     if !prompt.is_empty() {
+        let selected = state
+            .bootstrap
+            .plugins
+            .selected_context(&session.workspace.id, &session.session_id);
+        if !selected.is_empty() {
+            prompt.push_str("\n\n[Plugin selection context: untrusted view data]\n");
+            prompt.push_str(&serde_json::to_string(&selected).unwrap());
+        }
         messages.push(Message::User {
             content: vec![protocol::ContentPart::Text {
                 text: prompt.clone(),
@@ -2185,6 +2290,7 @@ async fn start_session_turn(
     tokio::spawn(async move {
         let worker_session = session.clone();
         let worker_live = live.clone();
+        let plugin_host = state.bootstrap.plugins.clone();
         let mut worker = tokio::spawn(async move {
             execute_ask(
                 &worker_session,
@@ -2193,6 +2299,17 @@ async fn start_session_turn(
                 &worker_pool,
                 |message| {
                     let live = worker_live.clone();
+                    if let ServerMessage::Event { event, .. } = &message
+                        && event["type"] == "tool_finish"
+                        && let Ok(event) = serde_json::from_value::<AgentEvent>(event.clone())
+                    {
+                        plugin_host.record_agent_changes(
+                            &worker_session.workspace.id,
+                            Path::new(&worker_session.workspace.path),
+                            &worker_session.session_id,
+                            &event,
+                        );
+                    }
                     async move {
                         let mut live = live.lock().await;
                         if message.is_ask_terminal().is_some() {
@@ -2212,6 +2329,9 @@ async fn start_session_turn(
         };
         {
             let mut agent = session.agent.lock().await;
+            if let Some(tools) = original_tools {
+                agent.replace_tools(tools);
+            }
             patch_dangling_tool_calls(&mut agent).await;
 
             if failure.is_some() {
@@ -3774,6 +3894,7 @@ mod tests {
                     .connect_lazy("sqlite::memory:")
                     .unwrap(),
                 mcp_tools: Vec::new(),
+                plugins: Default::default(),
                 skills: Vec::new(),
                 log_writer: None,
                 model: "test-model".to_string(),
@@ -4722,6 +4843,7 @@ mod tests {
                 provider: TestLlm::plain(),
                 pool,
                 mcp_tools: Vec::new(),
+                plugins: Default::default(),
                 skills: Vec::new(),
                 log_writer: None,
                 model: "test-model".to_string(),

@@ -536,28 +536,34 @@ async fn memory_table_exists(pool: &SqlitePool) -> Result<bool> {
 
 /// List persisted conversation sessions, newest first.
 ///
-/// Sessions are derived from the `memory_messages` table, so a session exists
-/// once it has at least one stored message. Subagent sessions recorded via
+/// Sessions start with a stored message or a persisted application binding.
+/// Subagent sessions recorded via
 /// [`record_subagent_session`] are excluded: they belong to their parent
 /// conversation, not the session list.
 pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<gewu_protocol::SessionSummary>> {
     session_agent(pool, "").await?;
     ensure_subagents(pool).await?;
+    ensure_session_state(pool).await?;
     if !memory_table_exists(pool).await? {
         return Ok(Vec::new());
     }
     let rows = sqlx::query(
         r#"
-        SELECT
-            memory_messages.session_id,
-            COALESCE((SELECT agent FROM session_agents WHERE session_agents.session_id = memory_messages.session_id), 'build') AS agent,
-            COUNT(*) AS message_count,
-            datetime(MAX(memory_messages.created_at), 'unixepoch', 'localtime') AS updated_at
-        FROM memory_messages
-        LEFT JOIN subagent_sessions ON subagent_sessions.session_id = memory_messages.session_id
+        WITH activity AS (
+            SELECT session_id, COUNT(*) AS message_count, MAX(created_at) AS time
+            FROM memory_messages GROUP BY session_id
+            UNION ALL
+            SELECT session_id, 0, CAST(value AS INTEGER) FROM session_state WHERE key = 'gewu.plugin.session'
+        )
+        SELECT activity.session_id,
+            COALESCE((SELECT agent FROM session_agents WHERE session_agents.session_id = activity.session_id), 'build') AS agent,
+            SUM(activity.message_count) AS message_count,
+            datetime(MAX(activity.time), 'unixepoch', 'localtime') AS updated_at
+        FROM activity
+        LEFT JOIN subagent_sessions ON subagent_sessions.session_id = activity.session_id
         WHERE subagent_sessions.session_id IS NULL
-        GROUP BY memory_messages.session_id
-        ORDER BY MAX(memory_messages.created_at) DESC, memory_messages.session_id ASC
+        GROUP BY activity.session_id
+        ORDER BY MAX(activity.time) DESC, activity.session_id ASC
         "#,
     )
     .fetch_all(pool)

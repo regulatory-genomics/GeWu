@@ -98,6 +98,7 @@ pub struct Bootstrap {
     pub provider: Arc<dyn LlmProvider>,
     pub pool: SqlitePool,
     pub mcp_tools: Vec<Arc<dyn gewu_core::traits::Tool>>,
+    pub plugins: Arc<crate::plugins::PluginHost>,
     pub skills: Vec<gewu_tools::SkillInfo>,
     pub log_writer: Option<RequestLog>,
     pub model: String,
@@ -473,6 +474,11 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
         info!("No config file found");
     }
     let file_config = &loaded_config.config;
+    let plugins = crate::plugins::PluginHost::from_config(
+        &file_config.plugins,
+        loaded_config.path.as_deref(),
+        file_config.plugin_host.clone(),
+    )?;
     let startup_directory = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     let workspace_roots = Arc::new(crate::config::resolve_workspace_roots(
         file_config,
@@ -552,8 +558,9 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
 
     Ok(Bootstrap {
         provider,
-        pool,
+        pool: pool.clone(),
         mcp_tools,
+        plugins: Arc::new(plugins.with_store(pool)),
         skills,
         log_writer,
         model,

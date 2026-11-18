@@ -154,11 +154,7 @@ impl Tool for BashTool {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        // Own process group so the timeout path can kill detached
-        // grandchildren (`bash -c "sleep 100 & wait"`), not just the direct
-        // `bash -c` child.
-        #[cfg(unix)]
-        child.process_group(0);
+        crate::process::own_group(&mut child);
 
         let mut child_process = child
             .spawn()
@@ -188,7 +184,7 @@ impl Tool for BashTool {
         };
 
         if !matches!(wait_result, WaitOutcome::Done(Ok(_))) {
-            kill_process_tree(&mut child_process);
+            crate::process::kill_group(&mut child_process);
             let _ =
                 tokio::time::timeout(std::time::Duration::from_secs(1), child_process.wait()).await;
         }
@@ -328,21 +324,6 @@ async fn read_capped(
         }
     }
     (buf, truncated)
-}
-
-/// Kills the child and, on Unix, its whole process group.
-fn kill_process_tree(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    {
-        if let Some(pid) = child.id() {
-            // The child was spawned with process_group(0), so it leads its
-            // own group; a negative pid signals every member.
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
-        }
-    }
-    let _ = child.start_kill();
 }
 
 #[cfg(test)]

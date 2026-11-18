@@ -159,16 +159,32 @@ fn write_block_body(out: &mut String, tab: &Tab, block: &Block, index: usize, st
                 .pending_steers
                 .iter()
                 .any(|(pending, at)| *at == index && pending == text);
+            let (prompt, plugin_context) = text
+                .rsplit_once("\n\n[Plugin selection context: untrusted view data]\n")
+                .and_then(|(prompt, context)| {
+                    serde_json::from_str::<Vec<String>>(context)
+                        .ok()
+                        .map(|c| (prompt, Some(c)))
+                })
+                .unwrap_or((text.as_str(), None));
             let _ = writeln!(
                 out,
                 "<div class=\"body plain\">{}{}</div>",
-                escape(text),
+                escape(prompt),
                 if queued {
                     "<span class=\"queue-status\">queued</span>"
                 } else {
                     ""
                 }
             );
+            if let Some(items) = plugin_context {
+                let _ = writeln!(
+                    out,
+                    "<details class=\"plugin-context-chip\"><summary>Plugin selection · {}</summary><pre>{}</pre></details>",
+                    items.len(),
+                    escape(&items.join("\n"))
+                );
+            }
         }
         _ => {
             let _ = writeln!(
@@ -581,6 +597,20 @@ fn render_tool(out: &mut String, tab: &Tab, view: &ToolView, index: usize, depth
             escape(input.trim_end())
         );
     }
+    let output = if (tool == "plugin_call" || tool.starts_with("plg_"))
+        && let Some((text, id)) = output.rsplit_once("\n[GeWu plugin result: ")
+        && let Some(id) = id.strip_suffix(']')
+        && uuid::Uuid::parse_str(id).is_ok()
+    {
+        let _ = writeln!(
+            out,
+            "<button type=\"button\" class=\"tool-more\" data-plugin-result=\"{}\">Open application result</button>",
+            escape(id)
+        );
+        text
+    } else {
+        output
+    };
     let lines: Vec<&str> = output.trim_end().lines().collect();
     let shown = if expanded {
         lines.len().min(TOOL_MAX_LINES)

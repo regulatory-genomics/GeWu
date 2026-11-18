@@ -4,6 +4,8 @@
 // applies snapshots/deltas, and forwards user actions. Model-authored text is
 // inserted with textContent, never innerHTML.
 
+import {panelHost} from './panels.mjs';
+
 (() => {
   "use strict";
 
@@ -265,6 +267,8 @@
       if (state.ws !== ws) return;
       state.connected = true;
       state.ready = false;
+      for (const entry of pluginPending.values()) entry.reject(Error('Disconnected'));
+      pluginPending.clear();
       state.attempt = 0;
       state.follow.clear();
       state.loadingEarlier = false;
@@ -355,6 +359,27 @@
     return true;
   }
 
+  const pluginPending = new Map();
+  let pluginRequest = 0;
+  let pluginTabs = [];
+  const panels = panelHost(document.getElementById('plugin-host'), document.getElementById('plugin-toggle'), (tab, plugin) => {
+    return new Promise((resolve,reject) => {
+      if (!Number.isSafeInteger(tab) || !state.ready) {reject(Error('No connected workspace'));return;}
+      const request=++pluginRequest;
+      const timer=setTimeout(()=>{pluginPending.delete(request);reject(Error('Plugin request timed out'));},65000);
+      pluginPending.set(request,{tab,resolve:value=>{clearTimeout(timer);resolve(value);},reject:error=>{clearTimeout(timer);reject(error);}});
+      if (!send({op:'plugin',tab,request,plugin})) {
+        pluginPending.get(request).reject(Error('Disconnected'));
+        pluginPending.delete(request);
+      }
+    });
+  });
+
+  function syncPanels(message) {
+    pluginTabs = message.tabs;
+    panels.switchTab(pluginTabs.find(tab=>tab.id===message.active));
+  }
+
   // -- server messages ----------------------------------------------------
 
   function handle(message) {
@@ -369,6 +394,7 @@
         el.sidebar.innerHTML = message.sidebar || "";
         setSessionSidebarHtml(message.session_sidebar);
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
+        syncPanels(message);
         break;
       case "tabs": {
         if (state.active !== message.active) {
@@ -384,6 +410,20 @@
           if (!alive.has(id)) state.follow.delete(id);
         }
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
+        syncPanels(message);
+        break;
+      }
+      case 'plugin': {
+        const entry=pluginPending.get(message.request);
+        if (!entry) break;
+        pluginPending.delete(message.request);
+        const tab=pluginTabs.find(tab=>tab.id===entry.tab);
+        if (tab && !tab.session_id && message.session_id) {
+          const bound={...tab,session_id:message.session_id};
+          pluginTabs=pluginTabs.map(item=>item.id===bound.id ? bound : item);
+          if (state.active===entry.tab) panels.switchTab(bound);
+        }
+        if (message.error) entry.reject(Error(message.error)); else entry.resolve(message.result);
         break;
       }
       case "session_sidebar":
@@ -935,6 +975,8 @@
   });
 
   el.transcript.addEventListener("click", (event) => {
+    const pluginResult=event.target.closest('[data-plugin-result]');
+    if (pluginResult) { panels.agentResult(pluginResult.dataset.pluginResult); return; }
     const loadEarlier = event.target.closest("[data-load-earlier]");
     if (loadEarlier) {
       if (state.loadingEarlier) return;
@@ -1225,6 +1267,12 @@
   });
 
   el.fileMenu.addEventListener("click", (event) => {
+    if (event.target.closest('[data-file-edit]')) {
+      const path = state.fileMenu.path;
+      closeFileMenu();
+      if (path) panels.editPath(path);
+      return;
+    }
     if (event.target.closest("[data-file-preview]")) {
       const path = state.fileMenu.path;
       closeFileMenu();
@@ -1686,4 +1734,3 @@
   });
   boot();
 })();
-

@@ -465,10 +465,15 @@ impl Tool for WriteFileTool {
         write(&file_path, input.content.as_bytes())
             .await
             .map_err(into_tool_error)?;
-        Ok(ToolResult::new(
+        let mut result = ToolResult::new(
             "write_file",
             format!("Successfully wrote to {}", file_path.to_string_lossy()),
-        ))
+        );
+        result.metadata.insert(
+            "gewu.fileChanges".into(),
+            serde_json::json!([{"path":file_path,"operation":"write"}]),
+        );
+        Ok(result)
     }
 }
 
@@ -511,10 +516,29 @@ impl Tool for EditFileTool {
         write(&file_path, new_content.as_bytes())
             .await
             .map_err(into_tool_error)?;
-        Ok(ToolResult::new(
+        let mut result = ToolResult::new(
             "edit_file",
             format!("Successfully modified {}", file_path.to_string_lossy()),
-        ))
+        );
+        let mut change = serde_json::json!({"path":file_path,"operation":"update"});
+        if content.len().saturating_add(new_content.len()) <= 96 * 1024 {
+            let diff = similar::TextDiff::from_lines(&content, &new_content);
+            change["diff"] = diff.unified_diff().context_radius(3).to_string().into();
+            change["additions"] = diff
+                .iter_all_changes()
+                .filter(|c| c.tag() == similar::ChangeTag::Insert)
+                .count()
+                .into();
+            change["deletions"] = diff
+                .iter_all_changes()
+                .filter(|c| c.tag() == similar::ChangeTag::Delete)
+                .count()
+                .into();
+        }
+        result
+            .metadata
+            .insert("gewu.fileChanges".into(), serde_json::json!([change]));
+        Ok(result)
     }
 }
 

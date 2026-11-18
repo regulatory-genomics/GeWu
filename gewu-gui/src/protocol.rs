@@ -20,6 +20,11 @@ pub struct TabInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ClientMsg {
+    Plugin {
+        tab: u64,
+        request: u64,
+        plugin: gewu_protocol::plugin::HostAction,
+    },
     RevertChat {
         tab: u64,
         block: Option<usize>,
@@ -174,6 +179,12 @@ pub struct UploadedFile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
+    Plugin {
+        request: u64,
+        result: Option<serde_json::Value>,
+        error: Option<String>,
+        session_id: Option<String>,
+    },
     /// Replace only the tool panel; leave transcript and sidebar tabs intact.
     Tools { html: String },
     /// Full initial state: tabs, active tab, transcript, status and sidebar HTML.

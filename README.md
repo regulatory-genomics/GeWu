@@ -118,3 +118,6 @@ the left sidebar. Each session remembers its root across restarts; switching
 is rejected while a turn is running.
 
 Agent state is stored in `~/.gewu/gewu.db` (override with `--db-path`).
+# Application plugins
+
+GeWu's **Applications** panel opens and runs configured app adapters alongside chat. See [installation](docs/plugins/installation.md) for package/config steps and the [adapter protocol](docs/plugins/protocol-v1.md) for integration.
