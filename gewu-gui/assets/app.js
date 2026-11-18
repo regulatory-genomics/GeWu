@@ -454,13 +454,27 @@ import {panelHost} from './panels.mjs';
     onHide: () => setSidebarTab("files"),
   });
 
-  // The sidebar HTML is re-rendered on every snapshot, so re-mount the
-  // application dock into the new Preview panel and keep the active tab.
+  // Replacing or moving an iframe's ancestors reloads it and loses its port.
+  // Keep Preview mounted; snapshots only replace the server-rendered panes.
+  function updateSidebar(html) {
+    if (!el.sidebar.querySelector('#sidebar-preview')) {
+      el.sidebar.innerHTML = html;
+      return;
+    }
+    const next = document.createElement('template');
+    next.innerHTML = html;
+    for (const selector of ['.sidebar-head', '#sidebar-files', '#sidebar-tools']) {
+      const current = el.sidebar.querySelector(selector);
+      const fresh = next.content.querySelector(selector);
+      if (current && fresh) current.replaceWith(fresh);
+    }
+  }
+
   function mountPanels() {
     const slot = el.sidebar.querySelector('#sidebar-preview');
     const host = el.pluginHost;
     if (!slot || !host) return;
-    slot.append(host);
+    if (host.parentNode !== slot) slot.append(host);
     host.hidden = false;
     setSidebarTab(state.sidebarTab || 'files');
   }
@@ -484,7 +498,7 @@ import {panelHost} from './panels.mjs';
         state.loadingEarlier = false;
         setTranscript(message.transcript, true);
         setStatus(message.status);
-        el.sidebar.innerHTML = message.sidebar || "";
+        updateSidebar(message.sidebar || "");
         setSessionSidebarHtml(message.session_sidebar);
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
         syncPanels(message);

@@ -3240,6 +3240,12 @@ body {
 .plugin-manager h3 { margin: 12px 0 4px; font-size: 11px; letter-spacing: 0.08em; color: var(--text-faint); text-transform: uppercase; }
 .plugin-row { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; padding: 3px 0; }
 .plugin-row > code { color: var(--text-faint); word-break: break-all; }
+.plugin-tools { width: 100%; padding: 6px 10px; border-left: 2px solid var(--line); }
+.plugin-tools summary { cursor: pointer; color: var(--text-faint); padding: 3px 0; }
+.plugin-tools details { margin: 4px 0 4px 10px; }
+.plugin-tools p { margin: 4px 0; }
+.plugin-tools code { overflow-wrap: anywhere; }
+.plugin-tools pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
 .plugin-panel { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: auto; }
 .plugin-panel textarea { width: 100%; min-height: 15rem; background: #0d1420; color: inherit; font: 12px var(--mono); }
 .plugin-panel iframe { flex: 1 1 auto; width: 100%; min-height: 24rem; border: 0; background: #101927; }

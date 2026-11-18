@@ -32,6 +32,7 @@ async fn opens_a_validated_package_once_per_workspace_and_rejects_escape() {
         settings: Default::default(),
         workspace_settings: Default::default(),
         service_origins: vec![],
+        sources: Default::default(),
     };
     let host = PluginHost::from_config(
         &BTreeMap::from([("demo".into(), entry)]),

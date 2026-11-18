@@ -42,7 +42,10 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
       const item = button(panel.title, () => { active = id; render(); });
       item.setAttribute('aria-pressed', String(active === id));
       tabs.append(item);
-      if (id === active) tabs.append(button('Close', () => close(id)));
+      if (id === active) {
+        if (panel.reload) tabs.append(button('Reload view', panel.reload));
+        tabs.append(button('Close', () => close(id)));
+      }
       panel.content.hidden = id !== active;
     }
     if (manager) manager.hidden = active !== 'plugins';
@@ -77,7 +80,21 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
     const request = requestFor();
     const panel = add(id, view.title, instance.id, view.id);
     let disposed = false, release = () => {};
-    panel.dispose = () => { disposed = true; release(); };
+    panel.dispose = () => {
+      if (disposed) return;
+      disposed = true;
+      return release();
+    };
+    if (view.kind === 'webview') panel.reload = async () => {
+      panel.reload = null;
+      render();
+      await panel.dispose();
+      if (panels.get(id) !== panel) return;
+      panels.delete(id);
+      panel.content.remove();
+      await openView(instance, view, resource, {reveal: active === id});
+      render();
+    };
     if (reveal) { active = id; render(); onShow?.(); }
     const state = read(stateKey(scope, instance, view), {});
     try {
@@ -108,7 +125,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
           getCall: ({callId}) => request({action: 'call_status', callId}),
           cancelCall: ({callId}) => request({action: 'cancel', callId}),
         }, (error) => fail(panel.content, error));
-        release = () => { local(); detach(); };
+        release = () => { local(); return detach(); };
       } else if (view.renderer === 'diff') await changes(panel.content, request);
       else if (!resource) throw Error('Select a content resource before opening this view.');
       else if (view.renderer === 'text') await editor(panel.content, request, resource);
@@ -204,7 +221,9 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
           const view = primaryView(instance);
           if (!view || dismissed.has(instance.id)) continue;
           if (panels.has(`${instance.id}/${view.id}`)) continue;
-          await openView(instance, view, undefined, {reveal: true});
+          // Reattaching a live app must not steal the file or result the user is viewing.
+          const reveal = active !== 'changes' && (!panels.has(active) || !!panels.get(active).instanceId);
+          await openView(instance, view, undefined, {reveal});
         }
         render();
         // Re-rendering the manager under the pointer steals clicks; only do it
@@ -247,6 +266,31 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
         if (plugin.version) name.append(node('code', ` v${plugin.version}`));
         row.append(name);
         row.append(node('span', !plugin.configured ? ' \u00b7 installed, not configured' : !plugin.enabled ? ' \u00b7 disabled' : ' \u00b7 enabled'));
+        const tools = [...new Map(running.flatMap(instance => instance.tools ?? []).map(tool => [tool.name, tool])).values()];
+        const details = node('details');
+        details.className = 'plugin-tools';
+        details.append(node('summary', tools.length ? `Tools (${tools.length})` : 'Tools'));
+        if (!tools.length) details.append(node('p', 'Open the plugin to discover its available tools.'));
+        for (const tool of tools) {
+          const item = node('details');
+          item.append(node('summary', `${tool.name} · ${tool.effect}`));
+          item.append(node('p', tool.description));
+          item.append(node('pre', JSON.stringify(tool.inputSchema, null, 2)));
+          details.append(item);
+        }
+        row.append(details);
+        if (plugin.package || Object.keys(plugin.sources ?? {}).length) {
+          const source = node('details');
+          source.className = 'plugin-tools';
+          source.append(node('summary', 'Source & package'));
+          for (const [label, path] of Object.entries({package: plugin.package, ...plugin.sources})) {
+            if (!path) continue;
+            const line = node('p', `${label}: `);
+            line.append(node('code', path));
+            source.append(line);
+          }
+          row.append(source);
+        }
         if (!plugin.configured) {
           if (plugin.package) row.append(node('code', plugin.package));
           row.append(node('span', ' add it to config.json to use it'));

@@ -22,6 +22,8 @@ pub struct PluginEntry {
     pub workspace_settings: BTreeMap<String, Object>,
     #[serde(default)]
     pub service_origins: Vec<String>,
+    #[serde(default)]
+    pub sources: BTreeMap<String, PathBuf>,
 }
 
 impl std::fmt::Debug for PluginEntry {

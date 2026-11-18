@@ -30,6 +30,7 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
                     settings: Default::default(),
                     workspace_settings: Default::default(),
                     service_origins: vec![],
+                    sources: Default::default(),
                 },
             )]),
             None,

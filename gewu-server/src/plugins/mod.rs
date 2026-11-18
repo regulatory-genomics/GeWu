@@ -103,6 +103,9 @@ impl PluginHost {
         for (id, entry) in entries {
             let mut entry = entry.clone();
             entry.package = base.join(&entry.package);
+            for path in entry.sources.values_mut() {
+                *path = base.join(&*path);
+            }
             if let Some(enabled) = overrides.get(id) {
                 entry.enabled = *enabled;
             }
@@ -151,13 +154,14 @@ impl PluginHost {
         let entries = self.entries.read().unwrap();
         let mut out: Vec<Value> = entries
             .iter()
-            .map(|(id, (_, package))| {
+            .map(|(id, (entry, package))| {
                 json!({
                     "id":id, "enabled":package.is_some(), "configured":true,
                     "title":package.as_ref().map(|p| &p.manifest.title),
                     "version":package.as_ref().map(|p| &p.manifest.version),
                     "scope":package.as_ref().map(|p| p.manifest.scope),
                     "views":package.as_ref().map(|p| &p.manifest.views),
+                    "package":entry.package, "sources":entry.sources,
                 })
             })
             .collect();

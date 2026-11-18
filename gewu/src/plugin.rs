@@ -106,6 +106,7 @@ pub async fn run(action: Action) -> Result<()> {
                         settings,
                         workspace_settings: BTreeMap::new(),
                         service_origins: vec![],
+                        sources: Default::default(),
                     },
                 )]),
                 None,

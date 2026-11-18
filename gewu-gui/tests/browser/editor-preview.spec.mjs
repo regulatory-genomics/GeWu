@@ -30,7 +30,8 @@ test('editor saves workspace text and refuses a stale second edit', async ({page
     await page.getByRole('button',{name:'Changes',exact:true}).click();
     await page.getByRole('button',{name:'Refresh', exact:true}).click();
     await page.getByText('workspace:///example.txt · editor',{exact:true}).click();
-    await expect(page.locator('#plugin-host pre')).toContainText('+from the editor');
-    await expect(page.locator('#plugin-host pre')).toContainText('-original text');
+    const diff = page.locator('.plugin-panel:not([hidden]) pre');
+    await expect(diff).toContainText('+from the editor');
+    await expect(diff).toContainText('-original text');
   } finally {await fixture.close();}
 });

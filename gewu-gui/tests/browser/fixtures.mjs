@@ -113,7 +113,7 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
       await fetch(`http://127.0.0.1:${http}/ready`,{signal:AbortSignal.timeout(150)});
       guiChild ??= start(['gui','--port',`${gui}`,'--server',`ws://127.0.0.1:${socket}`,'--server-http',`http://127.0.0.1:${http}`]);
       const response=await fetch(`${url}/api/config`,{signal:AbortSignal.timeout(150)});
-      if (response.ok) return {url,close,root,other,requests,log:()=>output,manifest, finishNativeStream:()=>nativeStream.end('data: done\n\n')};
+      if (response.ok) return {url,close,root,other,packagePath:pkg,requests,log:()=>output,manifest, finishNativeStream:()=>nativeStream.end('data: done\n\n')};
     } catch {}
     if (server.exitCode!==null || (guiChild && guiChild.exitCode!==null)) break;
     await new Promise(resolve=>setTimeout(resolve,50));

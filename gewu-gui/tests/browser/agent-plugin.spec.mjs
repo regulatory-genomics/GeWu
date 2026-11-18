@@ -17,7 +17,7 @@ test('a real agent turn calls the adapter and Plan does not advertise plugin too
     expect(fixture.requests.some(turn=>turn.messages.some(m=>m.role==='tool' && m.content.includes('adapter evidence')))).toBeTruthy();
     await page.reload();
     await page.getByRole('button',{name:'Open application result'}).click();
-    await expect(page.locator('#plugin-host pre')).toContainText('adapter evidence');
+    await expect(page.locator('.plugin-panel:not([hidden]) pre')).toContainText('adapter evidence');
     await page.getByRole('tab',{name:'FILES'}).click();
     await page.getByRole('button',{name:'plan',exact:true}).click();
     await expect(page.getByRole('button',{name:'plan',exact:true})).toHaveAttribute('aria-pressed','true');

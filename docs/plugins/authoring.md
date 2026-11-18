@@ -21,6 +21,40 @@ Send `{id,method,params,viewEpoch}` through the dedicated port. Each reply has `
 
 Use the URL returned by the host rather than constructing ticket paths. For HTTP bytes, fetch the URL with `credentials:'omit'`, the approved method, and optional body; read SSE with streaming `fetch`. The service host and private headers stay on the server. Tickets are short-lived, and a closed view or adapter generation cannot mint or redeem old tickets. Re-resolve an expired ticket. For assets use relative URLs to files under `web/` and external JS modules; the frame does not run inline scripts.
 
+## Source-aware development
+
+An optional `sources` map in a local plugin config entry identifies the adapter
+and the software it connects to. Paths resolve relative to the config file:
+
+```json
+{
+  "plugins": {
+    "manimble": {
+      "package": "/path/to/staged-manimble",
+      "enabled": true,
+      "sources": {
+        "adapter": "/path/to/Manimble/plugins/gewu",
+        "application": "/path/to/Manimble"
+      }
+    }
+  }
+}
+```
+
+Both the Plugins panel and the agent's `plugin_list` expose these paths, together
+with the loaded package path. This is source discovery, not a filesystem grant:
+normal workspace/tool permissions still apply. Put build/test/update instructions
+in the plugin's existing skill so the agent can follow the software's native
+development workflow. Source paths are host-local config, not portable package metadata.
+
+For a development package, edit source, run its tests, then stage/build into the
+configured package location. Use **Reload view** in Preview to read the updated
+web assets while retaining the current native instance. Adapter or native Python changes require
+Stop and Open to restart the instance; native compiled software also needs its normal
+build. Manifest/backend/settings changes require restarting GeWu to reload the
+configuration. A registered source directory is not itself the installed package.
+GeWu does not watch source paths or replace running code automatically.
+
 ## Test
 
 Run `scripts/plugin-conformance.py` against the staged package. A browser spec can export `register({test,expect,startFixture})`; GeWu's `application-plugin.spec.mjs` loads that spec with `GEWU_APP_SPEC` and `GEWU_APP_PLUGIN`. `startFixture({settings})` starts the actual Rust server and GUI on loopback, returning `url`, a temporary workspace `root`, and `close()`. Keep native engine fixtures small and pass configured dependencies explicitly. Package smoke tests should fail clearly when a required binary is missing.

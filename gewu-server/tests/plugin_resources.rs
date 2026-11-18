@@ -27,6 +27,7 @@ async fn tickets_stream_ranges_and_expire_when_instance_closes() {
                 settings: Default::default(),
                 workspace_settings: Default::default(),
                 service_origins: vec![],
+                sources: Default::default(),
             },
         )]),
         None,
