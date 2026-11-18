@@ -142,12 +142,10 @@ import {panelHost} from './panels.mjs';
 
   // The dock can never eat the composer: the transcript keeps its own room,
   // and hiding the sessions sidebar gives the dock what it frees.
-  const TRANSCRIPT_MIN = 360;
+  const TRANSCRIPT_MIN = 320;
 
   function panelWidthMax() {
-    const sessions = el.app.classList.contains("sessions-collapsed")
-      ? 0
-      : el.sessionSidebar.getBoundingClientRect().width;
+    const sessions = parseFloat(getComputedStyle(el.app).getPropertyValue("--session-sidebar-width")) || 0;
     return Math.max(PANEL_MIN, Math.round(window.innerWidth - sessions - TRANSCRIPT_MIN));
   }
 
@@ -446,7 +444,10 @@ import {panelHost} from './panels.mjs';
       setSidebarOpen(true, false);
       setSidebarTab("preview");
       // An application needs room: at the default Files width its canvas is
-      // unusable. A width the user chose on purpose is left alone.
+      // unusable. On a narrow window the session list steps aside, since the
+      // application is what the reader just opened. A width the user chose on
+      // purpose is left alone.
+      if (panelWidthMax() < PANEL_APP_MIN) setSessionsOpen(false, false);
       const dock = parseFloat(getComputedStyle(el.app).getPropertyValue("--panel-width")) || 0;
       if (dock <= 440) setPanelWidth(Math.min(900, panelWidthMax()), true);
     },
