@@ -46,8 +46,13 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
     requests.push(turn);
     const plugin=turn.tools?.find(t=>t.function.name.startsWith('plg_demo_echo_'));
     const openTool=turn.tools?.find(t=>t.function.name==='plugin_open');
-    const afterTool=turn.messages.some(m=>m.role==='tool');
-    const asked=turn.messages.filter(m=>m.role==='user').map(m=>typeof m.content==='string'?m.content:(m.content??[]).map(p=>p.text??'').join(' ')).join(' ');
+    const lastUser=turn.messages.reduce((index,message,current) => message.role === 'user' ? current : index, -1);
+    const afterTool=lastUser >= 0 && turn.messages.slice(lastUser + 1).some(m=>m.role==='tool');
+    const userMessages=turn.messages.filter(m=>m.role==='user');
+    const askedMessage=userMessages.at(-1);
+    const asked=typeof askedMessage?.content==='string'
+      ? askedMessage.content
+      : (askedMessage?.content??[]).map(p=>p.text??'').join(' ');
     const send=(delta,finish_reason=null)=>res.write(`data: ${JSON.stringify({id:'fixture',model:'fixture',object:'chat.completion.chunk',choices:[{index:0,delta,finish_reason}]})}\n\n`);
     res.writeHead(200,{'content-type':'text/event-stream'});
     // Any plugin conformance spec can say `call <tool> <json>`; the agent, not
