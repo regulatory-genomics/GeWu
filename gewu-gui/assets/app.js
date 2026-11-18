@@ -138,9 +138,17 @@ import {panelHost} from './panels.mjs';
 
   const PANEL_WIDTH_KEY = "gewu-gui-panel-width";
   const PANEL_MIN = 240;
+  const PANEL_APP_MIN = 720;
+
+  // The dock can never eat the composer: the transcript keeps its own room,
+  // and hiding the sessions sidebar gives the dock what it frees.
+  const TRANSCRIPT_MIN = 360;
 
   function panelWidthMax() {
-    return Math.max(PANEL_MIN, Math.round(window.innerWidth * 0.7));
+    const sessions = el.app.classList.contains("sessions-collapsed")
+      ? 0
+      : el.sessionSidebar.getBoundingClientRect().width;
+    return Math.max(PANEL_MIN, Math.round(window.innerWidth - sessions - TRANSCRIPT_MIN));
   }
 
   function setPanelWidth(px, remember) {
@@ -437,6 +445,10 @@ import {panelHost} from './panels.mjs';
     onShow: () => {
       setSidebarOpen(true, false);
       setSidebarTab("preview");
+      // An application needs room: at the default Files width its canvas is
+      // unusable. A width the user chose on purpose is left alone.
+      const dock = parseFloat(getComputedStyle(el.app).getPropertyValue("--panel-width")) || 0;
+      if (dock <= 440) setPanelWidth(Math.min(PANEL_APP_MIN + 40, panelWidthMax()), true);
     },
     onHide: () => setSidebarTab("files"),
   });
