@@ -45,10 +45,15 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
     const turn=JSON.parse(body);
     requests.push(turn);
     const plugin=turn.tools?.find(t=>t.function.name.startsWith('plg_demo_echo_'));
+    const openTool=turn.tools?.find(t=>t.function.name==='plugin_open');
     const afterTool=turn.messages.some(m=>m.role==='tool');
+    const asked=turn.messages.filter(m=>m.role==='user').map(m=>typeof m.content==='string'?m.content:(m.content??[]).map(p=>p.text??'').join(' ')).join(' ');
     const send=(delta,finish_reason=null)=>res.write(`data: ${JSON.stringify({id:'fixture',model:'fixture',object:'chat.completion.chunk',choices:[{index:0,delta,finish_reason}]})}\n\n`);
     res.writeHead(200,{'content-type':'text/event-stream'});
-    if (plugin && !afterTool) {
+    if (openTool && asked.includes('open the demo') && !afterTool) {
+      send({role:'assistant',tool_calls:[{index:0,id:'open-1',type:'function',function:{name:openTool.function.name,arguments:'{"pluginId":"demo"}'}}]});
+      send({},'tool_calls');
+    } else if (plugin && !afterTool) {
       send({role:'assistant',tool_calls:[{index:0,id:'echo-1',type:'function',function:{name:plugin.function.name,arguments:'{"evidence":"adapter evidence"}'}}]});
       send({},'tool_calls');
     } else {
@@ -67,7 +72,8 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
   }));
   const [socket,tcp,http,gui]=await Promise.all([port(),port(),port(),port()]);
   let output='';
-  const env={...process.env,GEWU_GUI_TOKEN:'',GEWU_SERVE_TOKEN:'',NO_PROXY:'127.0.0.1,localhost',no_proxy:'127.0.0.1,localhost'};
+  // A private HOME keeps ~/.gewu/plugins out of the workspace's inventory.
+  const env={...process.env,HOME:temp,GEWU_GUI_TOKEN:'',GEWU_SERVE_TOKEN:'',NO_PROXY:'127.0.0.1,localhost',no_proxy:'127.0.0.1,localhost'};
   for (const key of ['OPENAI_MODEL','GEWU_PROVIDER','OPENAI_API_KEY','OPENAI_BASE_URL','OPENAI_ENDPOINT']) delete env[key];
   const start=(args)=>{
     const child=spawn(binary,['--no-update-check',...args],{cwd:root,env,stdio:['ignore','pipe','pipe']});
@@ -100,4 +106,12 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
     await new Promise(resolve=>setTimeout(resolve,50));
   }
   await close(); throw Error(`GeWu fixture could not start:\n${output}`);
+}
+
+/// The files sidebar starts closed and remembers being opened, so a reload
+/// leaves it open. Tests only need the Preview tab visible either way.
+export async function openPreview(page) {
+  const reveal = page.getByRole('button', {name: 'Show files'});
+  if (await reveal.isVisible()) await reveal.click();
+  await page.getByRole('tab', {name: 'PREVIEW'}).click();
 }

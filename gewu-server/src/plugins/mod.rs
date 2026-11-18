@@ -8,7 +8,7 @@ pub mod tools;
 use anyhow::{Context, Result, bail, ensure};
 use gewu_protocol::plugin::*;
 use package::{Package, PluginEntry, contained, relative, validate, validator};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
@@ -30,6 +30,12 @@ pub struct PluginHost {
     calls: Arc<Mutex<actions::Calls>>,
     editor: changes::Editor,
     store: Option<gewu_core::types::SessionState>,
+    /// Packages found under `~/.gewu/plugins`, including ones no config entry
+    /// references yet; the Plugins panel lists both.
+    installed: Vec<Package>,
+    /// `~/.gewu/plugin-state.json`: enabled overrides kept out of the user's
+    /// config so enabling never rewrites comments or secrets.
+    state_file: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -80,16 +86,26 @@ impl PluginHost {
             (1..=1024 * 1024).contains(&limits.stderr_bytes),
             "pluginHost.stderrBytes must be 1–1048576"
         );
+        let (installed_root, state_file) = install_locations();
         let mut host = Self {
             limits,
+            installed: installed_root
+                .as_ref()
+                .and_then(|root| package::installed(root).ok())
+                .unwrap_or_default(),
+            state_file,
             ..Self::default()
         };
+        let overrides = host.enabled_overrides();
         let base = config_path
             .and_then(Path::parent)
             .unwrap_or_else(|| Path::new("."));
         for (id, entry) in entries {
             let mut entry = entry.clone();
             entry.package = base.join(&entry.package);
+            if let Some(enabled) = overrides.get(id) {
+                entry.enabled = *enabled;
+            }
             let package = if entry.enabled {
                 Some(load_entry(id, &entry)?)
             } else {
@@ -103,11 +119,62 @@ impl PluginHost {
         Ok(host)
     }
 
+    fn enabled_overrides(&self) -> BTreeMap<String, bool> {
+        self.state_file
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Record `enabled` for the next start. Best-effort: a read-only home must
+    /// not fail the toggle that already took effect in memory.
+    fn persist_enabled(&self, id: &str, enabled: bool) {
+        let Some(path) = &self.state_file else { return };
+        let mut state = self.enabled_overrides();
+        state.insert(id.into(), enabled);
+        let write = || -> Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let temp = path.with_extension("json.tmp");
+            std::fs::write(&temp, serde_json::to_vec_pretty(&state)?)?;
+            std::fs::rename(&temp, path)?;
+            Ok(())
+        };
+        if let Err(error) = write() {
+            tracing::warn!("could not persist plugin enabled state: {error}");
+        }
+    }
+
     pub fn catalog(&self) -> Vec<Value> {
-        self.entries.read().unwrap().iter().map(|(id, (_, package))| serde_json::json!({
-            "id":id, "enabled":package.is_some(), "title":package.as_ref().map(|p| &p.manifest.title),
-            "scope":package.as_ref().map(|p| p.manifest.scope), "views":package.as_ref().map(|p| &p.manifest.views),
-        })).collect()
+        let entries = self.entries.read().unwrap();
+        let mut out: Vec<Value> = entries
+            .iter()
+            .map(|(id, (_, package))| {
+                json!({
+                    "id":id, "enabled":package.is_some(), "configured":true,
+                    "title":package.as_ref().map(|p| &p.manifest.title),
+                    "version":package.as_ref().map(|p| &p.manifest.version),
+                    "scope":package.as_ref().map(|p| p.manifest.scope),
+                    "views":package.as_ref().map(|p| &p.manifest.views),
+                })
+            })
+            .collect();
+        // Installed packages no config entry points at: the user needs to know
+        // they exist before they can be configured.
+        for package in &self.installed {
+            if entries.contains_key(&package.manifest.id) {
+                continue;
+            }
+            out.push(json!({
+                "id":package.manifest.id, "enabled":false, "configured":false,
+                "title":package.manifest.title, "version":package.manifest.version,
+                "scope":package.manifest.scope, "views":package.manifest.views,
+                "package":package.root,
+            }));
+        }
+        out
     }
 
     pub fn has_enabled(&self) -> bool {
@@ -121,7 +188,9 @@ impl PluginHost {
     async fn set_enabled(&self, id: &str, enabled: bool) -> Result<()> {
         {
             let mut entries = self.entries.write().unwrap();
-            let (entry, package) = entries.get_mut(id).context("unknown configured plugin")?;
+            let (entry, package) = entries.get_mut(id).with_context(|| {
+                format!("'{id}' is installed but not configured; add it to config.json first")
+            })?;
             if enabled == package.is_some() {
                 return Ok(());
             }
@@ -151,6 +220,7 @@ impl PluginHost {
                 return Err(error);
             }
         }
+        self.persist_enabled(id, enabled);
         Ok(())
     }
 
@@ -352,6 +422,19 @@ impl PluginHost {
             .is_err_and(|err| err.to_string().starts_with("CLEANUP_INCOMPLETE"));
         result
     }
+}
+
+/// Where `gewu plugin install` puts packages, and where the GUI keeps the
+/// enabled override. Tests and probes run without a home and simply get none.
+fn install_locations() -> (Option<PathBuf>, Option<PathBuf>) {
+    let Some(home) = dirs::home_dir() else {
+        return (None, None);
+    };
+    let root = home.join(".gewu");
+    (
+        Some(root.join("plugins")),
+        Some(root.join("plugin-state.json")),
+    )
 }
 
 fn load_entry(id: &str, entry: &PluginEntry) -> Result<Package> {

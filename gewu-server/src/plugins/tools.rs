@@ -48,6 +48,7 @@ enum Action {
 enum Gateway {
     List,
     Open,
+    Close,
     Describe,
     Call,
 }
@@ -76,9 +77,16 @@ impl PluginHost {
             (
                 Gateway::Open,
                 "plugin_open",
-                "Open a configured application in this workspace; resource-scoped plugins need a bindingResource.",
+                "Open a configured application in this workspace and show it in the Preview panel. Resource-scoped plugins need a bindingResource.",
                 json!({"pluginId":{"type":"string"},"bindingResource":{"type":"object"}}),
                 json!(["pluginId"]),
+            ),
+            (
+                Gateway::Close,
+                "plugin_close",
+                "Close an open application instance and its Preview views. Files the application wrote stay on disk.",
+                json!({"instanceId":{"type":"string"}}),
+                json!(["instanceId"]),
             ),
             (
                 Gateway::Describe,
@@ -197,7 +205,11 @@ impl Tool for PluginTool {
                         let i = host
                             .open(text("pluginId")?, workspace, root, resource)
                             .await?;
-                        json!({"id":i.activation.instance_id,"pluginId":i.package.manifest.id,"tools":i.definitions().filter(|t|t.expose_to_agent).map(|t|&t.name).collect::<Vec<_>>()})
+                        json!({"id":i.activation.instance_id,"pluginId":i.package.manifest.id,"views":i.package.manifest.views,"tools":i.definitions().filter(|t|t.expose_to_agent).map(|t|&t.name).collect::<Vec<_>>()})
+                    }
+                    Gateway::Close => {
+                        host.close(workspace, root, text("instanceId")?).await?;
+                        json!({"closed":true})
                     }
                     Gateway::Describe | Gateway::Call => {
                         let id = text("instanceId")?;

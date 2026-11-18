@@ -39,6 +39,16 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
     );
     let now = host.open("demo", "workspace", root, None).await.unwrap();
     let selected = host.tools("workspace", root.to_owned(), &[]).await;
+    let names: Vec<&str> = selected.iter().map(|tool| tool.name()).collect();
+    for expected in [
+        "plugin_list",
+        "plugin_open",
+        "plugin_close",
+        "plugin_describe",
+        "plugin_call",
+    ] {
+        assert!(names.contains(&expected), "missing {expected} in {names:?}");
+    }
     let echo = selected
         .iter()
         .find(|tool| tool.name().starts_with("plg_demo_echo_"))
@@ -107,6 +117,27 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
         )
         .await;
     assert!(result.is_err());
-    host.close("workspace", root, &instance_id).await.unwrap();
-    assert!(echo.execute(json!({"value":7}), &ctx).await.is_err());
+    // The Agent closes an application through the same scoped gateway the GUI uses.
+    let close = selected
+        .iter()
+        .find(|tool| tool.name() == "plugin_close")
+        .unwrap();
+    let closed = close
+        .execute(json!({"instanceId": instance_id.clone()}), &ctx)
+        .await
+        .unwrap();
+    assert_eq!(closed.output.trim(), r#"{"closed":true}"#);
+    assert!(echo.execute(json!({"value": 7}), &ctx).await.is_err());
+    assert!(
+        now.invoke(
+            "echo",
+            Default::default(),
+            now.context("after-close".into(), None),
+            None,
+            false,
+            false,
+        )
+        .await
+        .is_err()
+    );
 }

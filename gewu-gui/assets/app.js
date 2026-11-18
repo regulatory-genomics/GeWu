@@ -40,6 +40,8 @@ import {panelHost} from './panels.mjs';
     filePreview: document.getElementById("file-preview"),
     fileMenu: document.getElementById("file-menu"),
     workflowZoom: document.getElementById("workflow-zoom"),
+    pluginHost: document.getElementById("plugin-host"),
+    sidebarResizer: document.getElementById("sidebar-resizer"),
   };
 
   const state = {
@@ -65,6 +67,7 @@ import {panelHost} from './panels.mjs';
     workflowZoom: { runId: null, scale: 1, x: 0, y: 0 },
     fileMenu: { path: null, entry: null },
     previewWindow: null,
+    sidebarTab: "files",
   };
 
   function loadToken() {
@@ -133,8 +136,64 @@ import {panelHost} from './panels.mjs';
     }
   }
 
-  function setSessionsOpen(open, remember) {
-    el.app.classList.toggle("sessions-collapsed", !open);
+  const PANEL_WIDTH_KEY = "gewu-gui-panel-width";
+  const PANEL_MIN = 240;
+
+  function panelWidthMax() {
+    return Math.max(PANEL_MIN, Math.round(window.innerWidth * 0.7));
+  }
+
+  function setPanelWidth(px, remember) {
+    const width = Math.min(Math.max(PANEL_MIN, Math.round(px)), panelWidthMax());
+    el.app.style.setProperty("--panel-width", `${width}px`);
+    if (!remember) return;
+    try {
+      localStorage.setItem(PANEL_WIDTH_KEY, String(width));
+    } catch {
+      // The width still applies to this page.
+    }
+  }
+
+  function loadPanelWidth() {
+    const saved = Number(localStorage.getItem(PANEL_WIDTH_KEY));
+    return Number.isFinite(saved) && saved >= PANEL_MIN ? saved : 420;
+  }
+
+  function installSidebarResizer() {
+    setPanelWidth(loadPanelWidth(), false);
+    const handle = el.sidebarResizer;
+    if (!handle) return;
+    let startX = 0;
+    let startWidth = 0;
+    const move = (event) => {
+      setPanelWidth(startWidth + (startX - event.clientX), false);
+    };
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      handle.classList.remove("dragging");
+      el.app.classList.remove("resizing");
+      setPanelWidth(parseFloat(getComputedStyle(el.app).getPropertyValue("--panel-width")) || 420, true);
+    };
+    handle.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      startX = event.clientX;
+      startWidth = el.sidebar.getBoundingClientRect().width;
+      handle.classList.add("dragging");
+      el.app.classList.add("resizing");
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", stop, {once: true});
+    });
+    handle.addEventListener("keydown", (event) => {
+      const current = el.sidebar.getBoundingClientRect().width;
+      if (event.key === "ArrowLeft") setPanelWidth(current + 24, true);
+      else if (event.key === "ArrowRight") setPanelWidth(current - 24, true);
+      else return;
+      event.preventDefault();
+    });
+  }
+
+  function setSessionsOpen(open, remember) {    el.app.classList.toggle("sessions-collapsed", !open);
     el.sessionsExpand.setAttribute("aria-expanded", String(open));
     if (!remember) return;
     try {
@@ -362,7 +421,8 @@ import {panelHost} from './panels.mjs';
   const pluginPending = new Map();
   let pluginRequest = 0;
   let pluginTabs = [];
-  const panels = panelHost(document.getElementById('plugin-host'), document.getElementById('plugin-toggle'), (tab, plugin) => {
+  let panelSyncTimer;
+  const panels = panelHost(document.getElementById('plugin-host'), (tab, plugin) => {
     return new Promise((resolve,reject) => {
       if (!Number.isSafeInteger(tab) || !state.ready) {reject(Error('No connected workspace'));return;}
       const request=++pluginRequest;
@@ -373,11 +433,31 @@ import {panelHost} from './panels.mjs';
         pluginPending.delete(request);
       }
     });
+  }, {
+    onShow: () => {
+      setSidebarOpen(true, false);
+      setSidebarTab("preview");
+    },
+    onHide: () => setSidebarTab("files"),
   });
+
+  // The sidebar HTML is re-rendered on every snapshot, so re-mount the
+  // application dock into the new Preview panel and keep the active tab.
+  function mountPanels() {
+    const slot = el.sidebar.querySelector('#sidebar-preview');
+    const host = el.pluginHost;
+    if (!slot || !host) return;
+    slot.append(host);
+    host.hidden = false;
+    setSidebarTab(state.sidebarTab || 'files');
+  }
 
   function syncPanels(message) {
     pluginTabs = message.tabs;
     panels.switchTab(pluginTabs.find(tab=>tab.id===message.active));
+    mountPanels();
+    clearTimeout(panelSyncTimer);
+    panelSyncTimer = setTimeout(() => panels.sync(), 120);
   }
 
   // -- server messages ----------------------------------------------------
@@ -1449,18 +1529,22 @@ import {panelHost} from './panels.mjs';
   });
 
   function setSidebarTab(name) {
+    state.sidebarTab = name;
     const tabs = el.sidebar.querySelectorAll("[data-sidebar-tab]");
-    const panels = el.sidebar.querySelectorAll(".sidebar-panel");
+    const panes = el.sidebar.querySelectorAll(".sidebar-panel");
     for (const tab of tabs) {
       const active = tab.dataset.sidebarTab === name;
       tab.classList.toggle("active", active);
       tab.setAttribute("aria-selected", String(active));
     }
-    for (const panel of panels) {
-      const active = panel.id === `sidebar-${name}`;
-      panel.classList.toggle("active", active);
-      panel.hidden = !active;
+    for (const pane of panes) {
+      const active = pane.id === `sidebar-${name}`;
+      pane.classList.toggle("active", active);
+      pane.hidden = !active;
     }
+    el.app.classList.toggle("preview-open", name === "preview");
+    el.pluginHost.hidden = name !== "preview";
+    panels.setVisible(name === "preview");
   }
 
   el.filePreview.addEventListener("click", (event) => {
@@ -1729,6 +1813,7 @@ import {panelHost} from './panels.mjs';
 
   setSessionsOpen(loadSessionsOpen(), false);
   setSidebarOpen(loadSidebarOpen(), false);
+  installSidebarResizer();
   requestAnimationFrame(() => {
     requestAnimationFrame(() => el.app.classList.remove("preload"));
   });
