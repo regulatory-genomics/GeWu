@@ -448,7 +448,7 @@ import {panelHost} from './panels.mjs';
       // An application needs room: at the default Files width its canvas is
       // unusable. A width the user chose on purpose is left alone.
       const dock = parseFloat(getComputedStyle(el.app).getPropertyValue("--panel-width")) || 0;
-      if (dock <= 440) setPanelWidth(Math.min(PANEL_APP_MIN + 40, panelWidthMax()), true);
+      if (dock <= 440) setPanelWidth(Math.min(900, panelWidthMax()), true);
     },
     onHide: () => setSidebarTab("files"),
   });
