@@ -109,6 +109,13 @@ pub fn list_agent_names() -> Vec<String> {
         .collect()
 }
 
+/// Primary eligibility shared by session creation, listing and profile switches.
+pub fn primary_agent_names(agents: &BTreeMap<String, AgentEntry>) -> Vec<String> {
+    let mut names = list_agent_names();
+    names.extend(agents.iter().filter(|(_, a)| a.primary).map(|(name, _)| name.clone()));
+    names
+}
+
 struct ToolRegistryImpl {
     tools: Arc<Vec<Arc<dyn Tool>>>,
 }
@@ -666,9 +673,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
     if !skills.is_empty() {
         tools.push(Box::new(SkillTool::new(skills.clone())));
     }
-    // Only top-level build/plan/general sessions can ask: subagent templates
-    // and config-defined agents are built with `question_broker: None`, since
-    // no front-end would render their questions.
+    // Only broker-backed top-level profiles can ask; subagent factories pass None.
     if let Some(broker) = question_broker
         && matches!(*name, "build" | "plan" | "general")
     {
@@ -725,14 +730,14 @@ fn build_custom_agent_tools(
         provider: inputs.provider.clone(),
         pool: inputs.pool.clone(),
         working_directory: inputs.working_directory.clone(),
-        additional_tools: Vec::new(),
+        additional_tools: if entry.primary { inputs.additional_tools.clone() } else { Vec::new() },
         skills: inputs.skills.clone(),
         enforcement: inputs.enforcement,
         image_limits: inputs.image_limits,
         context_limit: inputs.context_limit,
         agents: inputs.agents.clone(),
         workflow_progress: inputs.workflow_progress.clone(),
-        question_broker: None,
+        question_broker: if entry.primary { inputs.question_broker.clone() } else { None },
         session_id: inputs.session_id,
     })?;
     let tools: Vec<Arc<dyn Tool>> = match &entry.tools {
@@ -1041,6 +1046,15 @@ mod tests {
         .unwrap();
         assert!(!tools.iter().any(|tool| tool.name() == "question"));
 
+        let mut entry = custom_entry("general", None, Some(&["question"]));
+        entry.primary = true;
+        let (_, tools) = build_tool_registry_and_list(&ProfileInputs {
+            agents: Arc::new(BTreeMap::from([("benchmark".to_string(), entry)])),
+            question_broker: Some(broker),
+            ..test_inputs("benchmark", provider.clone(), pool.clone(), dir.path().to_path_buf(), vec![], vec![], "session")
+        }).unwrap();
+        assert!(tools.iter().any(|tool| tool.name() == "question"), "opted-in primary profiles must be able to ask supervised questions");
+
         let (_, tools) = build_tool_registry_and_list(&test_inputs(
             "build",
             provider,
@@ -1088,6 +1102,7 @@ mod tests {
     /// A config-defined agent entry for tests.
     fn custom_entry(base: &str, instructions: Option<&str>, tools: Option<&[&str]>) -> AgentEntry {
         AgentEntry {
+            primary: false,
             base: base.to_string(),
             description: "test agent".to_string(),
             instructions: instructions.map(str::to_string),

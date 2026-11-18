@@ -698,7 +698,7 @@ impl ServerState {
             Some(name) => name,
             None => gewu_storage::session_agent(&self.bootstrap.pool, &session_id).await?,
         };
-        if !registry::list_agent_names().contains(&agent_name) {
+        if !registry::primary_agent_names(&self.bootstrap.agents).contains(&agent_name) {
             anyhow::bail!("Unknown agent profile: {}", agent_name);
         }
 
@@ -1212,9 +1212,11 @@ async fn handle_request(
                     "cannot switch agent while a turn is running".into(),
                 ));
             }
-            if !["build", "plan"].contains(&target.as_str()) {
+            if !["build", "plan"].contains(&target.as_str())
+                && !state.bootstrap.agents.get(&target).is_some_and(|a| a.primary)
+            {
                 return Err(RequestError::Invalid(
-                    "switch_agent supports build or plan".into(),
+                    "switch_agent supports build, plan or an opted-in primary profile".into(),
                 ));
             }
             let current = state
@@ -1687,10 +1689,7 @@ async fn handle_request(
         }
 
         Op::ListAgents => {
-            let agents = registry::list_available_agents()
-                .into_iter()
-                .map(|a| a.name)
-                .collect();
+            let agents = registry::primary_agent_names(&state.bootstrap.agents);
             Ok(Handled::Reply(ServerMessage::Agents {
                 id: request.id,
                 agents,
