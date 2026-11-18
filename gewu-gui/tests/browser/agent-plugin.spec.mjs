@@ -43,3 +43,21 @@ test('a conversation opens the application in Preview without manual setup', asy
     await expect(page.getByRole('tab',{name:'PREVIEW'})).toHaveAttribute('aria-selected','true');
   } finally {await fixture.close();}
 });
+
+test('the conversation names a plugin tool and renders its result', async ({page})=>{
+  const fixture=await startFixture();
+  try {
+    await page.goto(fixture.url);
+    await expect(page.getByRole('textbox',{name:'Message'})).toBeEnabled();
+    // Plugin tools reach the agent, never a button wall in the panels. They
+    // exist only while the application instance is open.
+    await openPreview(page);
+    await page.getByRole('button',{name:'Open…',exact:true}).click();
+    await expect(page.frameLocator('iframe[title="Demo View"]').getByRole('heading')).toHaveText('GeWu connected');
+    const prompt=page.getByRole('textbox',{name:'Message'});
+    await prompt.fill('call echo {"value":9}');
+    await prompt.press('Enter');
+    await expect(page.locator('pre.tool-output').filter({hasText:'"value"'})).toContainText('9');
+    await expect(page.getByRole('button',{name:'Open application result'})).toBeVisible();
+  } finally {await fixture.close();}
+});

@@ -27,25 +27,3 @@ test('binds an opaque frame, streams native HTTP, restores state and revokes sta
     await expect.poll(async()=> (await page.request.get(asset)).status()).toBe(404);
   } finally { await fixture.close(); }
 });
-
-test('cancels a running tool and replays its settled state after browser reconnect', async ({page})=>{
-  const fixture=await startFixture();
-  try {
-    await page.goto(fixture.url);
-    await expect(page.getByRole('textbox',{name:'Message'})).toBeEnabled();
-    await openPreview(page);
-    await page.getByRole('button',{name:'Open…',exact:true}).click();
-    await expect(page.frameLocator('iframe[title="Demo View"]').getByRole('heading')).toHaveText('GeWu connected');
-    await page.getByRole('button',{name:'Plugins',exact:true}).click();
-    await page.getByText('Tool calls (advanced)').click();
-    page.once('dialog',dialog=>dialog.accept('{}'));
-    await page.getByRole('button',{name:'wait',exact:true}).click();
-    await expect(page.getByText(/wait · running · Waiting/)).toBeVisible();
-    await page.getByRole('button',{name:'Cancel',exact:true}).click();
-    await expect(page.getByText(/wait · cancelled/)).toBeVisible();
-    await page.reload();
-    await openPreview(page);
-    await page.getByRole('button',{name:'Plugins',exact:true}).click();
-    await expect(page.getByText(/wait · cancelled/)).toBeVisible();
-  } finally { await fixture.close(); }
-});

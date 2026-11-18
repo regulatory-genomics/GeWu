@@ -8,7 +8,7 @@ export const stateKey = (scope, instance, view) => `gewu.viewstate.v1:${JSON.str
 /// view. Server instances are the source of truth, so a reload attaches to a
 /// live instance and never starts a stopped one.
 export function panelHost(root, rpc, {onShow, onHide} = {}) {
-  let scope, active = 'plugins', seq = 0, syncing = null, manager, managerSignature = '';
+  let scope, active = 'plugins', seq = 0, syncing = null, manager, changesView, managerSignature = '';
   let dismissed = new Set();
   const panels = new Map();
   const tabs = node('nav');
@@ -46,6 +46,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
       panel.content.hidden = id !== active;
     }
     if (manager) manager.hidden = active !== 'plugins';
+    if (changesView) changesView.hidden = active !== 'changes';
   }
 
   function close(id) {
@@ -158,22 +159,21 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
   }
 
   function showChanges() {
-    let panel = panels.get('changes');
-    if (!panel) {
-      panel = add('changes', 'File changes', null, null);
-      panel.dispose = null;
-      panel.content.append(button('Refresh changes', () => loadChanges(panel)));
-    }
+    if (!changesView) return;
     active = 'changes';
     render();
-    loadChanges(panel);
+    loadChanges();
   }
 
-  async function loadChanges(panel) {
-    panel.content.querySelector('section')?.remove();
-    const target = node('section');
-    panel.content.append(target);
-    try { await changes(target, requestFor()); } catch (error) { fail(target, error); }
+  async function loadChanges() {
+    const pane = node('div');
+    const bar = node('div');
+    bar.append(button('Refresh', () => loadChanges()));
+    pane.append(bar);
+    const list = node('div');
+    pane.append(list);
+    changesView.replaceChildren(pane);
+    try { await changes(list, requestFor()); } catch (error) { fail(pane, error); }
   }
 
   function primaryView(instance) {
@@ -235,96 +235,62 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
     const request = requestFor();
     const key = scope.id;
     try {
-      const [{plugins, instances}, calls] = await Promise.all([request({action: 'list'}), request({action: 'calls'})]);
+      const {plugins, instances} = await request({action: 'list'});
       if (active !== 'plugins' || scope?.id !== key) return;
       const view = node('div');
       view.append(node('h3', 'Plugins'));
-      for (const p of plugins) {
+      for (const plugin of plugins) {
+        const running = instances.filter((instance) => instance.pluginId === plugin.id);
         const row = node('div');
         row.className = 'plugin-row';
-        const name = node('span', `${p.title ?? p.id}`);
-        if (p.version) name.append(node('code', ` v${p.version}`));
+        const name = node('span', `${plugin.title ?? plugin.id}`);
+        if (plugin.version) name.append(node('code', ` v${plugin.version}`));
         row.append(name);
-        row.append(node('span', !p.configured ? ' · installed, not configured' : !p.enabled ? ' · disabled' : ' · enabled'));
-        if (p.configured) {
-          row.append(button(p.enabled ? 'Disable' : 'Enable', async () => {
-            try { await request({action: 'set_enabled', pluginId: p.id, enabled: !p.enabled}); await refresh(); }
-            catch (error) { fail(view, error); }
-          }));
-          if (p.enabled) row.append(button('Open…', async () => {
-            try { await openPlugin(p); } catch (error) { fail(view, error); }
-          }));
-        } else {
-          if (p.package) row.append(node('code', p.package));
+        row.append(node('span', !plugin.configured ? ' \u00b7 installed, not configured' : !plugin.enabled ? ' \u00b7 disabled' : ' \u00b7 enabled'));
+        if (!plugin.configured) {
+          if (plugin.package) row.append(node('code', plugin.package));
           row.append(node('span', ' add it to config.json to use it'));
+          view.append(row);
+          continue;
         }
-        view.append(row);
-      }
-      if (instances.length) view.append(node('h3', 'Open'));
-      for (const instance of instances) {
-        const row = node('div');
-        row.className = 'plugin-row';
-        row.append(node('span', instance.title ?? instance.pluginId));
-        if (instance.bindingResource) row.append(node('code', instance.bindingResource.uri));
-        for (const v of instance.views ?? []) {
-          row.append(button(v.title, () => {
-            const resource = v.kind !== 'webview' && v.renderer !== 'diff'
-              ? promptResource(`Workspace content path for ${v.title}`, v.resourceTypes?.[0])
-              : undefined;
-            if (v.kind === 'webview' || v.renderer === 'diff' || resource) {
-              openView(instance, v, resource).catch((error) => fail(view, error));
-            }
-          }));
-        }
-        row.append(button('Stop', async () => {
-          try { await request({action: 'close', instanceId: instance.id}); await sync(); }
+        row.append(button(plugin.enabled ? 'Disable' : 'Enable', async () => {
+          try { await request({action: 'set_enabled', pluginId: plugin.id, enabled: !plugin.enabled}); await refresh(); }
           catch (error) { fail(view, error); }
         }));
+        if (plugin.enabled) row.append(button('Open\u2026', async () => {
+          try { await openPlugin(plugin); } catch (error) { fail(view, error); }
+        }));
         view.append(row);
+        for (const instance of running) view.append(runningRow(instance, request, view));
       }
-      view.append(node('h3', 'Calls'));
-      for (const call of calls) {
-        const row = node('div');
-        row.className = 'plugin-row';
-        row.append(node('span', `${call.tool} · ${call.status}${call.progress ? ` · ${call.progress}` : ''}`));
-        if (call.status === 'running') row.append(button('Cancel', async () => {
-          try { await request({action: 'cancel', callId: call.id}); await refresh(); } catch (error) { fail(view, error); }
-        }));
-        else row.append(button('Result', async () => {
-          try {
-            const {result} = await request({action: 'call_status', callId: call.id});
-            agentResultPanel(`Result · ${call.tool}`, result, instances.find((i) => i.id === call.instanceId));
-          } catch (error) { fail(view, error); }
-        }));
-        const instance = instances.find((i) => i.id === call.instanceId);
-        if (instance) for (const resource of call.resources ?? []) row.append(button(resource.uri, () => openResultResource(instance, resource)));
-        view.append(row);
-      }
-      // Advanced: raw tool invocation for debugging and conformance runs.
-      const tools = node('details');
-      tools.append(node('summary', 'Tool calls (advanced)'));
-      for (const instance of instances) for (const tool of instance.tools.filter((t) => t.target === 'backend')) {
-        tools.append(button(tool.name, async () => {
-          try {
-            const text = window.prompt(`${tool.description}\nArguments (JSON object)`, '{}');
-            if (text === null) return;
-            await request({action: 'call', instanceId: instance.id, tool: tool.name, args: JSON.parse(text)});
-            await refresh();
-          } catch (error) { fail(view, error); }
-        }));
-      }
-      view.append(tools);
-      managerSignature = instances.map((i) => i.id).join(',');
+      managerSignature = instances.map((instance) => instance.id).join(',');
       manager.replaceChildren(view);
     } catch (error) { manager.replaceChildren(node('p', error.message)); }
   }
 
-  function agentResultPanel(title, result, instance) {
-    const panel = add(`result-${++seq}`, title, null, null);
-    panel.content.append(node('pre', JSON.stringify(result, null, 2)));
-    if (instance) for (const resource of result.resources ?? []) panel.content.append(button(resource.uri, () => openResultResource(instance, resource)));
-    active = [...panels.keys()].at(-1);
-    render();
+  /// One compact line per running instance: where it is bound, its extra views,
+  /// and Stop. The main view is already the tab above.
+  function runningRow(instance, request, view) {
+    const row = node('div');
+    row.className = 'plugin-sub';
+    if (instance.bindingResource) row.append(node('code', instance.bindingResource.uri));
+    const primary = primaryView(instance);
+    for (const item of instance.views ?? []) {
+      if (primary && item.id === primary.id) continue;
+      row.append(button(item.title, () => {
+        const resource = item.kind !== 'webview' && item.renderer !== 'diff'
+          ? promptResource(`Workspace content path for ${item.title}`, item.resourceTypes?.[0])
+          : undefined;
+        if (item.kind === 'webview' || item.renderer === 'diff' || resource) {
+          openView(instance, item, resource).catch((error) => fail(view, error));
+        }
+      }));
+    }
+    row.append(button('Stop', async () => {
+      try { await request({action: 'close', instanceId: instance.id}); await sync(); }
+      catch (error) { fail(view, error); }
+    }));
+    return row;
   }
 
   function promptResource(message, type = 'document') {
@@ -342,7 +308,10 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
     body.replaceChildren();
     manager = node('div');
     manager.className = 'plugin-manager';
-    body.append(manager);
+    changesView = node('div');
+    changesView.className = 'plugin-panel';
+    changesView.hidden = true;
+    body.append(manager, changesView);
     active = 'plugins';
     render();
     refresh();

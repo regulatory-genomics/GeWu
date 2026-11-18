@@ -50,7 +50,20 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
     const asked=turn.messages.filter(m=>m.role==='user').map(m=>typeof m.content==='string'?m.content:(m.content??[]).map(p=>p.text??'').join(' ')).join(' ');
     const send=(delta,finish_reason=null)=>res.write(`data: ${JSON.stringify({id:'fixture',model:'fixture',object:'chat.completion.chunk',choices:[{index:0,delta,finish_reason}]})}\n\n`);
     res.writeHead(200,{'content-type':'text/event-stream'});
-    if (openTool && asked.includes('open the demo') && !afterTool) {
+    // Any plugin conformance spec can say `call <tool> <json>`; the agent, not
+    // the browser, is the surface that names plugin tools.
+    const askedCall = /^call\s+(\S+)\s+(\{[\s\S]*\})$/.exec(asked.trim());
+    if (askedCall && !afterTool) {
+      const name = turn.tools?.find(t => t.function.name === askedCall[1]
+        || (t.function.name.startsWith('plg_') && t.function.name.includes(`_${askedCall[1]}_`)))?.function.name;
+      if (name) {
+        send({role:'assistant',tool_calls:[{index:0,id:'call-1',type:'function',function:{name,arguments:askedCall[2]}}]});
+        send({},'tool_calls');
+      } else {
+        send({role:'assistant',content:`No tool named ${askedCall[1]}.`});
+        send({},'stop');
+      }
+    } else if (openTool && asked.includes('open the demo') && !afterTool) {
       send({role:'assistant',tool_calls:[{index:0,id:'open-1',type:'function',function:{name:openTool.function.name,arguments:'{"pluginId":"demo"}'}}]});
       send({},'tool_calls');
     } else if (plugin && !afterTool) {

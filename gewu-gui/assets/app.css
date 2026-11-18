@@ -3246,3 +3246,20 @@ body {
 .plugin-panel pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .plugin-panel img, .plugin-panel video { max-width: 100%; }
 .plugin-panel a { color: var(--accent); }
+
+/* A running plugin's binding, extra views and Stop, kept under its own row. */
+.plugin-sub {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 6px;
+  margin: 0 0 6px 2px;
+  padding: 0 0 2px 9px;
+  border-left: 2px solid var(--line);
+  color: var(--text-faint);
+}
+
+.plugin-sub > code {
+  color: var(--text-faint);
+  word-break: break-all;
+}

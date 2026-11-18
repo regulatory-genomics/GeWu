@@ -28,7 +28,7 @@ test('editor saves workspace text and refuses a stale second edit', async ({page
     expect(await readFile(path,'utf8')).toBe('external edit');
     expect(await readFile(join(fixture.other,'example.txt'),'utf8')).toBe('original text');
     await page.getByRole('button',{name:'Changes',exact:true}).click();
-    await page.getByRole('button',{name:'Refresh changes'}).click();
+    await page.getByRole('button',{name:'Refresh', exact:true}).click();
     await page.getByText('workspace:///example.txt · editor',{exact:true}).click();
     await expect(page.locator('#plugin-host pre')).toContainText('+from the editor');
     await expect(page.locator('#plugin-host pre')).toContainText('-original text');
