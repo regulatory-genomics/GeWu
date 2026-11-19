@@ -14,6 +14,7 @@ const DEFAULT_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Large artifacts are fetched in bounded ranges so a proxy or tunnel cannot
 /// truncate one long response, and a failed chunk restarts only that chunk.
 const DOWNLOAD_CHUNK: u64 = 32 * 1024 * 1024;
+const DOWNLOAD_ATTEMPTS: u32 = 5;
 pub const OFFICIAL_KEY_ID: &str = "official-v1";
 pub const OFFICIAL_PUBLIC_KEY_B64: &str = include_str!("../../resources/marketplace/official-v1.pub.b64");
 pub const OFFICIAL_INDEX_BASE: &str = "https://plugin.regulogen.cn";
@@ -154,7 +155,6 @@ impl MarketplaceClient {
         artifact: &Artifact,
         store: &ArtifactStore,
     ) -> Result<PathBuf, MarketplaceError> {
-        use std::io::Write;
         std::fs::create_dir_all(store.root()).map_err(|error| MarketplaceError::Cache(error.to_string()))?;
         let mut file = tempfile::Builder::new()
             .prefix(".artifact-download-")
@@ -163,31 +163,22 @@ impl MarketplaceClient {
         let mut offset = 0u64;
         while offset < artifact.bytes {
             let end = (offset + DOWNLOAD_CHUNK - 1).min(artifact.bytes - 1);
-            let response = client
-                .get(url)
-                .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
-                .send()
-                .await
-                .map_err(|error| MarketplaceError::Network(format!("chunk at {offset}: {error}")))?;
-            if response.status() == reqwest::StatusCode::OK {
-                return Err(MarketplaceError::Network("server ignored the range request".into()));
-            }
-            if !response.status().is_success() {
-                return Err(MarketplaceError::HttpStatus(response.status().as_u16()));
-            }
-            let expected = end - offset + 1;
-            let mut received = 0u64;
-            let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|error| MarketplaceError::Network(format!("chunk at {offset}: {error}")))?;
-                received += chunk.len() as u64;
-                if received > expected {
-                    return Err(MarketplaceError::InvalidIndex("chunk exceeds the requested range".into()));
+            let mut last_error = None;
+            for attempt in 0..DOWNLOAD_ATTEMPTS {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))).await;
                 }
-                file.as_file_mut().write_all(&chunk).map_err(|error| MarketplaceError::Cache(error.to_string()))?;
+                match fetch_chunk(client, url, offset, end, file.as_file_mut()).await {
+                    Ok(()) => {
+                        last_error = None;
+                        break;
+                    }
+                    Err(error) if retryable(&error) => last_error = Some(error),
+                    Err(error) => return Err(error),
+                }
             }
-            if received != expected {
-                return Err(MarketplaceError::Network(format!("chunk at {offset} ended after {received} of {expected} bytes")));
+            if let Some(error) = last_error {
+                return Err(error);
             }
             offset = end + 1;
         }
@@ -229,6 +220,53 @@ pub fn rewrite_origin(value: &str, origin: &str) -> Result<String, MarketplaceEr
         .set_port(base.port())
         .map_err(|_| MarketplaceError::InvalidIndex("unsupported mirror port".into()))?;
     Ok(parsed.to_string())
+}
+
+fn retryable(error: &MarketplaceError) -> bool {
+    match error {
+        MarketplaceError::Network(_) => true,
+        MarketplaceError::HttpStatus(status) => *status >= 500 || *status == 429,
+        _ => false,
+    }
+}
+
+async fn fetch_chunk(
+    client: &reqwest::Client,
+    url: &str,
+    start: u64,
+    end: u64,
+    file: &mut std::fs::File,
+) -> Result<(), MarketplaceError> {
+    use std::io::{Seek, SeekFrom, Write};
+    let expected = end - start + 1;
+    file.set_len(start).map_err(|error| MarketplaceError::Cache(error.to_string()))?;
+    file.seek(SeekFrom::Start(start)).map_err(|error| MarketplaceError::Cache(error.to_string()))?;
+    let response = client
+        .get(url)
+        .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+        .send()
+        .await
+        .map_err(|error| MarketplaceError::Network(format!("chunk at {start}: {error}")))?;
+    if response.status() == reqwest::StatusCode::OK {
+        return Err(MarketplaceError::InvalidIndex("server ignored the range request".into()));
+    }
+    if !response.status().is_success() {
+        return Err(MarketplaceError::HttpStatus(response.status().as_u16()));
+    }
+    let mut received = 0u64;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| MarketplaceError::Network(format!("chunk at {start}: {error}")))?;
+        received += chunk.len() as u64;
+        if received > expected {
+            return Err(MarketplaceError::InvalidIndex("chunk exceeds the requested range".into()));
+        }
+        file.write_all(&chunk).map_err(|error| MarketplaceError::Cache(error.to_string()))?;
+    }
+    if received != expected {
+        return Err(MarketplaceError::Network(format!("chunk at {start} ended after {received} of {expected} bytes")));
+    }
+    Ok(())
 }
 
 async fn fetch_bounded(client: &reqwest::Client, url: &str, limit: usize) -> Result<Vec<u8>, MarketplaceError> {
