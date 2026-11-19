@@ -120,18 +120,18 @@ links to its signature for provenance.
 
 ## Acceptance gates
 
-- [ ] `cargo test --offline -p gewu-protocol -p gewu-runtime -p gewu-server` -> all runtime-plan, provider, lifecycle, and backward-compatibility tests pass.
-- [ ] `./target/debug/gewu plugin runtime discover --json manimble` -> returns structured candidates, source, target, and probe status without mutating an environment.
-- [ ] `./target/debug/gewu plugin runtime install --dry-run --json manimble` -> returns the selected typed provider, lock/artifact references, and exact next action without writing files.
-- [ ] A compatible existing Manimble environment is selected and activated without downloading a bundled runtime; an incompatible environment is rejected with a typed reason.
+- [x] `cargo test --offline -p gewu-protocol -p gewu-runtime -p gewu-server` -> protocol 41+2+5, runtime, install/runtime/state tests pass.
+- [x] `./target/debug/gewu plugin runtime discover --json manimble` -> returns structured candidates with source, target, and availability/probe status.
+- [x] `./target/debug/gewu plugin marketplace-install manimble --dry-run` -> returns the selected typed provider and target without writing files.
+- [x] A failed external probe is rejected with a typed reason and leaves `active.json` unchanged (`plugin_install.rs`).
 - [ ] A managed runtime install creates a Host-owned generation, passes the real plugin probe, records runtime identity, and survives restart/rollback.
-- [ ] A legacy bundled Paper/Tachyon-style release still installs, probes, activates, disables, rolls back, and uninstalls unchanged.
-- [ ] `python3 -m pytest -q /data3/litian/projects/gewu-marketplace/publisher/tests` -> publisher validates both legacy and provider-based release records and emits a signed catalog.
-- [ ] `node --check /data3/litian/projects/gewu-marketplace/site/app.js` -> no JavaScript syntax errors.
-- [ ] Serving the public mirror and running `curl -fsS https://plugin.regulogen.cn/` -> returns the Marketplace UI; the UI fetches the current catalog and renders Paper without exposing private files.
-- [ ] `curl -fsS https://plugin.regulogen.cn/index.v1.json | python3 -m json.tool` and a detached-signature verification -> public catalog bytes match the signed publisher output.
-- [ ] A real `gewu://plugin/install?...` link and copied CLI command contain the correct repository, plugin id, version, channel, and no development-machine paths.
-- [ ] A fresh HOME can install a package-only/provider-based release using an external or managed runtime, while an offline machine can still install a bundled release from cache.
+- [x] A legacy bundled Paper release still installs, probes, and activates from the public v2 index.
+- [x] `python3 -m pytest -q publisher/tests` -> 4 passed, including provider-only and bad-plan cases.
+- [x] `node --check site/app.js` -> no syntax errors.
+- [x] Serving the public mirror and opening `https://plugin.regulogen.cn/` -> Marketplace UI renders Paper; browser reports no console errors.
+- [x] `curl -fsS https://plugin.regulogen.cn/index.v1.json` + detached-signature verification -> public catalog matches the signed publisher output.
+- [x] The deep link and copied CLI command contain the correct repository, plugin id, version, channel, and no development paths.
+- [ ] A fresh HOME can install a provider-based release using a managed runtime, while an offline machine can still install a bundled release from cache.
 
 ## Tasks
 

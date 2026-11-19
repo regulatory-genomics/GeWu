@@ -16,8 +16,7 @@ use std::{
 use tokio::{process::Command, time::timeout};
 
 #[derive(Debug)]
-pub enum ProviderError {
-    Unavailable(String),
+pub enum ProviderError {    Unavailable(String),
     Invalid(String),
     ProbeFailed(String),
 }
@@ -185,7 +184,7 @@ pub async fn install_managed(
     prefix: &Path,
     timeout_seconds: u64,
 ) -> Result<(), ProviderError> {
-    let RuntimeProvider::Managed { manager, channels, packages, pip, .. } = provider else {
+    let RuntimeProvider::Managed { manager, channels, packages, pip, pip_index, pip_extra_index, .. } = provider else {
         return Err(ProviderError::Invalid("provider is not managed".into()));
     };
     if manager != "micromamba" {
@@ -206,9 +205,14 @@ pub async fn install_managed(
     run_install(create, deadline, "micromamba create").await?;
     if !pip.is_empty() {
         let mut install = Command::new(&binary);
-        install.arg("run").arg("--prefix").arg(prefix).arg("python").arg("-m").arg("pip").arg("install").arg("--disable-pip-version-check");
-        if let Ok(index) = std::env::var("GEWU_PIP_INDEX_URL") {
+        install.arg("run").arg("--prefix").arg(prefix).arg("python").arg("-m").arg("pip").arg("install").arg("--disable-pip-version-check").arg("--prefer-binary");
+        let index = std::env::var("GEWU_PIP_INDEX_URL").ok().or_else(|| pip_index.clone());
+        let extra = std::env::var("GEWU_PIP_EXTRA_INDEX_URL").ok().or_else(|| pip_extra_index.clone());
+        if let Some(index) = index.filter(|value| !value.trim().is_empty()) {
             install.arg("--index-url").arg(index);
+        }
+        if let Some(extra) = extra.filter(|value| !value.trim().is_empty()) {
+            install.arg("--extra-index-url").arg(extra);
         }
         install.args(pip);
         run_install(install, deadline, "pip install").await?;

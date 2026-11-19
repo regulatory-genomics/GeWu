@@ -270,7 +270,7 @@ pub async fn run(action: Action) -> Result<()> {
             for (plugin_id, plugin) in saved.plugins {
                 if id.as_deref().is_some_and(|wanted| wanted != plugin_id) { continue; }
                 let active = plugin.active_generation.as_ref().and_then(|generation| plugin.generations.get(generation));
-                reports.push(serde_json::json!({"id":plugin_id,"enabled":plugin.enabled,"active":active.map(|generation| state.root().join(&generation.package_path)),"generations":plugin.generations.len()}));
+                reports.push(serde_json::json!({"id":plugin_id,"enabled":plugin.enabled,"active":active.map(|generation| state.root().join(&generation.package_path)),"runtime":active.and_then(|generation| generation.runtime.clone()),"generations":plugin.generations.len()}));
             }
             println!("{}", serde_json::to_string(&reports)?);
         }

@@ -2,27 +2,48 @@
 
 ## Verified facts
 
-- The current `runtime.v1` manifest requires `launcher`, `probe`, and
-  `capabilities`, but it describes a packed runtime rather than an acquisition
-  strategy — evidence: `gewu-protocol/schema/runtime.v1.schema.json`.
-- The current `release.v1` requires at least one runtime and requires every
-  runtime reference to contain both an artifact and a manifest — evidence:
+- `runtime.v1` requires `launcher`, `probe`, and `capabilities`, but describes a
+  packed runtime rather than an acquisition strategy — evidence:
+  `gewu-protocol/schema/runtime.v1.schema.json`.
+- `release.v1` requires at least one runtime and every runtime reference contains
+  both an artifact and a manifest — evidence:
   `gewu-protocol/schema/release.v1.schema.json`.
-- The current marketplace client verifies the detached Ed25519 signature before
+- The marketplace client verifies the detached Ed25519 signature before
   parsing/caching the index and verifies artifact byte count and SHA-256 before
   storing an artifact — evidence:
   `gewu-server/src/plugins/marketplace.rs`.
-- The current public marketplace page is a placeholder that tells users to use
-  the GeWu Marketplace tab — evidence:
+- The old public marketplace page was a placeholder — evidence:
   `/data3/litian/projects/gewu-marketplace/plugin/web/index.html`.
 - The public origin already serves the signed catalog and release assets, so a
-  static site can share the same origin without a new backend — evidence:
-  `/data3/litian/projects/gewu-marketplace/deploy/serve-marketplace.py` and the
-  existing `https://plugin.regulogen.cn` deployment.
-- Existing host lifecycle code already has transactional package/runtime
-  installation and generation state, which should be extended rather than
-  replaced — evidence: `gewu-server/src/plugins/lifecycle.rs`,
-  `gewu-server/src/plugins/state.rs`, and `gewu-server/src/plugins/runtime.rs`.
+  static site shares the same origin without a backend — evidence:
+  `deploy/serve-marketplace.py`, `https://plugin.regulogen.cn`.
+- An external runtime can reuse the existing activation path by synthesizing a
+  runtime root (`runtime.json`, `bin/launch`, `bin/probe`, `bin/python3`):
+  `cargo test -p gewu-server --test plugin_install` covers reuse and rollback on
+  probe failure.
+- conda-forge provides `manimpango 0.7.1` and `av`, while the Westlake PyPI
+  mirror's `manimpango` sdist is truncated and lacks an `av` wheel; the managed
+  Manimble plan therefore takes native Python packages from conda-forge and
+  pure-Python packages from pip — evidence: `/tmp/manimble-managed-test*.log`.
+
+## Implementation notes
+
+- Wire contracts: `runtime-plan.v1`, `release.v2`, `marketplace.v2`; the Rust
+  `Release` type accepts v1 and v2, and `MarketplaceIndex::select_release_version`
+  no longer requires a bundled runtime.
+- Providers: `external` (resolve env/command/override, probe, synthesize root),
+  `managed` (micromamba prefix + pip, then synthesize root), `bundled`
+  (unchanged archive path). Resolved identity is stored on the generation.
+- CLI: `runtime discover|plan|probe`; `marketplace-install --runtime
+  auto|external|managed|bundled --executable --dry-run`.
+- Publisher: `build_index.py` validates v1/v2, provider plans, and emits
+  `gewu.marketplace/v2` when any release is v2; `make_release.py` accepts
+  `--runtime-plan`.
+- Public UI: `site/index.html`, `site/app.js`, `site/styles.css`; verified in a
+  real browser (1 card, filters, empty state, deep link) with no console errors.
+- Manimble package now ships the engine (`engine/`) and the adapter resolves it
+  from `GEWU_PLUGIN_ROOT/engine` when the runtime root has no engine copy.
+
 
 ## Decisions
 

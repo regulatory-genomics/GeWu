@@ -104,6 +104,10 @@ pub enum RuntimeProvider {
         packages: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pip: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pip_index: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pip_extra_index: Option<String>,
         probe: ProbeSpec,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         binaries: BTreeMap<String, String>,
