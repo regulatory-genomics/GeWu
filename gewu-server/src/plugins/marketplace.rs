@@ -11,6 +11,9 @@ use time::format_description::well_known::Rfc3339;
 use super::artifacts::ArtifactStore;
 
 const DEFAULT_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Large artifacts are fetched in bounded ranges so a proxy or tunnel cannot
+/// truncate one long response, and a failed chunk restarts only that chunk.
+const DOWNLOAD_CHUNK: u64 = 32 * 1024 * 1024;
 pub const OFFICIAL_KEY_ID: &str = "official-v1";
 pub const OFFICIAL_PUBLIC_KEY_B64: &str = include_str!("../../resources/marketplace/official-v1.pub.b64");
 pub const OFFICIAL_INDEX_BASE: &str = "https://plugin.regulogen.cn";
@@ -131,6 +134,9 @@ impl MarketplaceClient {
             .ok()
             .filter(|limit| *limit <= 4 * 1024 * 1024 * 1024)
             .ok_or_else(|| MarketplaceError::InvalidIndex("artifact size is out of range".into()))?;
+        if artifact.bytes > DOWNLOAD_CHUNK {
+            return self.download_ranged(&client, &url, artifact, store).await;
+        }
         let bytes = fetch_bounded(&client, &url, limit).await?;
         if bytes.len() as u64 != artifact.bytes {
             return Err(MarketplaceError::InvalidIndex("artifact size does not match its metadata".into()));
@@ -139,6 +145,56 @@ impl MarketplaceClient {
             return Err(MarketplaceError::InvalidSignature);
         }
         store.put_bytes(&bytes, &artifact.sha256).map_err(|error| MarketplaceError::Cache(error.to_string()))
+    }
+
+    async fn download_ranged(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        artifact: &Artifact,
+        store: &ArtifactStore,
+    ) -> Result<PathBuf, MarketplaceError> {
+        use std::io::Write;
+        std::fs::create_dir_all(store.root()).map_err(|error| MarketplaceError::Cache(error.to_string()))?;
+        let mut file = tempfile::Builder::new()
+            .prefix(".artifact-download-")
+            .tempfile_in(store.root())
+            .map_err(|error| MarketplaceError::Cache(error.to_string()))?;
+        let mut offset = 0u64;
+        while offset < artifact.bytes {
+            let end = (offset + DOWNLOAD_CHUNK - 1).min(artifact.bytes - 1);
+            let response = client
+                .get(url)
+                .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
+                .send()
+                .await
+                .map_err(|error| MarketplaceError::Network(format!("chunk at {offset}: {error}")))?;
+            if response.status() == reqwest::StatusCode::OK {
+                return Err(MarketplaceError::Network("server ignored the range request".into()));
+            }
+            if !response.status().is_success() {
+                return Err(MarketplaceError::HttpStatus(response.status().as_u16()));
+            }
+            let expected = end - offset + 1;
+            let mut received = 0u64;
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|error| MarketplaceError::Network(format!("chunk at {offset}: {error}")))?;
+                received += chunk.len() as u64;
+                if received > expected {
+                    return Err(MarketplaceError::InvalidIndex("chunk exceeds the requested range".into()));
+                }
+                file.as_file_mut().write_all(&chunk).map_err(|error| MarketplaceError::Cache(error.to_string()))?;
+            }
+            if received != expected {
+                return Err(MarketplaceError::Network(format!("chunk at {offset} ended after {received} of {expected} bytes")));
+            }
+            offset = end + 1;
+        }
+        file.as_file().sync_all().map_err(|error| MarketplaceError::Cache(error.to_string()))?;
+        store
+            .put_file(file.path(), &artifact.sha256, artifact.bytes)
+            .map_err(|error| MarketplaceError::Cache(error.to_string()))
     }
 
     pub fn search<'a>(index: &'a MarketplaceIndex, query: &str) -> Vec<&'a Release> {
