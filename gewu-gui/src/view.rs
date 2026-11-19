@@ -18,6 +18,9 @@ use crate::workspace::Tab;
 
 /// Lines of tool output shown before collapsing.
 const TOOL_PREVIEW_LINES: usize = 6;
+/// A single-line JSON result must still collapse: line count alone cannot
+/// bound a one-line payload that wraps across dozens of visual rows.
+const TOOL_PREVIEW_CHARS: usize = 400;
 /// Defensive cap on expanded tool output. Tool output is already truncated
 /// server-side; this only guards against pathological renders.
 const TOOL_MAX_LINES: usize = 5000;
@@ -617,20 +620,30 @@ fn render_tool(out: &mut String, tab: &Tab, view: &ToolView, index: usize, depth
     } else {
         lines.len().min(TOOL_PREVIEW_LINES)
     };
-    if shown > 0 {
+    let preview = lines[..shown].join("\n");
+    let (preview, clipped) = if expanded {
+        (preview, false)
+    } else {
+        clip_chars(&preview, TOOL_PREVIEW_CHARS)
+    };
+    if !preview.is_empty() {
         let _ = writeln!(
             out,
             "<pre class=\"tool-output\">{}</pre>",
-            escape(&lines[..shown].join("\n"))
+            escape(&preview)
         );
     }
-    if lines.len() > shown {
+    if lines.len() > shown || clipped {
         let hidden = lines.len() - shown;
+        let label = if hidden > 0 {
+            format!("… +{hidden} line{}", if hidden == 1 { "" } else { "s" })
+        } else {
+            "… show more".to_string()
+        };
         let _ = writeln!(
             out,
-            "<button class=\"tool-more\" data-action=\"toggle_tool\" data-tab=\"{}\" data-block=\"{index}\">… +{hidden} line{}</button>",
-            tab.id,
-            if hidden == 1 { "" } else { "s" }
+            "<button class=\"tool-more\" data-action=\"toggle_tool\" data-tab=\"{}\" data-block=\"{index}\">{label}</button>",
+            tab.id
         );
     }
     // Images stay collapsed with the rest of the output: the row's badge says
@@ -639,6 +652,16 @@ fn render_tool(out: &mut String, tab: &Tab, view: &ToolView, index: usize, depth
         out.push_str(&media);
     }
     out.push_str("</div>\n");
+}
+
+/// Bound a preview by characters so one long line cannot defeat the line cap.
+fn clip_chars(value: &str, max: usize) -> (String, bool) {
+    if value.chars().count() <= max {
+        return (value.to_string(), false);
+    }
+    let mut clipped: String = value.chars().take(max).collect();
+    clipped.push('…');
+    (clipped, true)
 }
 
 /// Whether any image part is a raster format the GUI draws inline.
@@ -2234,6 +2257,26 @@ mod tests {
 
         let html = markdown_to_html("[ok](https://example.org)");
         assert!(html.contains("href=\"https://example.org\""), "{html}");
+    }
+
+    #[test]
+    fn long_single_line_output_is_clipped_until_expanded() {
+        let output = "x".repeat(2_000);
+        let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
+            tool: "plugin_list".into(),
+            input: "{}".into(),
+            output: Some(output.clone()),
+            images: Vec::new(),
+            status: None,
+        }]);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(!html.contains(&output), "long output rendered in full: {html}");
+        assert!(html.contains("show more"), "{html}");
+
+        ws.tab_mut(id).unwrap().expanded_outputs.insert(0);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(html.contains(&output), "expanded output should be complete: {html}");
     }
 
     #[test]
