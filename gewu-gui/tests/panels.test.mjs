@@ -10,10 +10,9 @@ test('workspace and conversation delimiters do not alias saved panel state', () 
   assert.notEqual(dismissedKey(scope('a', 's1')), dismissedKey(scope('a', 's2')));
 });
 
-test('view state is scoped per document so two decks keep separate selections', () => {
+test('view state is scoped per session document so sessions keep separate selections', () => {
   const one = stateKey(scope('w', 's'), instance('i1', 'manimble', 'workspace:///one'), {id: 'editor'});
   const two = stateKey(scope('w', 's'), instance('i2', 'manimble', 'workspace:///two'), {id: 'editor'});
   assert.notEqual(one, two);
-  // The document, not the conversation, owns its selected slide and zoom.
-  assert.equal(one, stateKey(scope('w', 'other-session'), instance('i1', 'manimble', 'workspace:///one'), {id: 'editor'}));
+  assert.notEqual(one, stateKey(scope('w', 'other-session'), instance('i1', 'manimble', 'workspace:///one'), {id: 'editor'}));
 });

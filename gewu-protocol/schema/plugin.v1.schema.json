@@ -14,7 +14,7 @@
       "required":["apiVersion","id","version","title","scope","backend"],
       "properties":{"$schema":{"type":"string"},"apiVersion":{"$ref":"#/$defs/Version"},"id":{"$ref":"#/$defs/Id"},
         "version":{"type":"string","maxLength":128,"pattern":"^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"},"title":{"$ref":"#/$defs/String"},
-        "scope":{"enum":["workspace","resource"]},"backend":{"$ref":"#/$defs/Backend"},"settingsSchema":{"type":"object"},"views":{"type":"array","items":{"$ref":"#/$defs/View"}}}},
+        "scope":{"enum":["workspace","session","resource"]},"backend":{"$ref":"#/$defs/Backend"},"settingsSchema":{"type":"object"},"views":{"type":"array","items":{"$ref":"#/$defs/View"}}}},
     "Backend": {"type":"object","additionalProperties":false,"required":["connector","config"],"properties":{
       "connector":{"const":"gewu-stdio"},"config":{"type":"object","additionalProperties":false,"required":["entry"],"properties":{"entry":{"$ref":"#/$defs/PackagePath"},"args":{"type":"array","items":{"type":"string"}}}}}},
     "View": {"type":"object","additionalProperties":false,"required":["id","title","kind","placement","resourceTypes"],"properties":{
@@ -30,7 +30,7 @@
       "instanceId":{"$ref":"#/$defs/String"},"generation":{"$ref":"#/$defs/Counter"},"workspaceId":{"$ref":"#/$defs/String"},"callId":{"$ref":"#/$defs/String"},
       "sessionId":{"$ref":"#/$defs/String"},"runId":{"$ref":"#/$defs/String"},"bindingResource":{"$ref":"#/$defs/ResourceRef"},"resource":{"$ref":"#/$defs/ResourceRef"},"viewId":{"$ref":"#/$defs/String"},"viewEpoch":{"$ref":"#/$defs/Counter"}}},
     "Activation": {"type":"object","additionalProperties":false,"required":["apiVersion","instanceId","generation","workspaceId","workspaceRoot","settings"],"properties":{
-      "apiVersion":{"$ref":"#/$defs/Version"},"instanceId":{"$ref":"#/$defs/String"},"generation":{"$ref":"#/$defs/Counter"},"workspaceId":{"$ref":"#/$defs/String"},"workspaceRoot":{"$ref":"#/$defs/String"},"bindingResource":{"$ref":"#/$defs/ResourceRef"},"settings":{"type":"object"}}},
+      "apiVersion":{"$ref":"#/$defs/Version"},"instanceId":{"$ref":"#/$defs/String"},"generation":{"$ref":"#/$defs/Counter"},"workspaceId":{"$ref":"#/$defs/String"},"workspaceRoot":{"$ref":"#/$defs/String"},"sessionId":{"$ref":"#/$defs/String"},"bindingResource":{"$ref":"#/$defs/ResourceRef"},"settings":{"type":"object"}}},
     "Call": {"type":"object","additionalProperties":false,"required":["tool","args","context"],"properties":{
       "tool":{"$ref":"#/$defs/ToolName"},"args":{"type":"object"},"context":{"$ref":"#/$defs/CallContext"}}},
     "Cancel": {"type":"object","additionalProperties":false,"required":["callId"],"properties":{"callId":{"$ref":"#/$defs/String"}}},
@@ -49,7 +49,7 @@
       "code":{"type":"string","pattern":"^[A-Z][A-Z0-9_]*$"},"message":{"$ref":"#/$defs/String"},"retryable":{"type":"boolean"}}},
     "ToolName": {"type":"string","minLength":1,"maxLength":128,"pattern":"^[^\\u0000-\\u001f\\u007f-\\u009f]+$"},
     "ToolDefinition": {"type":"object","additionalProperties":false,"required":["name","description","inputSchema","outputSchema","exposeToAgent","effect","target"],"properties":{
-      "name":{"$ref":"#/$defs/ToolName"},"description":{"$ref":"#/$defs/String"},"inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"exposeToAgent":{"type":"boolean"},"effect":{"enum":["read","write"]},"target":{"enum":["backend","view"]}}},
+      "name":{"$ref":"#/$defs/ToolName"},"description":{"$ref":"#/$defs/String"},"group":{"type":"string","pattern":"^[a-z][a-z0-9-]{0,63}$"},"inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"exposeToAgent":{"type":"boolean"},"effect":{"enum":["read","write"]},"target":{"enum":["backend","view"]}}},
     "ServiceEndpoint": {"type":"object","additionalProperties":false,"required":["id","baseUrl","protocol"],"properties":{
       "id":{"$ref":"#/$defs/Id"},"baseUrl":{"type":"string","pattern":"^https?://[^/?#@\\s]+/?$"},"protocol":{"const":"http"},"headers":{"type":"object","additionalProperties":{"type":"string"}},
       "routes":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["pathPrefix","methods"],"properties":{

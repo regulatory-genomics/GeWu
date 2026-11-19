@@ -39,7 +39,9 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
         .unwrap(),
     );
     let now = host.open("demo", "workspace", root, None).await.unwrap();
-    let selected = host.tools("workspace", root.to_owned(), &[]).await;
+    let selected = host
+        .tools("workspace", root.to_owned(), "conversation", &[])
+        .await;
     let names: Vec<&str> = selected.iter().map(|tool| tool.name()).collect();
     for expected in [
         "plugin_list",
@@ -54,10 +56,28 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
         .iter()
         .find(|tool| tool.name().starts_with("plg_demo_echo_"))
         .unwrap();
+    assert!(!selected.iter().any(|tool| tool.name().contains("workflow_echo")));
     let ctx = ToolContext::new("conversation", "message").with_working_directory(root);
     let out = echo.execute(json!({"value":7}), &ctx).await.unwrap();
     assert_eq!(out.metadata["gewu.plugin"]["data"]["value"], 7);
     assert!(echo.execute(json!({"value":"bad"}), &ctx).await.is_err());
+
+    host.action(
+        "workspace",
+        root,
+        "conversation",
+        HostAction::SetSession {
+            plugin_id: "demo".into(),
+            enabled: true,
+            profiles: vec!["workspace-basic".into(), "analysis-read".into(), "workflow-authoring".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let profiled = host
+        .tools("workspace", root.to_owned(), "conversation", &[])
+        .await;
+    assert!(profiled.iter().any(|tool| tool.name().contains("workflow_echo")));
 
     let instance_id = now.activation.instance_id.clone();
     let joined = host

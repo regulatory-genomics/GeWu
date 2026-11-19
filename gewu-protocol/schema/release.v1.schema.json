@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:gewu:release:v1",
+  "$ref": "#/$defs/Release",
+  "$defs": {
+    "Version": {"const": "gewu.release/v1"},
+    "Id": {"type": "string", "pattern": "^[a-z][a-z0-9.-]{0,127}$"},
+    "Semver": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"},
+    "Digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "Url": {"type": "string", "pattern": "^https?://[^\\s]+$"},
+    "Artifact": {"type": "object", "additionalProperties": false, "required": ["url", "sha256", "bytes"], "properties": {
+      "url": {"$ref": "#/$defs/Url"},
+      "sha256": {"$ref": "#/$defs/Digest"},
+      "bytes": {"type": "integer", "minimum": 1}
+    }},
+    "Target": {"type": "object", "additionalProperties": false, "required": ["os", "arch"], "properties": {
+      "os": {"enum": ["linux", "macos"]},
+      "arch": {"enum": ["x86_64", "aarch64"]},
+      "libc": {"type": "string", "minLength": 1}
+    }},
+    "Compatibility": {"type": "object", "additionalProperties": false, "required": ["api", "host"], "properties": {
+      "api": {"const": "gewu.plugin/v1"},
+      "host": {"type": "string", "minLength": 1}
+    }},
+    "RuntimeRef": {"type": "object", "additionalProperties": false, "required": ["id", "version", "target", "artifact", "manifest"], "properties": {
+      "id": {"$ref": "#/$defs/Id"},
+      "version": {"$ref": "#/$defs/Semver"},
+      "target": {"$ref": "#/$defs/Target"},
+      "artifact": {"$ref": "#/$defs/Artifact"},
+      "manifest": {"$ref": "#/$defs/Artifact"}
+    }},
+    "Provenance": {"type": "object", "additionalProperties": false, "required": ["builder", "source", "sourceCommit", "buildInputs", "createdAt"], "properties": {
+      "builder": {"type": "string", "minLength": 1},
+      "source": {"type": "string", "minLength": 1},
+      "sourceCommit": {"type": "string", "pattern": "^[0-9a-fA-F]{7,64}$"},
+      "buildInputs": {"type": "array", "items": {"type": "string", "minLength": 1}},
+      "sbom": {"$ref": "#/$defs/Url"},
+      "createdAt": {"type": "string", "minLength": 1}
+    }},
+    "Revocation": {"type": "object", "additionalProperties": false, "required": ["reason", "revokedAt"], "properties": {
+      "reason": {"type": "string", "minLength": 1},
+      "revokedAt": {"type": "string", "minLength": 1}
+    }},
+    "Release": {"type": "object", "additionalProperties": false, "required": ["schemaVersion", "releaseId", "plugin", "version", "channel", "gewu", "package", "runtimes", "capabilities", "permissions", "provenance"], "properties": {
+      "schemaVersion": {"$ref": "#/$defs/Version"},
+      "releaseId": {"$ref": "#/$defs/Id"},
+      "plugin": {"$ref": "#/$defs/Id"},
+      "version": {"$ref": "#/$defs/Semver"},
+      "channel": {"enum": ["stable", "beta", "nightly"]},
+      "gewu": {"$ref": "#/$defs/Compatibility"},
+      "package": {"$ref": "#/$defs/Artifact"},
+      "runtimes": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/RuntimeRef"}},
+      "capabilities": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+      "permissions": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+      "provenance": {"$ref": "#/$defs/Provenance"},
+      "releaseNotes": {"type": "string"},
+      "revocation": {"$ref": "#/$defs/Revocation"}
+    }}
+  }
+}

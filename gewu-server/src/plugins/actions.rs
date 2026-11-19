@@ -146,8 +146,14 @@ impl PluginHost {
             context.resource = view.resource.clone();
         }
     }
-    async fn find(&self, workspace: &str, root: &Path, id: &str) -> Result<Arc<Instance>> {
-        self.active(workspace, root)
+    async fn find(
+        &self,
+        workspace: &str,
+        root: &Path,
+        id: &str,
+        session: Option<&str>,
+    ) -> Result<Arc<Instance>> {
+        self.active_for_session(workspace, root, session)
             .await
             .into_iter()
             .find(|i| i.activation.instance_id == id)
@@ -201,21 +207,68 @@ impl PluginHost {
                 self.set_enabled(&plugin_id, enabled).await?;
                 Ok(json!({"enabled":enabled}))
             }
+            HostAction::SetSession {
+                plugin_id,
+                enabled,
+                profiles,
+            } => {
+                ensure!(profiles.len() <= 8, "too many plugin profiles");
+                ensure!(
+                    profiles.iter().all(|profile| matches!(
+                        profile.as_str(),
+                        "workspace-basic" | "analysis-read" | "workflow-authoring" | "references"
+                    )),
+                    "unknown plugin profile"
+                );
+                let mut profiles = profiles;
+                profiles.sort();
+                profiles.dedup();
+                let state = super::SessionPluginState {
+                    enabled,
+                    profiles,
+                };
+                self.persist_session_state(owner, &plugin_id, &state).await?;
+                if !enabled {
+                    let ids: Vec<_> = self
+                        .active_for_session(workspace, root, Some(owner))
+                        .await
+                        .into_iter()
+                        .filter(|instance| instance.package.manifest.id == plugin_id)
+                        .map(|instance| instance.activation.instance_id.clone())
+                        .collect();
+                    for id in ids {
+                        self.close_for_session(workspace, root, &id, Some(owner))
+                            .await?;
+                    }
+                }
+                Ok(json!({"enabled":enabled,"profiles":state.profiles}))
+            }
             HostAction::AgentResult { .. } => {
                 anyhow::bail!("agent results require persistent session storage")
             }
-            HostAction::List => Ok(
-                json!({"plugins":self.catalog(),"instances":self.active(workspace, root).await.iter().map(|i| i.public_info()).collect::<Vec<_>>()}),
-            ),
+            HostAction::List => {
+                let mut plugins = self.catalog();
+                for plugin in &mut plugins {
+                    if let Some(id) = plugin["id"].as_str() {
+                        let state = self.session_state(owner, id).await?;
+                        plugin["session"] = serde_json::to_value(state)?;
+                    }
+                }
+                Ok(json!({
+                    "plugins":plugins,
+                    "instances":self.active_for_session(workspace, root, Some(owner)).await.iter().map(|i| i.public_info()).collect::<Vec<_>>()
+                }))
+            }
             HostAction::Open {
                 plugin_id,
                 binding_resource,
             } => Ok(self
-                .open(&plugin_id, workspace, root, binding_resource)
+                .open_for_session(&plugin_id, workspace, root, binding_resource, Some(owner))
                 .await?
                 .public_info()),
             HostAction::Close { instance_id } => {
-                self.close(workspace, root, &instance_id).await?;
+                self.close_for_session(workspace, root, &instance_id, Some(owner))
+                    .await?;
                 self.calls
                     .lock()
                     .unwrap()
@@ -229,7 +282,9 @@ impl PluginHost {
                 args,
                 view_id,
             } => {
-                let instance = self.find(workspace, root, &instance_id).await?;
+                let instance = self
+                    .find(workspace, root, &instance_id, Some(owner))
+                    .await?;
                 let id = Uuid::new_v4().to_string();
                 let mut context = instance.context(id.clone(), Some(owner.into()));
                 if let Some(view_id) = view_id {
@@ -416,7 +471,9 @@ impl PluginHost {
                 view_type,
                 resource,
             } => {
-                let instance = self.find(workspace, root, &instance_id).await?;
+                let instance = self
+                    .find(workspace, root, &instance_id, Some(owner))
+                    .await?;
                 let declared = instance
                     .package
                     .manifest
@@ -535,7 +592,9 @@ impl PluginHost {
                 resource,
                 view_id,
             } => {
-                let instance = self.find(workspace, root, &instance_id).await?;
+                let instance = self
+                    .find(workspace, root, &instance_id, Some(owner))
+                    .await?;
                 let view = if let Some(id) = view_id {
                     let view = self.view(workspace, owner, &id)?;
                     ensure!(
@@ -598,7 +657,79 @@ impl PluginHost {
                     .collect();
                 Ok(json!(entries))
             }
+            HostAction::MarketplaceSearch { query, refresh } => {
+                let (_client, index) = self.marketplace_index(refresh).await?;
+                let query = query.unwrap_or_default();
+                let releases = super::marketplace::MarketplaceClient::search(&index, &query);
+                Ok(json!({
+                    "repository": index.repository,
+                    "generatedAt": index.generated_at,
+                    "expiresAt": index.expires_at,
+                    "releases": releases,
+                }))
+            }
+            HostAction::MarketplaceInstall { plugin_id, version, channel } => {
+                let root = self.installation_root.clone().context("host has no installation root")?;
+                let (client, index) = self.marketplace_index(true).await?;
+                let target = super::runtime::current_target()
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                let (release, runtime_ref) = index
+                    .select_version(&plugin_id, version.as_deref(), &channel, &target, &super::marketplace::now_rfc3339())
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                let store = super::artifacts::ArtifactStore::new(root.join("store"));
+                let package = client.download_artifact(&release.package, &store).await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                let runtime_archive = client.download_artifact(&runtime_ref.artifact, &store).await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                let release = release.clone();
+                super::lifecycle::InstallManager::new(&root)
+                    .install_archives(&release, &package, &runtime_archive, &target, &root, std::time::Duration::from_secs(60))
+                    .await?;
+                self.refresh_installation(&plugin_id)?;
+                Ok(json!({"installed": plugin_id, "version": release.version}))
+            }
+            HostAction::MarketplaceRollback { plugin_id } => {
+                let root = self.installation_root.clone().context("host has no installation root")?;
+                let release = super::state::StateStore::new(&root).rollback(&plugin_id)?;
+                self.refresh_installation(&plugin_id)?;
+                Ok(json!({"rolledBack": plugin_id, "release": release}))
+            }
+            HostAction::MarketplaceDoctor => {
+                let root = self.installation_root.clone().context("host has no installation root")?;
+                let state = super::state::StateStore::new(&root).load()?;
+                Ok(json!(state.plugins))
+            }
         }
+    }
+
+    async fn marketplace_index(
+        &self,
+        refresh: bool,
+    ) -> Result<(super::marketplace::MarketplaceClient, gewu_protocol::MarketplaceIndex)> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+        let root = self.installation_root.clone().context("host has no installation root")?;
+        let key_text = std::env::var("GEWU_MARKETPLACE_PUBLIC_KEY")
+            .unwrap_or_else(|_| super::marketplace::OFFICIAL_PUBLIC_KEY_B64.trim().into());
+        let public_key = BASE64.decode(key_text).context("official marketplace public key is not base64")?;
+        let base = std::env::var("GEWU_MARKETPLACE_BASE_URL")
+            .unwrap_or_else(|_| super::marketplace::OFFICIAL_INDEX_BASE.into());
+        let client = super::marketplace::MarketplaceClient::new(
+            super::marketplace::MarketplaceRepository {
+                id: "official".into(),
+                index_url: format!("{base}/index.v1.json"),
+                signature_url: format!("{base}/index.v1.json.sig"),
+                public_key,
+                key_id: super::marketplace::OFFICIAL_KEY_ID.into(),
+            },
+            root.join("marketplace/official"),
+        );
+        let index = if refresh {
+            client.refresh().await
+        } else {
+            client.load_cached()
+        }
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Ok((client, index))
     }
 }
 

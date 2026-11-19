@@ -41,7 +41,18 @@ impl Tool for ApplicationSkills {
 
 enum Action {
     Typed(Arc<PluginHost>, Arc<Instance>, String),
-    Gateway(Arc<PluginHost>, String, PathBuf, Gateway),
+    Gateway(Arc<PluginHost>, String, PathBuf, String, Gateway),
+}
+
+fn group_enabled(state: &super::SessionPluginState, group: &str) -> bool {
+    let has = |profile: &str| state.profiles.iter().any(|item| item == profile);
+    match group {
+        "workspace" => has("workspace-basic"),
+        "analysis" => has("analysis-read"),
+        "workflow" => has("workflow-authoring"),
+        "references" => has("references"),
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -59,6 +70,7 @@ impl PluginHost {
         self: &Arc<Self>,
         workspace: &str,
         root: PathBuf,
+        session: &str,
         existing: &[Arc<dyn Tool>],
     ) -> Vec<Arc<dyn Tool>> {
         if !self.has_enabled() {
@@ -109,11 +121,19 @@ impl PluginHost {
                     name: name.into(),
                     description: description.into(),
                     schema,
-                    action: Action::Gateway(self.clone(), workspace.into(), root.clone(), kind),
+                action: Action::Gateway(
+                    self.clone(),
+                    workspace.into(),
+                    root.clone(),
+                    session.into(),
+                    kind,
+                ),
                 }));
             }
         }
-        let active = self.active(workspace, &root).await;
+        let active = self
+            .active_for_session(workspace, &root, Some(session))
+            .await;
         let mut seen = HashSet::new();
         let skills: Vec<_> = active
             .iter()
@@ -127,11 +147,20 @@ impl PluginHost {
             )));
         }
         for instance in active {
+            let state = self
+                .session_state(session, &instance.package.manifest.id)
+                .await
+                .unwrap_or_default();
             // Resource-scoped tools are selected explicitly through the gateway.
             if instance.package.manifest.scope != Scope::Workspace {
-                continue;
+                if instance.package.manifest.scope != Scope::Session {
+                    continue;
+                }
             }
             for definition in instance.definitions().filter(|t| t.expose_to_agent) {
+                if !group_enabled(&state, &definition.group) {
+                    continue;
+                }
                 let plugin = &instance.package.manifest.id;
                 let native = &definition.name;
                 let digest = format!("{:x}", Sha256::digest(format!("{plugin}\0{native}")));
@@ -140,7 +169,16 @@ impl PluginHost {
                     .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
                     .take(46)
                     .collect();
-                let name = format!("plg_{human}_{}", &digest[..12]);
+                let preferred = if plugin == "tachyon" {
+                    format!("tachyon.{native}")
+                } else {
+                    format!("plg_{human}_{}", &digest[..12])
+                };
+                let name = if names.contains(&preferred) && plugin == "tachyon" {
+                    format!("plg_{human}_{}", &digest[..12])
+                } else {
+                    preferred
+                };
                 if !names.insert(name.clone()) {
                     continue;
                 }
@@ -184,14 +222,14 @@ impl Tool for PluginTool {
             Action::Typed(host, instance, tool) => {
                 Ok(invoke(host, instance, tool, args, ctx).await?)
             }
-            Action::Gateway(host, workspace, root, kind) => {
+            Action::Gateway(host, workspace, root, session, kind) => {
                 let text = |key| {
                     args.get(key)
                         .and_then(Value::as_str)
                         .filter(|s| !s.is_empty())
                         .ok_or_else(|| anyhow::anyhow!("missing {key}"))
                 };
-                let live = || host.active(workspace, root);
+                let live = || host.active_for_session(workspace, root, Some(session));
                 let data = match kind {
                     Gateway::List => {
                         json!({"plugins":host.catalog(),"instances":live().await.iter().map(|i|json!({"id":i.activation.instance_id,"pluginId":i.package.manifest.id,"bindingResource":i.activation.binding_resource})).collect::<Vec<_>>()})
@@ -203,12 +241,24 @@ impl Tool for PluginTool {
                             .map(serde_json::from_value)
                             .transpose()?;
                         let i = host
-                            .open(text("pluginId")?, workspace, root, resource)
+                            .open_for_session(
+                                text("pluginId")?,
+                                workspace,
+                                root,
+                                resource,
+                                Some(session),
+                            )
                             .await?;
                         json!({"id":i.activation.instance_id,"pluginId":i.package.manifest.id,"views":i.package.manifest.views,"tools":i.definitions().filter(|t|t.expose_to_agent).map(|t|&t.name).collect::<Vec<_>>()})
                     }
                     Gateway::Close => {
-                        host.close(workspace, root, text("instanceId")?).await?;
+                        host.close_for_session(
+                            workspace,
+                            root,
+                            text("instanceId")?,
+                            Some(session),
+                        )
+                        .await?;
                         json!({"closed":true})
                     }
                     Gateway::Describe | Gateway::Call => {

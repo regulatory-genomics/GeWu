@@ -30,11 +30,10 @@ async fn installed_but_unconfigured_packages_are_listed_and_refuse_enabling() {
 
     let host = PluginHost::from_config(&BTreeMap::new(), None, Limits::default()).unwrap();
     let catalog = host.catalog();
-    assert_eq!(catalog.len(), 1, "{catalog:?}");
-    assert_eq!(catalog[0]["id"], "demo");
-    assert_eq!(catalog[0]["version"], "0.1.0");
-    assert_eq!(catalog[0]["configured"], false);
-    assert_eq!(catalog[0]["enabled"], false);
+    let demo = catalog.iter().find(|entry| entry["id"] == "demo").unwrap();
+    assert_eq!(demo["version"], "0.1.0");
+    assert_eq!(demo["configured"], false);
+    assert_eq!(demo["enabled"], false);
 
     let error = host
         .action(

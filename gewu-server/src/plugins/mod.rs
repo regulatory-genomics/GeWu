@@ -1,13 +1,20 @@
 mod actions;
+pub mod builtin;
+pub mod lifecycle;
 mod changes;
+pub mod artifacts;
+pub mod marketplace;
 pub mod package;
 pub mod resources;
+pub mod runtime;
 pub mod stdio;
+pub mod state;
 pub mod tools;
 
 use anyhow::{Context, Result, bail, ensure};
 use gewu_protocol::plugin::*;
 use package::{Package, PluginEntry, contained, relative, validate, validator};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -30,12 +37,17 @@ pub struct PluginHost {
     calls: Arc<Mutex<actions::Calls>>,
     editor: changes::Editor,
     store: Option<gewu_core::types::SessionState>,
+    session_states: Mutex<HashMap<(String, String), SessionPluginState>>,
     /// Packages found under `~/.gewu/plugins`, including ones no config entry
     /// references yet; the Plugins panel lists both.
     installed: Vec<Package>,
+    blocked: Vec<package::PackageIssue>,
     /// `~/.gewu/plugin-state.json`: enabled overrides kept out of the user's
     /// config so enabling never rewrites comments or secrets.
     state_file: Option<PathBuf>,
+    installation_root: Option<PathBuf>,
+    runtimes: RwLock<BTreeMap<String, runtime::RuntimeBundle>>,
+    protected: std::collections::BTreeSet<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -43,6 +55,7 @@ struct InstanceKey {
     plugin: String,
     root: PathBuf,
     resource: Option<String>,
+    session: Option<String>,
 }
 
 #[derive(Default)]
@@ -50,6 +63,23 @@ struct Slot {
     instance: Option<Arc<Instance>>,
     blocked: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionPluginState {
+    pub enabled: bool,
+    pub profiles: Vec<String>,
+}
+
+impl Default for SessionPluginState {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            profiles: vec!["workspace-basic".into(), "analysis-read".into()],
+        }
+    }
+}
+
+const SESSION_STATE_PREFIX: &str = "gewu.plugin.activation.";
 
 pub struct Instance {
     pub package: Package,
@@ -87,13 +117,24 @@ impl PluginHost {
             "pluginHost.stderrBytes must be 1–1048576"
         );
         let (installed_root, state_file) = install_locations();
+        let installation_root = installed_root
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+        let installation_state = installation_root.as_ref().map(state::StateStore::new);
+        let installation = installation_state.as_ref().map(state::StateStore::load).transpose()?.unwrap_or_default();
+        let (installed, blocked) = installed_root
+            .as_ref()
+            .map(|root| package::installed_report(root))
+            .transpose()?
+            .unwrap_or_default();
         let mut host = Self {
             limits,
-            installed: installed_root
-                .as_ref()
-                .and_then(|root| package::installed(root).ok())
-                .unwrap_or_default(),
+            installed,
+            blocked,
             state_file,
+            installation_root: installation_root.clone(),
+            runtimes: Default::default(),
+            protected: Default::default(),
             ..Self::default()
         };
         let overrides = host.enabled_overrides();
@@ -119,7 +160,84 @@ impl PluginHost {
                 .unwrap()
                 .insert(id.clone(), (entry, package));
         }
+        // Marketplace generations are host-owned and do not require a manual
+        // absolute package path in config.json. Explicit config still wins so
+        // legacy development installations keep their existing behavior.
+        for id in installation.plugins.keys().cloned().collect::<Vec<_>>() {
+            if host.entries.read().unwrap().contains_key(&id) {
+                continue;
+            }
+            host.refresh_installation(&id)?;
+        }
+        let marketplace_root = builtin::marketplace_root();
+        if marketplace_root.is_dir() {
+            let package = package::Package::read(&marketplace_root)
+                .context("bundled Marketplace plugin is invalid")?;
+            let entry = PluginEntry {
+                package: marketplace_root,
+                enabled: true,
+                settings: Default::default(),
+                workspace_settings: Default::default(),
+                service_origins: Default::default(),
+                sources: Default::default(),
+            };
+            host.entries.get_mut().unwrap().insert(builtin::MARKETPLACE_ID.into(), (entry, Some(package)));
+            host.protected.insert(builtin::MARKETPLACE_ID.into());
+        }
         Ok(host)
+    }
+
+    /// Re-read one host-owned marketplace generation into the live registry.
+    /// Config entries are never replaced: an explicit local package still wins.
+    pub(crate) fn refresh_installation(&self, id: &str) -> Result<()> {
+        let root = self
+            .installation_root
+            .as_ref()
+            .context("host has no installation root")?;
+        let installation = state::StateStore::new(root).load()?;
+        let plugin_state = installation
+            .plugins
+            .get(id)
+            .with_context(|| format!("'{id}' has no installation state"))?;
+        let release_id = plugin_state
+            .active_generation
+            .as_ref()
+            .with_context(|| format!("'{id}' has no active generation"))?;
+        let generation = plugin_state
+            .generations
+            .get(release_id)
+            .with_context(|| format!("active generation for '{id}' is missing"))?;
+        let package_root = root.join(&generation.package_path);
+        let package = package::Package::read(&package_root)
+            .with_context(|| format!("active installed generation for '{id}' is invalid"))?;
+        let entry = PluginEntry {
+            package: package_root,
+            enabled: plugin_state.enabled,
+            settings: Default::default(),
+            workspace_settings: Default::default(),
+            service_origins: Default::default(),
+            sources: Default::default(),
+        };
+        {
+            let mut runtimes = self.runtimes.write().unwrap();
+            match generation.runtime_path.as_deref() {
+                Some(runtime_path) => {
+                    let target = runtime::current_target()
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    let bundle = runtime::RuntimeBundle::load(root.join(runtime_path), id, &target)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    runtimes.insert(id.into(), bundle);
+                }
+                None => {
+                    runtimes.remove(id);
+                }
+            }
+        }
+        self.entries
+            .write()
+            .unwrap()
+            .insert(id.into(), (entry, plugin_state.enabled.then_some(package)));
+        Ok(())
     }
 
     fn enabled_overrides(&self) -> BTreeMap<String, bool> {
@@ -150,6 +268,55 @@ impl PluginHost {
         }
     }
 
+    fn session_state_key(plugin_id: &str) -> String {
+        format!("{SESSION_STATE_PREFIX}{plugin_id}")
+    }
+
+    async fn session_state(&self, session: &str, plugin_id: &str) -> Result<SessionPluginState> {
+        if let Some(state) = self
+            .session_states
+            .lock()
+            .unwrap()
+            .get(&(session.into(), plugin_id.into()))
+            .cloned()
+        {
+            return Ok(state);
+        }
+        let Some(store) = &self.store else {
+            return Ok(SessionPluginState::default());
+        };
+        Ok(store
+            .read(session, &Self::session_state_key(plugin_id))
+            .await?
+            .unwrap_or_default())
+    }
+
+    async fn persist_session_state(
+        &self,
+        session: &str,
+        plugin_id: &str,
+        state: &SessionPluginState,
+    ) -> Result<()> {
+        self.session_states
+            .lock()
+            .unwrap()
+            .insert((session.into(), plugin_id.into()), state.clone());
+        if let Some(store) = &self.store {
+            store
+                .write(session, &Self::session_state_key(plugin_id), state)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn session_state_for(
+        &self,
+        session: &str,
+        plugin_id: &str,
+    ) -> Result<SessionPluginState> {
+        self.session_state(session, plugin_id).await
+    }
+
     pub fn catalog(&self) -> Vec<Value> {
         let entries = self.entries.read().unwrap();
         let mut out: Vec<Value> = entries
@@ -157,6 +324,7 @@ impl PluginHost {
             .map(|(id, (entry, package))| {
                 json!({
                     "id":id, "enabled":package.is_some(), "configured":true,
+                    "builtin":self.protected.contains(id),
                     "title":package.as_ref().map(|p| &p.manifest.title),
                     "version":package.as_ref().map(|p| &p.manifest.version),
                     "scope":package.as_ref().map(|p| p.manifest.scope),
@@ -178,6 +346,16 @@ impl PluginHost {
                 "package":package.root,
             }));
         }
+        for issue in &self.blocked {
+            out.push(json!({
+                "id": issue.root.parent().and_then(Path::file_name).and_then(|name| name.to_str()),
+                "enabled": false,
+                "configured": false,
+                "blocked": true,
+                "error": issue.error,
+                "package": issue.root,
+            }));
+        }
         out
     }
 
@@ -190,6 +368,7 @@ impl PluginHost {
     }
 
     async fn set_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        ensure!(!self.protected.contains(id) || enabled, "bundled system plugin cannot be disabled");
         {
             let mut entries = self.entries.write().unwrap();
             let (entry, package) = entries.get_mut(id).with_context(|| {
@@ -235,6 +414,18 @@ impl PluginHost {
         root: &Path,
         binding_resource: Option<ResourceRef>,
     ) -> Result<Arc<Instance>> {
+        self.open_for_session(id, workspace, root, binding_resource, None)
+            .await
+    }
+
+    pub async fn open_for_session(
+        &self,
+        id: &str,
+        workspace: &str,
+        root: &Path,
+        binding_resource: Option<ResourceRef>,
+        session: Option<&str>,
+    ) -> Result<Arc<Instance>> {
         let (entry, package) = self
             .entries
             .read()
@@ -245,6 +436,21 @@ impl PluginHost {
         let package = package.context("plugin is disabled")?;
         let root = root.canonicalize()?;
         ensure!(root.is_dir(), "workspace root is not a directory");
+        let session = match package.manifest.scope {
+            Scope::Session => Some(
+                session
+                    .filter(|session| !session.is_empty())
+                    .context("session-scoped plugin requires a session id")?
+                    .to_owned(),
+            ),
+            _ => None,
+        };
+        if let Some(session_id) = &session {
+            ensure!(
+                self.session_state(session_id, id).await?.enabled,
+                "plugin is disabled in this session"
+            );
+        }
         let binding_resource = match (package.manifest.scope, binding_resource) {
             (Scope::Resource, Some(mut resource)) => {
                 package::validate(
@@ -268,12 +474,14 @@ impl PluginHost {
                 Some(resource)
             }
             (Scope::Workspace, None) => None,
+            (Scope::Session, None) => None,
             _ => bail!("binding resource does not match plugin scope"),
         };
         let key = InstanceKey {
             plugin: id.into(),
             root: root.clone(),
             resource: binding_resource.as_ref().map(|r| r.uri.clone()),
+            session: session.clone(),
         };
         let slot = self.slots.lock().unwrap().entry(key).or_default().clone();
         let mut state = slot.lock().await;
@@ -306,6 +514,7 @@ impl PluginHost {
             generation: self.next_generation.fetch_add(1, Ordering::Relaxed) + 1,
             workspace_id: workspace.into(),
             workspace_root: root.to_str().context("workspace root is not UTF-8")?.into(),
+            session_id: session,
             binding_resource,
             settings: entry
                 .workspace_settings
@@ -314,12 +523,15 @@ impl PluginHost {
                 .clone(),
         };
         package.validate_settings(&activation.settings)?;
-        let result = Adapter::start(
-            package.command(&root),
-            activation.clone(),
-            self.limits.clone(),
-        )
-        .await;
+        let runtime_bundle = self.runtimes.read().unwrap().get(id).cloned();
+        let command = if let Some(runtime) = &runtime_bundle {
+            runtime.probe(&package.root, &root, self.limits.startup).await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            package.command_with_runtime(&root, &runtime.environment(&package.root, &root))
+        } else {
+            package.command(&root)
+        };
+        let result = Adapter::start(command, activation.clone(), self.limits.clone()).await;
         let (adapter, catalog) = match result {
             Ok(result) => result,
             Err(error) => {
@@ -348,6 +560,15 @@ impl PluginHost {
     }
 
     pub async fn active(&self, workspace: &str, root: &Path) -> Vec<Arc<Instance>> {
+        self.active_for_session(workspace, root, None).await
+    }
+
+    pub async fn active_for_session(
+        &self,
+        workspace: &str,
+        root: &Path,
+        session: Option<&str>,
+    ) -> Vec<Arc<Instance>> {
         let Ok(root) = root.canonicalize() else {
             return vec![];
         };
@@ -364,6 +585,8 @@ impl PluginHost {
             if let Ok(state) = slot.try_lock()
                 && let Some(instance) = &state.instance
                 && instance.activation.workspace_id == workspace
+                && (instance.activation.session_id.is_none()
+                    || instance.activation.session_id.as_deref() == session)
                 && !instance.adapter.is_closed()
             {
                 instances.push(instance.clone());
@@ -380,6 +603,16 @@ impl PluginHost {
     }
 
     pub async fn close(&self, workspace: &str, root: &Path, id: &str) -> Result<()> {
+        self.close_for_session(workspace, root, id, None).await
+    }
+
+    pub async fn close_for_session(
+        &self,
+        workspace: &str,
+        root: &Path,
+        id: &str,
+        session: Option<&str>,
+    ) -> Result<()> {
         let root = root.canonicalize()?;
         let slots: Vec<_> = self
             .slots
@@ -392,7 +625,10 @@ impl PluginHost {
         for slot in slots {
             let mut state = slot.lock().await;
             if state.instance.as_ref().is_some_and(|i| {
-                i.activation.instance_id == id && i.activation.workspace_id == workspace
+                i.activation.instance_id == id
+                    && i.activation.workspace_id == workspace
+                    && (i.activation.session_id.is_none()
+                        || i.activation.session_id.as_deref() == session)
             }) {
                 return Self::shutdown(&mut state).await;
             }
@@ -528,7 +764,7 @@ impl Instance {
     pub fn public_info(&self) -> Value {
         serde_json::json!({
             "id": self.activation.instance_id, "pluginId": self.package.manifest.id, "generation":self.activation.generation,
-            "bindingResource":self.activation.binding_resource, "title":self.package.manifest.title,
+            "sessionId":self.activation.session_id, "bindingResource":self.activation.binding_resource, "title":self.package.manifest.title,
             "views":self.package.manifest.views,
             "tools":self.definitions().filter(|t| !matches!(t.name.as_str(), "view.attach" | "view.detach")).collect::<Vec<_>>(),
         })

@@ -77,3 +77,118 @@ async fn opens_a_validated_package_once_per_workspace_and_rejects_escape() {
     std::fs::write(tmp.path().join("plugin.json"), bad.to_string()).unwrap();
     assert!(Package::read(tmp.path()).is_err());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_scoped_plugins_get_independent_instances_in_one_workspace() {
+    use gewu_server::plugins::stdio::Limits;
+    use gewu_server::plugins::{PluginHost, package::PluginEntry};
+    use std::{collections::BTreeMap, path::Path};
+
+    let package = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plugin-adapter");
+    for file in ["adapter.py"] {
+        std::fs::copy(fixture.join(file), package.path().join(file)).unwrap();
+    }
+    std::fs::create_dir(package.path().join("web")).unwrap();
+    std::fs::copy(
+        fixture.join("web/index.html"),
+        package.path().join("web/index.html"),
+    )
+    .unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../sdk/python/gewu_plugin.py"),
+        package.path().join("gewu_plugin.py"),
+    )
+    .unwrap();
+    let manifest = std::fs::read_to_string(fixture.join("plugin.json"))
+        .unwrap()
+        .replace("\"scope\": \"workspace\"", "\"scope\": \"session\"");
+    std::fs::write(package.path().join("plugin.json"), manifest).unwrap();
+
+    let host = PluginHost::from_config(
+        &BTreeMap::from([(
+            "demo".into(),
+            PluginEntry {
+                package: package.path().into(),
+                enabled: true,
+                settings: Default::default(),
+                workspace_settings: Default::default(),
+                service_origins: vec![],
+                sources: Default::default(),
+            },
+        )]),
+        None,
+        Limits::default(),
+    )
+    .unwrap();
+
+    let first = host
+        .open_for_session("demo", "workspace", workspace.path(), None, Some("session-a"))
+        .await
+        .unwrap();
+    let second = host
+        .open_for_session("demo", "workspace", workspace.path(), None, Some("session-b"))
+        .await
+        .unwrap();
+    assert_ne!(first.activation.instance_id, second.activation.instance_id);
+
+    let same = host
+        .open_for_session("demo", "workspace", workspace.path(), None, Some("session-a"))
+        .await
+        .unwrap();
+    assert_eq!(first.activation.instance_id, same.activation.instance_id);
+
+    host.action(
+        "workspace",
+        workspace.path(),
+        "session-a",
+        gewu_protocol::plugin::HostAction::SetSession {
+            plugin_id: "demo".into(),
+            enabled: false,
+            profiles: vec!["workspace-basic".into()],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(host
+        .open_for_session("demo", "workspace", workspace.path(), None, Some("session-a"))
+        .await
+        .is_err());
+    assert_eq!(
+        host.open_for_session("demo", "workspace", workspace.path(), None, Some("session-b"))
+            .await
+            .unwrap()
+            .activation
+            .instance_id,
+        second.activation.instance_id
+    );
+
+    let opened = host
+        .action(
+            "workspace",
+            workspace.path(),
+            "session-b",
+            gewu_protocol::plugin::HostAction::Open {
+                plugin_id: "demo".into(),
+                binding_resource: None,
+            },
+        )
+        .await
+        .unwrap();
+    let view = host
+        .action(
+            "workspace",
+            workspace.path(),
+            "session-b",
+            gewu_protocol::plugin::HostAction::Attach {
+                instance_id: opened["id"].as_str().unwrap().into(),
+                view_type: "demo-view".into(),
+                resource: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(view["viewId"].as_str().is_some());
+}

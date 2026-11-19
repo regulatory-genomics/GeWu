@@ -19,6 +19,7 @@ async fn cancel_ack_does_not_replace_terminal_and_adapter_exits() {
         generation: 1,
         workspace_id: "w".into(),
         workspace_root: directory.display().to_string(),
+        session_id: None,
         binding_resource: None,
         settings: Object::new(),
     };

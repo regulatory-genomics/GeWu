@@ -2,13 +2,13 @@ import {bindFrame} from './plugin-bridge.mjs';
 import {button, changes, editor, node, preview} from './editor.mjs';
 
 export const dismissedKey = (scope) => `gewu.dismissed.v1:${JSON.stringify([scope.workspace, scope.session_id ?? scope.id])}`;
-export const stateKey = (scope, instance, view) => `gewu.viewstate.v1:${JSON.stringify([scope.workspace, instance.pluginId, instance.bindingResource?.uri ?? '', view.id])}`;
+export const stateKey = (scope, instance, view) => `gewu.viewstate.v2:${JSON.stringify([scope.workspace, scope.session_id ?? scope.id, instance.pluginId, instance.bindingResource?.uri ?? '', view.id])}`;
 
 /// The right-dock host: a Plugins manager plus one tab per open application
 /// view. Server instances are the source of truth, so a reload attaches to a
 /// live instance and never starts a stopped one.
 export function panelHost(root, rpc, {onShow, onHide} = {}) {
-  let scope, active = 'plugins', seq = 0, syncing = null, manager, changesView, managerSignature = '';
+  let scope, active = 'plugins', seq = 0, syncing = null, manager, changesView, marketplaceView, managerSignature = '';
   let dismissed = new Set();
   const panels = new Map();
   const tabs = node('nav');
@@ -38,6 +38,9 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
     const changed = button('Changes', () => showChanges());
     changed.setAttribute('aria-pressed', String(active === 'changes'));
     tabs.append(changed);
+    const market = button('Marketplace', () => showMarketplace());
+    market.setAttribute('aria-pressed', String(active === 'marketplace'));
+    tabs.append(market);
     for (const [id, panel] of panels) {
       const item = button(panel.title, () => { active = id; render(); });
       item.setAttribute('aria-pressed', String(active === id));
@@ -50,6 +53,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
     }
     if (manager) manager.hidden = active !== 'plugins';
     if (changesView) changesView.hidden = active !== 'changes';
+    if (marketplaceView) marketplaceView.hidden = active !== 'marketplace';
   }
 
   function close(id) {
@@ -182,6 +186,66 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
     loadChanges();
   }
 
+  function showMarketplace() {
+    if (!marketplaceView) return;
+    active = 'marketplace';
+    render();
+    loadMarketplace();
+  }
+
+  /// The signed catalog is rendered by the host, not by a plugin webview, so
+  /// installation always goes through the same verified InstallManager path.
+  async function loadMarketplace(query = '') {
+    if (!marketplaceView) return;
+    const request = requestFor();
+    const pane = node('div');
+    pane.className = 'plugin-marketplace';
+    const bar = node('div');
+    const search = node('input');
+    search.placeholder = 'Search plugins';
+    search.value = query;
+    bar.append(search, button('Search', () => loadMarketplace(search.value.trim())));
+    bar.append(button('Doctor', async () => {
+      try {
+        const state = await request({action: 'marketplace_doctor'});
+        pane.append(node('pre', JSON.stringify(state, null, 2)));
+      } catch (error) { fail(pane, error); }
+    }));
+    pane.append(bar);
+    const list = node('div');
+    pane.append(list);
+    marketplaceView.replaceChildren(pane);
+    try {
+      const data = await request({action: 'marketplace_search', query, refresh: true});
+      list.append(node('p', `${data.releases.length} release(s) · ${data.repository} · expires ${data.expiresAt}`));
+      if (!data.releases.length) list.append(node('p', 'No matching release in the signed catalog.'));
+      for (const release of data.releases) {
+        const row = node('div');
+        row.className = 'plugin-row';
+        row.append(node('span', `${release.plugin} ${release.version} (${release.channel})`));
+        if (release.releaseNotes) row.append(node('p', release.releaseNotes));
+        const runtime = release.runtimes?.[0];
+        if (runtime) {
+          const mb = Math.round((runtime.artifact.bytes + release.package.bytes) / 1e6);
+          row.append(node('code', `${runtime.target.os}-${runtime.target.arch} · ${mb} MB`));
+        }
+        row.append(button('Install', async () => {
+          try {
+            const result = await request({action: 'marketplace_install', pluginId: release.plugin, version: release.version, channel: release.channel});
+            row.append(node('p', `Installed ${result.version}. Restart or reopen the plugin to use it.`));
+          } catch (error) { fail(row, error); }
+        }));
+        row.append(button('Rollback', async () => {
+          try {
+            const result = await request({action: 'marketplace_rollback', pluginId: release.plugin});
+            row.append(node('p', `Rolled back to ${result.release}.`));
+          } catch (error) { fail(row, error); }
+        }));
+        list.append(row);
+      }
+    } catch (error) { fail(list, error); }
+  }
+
   async function loadChanges() {
     const pane = node('div');
     const bar = node('div');
@@ -260,12 +324,19 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
       view.append(node('h3', 'Plugins'));
       for (const plugin of plugins) {
         const running = instances.filter((instance) => instance.pluginId === plugin.id);
+        const session = plugin.session ?? {enabled: true, profiles: ['workspace-basic', 'analysis-read']};
         const row = node('div');
         row.className = 'plugin-row';
         const name = node('span', `${plugin.title ?? plugin.id}`);
         if (plugin.version) name.append(node('code', ` v${plugin.version}`));
         row.append(name);
-        row.append(node('span', !plugin.configured ? ' \u00b7 installed, not configured' : !plugin.enabled ? ' \u00b7 disabled' : ' \u00b7 enabled'));
+        row.append(node('span', !plugin.configured
+          ? ' \u00b7 installed, not configured'
+          : !plugin.enabled
+            ? ' \u00b7 globally disabled'
+            : session.enabled
+              ? ' \u00b7 enabled in this session'
+              : ' \u00b7 disabled in this session'));
         const tools = [...new Map(running.flatMap(instance => instance.tools ?? []).map(tool => [tool.name, tool])).values()];
         const details = node('details');
         details.className = 'plugin-tools';
@@ -273,7 +344,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
         if (!tools.length) details.append(node('p', 'Open the plugin to discover its available tools.'));
         for (const tool of tools) {
           const item = node('details');
-          item.append(node('summary', `${tool.name} · ${tool.effect}`));
+          item.append(node('summary', `${tool.name} · ${tool.group ?? 'workspace'} · ${tool.effect}`));
           item.append(node('p', tool.description));
           item.append(node('pre', JSON.stringify(tool.inputSchema, null, 2)));
           details.append(item);
@@ -297,13 +368,46 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
           view.append(row);
           continue;
         }
-        row.append(button(plugin.enabled ? 'Disable' : 'Enable', async () => {
+        row.append(button(plugin.enabled ? 'Disable globally' : 'Enable globally', async () => {
           try { await request({action: 'set_enabled', pluginId: plugin.id, enabled: !plugin.enabled}); await refresh(); }
           catch (error) { fail(view, error); }
         }));
-        if (plugin.enabled) row.append(button('Open\u2026', async () => {
+        if (plugin.enabled) row.append(button(session.enabled ? 'Disable in this session' : 'Enable in this session', async () => {
+          try {
+            await request({action: 'set_session', pluginId: plugin.id, enabled: !session.enabled, profiles: session.profiles});
+            await refresh();
+          } catch (error) { fail(view, error); }
+        }));
+        if (plugin.enabled && session.enabled) row.append(button('Open\u2026', async () => {
           try { await openPlugin(plugin); } catch (error) { fail(view, error); }
         }));
+        if (plugin.enabled && session.enabled && (plugin.id === 'tachyon' || plugin.scope === 'session')) {
+          const profiles = node('span');
+          profiles.className = 'plugin-profiles';
+          for (const profile of ['workflow-authoring', 'references']) {
+            const label = node('label');
+            const input = node('input');
+            input.type = 'checkbox';
+            input.checked = session.profiles.includes(profile);
+            input.addEventListener('change', async () => {
+              const next = input.checked
+                ? [...new Set([...session.profiles, profile])]
+                : session.profiles.filter((item) => item !== profile);
+              input.disabled = true;
+              try {
+                await request({action: 'set_session', pluginId: plugin.id, enabled: session.enabled, profiles: next});
+                await refresh();
+              } catch (error) {
+                input.disabled = false;
+                input.checked = !input.checked;
+                fail(view, error);
+              }
+            });
+            label.append(input, node('span', profile));
+            profiles.append(label);
+          }
+          row.append(profiles);
+        }
         view.append(row);
         for (const instance of running) view.append(runningRow(instance, request, view));
       }
@@ -355,7 +459,10 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
     changesView = node('div');
     changesView.className = 'plugin-panel';
     changesView.hidden = true;
-    body.append(manager, changesView);
+    marketplaceView = node('div');
+    marketplaceView.className = 'plugin-panel';
+    marketplaceView.hidden = true;
+    body.append(manager, changesView, marketplaceView);
     active = 'plugins';
     render();
     refresh();

@@ -11,6 +11,8 @@ gewu-update = { path = "../gewu-update" }
 anyhow = "1.0"
 dirs = "6.0"
 serde_json = "1.0"
+base64 = "0.22"
+url = "2"
 gewu-protocol = { path = "../gewu-protocol" }
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"

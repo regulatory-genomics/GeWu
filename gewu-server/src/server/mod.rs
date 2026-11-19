@@ -2201,6 +2201,7 @@ async fn start_session_turn(
                 .tools(
                     &session.workspace.id,
                     PathBuf::from(&session.workspace.path),
+                    &session.session_id,
                     agent.tools(),
                 )
                 .await

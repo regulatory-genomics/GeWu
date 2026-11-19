@@ -1113,6 +1113,7 @@ name = "gewu"
 version = "0.1.6"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "dirs",
  "dotenvy",
@@ -1125,6 +1126,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1303,6 +1305,7 @@ dependencies = [
  "gewu-providers",
  "gewu-storage",
  "gewu-tools",
+ "hex",
  "ignore",
  "image",
  "json-strip-comments",
@@ -1310,6 +1313,7 @@ dependencies = [
  "mime_guess",
  "percent-encoding",
  "reqwest",
+ "ring",
  "schemars",
  "serde",
  "serde_json",
@@ -1317,6 +1321,7 @@ dependencies = [
  "similar",
  "sqlx",
  "tempfile",
+ "time",
  "tokio",
  "tokio-tungstenite 0.28.0",
  "tokio-util",

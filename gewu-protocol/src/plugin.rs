@@ -22,6 +22,12 @@ pub enum HostAction {
         plugin_id: String,
         enabled: bool,
     },
+    SetSession {
+        plugin_id: String,
+        enabled: bool,
+        #[serde(default)]
+        profiles: Vec<String>,
+    },
     Open {
         plugin_id: String,
         binding_resource: Option<ResourceRef>,
@@ -87,6 +93,19 @@ pub enum HostAction {
         expected: String,
     },
     Changes,
+    MarketplaceSearch {
+        query: Option<String>,
+        refresh: bool,
+    },
+    MarketplaceInstall {
+        plugin_id: String,
+        version: Option<String>,
+        channel: String,
+    },
+    MarketplaceRollback {
+        plugin_id: String,
+    },
+    MarketplaceDoctor,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -99,6 +118,7 @@ pub enum ApiVersion {
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
     Workspace,
+    Session,
     Resource,
 }
 
@@ -190,6 +210,8 @@ pub struct Activation {
     pub generation: u64,
     pub workspace_id: String,
     pub workspace_root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding_resource: Option<ResourceRef>,
     pub settings: Object,
@@ -323,11 +345,24 @@ pub struct Activated {
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
+    #[serde(
+        default = "default_tool_group",
+        skip_serializing_if = "is_default_tool_group"
+    )]
+    pub group: String,
     pub input_schema: Object,
     pub output_schema: Object,
     pub expose_to_agent: bool,
     pub effect: Effect,
     pub target: Target,
+}
+
+fn default_tool_group() -> String {
+    "workspace".into()
+}
+
+fn is_default_tool_group(group: &str) -> bool {
+    group == "workspace"
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

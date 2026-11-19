@@ -31,9 +31,9 @@ test('binds an opaque frame, streams native HTTP, restores state and revokes sta
     await frame.getByRole('button',{name:'Read native service'}).click();
     await expect(frame.getByRole('heading')).toHaveText('Native service: 7');
     await page.getByRole('button', {name:'Plugins',exact:true}).click();
-    await page.getByText('Tools (4)', {exact:true}).click();
+     await page.getByText('Tools (5)', {exact:true}).click();
     await expect(page.locator('.plugin-tools').first()).toContainText('echo');
-    await page.locator('.plugin-tools summary').filter({hasText:'wait · read'}).click();
+     await page.locator('.plugin-tools summary').filter({hasText:'wait · workspace · read'}).click();
     await expect(page.getByText('Wait in the fixture', {exact:true})).toBeVisible();
     await page.getByRole('button', {name:'Demo View',exact:true}).click();
     const originalAsset = await page.locator('iframe[title="Demo View"]').getAttribute('src');

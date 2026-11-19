@@ -45,3 +45,41 @@ fn install_check_remove_are_static_and_preserve_workspace() {
         "keep"
     );
 }
+
+#[test]
+fn lifecycle_keeps_previous_generation_and_workspace_data() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("workspace");
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    for (root, version) in [(&first, "1.0.0"), (&second, "2.0.0")] {
+        std::fs::create_dir(root).unwrap();
+        std::fs::write(root.join("adapter"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(root.join("adapter"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::write(root.join("plugin.json"), format!(r#"{{"apiVersion":"gewu.plugin/v1","id":"demo","title":"Demo","version":"{version}","scope":"workspace","backend":{{"connector":"gewu-stdio","config":{{"entry":"adapter"}}}}}}"#)).unwrap();
+    }
+    std::fs::write(workspace.join("keep.txt"), "keep").unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_gewu"))
+            .args(["--no-update-check", "plugin"])
+            .args(args)
+            .env("HOME", &home)
+            .current_dir(&workspace)
+            .output()
+            .unwrap()
+    };
+    assert!(run(&["install", first.to_str().unwrap()]).status.success());
+    assert!(run(&["install", second.to_str().unwrap()]).status.success());
+    assert!(run(&["disable", "demo"]).status.success());
+    assert!(run(&["enable", "demo"]).status.success());
+    let rollback = run(&["rollback", "demo"]);
+    assert!(rollback.status.success(), "{}", String::from_utf8_lossy(&rollback.stderr));
+    let doctor = run(&["doctor", "demo"]);
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("generations\":2"));
+    assert_eq!(std::fs::read_to_string(workspace.join("keep.txt")).unwrap(), "keep");
+    assert!(run(&["uninstall", "demo"]).status.success());
+    assert!(!home.join(".gewu/plugins/demo").exists());
+}

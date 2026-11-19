@@ -9,6 +9,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 use tokio::process::Command;
+use super::runtime::RuntimeEnvironment;
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -41,6 +42,12 @@ pub struct Package {
     pub manifest: Manifest,
     executable: PathBuf,
     pub(crate) skills: Vec<gewu_tools::SkillInfo>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PackageIssue {
+    pub root: PathBuf,
+    pub error: String,
 }
 
 pub fn validator(schema: &Value) -> Result<jsonschema::Validator> {
@@ -164,6 +171,16 @@ impl Package {
         }
         command
     }
+
+    /// Add the host-owned runtime ABI to a normal adapter command. The
+    /// development command remains available for legacy local packages.
+    pub fn command_with_runtime(&self, cwd: &Path, runtime: &RuntimeEnvironment) -> Command {
+        let mut command = self.command(cwd);
+        for (key, value) in runtime.variables() {
+            command.env(key, value);
+        }
+        command
+    }
 }
 
 pub fn install(root: &Path, source: &Path) -> Result<PathBuf> {
@@ -196,7 +213,7 @@ pub fn install(root: &Path, source: &Path) -> Result<PathBuf> {
     Ok(dest)
 }
 
-fn copy_dir(source: &Path, dest: &Path) -> Result<()> {
+pub fn copy_dir(source: &Path, dest: &Path) -> Result<()> {
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let to = dest.join(entry.file_name());
@@ -214,10 +231,19 @@ fn copy_dir(source: &Path, dest: &Path) -> Result<()> {
 }
 
 pub fn installed(root: &Path) -> Result<Vec<Package>> {
+    let (packages, issues) = installed_report(root)?;
+    if let Some(issue) = issues.first() {
+        anyhow::bail!("invalid installed package {}: {}", issue.root.display(), issue.error);
+    }
+    Ok(packages)
+}
+
+pub fn installed_report(root: &Path) -> Result<(Vec<Package>, Vec<PackageIssue>)> {
     if !root.exists() {
-        return Ok(vec![]);
+        return Ok((vec![], vec![]));
     }
     let mut packages = Vec::new();
+    let mut issues = Vec::new();
     for namespace in fs::read_dir(root)? {
         let namespace = namespace?;
         if !namespace.file_type()?.is_dir() {
@@ -225,22 +251,29 @@ pub fn installed(root: &Path) -> Result<Vec<Package>> {
         }
         for version in fs::read_dir(namespace.path())? {
             let version = version?;
+            if version.file_name() == "generations" {
+                continue;
+            }
             if !version.file_type()?.is_dir()
                 || version.file_name().to_string_lossy().starts_with('.')
             {
                 continue;
             }
-            let package = Package::read(&version.path())?;
-            ensure!(
-                namespace.file_name() == package.manifest.id.as_str()
-                    && version.file_name() == package.manifest.version.as_str(),
-                "installed package identity does not match its directory"
-            );
-            packages.push(package);
+            match Package::read(&version.path()).and_then(|package| {
+                ensure!(
+                    namespace.file_name() == package.manifest.id.as_str()
+                        && version.file_name() == package.manifest.version.as_str(),
+                    "installed package identity does not match its directory"
+                );
+                Ok(package)
+            }) {
+                Ok(package) => packages.push(package),
+                Err(error) => issues.push(PackageIssue { root: version.path(), error: error.to_string() }),
+            }
         }
     }
     packages.sort_by(|a, b| {
         (&a.manifest.id, &a.manifest.version).cmp(&(&b.manifest.id, &b.manifest.version))
     });
-    Ok(packages)
+    Ok((packages, issues))
 }

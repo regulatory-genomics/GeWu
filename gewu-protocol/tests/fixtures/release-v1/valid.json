@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "gewu.release/v1",
+  "releaseId": "paper-0.2.0",
+  "plugin": "paper",
+  "version": "0.2.0",
+  "channel": "stable",
+  "gewu": {"api": "gewu.plugin/v1", "host": ">=0.1.0 <0.2.0"},
+  "package": {"url": "http://172.16.211.53:3000/gilbert/gewu-marketplace/releases/download/paper-0.2.0/paper.package.zip", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bytes": 100},
+  "runtimes": [{
+    "id": "paper-runtime",
+    "version": "0.2.0",
+    "target": {"os": "linux", "arch": "x86_64", "libc": "glibc-2.28"},
+    "artifact": {"url": "http://172.16.211.53:3000/gilbert/gewu-marketplace/releases/download/paper-0.2.0/paper.runtime.zip", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "bytes": 200},
+    "manifest": {"url": "http://172.16.211.53:3000/gilbert/gewu-marketplace/raw/tag/paper-0.2.0/paper.runtime.json", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "bytes": 300}
+  }],
+  "capabilities": ["html", "docx", "pdf"],
+  "permissions": [],
+  "provenance": {"builder": "gewu-release", "source": "https://example.invalid/paper", "sourceCommit": "0123456789abcdef0123456789abcdef01234567", "buildInputs": ["paper-lock-v1"], "sbom": "http://172.16.211.53:3000/gilbert/gewu-marketplace/releases/download/paper-0.2.0/paper.sbom.json", "createdAt": "2026-11-18T00:00:00Z"},
+  "releaseNotes": "Initial release"
+}

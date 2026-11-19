@@ -1,15 +1,75 @@
 # Install an application plugin
 
-Build or obtain the application's versioned GeWu package, then run:
+## From the signed marketplace (preferred)
+
+GeWu ships the official Ed25519 public key and the internal Gitea catalog URL:
+
+```sh
+gewu plugin search tachyon
+gewu plugin info tachyon --version 0.1.0
+gewu plugin marketplace-install tachyon --version 0.1.0
+gewu plugin doctor
+gewu plugin rollback tachyon
+gewu plugin disable tachyon
+gewu plugin enable tachyon
+gewu plugin uninstall tachyon
+```
+
+The host downloads the package and the matching packed runtime, verifies both
+SHA-256 digests, rejects unsafe archives, validates `plugin.json` and
+`runtime.json`, runs the runtime probe, and only then switches `active.json`.
+A failed download, digest, or probe leaves the previous generation active.
+
+The GUI exposes the same path in the **Marketplace** tab of the Applications
+panel. A website or launcher can hand one release to the same installer with:
+
+```sh
+gewu plugin open-link 'gewu://plugin/install?repo=official&id=tachyon&version=0.1.0'
+```
+
+Deep links accept only `repo=official`, `id`, `version`, and `channel`; local
+paths, tokens, and runtime executables are never accepted.
+
+Overrides for a mirror or a test key:
+
+```text
+GEWU_MARKETPLACE_BASE_URL   index directory URL
+GEWU_MARKETPLACE_PUBLIC_KEY base64 raw Ed25519 public key
+```
+
+The current Gitea instance is LAN-only. On a machine that cannot reach it
+directly (for example this development workstation), point
+`GEWU_MARKETPLACE_BASE_URL` at a tunnel or mirror that serves the same signed
+index and assets.
+
+## From a local package directory
 
 ```sh
 gewu plugin install /path/to/package
-gewu plugin list
-gewu plugin check paper
-gewu plugin check paper --probe --workspace /path/to/test-workspace --settings settings.json
+gewu plugin list --json
+gewu plugin check tachyon
+gewu plugin check tachyon --probe --workspace /path/to/workspace --settings settings.json
 ```
 
-Install/check without `--probe` only inspect files; they do not start the app or need a model. The installer prints the installed package directory. Add it to the server's existing `--llm-config` file:
+`install` copies the package into a host-owned generation and records it in
+`~/.gewu/plugins/state.json`. It does not execute the application.
+
+## From downloaded release archives
+
+For offline release verification:
+
+```sh
+gewu plugin install-archive release.json package.zip runtime.zip --workspace /path/to/workspace
+```
+
+This performs the same digest, archive, manifest, and runtime probe checks as a
+marketplace install.
+
+## Configuration notes
+
+Marketplace-installed plugins do not need a `package` path in `config.json`.
+Explicit `plugins` entries still win and keep their legacy settings. A
+development entry still looks like this:
 
 ```json
 {
@@ -23,8 +83,20 @@ Install/check without `--probe` only inspect files; they do not start the app or
 }
 ```
 
-Merge this into your existing config. Relative package paths resolve against the config file. `workspaceSettings` can replace `settings` for selected workspace IDs. The optional `serviceOrigins` list permits specific non-loopback HTTP origins for registered service routes; literal loopback addresses can be used for locally managed services. The default `pluginHost` limits can be changed with `startupMs`, `callMs`, `shutdownMs`, `cleanupMs`, and `stderrBytes`.
+`workspaceSettings` can replace `settings` for selected workspace IDs. The
+optional `serviceOrigins` list permits specific non-loopback HTTP origins for
+registered service routes; literal loopback addresses are used for locally
+managed services. `pluginHost` limits are `startupMs`, `callMs`, `shutdownMs`,
+`cleanupMs`, and `stderrBytes`.
 
-In the web GUI, **Applications → Services → Start** opens an instance in the selected workspace. Resource-scoped apps ask for a binding type and a workspace-relative path. `check --probe` accepts the equivalent `--resource workspace:///path --resource-type app.kind`. **Close view** closes a panel without stopping a running tool; **Stop** shuts down its instance. Use **Cancel** to request cancellation of one call. An interrupted or unknown outcome should be checked in the application before retrying a write. The editor refuses stale revisions; reopen the file to read its current contents.
+## Lifecycle
 
-To roll back, stop the instance, change the configured package path to the desired installed version, and restart the server. The Services panel can enable or disable configured packages until restart; disabling stops all of that plugin's instances. To disable a plugin persistently, set `enabled` to `false`; `gewu plugin remove paper --version 0.1.0` deletes that package only. Existing plugins may depend on application runtimes such as Tectonic or Manim; the application handles its own dependency checks during `--probe`.
+- **disable** stops active instances and keeps the installed generation.
+- **enable** reopens the plugin on the next start or instance open.
+- **rollback** switches to the previously active generation.
+- **uninstall** removes the plugin's generations and state only; workspaces,
+  Canvas documents, Paper outputs, and Manimble decks are never removed.
+- The bundled `gewu-marketplace` system plugin cannot be disabled or removed.
+
+An invalid installed package is shown as a blocked entry with its error instead
+of disappearing from the panel.
