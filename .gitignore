@@ -6,3 +6,6 @@ target/
 .opencode/
 gewu-cli/target/
 gewu-core/truncation/
+
+# Local plans and evidence are not committed.
+plans/
