@@ -399,7 +399,11 @@ async fn marketplace_install(
         .select_release_version(id, version, channel, &now_rfc3339())
         .map_err(|error| anyhow::anyhow!(error.to_string()))?
         .clone();
-    let selection = RuntimeSelection::select(&release, policy, &target, executable)?;
+    let selection = if policy == "auto" {
+        RuntimeSelection::select_auto(&release, &target, executable).await?
+    } else {
+        RuntimeSelection::select(&release, policy, &target, executable)?
+    };
     if dry_run {
         let value = serde_json::json!({
             "release": release.release_id,

@@ -723,7 +723,7 @@ impl PluginHost {
                     .select_release_version(&plugin_id, version.as_deref(), &channel, &super::marketplace::now_rfc3339())
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?
                     .clone();
-                let selection = super::lifecycle::RuntimeSelection::select(&release, "auto", &target, None)?;
+                let selection = super::lifecycle::RuntimeSelection::select_auto(&release, &target, None).await?;
                 let store = super::artifacts::ArtifactStore::new(root.join("store"));
                 let package = client.download_artifact(&release.package, &store).await
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
