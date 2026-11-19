@@ -24,14 +24,12 @@ pub enum RuntimeSelection<'a> {
 }
 
 impl<'a> RuntimeSelection<'a> {
-    /// Prefer the first provider that actually works on this host. External
-    /// providers are probed before selection so a stale interpreter falls
-    /// through to a managed environment or a bundled runtime.
-    pub async fn select_auto(
+    pub async fn auto_candidates(
         release: &'a Release,
         target: &Target,
         executable: Option<&Path>,
-    ) -> Result<Self> {
+    ) -> Result<Vec<Self>> {
+        let mut candidates = Vec::new();
         if let Some(plan) = &release.runtime_plan {
             for kind in &plan.policies {
                 for provider in plan.providers.iter().filter(|provider| provider.kind() == kind && provider.target() == target) {
@@ -40,26 +38,49 @@ impl<'a> RuntimeSelection<'a> {
                             if let Ok(path) = providers::resolve_external(provider, executable)
                                 && providers::probe_executable(&path, probe).await.is_ok()
                             {
-                                return Ok(Self::External { provider, executable: Some(path) });
+                                candidates.push(Self::External { provider, executable: Some(path) });
                             }
                         }
                         RuntimeProvider::Managed { manager, .. } => {
                             if providers::managed_available(manager) {
-                                return Ok(Self::Managed { provider });
+                                candidates.push(Self::Managed { provider });
                             }
                         }
-                        RuntimeProvider::Bundled { .. } => {
-                            if let Some(runtime) = release.runtimes.iter().find(|runtime| runtime.target == *target) {
-                                return Ok(Self::Bundled(runtime));
+                        RuntimeProvider::Bundled { id, .. } => {
+                            if let Some(runtime) = release
+                                .runtimes
+                                .iter()
+                                .find(|runtime| runtime.id == *id && runtime.target == *target)
+                            {
+                                candidates.push(Self::Bundled(runtime));
                             }
                         }
                     }
                 }
             }
         }
-        let bundled = select_runtime(&release.runtimes, target)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        Ok(Self::Bundled(bundled))
+        if candidates.is_empty() {
+            candidates.push(Self::Bundled(
+                select_runtime(&release.runtimes, target)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+            ));
+        }
+        Ok(candidates)
+    }
+
+    /// Prefer the first provider that actually works on this host. External
+    /// providers are probed before selection so a stale interpreter falls
+    /// through to a managed environment or a bundled runtime.
+    pub async fn select_auto(
+        release: &'a Release,
+        target: &Target,
+        executable: Option<&Path>,
+    ) -> Result<Self> {
+        Self::auto_candidates(release, target, executable)
+            .await?
+            .into_iter()
+            .next()
+            .context("auto runtime selection produced no candidates")
     }
     /// Choose a runtime without touching the filesystem. `auto` follows the
     /// plan's declared policy order and falls back to a bundled runtime.
@@ -220,8 +241,10 @@ impl InstallManager {
             }
             RuntimeSelection::Managed { provider } => {
                 ensure!(provider.target() == &host_target, "runtime provider target does not match host");
-                let target_prefix = self.state.root().join("runtimes").join(provider.id()).join(&release.plugin);
-                if !providers::is_executable(&target_prefix.join("bin/python3")) {
+                let key = providers::managed_prefix_key(&release.plugin, provider)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                let target_prefix = self.state.root().join("runtimes").join(key);
+                if !providers::managed_complete(&target_prefix) {
                     providers::install_managed(provider, &target_prefix, 3600).await
                         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                 }

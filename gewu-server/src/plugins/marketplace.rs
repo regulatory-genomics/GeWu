@@ -3,8 +3,9 @@
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures::StreamExt;
-use gewu_protocol::release::{Artifact, MarketplaceIndex, Release};
+use gewu_protocol::release::{Artifact, MARKETPLACE_SCHEMA, MARKETPLACE_V2_SCHEMA, MarketplaceIndex, Release};
 use ring::signature::{ED25519, UnparsedPublicKey};
+use serde_json::Value;
 use std::{fmt, path::{Path, PathBuf}, time::Duration};
 use time::format_description::well_known::Rfc3339;
 
@@ -82,8 +83,35 @@ impl MarketplaceClient {
         UnparsedPublicKey::new(&ED25519, &repository.public_key)
             .verify(index_bytes, &signature)
             .map_err(|_| MarketplaceError::InvalidSignature)?;
-        let index: MarketplaceIndex = serde_json::from_slice(index_bytes)
+        let value: Value = serde_json::from_slice(index_bytes)
             .map_err(|error| MarketplaceError::InvalidIndex(error.to_string()))?;
+        let schema_version = value
+            .get("schemaVersion")
+            .and_then(Value::as_str)
+            .ok_or_else(|| MarketplaceError::InvalidIndex("marketplace schemaVersion is missing".into()))?;
+        let schema = match schema_version {
+            "gewu.marketplace/v1" => MARKETPLACE_SCHEMA,
+            "gewu.marketplace/v2" => MARKETPLACE_V2_SCHEMA,
+            _ => return Err(MarketplaceError::InvalidIndex("unsupported marketplace schema".into())),
+        };
+        let signed = serde_json::json!({
+            "index": value,
+            "signature": {"algorithm": "ed25519", "keyId": repository.key_id, "value": signature_text},
+        });
+        let schema: Value = serde_json::from_str(schema)
+            .map_err(|error| MarketplaceError::InvalidIndex(error.to_string()))?;
+        let validator = jsonschema::validator_for(&schema)
+            .map_err(|error| MarketplaceError::InvalidIndex(error.to_string()))?;
+        if let Err(error) = validator.validate(&signed) {
+            return Err(MarketplaceError::InvalidIndex(format!(
+                "schema validation failed at {}",
+                error.instance_path()
+            )));
+        }
+        let index: MarketplaceIndex = serde_json::from_value(
+            signed["index"].clone(),
+        )
+        .map_err(|error| MarketplaceError::InvalidIndex(error.to_string()))?;
         if index.repository != repository.id || index.key_id != repository.key_id {
             return Err(MarketplaceError::InvalidIndex("repository or key identity mismatch".into()));
         }

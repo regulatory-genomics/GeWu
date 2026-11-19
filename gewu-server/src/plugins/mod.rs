@@ -18,7 +18,7 @@ use package::{Package, PluginEntry, contained, relative, validate, validator};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
@@ -32,6 +32,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 pub struct PluginHost {
     entries: RwLock<BTreeMap<String, (PluginEntry, Option<Package>)>>,
     slots: Mutex<HashMap<InstanceKey, Arc<AsyncMutex<Slot>>>>,
+    resource_attachments: Mutex<HashMap<String, HashSet<String>>>,
     next_generation: AtomicU64,
     limits: Limits,
     resources: Arc<resources::Resources>,
@@ -553,7 +554,7 @@ impl PluginHost {
                     .clone()
                     .context("session-scoped plugin requires a session id")?,
             ),
-            Scope::Resource => session_key.clone(),
+            Scope::Resource => None,
             Scope::Workspace => None,
         };
         let binding_resource = match (meta.manifest.scope, binding_resource) {
@@ -633,6 +634,11 @@ impl PluginHost {
                 !instance.adapter.is_closed(),
                 "adapter disconnected; close the instance before reopening"
             );
+            if meta.manifest.scope == Scope::Resource {
+                if let Some(session) = session_key.as_deref() {
+                    self.attach_resource(instance, session);
+                }
+            }
             return Ok(instance.clone());
         }
         let activation = Activation {
@@ -683,6 +689,11 @@ impl PluginHost {
             }
         };
         state.instance = Some(instance.clone());
+        if meta.manifest.scope == Scope::Resource {
+            if let Some(session) = session_key.as_deref() {
+                self.attach_resource(&instance, session);
+            }
+        }
         Ok(instance)
     }
 
@@ -712,8 +723,7 @@ impl PluginHost {
             if let Ok(state) = slot.try_lock()
                 && let Some(instance) = &state.instance
                 && instance.activation.workspace_id == workspace
-                && (instance.activation.session_id.is_none()
-                    || instance.activation.session_id.as_deref() == session)
+                && self.visible_to_session(instance, session)
                 && !instance.adapter.is_closed()
             {
                 instances.push(instance.clone());
@@ -730,7 +740,7 @@ impl PluginHost {
     }
 
     pub async fn close(&self, workspace: &str, root: &Path, id: &str) -> Result<()> {
-        self.close_for_session(workspace, root, id, None).await
+        self.close_for_session(workspace, root, id, None).await.map(|_| ())
     }
 
     pub async fn close_for_session(
@@ -739,7 +749,7 @@ impl PluginHost {
         root: &Path,
         id: &str,
         session: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let root = root.canonicalize()?;
         let slots: Vec<_> = self
             .slots
@@ -751,14 +761,43 @@ impl PluginHost {
             .collect();
         for slot in slots {
             let mut state = slot.lock().await;
-            if state.instance.as_ref().is_some_and(|i| {
-                i.activation.instance_id == id
-                    && i.activation.workspace_id == workspace
-                    && (i.activation.session_id.is_none()
-                        || i.activation.session_id.as_deref() == session)
-            }) {
-                return Self::shutdown(&mut state).await;
+            let Some(instance) = state.instance.clone() else {
+                continue;
+            };
+            if instance.activation.instance_id != id
+                || instance.activation.workspace_id != workspace
+            {
+                continue;
             }
+            if instance.package.manifest.scope == Scope::Resource {
+                if let Some(session) = session {
+                    ensure!(
+                        self.detach_resource(&instance, session),
+                        "plugin instance is not attached to this session"
+                    );
+                    if self.has_resource_attachments(&instance) {
+                        return Ok(false);
+                    }
+                } else {
+                    ensure!(
+                        !self.has_resource_attachments(&instance),
+                        "plugin instance is still attached to a session"
+                    );
+                }
+                self.resource_attachments
+                    .lock()
+                    .unwrap()
+                    .remove(&instance.activation.instance_id);
+                Self::shutdown(&mut state).await?;
+                return Ok(true);
+            }
+            ensure!(
+                instance.activation.session_id.is_none()
+                    || instance.activation.session_id.as_deref() == session,
+                "plugin instance is not ready in this session"
+            );
+            Self::shutdown(&mut state).await?;
+            return Ok(true);
         }
         bail!("plugin instance was not found in the workspace")
     }
@@ -772,7 +811,51 @@ impl PluginHost {
                 failure = Some(error);
             }
         }
+        self.resource_attachments.lock().unwrap().clear();
         failure.map_or(Ok(()), Err)
+    }
+
+    fn attach_resource(&self, instance: &Instance, session: &str) {
+        self.resource_attachments
+            .lock()
+            .unwrap()
+            .entry(instance.activation.instance_id.clone())
+            .or_default()
+            .insert(session.into());
+    }
+
+    fn detach_resource(&self, instance: &Instance, session: &str) -> bool {
+        let mut attachments = self.resource_attachments.lock().unwrap();
+        let Some(sessions) = attachments.get_mut(&instance.activation.instance_id) else {
+            return false;
+        };
+        let removed = sessions.remove(session);
+        if sessions.is_empty() {
+            attachments.remove(&instance.activation.instance_id);
+        }
+        removed
+    }
+
+    fn has_resource_attachments(&self, instance: &Instance) -> bool {
+        self.resource_attachments
+            .lock()
+            .unwrap()
+            .get(&instance.activation.instance_id)
+            .is_some_and(|sessions| !sessions.is_empty())
+    }
+
+    fn visible_to_session(&self, instance: &Instance, session: Option<&str>) -> bool {
+        if instance.package.manifest.scope == Scope::Resource {
+            return session.is_none()
+                || self
+                    .resource_attachments
+                    .lock()
+                    .unwrap()
+                    .get(&instance.activation.instance_id)
+                    .is_some_and(|sessions| session.is_some_and(|id| sessions.contains(id)));
+        }
+        instance.activation.session_id.is_none()
+            || instance.activation.session_id.as_deref() == session
     }
 
     async fn shutdown(state: &mut Slot) -> Result<()> {

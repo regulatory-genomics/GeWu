@@ -176,6 +176,13 @@ impl PluginHost {
             .context("VIEW_NOT_READY: view binding is stale or unavailable")
     }
 
+    fn remove_views_for(&self, owner: &str, instance_id: &str, all: bool) {
+        self.calls.lock().unwrap().views.retain(|_, view| {
+            view.instance.activation.instance_id != instance_id
+                || (!all && view.owner != owner)
+        });
+    }
+
     pub fn selected_context(&self, workspace: &str, session: &str) -> Vec<String> {
         let mut items: Vec<_> = self
             .calls
@@ -237,8 +244,10 @@ impl PluginHost {
                         .map(|instance| instance.activation.instance_id.clone())
                         .collect();
                     for id in ids {
-                        self.close_for_session(workspace, root, &id, Some(owner))
+                        let stopped = self
+                            .close_for_session(workspace, root, &id, Some(owner))
                             .await?;
+                        self.remove_views_for(owner, &id, stopped);
                     }
                 }
                 Ok(json!({"enabled":enabled,"profiles":state.profiles}))
@@ -292,13 +301,10 @@ impl PluginHost {
                 .await?
                 .public_info()),
             HostAction::Close { instance_id } => {
-                self.close_for_session(workspace, root, &instance_id, Some(owner))
+                let stopped = self
+                    .close_for_session(workspace, root, &instance_id, Some(owner))
                     .await?;
-                self.calls
-                    .lock()
-                    .unwrap()
-                    .views
-                    .retain(|_, v| v.instance.activation.instance_id != instance_id);
+                self.remove_views_for(owner, &instance_id, stopped);
                 Ok(json!({"closed":true}))
             }
             HostAction::Call {
@@ -723,22 +729,35 @@ impl PluginHost {
                     .select_release_version(&plugin_id, version.as_deref(), &channel, &super::marketplace::now_rfc3339())
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?
                     .clone();
-                let selection = super::lifecycle::RuntimeSelection::select_auto(&release, &target, None).await?;
                 let store = super::artifacts::ArtifactStore::new(root.join("store"));
                 let package = client.download_artifact(&release.package, &store).await
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                let runtime_archive = match &selection {
-                    super::lifecycle::RuntimeSelection::Bundled(runtime_ref) => Some(
-                        client.download_artifact(&runtime_ref.artifact, &store).await
-                            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
-                    ),
-                    _ => None,
-                };
-                let runtime = super::lifecycle::InstallManager::new(&root)
-                    .install_release(&release, &package, runtime_archive.as_deref(), selection, &root, std::time::Duration::from_secs(60))
-                    .await?;
-                self.refresh_installation(&plugin_id)?;
-                Ok(json!({"installed": plugin_id, "version": release.version, "runtime": runtime.runtime}))
+                let selections = super::lifecycle::RuntimeSelection::auto_candidates(&release, &target, None).await?;
+                let manager = super::lifecycle::InstallManager::new(&root);
+                let mut failures = Vec::new();
+                for selection in selections {
+                    let runtime_archive = match &selection {
+                        super::lifecycle::RuntimeSelection::Bundled(runtime_ref) => match client.download_artifact(&runtime_ref.artifact, &store).await {
+                            Ok(path) => Some(path),
+                            Err(error) => {
+                                failures.push(error.to_string());
+                                continue;
+                            }
+                        },
+                        _ => None,
+                    };
+                    match manager
+                        .install_release(&release, &package, runtime_archive.as_deref(), selection, &root, std::time::Duration::from_secs(60))
+                        .await
+                    {
+                        Ok(runtime) => {
+                            self.refresh_installation(&plugin_id)?;
+                            return Ok(json!({"installed": plugin_id, "version": release.version, "runtime": runtime.runtime}));
+                        }
+                        Err(error) => failures.push(error.to_string()),
+                    }
+                }
+                bail!("all runtime providers failed for {}: {}", release.release_id, failures.join("; "))
             }
             HostAction::MarketplaceRollback { plugin_id } => {
                 let root = self.installation_root.clone().context("host has no installation root")?;

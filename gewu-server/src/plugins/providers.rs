@@ -7,11 +7,13 @@
 
 use gewu_protocol::release::{ProbeSpec, RuntimeProvider, Target};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     fmt,
+    io::ErrorKind,
     path::{Path, PathBuf},
     process::Stdio,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{process::Command, time::timeout};
 
@@ -75,6 +77,24 @@ pub fn managed_available(manager: &str) -> bool {
         .filter(|path| is_executable(path))
         .or_else(|| find_command(manager))
         .is_some()
+}
+
+pub fn managed_prefix_key(plugin: &str, provider: &RuntimeProvider) -> Result<String, ProviderError> {
+    if !matches!(provider, RuntimeProvider::Managed { .. }) {
+        return Err(ProviderError::Invalid("provider is not managed".into()));
+    }
+    let value = serde_json::json!({
+        "plugin": plugin,
+        "provider": provider,
+        "target": provider.target(),
+    });
+    let bytes = serde_json::to_vec(&value)
+        .map_err(|error| ProviderError::Invalid(error.to_string()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+pub fn managed_complete(prefix: &Path) -> bool {
+    prefix.join(".gewu-complete").is_file() && is_executable(&prefix.join("bin/python3"))
 }
 
 /// Resolve an external provider's interpreter. An explicit `override_path`
@@ -192,7 +212,7 @@ pub async fn install_managed(
     prefix: &Path,
     timeout_seconds: u64,
 ) -> Result<(), ProviderError> {
-    let RuntimeProvider::Managed { manager, channels, packages, pip, pip_index, pip_extra_index, .. } = provider else {
+    let RuntimeProvider::Managed { manager, .. } = provider else {
         return Err(ProviderError::Invalid("provider is not managed".into()));
     };
     if manager != "micromamba" {
@@ -203,17 +223,50 @@ pub async fn install_managed(
         .filter(|path| is_executable(path))
         .or_else(|| find_command("micromamba"))
         .ok_or_else(|| ProviderError::Unavailable("micromamba is not installed".into()))?;
+    install_managed_with_binary(provider, prefix, timeout_seconds, &binary).await
+}
+
+async fn install_managed_with_binary(
+    provider: &RuntimeProvider,
+    prefix: &Path,
+    timeout_seconds: u64,
+    binary: &Path,
+) -> Result<(), ProviderError> {
+    let RuntimeProvider::Managed { manager, channels, packages, pip, pip_index, pip_extra_index, probe, .. } = provider else {
+        return Err(ProviderError::Invalid("provider is not managed".into()));
+    };
+    if manager != "micromamba" {
+        return Err(ProviderError::Invalid(format!("unsupported manager {manager}")));
+    }
+    let parent = prefix
+        .parent()
+        .ok_or_else(|| ProviderError::Invalid("managed prefix has no parent".into()))?;
+    std::fs::create_dir_all(parent).map_err(|error| ProviderError::Invalid(error.to_string()))?;
+    let _lock = ManagedLock::acquire(prefix, timeout_seconds).await?;
+    if managed_complete(prefix) {
+        return Ok(());
+    }
+    if prefix.exists() {
+        std::fs::remove_dir_all(prefix)
+            .map_err(|error| ProviderError::Invalid(format!("cannot remove incomplete managed prefix: {error}")))?;
+    }
+    let temporary = tempfile::Builder::new()
+        .prefix(".managed-")
+        .tempdir_in(parent)
+        .map_err(|error| ProviderError::Invalid(error.to_string()))?;
+    let work = temporary.path().join("prefix");
+    std::fs::create_dir_all(&work).map_err(|error| ProviderError::Invalid(error.to_string()))?;
     let deadline = Duration::from_secs(timeout_seconds);
-    let mut create = Command::new(&binary);
-    create.arg("create").arg("--yes").arg("--prefix").arg(prefix);
+    let mut create = Command::new(binary);
+    create.arg("create").arg("--yes").arg("--prefix").arg(&work);
     for channel in channels {
         create.arg("--channel").arg(channel);
     }
     create.args(packages);
     run_install(create, deadline, "micromamba create").await?;
     if !pip.is_empty() {
-        let mut install = Command::new(&binary);
-        install.arg("run").arg("--prefix").arg(prefix).arg("python").arg("-m").arg("pip").arg("install").arg("--disable-pip-version-check").arg("--prefer-binary");
+        let mut install = Command::new(binary);
+        install.arg("run").arg("--prefix").arg(&work).arg("python").arg("-m").arg("pip").arg("install").arg("--disable-pip-version-check").arg("--prefer-binary");
         let index = std::env::var("GEWU_PIP_INDEX_URL").ok().or_else(|| pip_index.clone());
         let extra = std::env::var("GEWU_PIP_EXTRA_INDEX_URL").ok().or_else(|| pip_extra_index.clone());
         if let Some(index) = index.filter(|value| !value.trim().is_empty()) {
@@ -225,7 +278,80 @@ pub async fn install_managed(
         install.args(pip);
         run_install(install, deadline, "pip install").await?;
     }
+    probe_managed(&work, probe, deadline).await?;
+    std::fs::write(work.join(".gewu-complete"), b"gewu managed runtime\n")
+        .map_err(|error| ProviderError::Invalid(error.to_string()))?;
+    std::fs::rename(&work, prefix)
+        .map_err(|error| ProviderError::Invalid(format!("cannot activate managed prefix: {error}")))?;
     Ok(())
+}
+
+async fn probe_managed(
+    prefix: &Path,
+    probe: &ProbeSpec,
+    deadline: Duration,
+) -> Result<(), ProviderError> {
+    let python = prefix.join("bin/python3");
+    if !is_executable(&python) {
+        return Err(ProviderError::Invalid("managed environment has no bin/python3".into()));
+    }
+    let mut command = Command::new(&python);
+    command.args(&probe.args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).env_clear();
+    for key in ["HOME", "LANG", "LC_ALL", "TMPDIR"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    let mut path = prefix.join("bin").display().to_string();
+    if let Some(value) = std::env::var_os("PATH") {
+        path.push(':');
+        path.push_str(&value.to_string_lossy());
+    }
+    command.env("PATH", path);
+    let library = prefix.join("lib");
+    if library.is_dir() {
+        command.env("LD_LIBRARY_PATH", library);
+    }
+    let output = timeout(deadline, command.output())
+        .await
+        .map_err(|_| ProviderError::ProbeFailed("managed runtime probe timed out".into()))?
+        .map_err(|error| ProviderError::ProbeFailed(error.to_string()))?;
+    if !output.status.success() {
+        return Err(ProviderError::ProbeFailed(trim_message(&String::from_utf8_lossy(&output.stderr))));
+    }
+    Ok(())
+}
+
+struct ManagedLock {
+    path: PathBuf,
+}
+
+impl ManagedLock {
+    async fn acquire(prefix: &Path, timeout_seconds: u64) -> Result<Self, ProviderError> {
+        let path = PathBuf::from(format!("{}.lock", prefix.display()));
+        let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+        loop {
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    if Instant::now() >= deadline {
+                        return Err(ProviderError::Unavailable(format!(
+                            "managed runtime is locked: {}",
+                            prefix.display()
+                        )));
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => return Err(ProviderError::Invalid(error.to_string())),
+            }
+        }
+    }
+}
+
+impl Drop for ManagedLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.path);
+    }
 }
 
 async fn run_install(mut command: Command, deadline: Duration, what: &str) -> Result<(), ProviderError> {
@@ -348,5 +474,56 @@ mod tests {
             binaries: Default::default(),
         };
         assert!(matches!(resolve_external(&provider, None), Err(ProviderError::Unavailable(_))));
+    }
+
+    #[test]
+    fn managed_prefix_key_changes_when_provider_inputs_change() {
+        let first = RuntimeProvider::Managed {
+            id: "demo".into(),
+            target: target(),
+            manager: "micromamba".into(),
+            channels: vec!["conda-forge".into()],
+            packages: vec!["python=3.11".into()],
+            pip: vec![],
+            pip_index: None,
+            pip_extra_index: None,
+            probe: ProbeSpec { args: vec![], timeout_seconds: None },
+            binaries: Default::default(),
+        };
+        let mut second = first.clone();
+        if let RuntimeProvider::Managed { packages, .. } = &mut second {
+            packages.push("cairo".into());
+        }
+        assert_ne!(
+            managed_prefix_key("demo", &first).unwrap(),
+            managed_prefix_key("demo", &second).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_managed_install_does_not_leave_a_final_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = temp.path().join("micromamba");
+        write_executable(
+            &manager,
+            "#!/bin/sh\nset -eu\nif [ \"$1\" = create ]; then\n  prefix=\"\"\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = --prefix ]; then prefix=$2; shift 2; else shift; fi\n  done\n  mkdir -p \"$prefix/bin\"\nelif [ \"$1\" = run ]; then\n  exit 7\nfi\n",
+        )
+        .unwrap();
+        let provider = RuntimeProvider::Managed {
+            id: "demo".into(),
+            target: target(),
+            manager: "micromamba".into(),
+            channels: vec![],
+            packages: vec!["python=3.11".into()],
+            pip: vec!["broken==1.0".into()],
+            pip_index: None,
+            pip_extra_index: None,
+            probe: ProbeSpec { args: vec![], timeout_seconds: Some(1) },
+            binaries: Default::default(),
+        };
+        let prefix = temp.path().join("runtime");
+        assert!(install_managed_with_binary(&provider, &prefix, 2, &manager).await.is_err());
+        assert!(!prefix.exists());
+        assert!(!temp.path().join("runtime.lock").exists());
     }
 }

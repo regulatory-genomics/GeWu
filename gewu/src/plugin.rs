@@ -240,10 +240,25 @@ pub async fn run(action: Action) -> Result<()> {
         }
         Action::Remove { id, version } => {
             if let Ok(saved) = state.load()
-                && saved.plugins.get(&id).is_some_and(|plugin| version.as_deref().is_none_or(|wanted| plugin.generations.contains_key(wanted) || plugin.generations.keys().any(|key| key.ends_with(&format!("-{wanted}")))))
+                && let Some(plugin) = saved.plugins.get(&id)
             {
-                state.uninstall(&id)?;
-                println!("Removed {id}");
+                if let Some(wanted) = version.as_deref()
+                    && let Some(release_id) = plugin
+                        .generations
+                        .keys()
+                        .find(|key| *key == wanted || key.ends_with(&format!("-{wanted}")))
+                        .cloned()
+                {
+                    state.remove_generation(&id, &release_id)?;
+                    println!("Removed {id} {wanted}");
+                } else if version.is_none() {
+                    state.uninstall(&id)?;
+                    println!("Removed {id}");
+                } else {
+                    let package = select(&id, version.as_deref())?;
+                    std::fs::remove_dir_all(package.root)?;
+                    println!("Removed {id} {}", package.manifest.version);
+                }
             } else {
                 let package = select(&id, version.as_deref())?;
                 std::fs::remove_dir_all(package.root)?;
@@ -405,12 +420,13 @@ async fn marketplace_install(
         .select_release_version(id, version, channel, &now_rfc3339())
         .map_err(|error| anyhow::anyhow!(error.to_string()))?
         .clone();
-    let selection = if policy == "auto" {
-        RuntimeSelection::select_auto(&release, &target, executable).await?
+    let selections = if policy == "auto" {
+        RuntimeSelection::auto_candidates(&release, &target, executable).await?
     } else {
-        RuntimeSelection::select(&release, policy, &target, executable)?
+        vec![RuntimeSelection::select(&release, policy, &target, executable)?]
     };
     if dry_run {
+        let selection = &selections[0];
         let value = serde_json::json!({
             "release": release.release_id,
             "plugin": release.plugin,
@@ -430,29 +446,40 @@ async fn marketplace_install(
         .download_artifact(&release.package, &store)
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let runtime_archive = match &selection {
-        RuntimeSelection::Bundled(runtime) => Some(
-            client
-                .download_artifact(&runtime.artifact, &store)
-                .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?,
-        ),
-        _ => None,
-    };
     let workspace = std::env::current_dir()?;
-    let generation = InstallManager::new(state.root())
-        .install_release(
-            &release,
-            &package_archive,
-            runtime_archive.as_deref(),
-            selection,
-            &workspace,
-            Limits::default().startup,
-        )
-        .await?;
-    let runtime = generation.runtime.as_ref().map(|runtime| format!(" via {} ({})", runtime.provider, runtime.kind)).unwrap_or_default();
-    println!("Installed {} {}{}", release.plugin, release.version, runtime);
-    Ok(())
+    let manager = InstallManager::new(state.root());
+    let mut failures = Vec::new();
+    for selection in selections {
+        let runtime_archive = match &selection {
+            RuntimeSelection::Bundled(runtime) => match client.download_artifact(&runtime.artifact, &store).await {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    failures.push(error.to_string());
+                    continue;
+                }
+            },
+            _ => None,
+        };
+        match manager
+            .install_release(
+                &release,
+                &package_archive,
+                runtime_archive.as_deref(),
+                selection,
+                &workspace,
+                Limits::default().startup,
+            )
+            .await
+        {
+            Ok(generation) => {
+                let runtime = generation.runtime.as_ref().map(|runtime| format!(" via {} ({})", runtime.provider, runtime.kind)).unwrap_or_default();
+                println!("Installed {} {}{}", release.plugin, release.version, runtime);
+                return Ok(());
+            }
+            Err(error) => failures.push(error.to_string()),
+        }
+    }
+    bail!("all runtime providers failed for {}: {}", release.release_id, failures.join("; "))
 }
 
 async fn runtime_discover(

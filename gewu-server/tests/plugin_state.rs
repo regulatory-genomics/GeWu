@@ -46,3 +46,62 @@ fn failed_staging_does_not_create_a_generation_or_state() {
     assert!(!store.root().join("plugins/paper/generations/paper-0.2.0").exists());
     assert!(store.load().unwrap().plugins.is_empty());
 }
+
+#[test]
+fn removing_one_generation_preserves_the_other_generation_and_rollback_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = StateStore::new(temp.path().join(".gewu"));
+    let first = generation("paper-0.1.0");
+    let second = generation("paper-0.2.0");
+    store
+        .stage_generation("paper", &first, |root| {
+            std::fs::create_dir_all(root.join("package"))?;
+            Ok(())
+        })
+        .unwrap();
+    store.commit_active("paper", first, "stable").unwrap();
+    store
+        .stage_generation("paper", &second, |root| {
+            std::fs::create_dir_all(root.join("package"))?;
+            Ok(())
+        })
+        .unwrap();
+    store.commit_active("paper", second, "stable").unwrap();
+
+    store.remove_generation("paper", "paper-0.1.0").unwrap();
+    let state = store.load().unwrap();
+    let paper = state.plugins.get("paper").unwrap();
+    assert_eq!(paper.active_generation.as_deref(), Some("paper-0.2.0"));
+    assert_eq!(paper.previous_generation, None);
+    assert!(!store
+        .generation_root("paper", "paper-0.1.0")
+        .unwrap()
+        .exists());
+    assert!(store
+        .generation_root("paper", "paper-0.2.0")
+        .unwrap()
+        .exists());
+}
+
+#[test]
+fn removing_the_active_generation_rolls_back_to_the_previous_generation() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = StateStore::new(temp.path().join(".gewu"));
+    let first = generation("paper-0.1.0");
+    let second = generation("paper-0.2.0");
+    for value in [first, second] {
+        store
+            .stage_generation("paper", &value, |root| {
+                std::fs::create_dir_all(root.join("package"))?;
+                Ok(())
+            })
+            .unwrap();
+        store.commit_active("paper", value, "stable").unwrap();
+    }
+
+    store.remove_generation("paper", "paper-0.2.0").unwrap();
+    let state = store.load().unwrap();
+    let paper = state.plugins.get("paper").unwrap();
+    assert_eq!(paper.active_generation.as_deref(), Some("paper-0.1.0"));
+    assert_eq!(paper.previous_generation, None);
+}

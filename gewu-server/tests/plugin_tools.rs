@@ -209,7 +209,7 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
 }
 
 #[tokio::test]
-async fn resource_instances_are_scoped_to_the_session_that_opened_them() {
+async fn resource_instances_are_shared_but_visible_only_to_attached_sessions() {
     use gewu_protocol::plugin::ResourceRef;
 
     let package = tempfile::tempdir().unwrap();
@@ -271,10 +271,23 @@ async fn resource_instances_are_scoped_to_the_session_that_opened_them() {
         .open_for_session("demo", "workspace", root, Some(resource()), Some("session-b"))
         .await
         .unwrap();
-    assert_ne!(first.activation.instance_id, second.activation.instance_id);
+    assert_eq!(first.activation.instance_id, second.activation.instance_id);
     assert_eq!(
         host.active_for_session("workspace", root, Some("session-b")).await.len(),
         1
+    );
+    host.close_for_session(
+        "workspace",
+        root,
+        &second.activation.instance_id,
+        Some("session-b"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        host.active_for_session("workspace", root, Some("session-a")).await.len(),
+        1,
+        "closing one session must not stop the shared resource instance"
     );
     host.close_all().await.unwrap();
 }
