@@ -703,11 +703,12 @@ impl PluginHost {
                 Ok(json!(entries))
             }
             HostAction::MarketplaceSearch { query, refresh } => {
-                let (_client, index) = self.marketplace_index(refresh).await?;
+                let (client, index) = self.marketplace_index(refresh).await?;
                 let query = query.unwrap_or_default();
                 let releases = super::marketplace::MarketplaceClient::search(&index, &query);
                 Ok(json!({
                     "repository": index.repository,
+                    "indexUrl": client.repository().index_url,
                     "generatedAt": index.generated_at,
                     "expiresAt": index.expires_at,
                     "releases": releases,
@@ -769,7 +770,12 @@ impl PluginHost {
             root.join("marketplace/official"),
         );
         let index = if refresh {
-            client.refresh().await
+            match client.refresh().await {
+                Ok(index) => Ok(index),
+                // A previously verified snapshot is still usable offline; the
+                // expiry and artifact digests are checked on every use.
+                Err(_) => client.load_cached(),
+            }
         } else {
             client.load_cached()
         }

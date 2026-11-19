@@ -213,11 +213,14 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
     }));
     pane.append(bar);
     const list = node('div');
+    list.append(node('p', 'Loading signed catalog…'));
     pane.append(list);
     marketplaceView.replaceChildren(pane);
     try {
       const data = await request({action: 'marketplace_search', query, refresh: true});
+      list.replaceChildren();
       list.append(node('p', `${data.releases.length} release(s) · ${data.repository} · expires ${data.expiresAt}`));
+      list.append(node('p', `Catalog: ${data.indexUrl}`));
       if (!data.releases.length) list.append(node('p', 'No matching release in the signed catalog.'));
       for (const release of data.releases) {
         const row = node('div');
@@ -243,7 +246,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
         }));
         list.append(row);
       }
-    } catch (error) { fail(list, error); }
+    } catch (error) { list.replaceChildren(); fail(list, error); }
   }
 
   async function loadChanges() {

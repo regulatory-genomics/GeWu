@@ -107,7 +107,7 @@ impl MarketplaceClient {
     pub async fn refresh(&self) -> Result<MarketplaceIndex, MarketplaceError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| MarketplaceError::Network(e.to_string()))?;
         let index = fetch_bounded(&client, &self.repository.index_url, self.max_bytes).await?;
