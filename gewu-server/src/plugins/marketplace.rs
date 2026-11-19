@@ -13,8 +13,7 @@ use super::artifacts::ArtifactStore;
 const DEFAULT_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const OFFICIAL_KEY_ID: &str = "official-v1";
 pub const OFFICIAL_PUBLIC_KEY_B64: &str = include_str!("../../resources/marketplace/official-v1.pub.b64");
-pub const OFFICIAL_INDEX_BASE: &str =
-    "http://172.16.211.53:3000/gilbert/gewu-marketplace/raw/branch/master/public";
+pub const OFFICIAL_INDEX_BASE: &str = "https://plugin.regulogen.cn";
 
 #[derive(Debug)]
 pub enum MarketplaceError {

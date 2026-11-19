@@ -38,18 +38,19 @@ GEWU_MARKETPLACE_PUBLIC_KEY   base64 raw Ed25519 public key
 GEWU_MARKETPLACE_ASSET_ORIGIN rewrite only scheme/host/port of artifact URLs
 ```
 
-`GEWU_MARKETPLACE_ASSET_ORIGIN` is for a tunnel or mirror. The artifact path and
-its SHA-256 stay authoritative, so a rewritten URL cannot change content.
+The default official catalog is public:
 
-The current Gitea instance is LAN-only and its marketplace repository is
-public-read. On a machine that cannot reach it directly, tunnel port 3000 and
-set both variables:
-
-```sh
-ssh -N -L 19080:127.0.0.1:3000 rpi-ubuntu &
-export GEWU_MARKETPLACE_BASE_URL=http://127.0.0.1:19080/gilbert/gewu-marketplace/raw/branch/master/public
-export GEWU_MARKETPLACE_ASSET_ORIGIN=http://127.0.0.1:19080
+```text
+https://plugin.regulogen.cn/index.v1.json
 ```
+
+Override the base URL for a mirror, and `GEWU_MARKETPLACE_ASSET_ORIGIN` when only
+artifact downloads need a different origin. The artifact path and its SHA-256
+stay authoritative, so a rewritten URL cannot change content.
+
+The internal Gitea repository remains the publishing source. On a machine that
+cannot reach the public origin, point the base URL at a local mirror serving the
+same signed bytes.
 
 ## From a local package directory
 
