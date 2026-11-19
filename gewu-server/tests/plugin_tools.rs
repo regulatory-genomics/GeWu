@@ -207,3 +207,74 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
         .is_err()
     );
 }
+
+#[tokio::test]
+async fn resource_instances_are_scoped_to_the_session_that_opened_them() {
+    use gewu_protocol::plugin::ResourceRef;
+
+    let package = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plugin-adapter");
+    std::fs::create_dir(package.path().join("web")).unwrap();
+    for file in ["adapter.py", "web/index.html"] {
+        std::fs::copy(fixture.join(file), package.path().join(file)).unwrap();
+    }
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../sdk/python/gewu_plugin.py"),
+        package.path().join("gewu_plugin.py"),
+    )
+    .unwrap();
+    let manifest = std::fs::read_to_string(fixture.join("plugin.json"))
+        .unwrap()
+        .replace("\"scope\": \"workspace\"", "\"scope\": \"resource\"");
+    std::fs::write(package.path().join("plugin.json"), manifest).unwrap();
+    std::fs::create_dir(root.join("doc")).unwrap();
+
+    let host = PluginHost::from_config(
+        &BTreeMap::from([(
+            "demo".into(),
+            PluginEntry {
+                package: package.path().into(),
+                enabled: true,
+                settings: Default::default(),
+                workspace_settings: Default::default(),
+                service_origins: vec![],
+                sources: Default::default(),
+            },
+        )]),
+        None,
+        Limits::default(),
+    )
+    .unwrap();
+    let resource = || ResourceRef {
+        uri: "workspace:///doc".into(),
+        resource_type: "demo.view".into(),
+        mime_type: None,
+        revision: None,
+    };
+
+    let first = host
+        .open_for_session("demo", "workspace", root, Some(resource()), Some("session-a"))
+        .await
+        .unwrap();
+    assert_eq!(
+        host.active_for_session("workspace", root, Some("session-a")).await.len(),
+        1
+    );
+    assert!(
+        host.active_for_session("workspace", root, Some("session-b")).await.is_empty(),
+        "another session must not see this instance or its preview"
+    );
+
+    let second = host
+        .open_for_session("demo", "workspace", root, Some(resource()), Some("session-b"))
+        .await
+        .unwrap();
+    assert_ne!(first.activation.instance_id, second.activation.instance_id);
+    assert_eq!(
+        host.active_for_session("workspace", root, Some("session-b")).await.len(),
+        1
+    );
+    host.close_all().await.unwrap();
+}

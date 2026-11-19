@@ -544,14 +544,17 @@ impl PluginHost {
             None => Package::read(&entry.package)
                 .with_context(|| format!("plugin '{id}' could not be loaded"))?,
         };
-        // Only session-scoped plugins key their instance by session identity.
+        // Session- and resource-scoped instances belong to the session that
+        // opened them. A resource instance still keys by its resource, but it
+        // must not appear in another session's dock (that leaked previews).
         let session = match meta.manifest.scope {
             Scope::Session => Some(
                 session_key
                     .clone()
                     .context("session-scoped plugin requires a session id")?,
             ),
-            _ => None,
+            Scope::Resource => session_key.clone(),
+            Scope::Workspace => None,
         };
         let binding_resource = match (meta.manifest.scope, binding_resource) {
             (Scope::Resource, Some(mut resource)) => {
