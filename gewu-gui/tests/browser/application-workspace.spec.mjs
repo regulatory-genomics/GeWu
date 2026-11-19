@@ -53,19 +53,19 @@ test('stopping a plugin then reloading never starts it again', async ({page})=>{
     await page.goto(fixture.url);
     await expect(page.getByRole('textbox',{name:'Message'})).toBeEnabled();
     await openPreview(page);
-    await page.getByRole('button',{name:'Open…',exact:true}).click();
+    await page.locator('.plugin-row').filter({hasText:'Demo adapter'}).getByRole('button',{name:'Open…',exact:true}).click();
     await expect(page.frameLocator('iframe[title="Demo View"]').getByRole('heading')).toHaveText('GeWu connected');
     expect(opens.length).toBe(1);
 
     await page.getByRole('button',{name:'Plugins',exact:true}).click();
     await page.getByRole('button',{name:'Stop',exact:true}).click();
     await expect(page.locator('iframe[title="Demo View"]')).toHaveCount(0);
-    await expect(page.getByRole('button',{name:'Open…',exact:true})).toBeVisible();
+    await expect(page.locator('.plugin-row').filter({hasText:'Demo adapter'}).getByRole('button',{name:'Open…',exact:true})).toBeVisible();
 
     const before=opens.length;
     await page.reload();
     await openPreview(page);
-    await expect(page.getByRole('button',{name:'Open…',exact:true})).toBeVisible();
+    await expect(page.locator('.plugin-row').filter({hasText:'Demo adapter'}).getByRole('button',{name:'Open…',exact:true})).toBeVisible();
     await expect(page.locator('iframe[title="Demo View"]')).toHaveCount(0);
     expect(opens.length).toBe(before);
   } finally {await fixture.close();}

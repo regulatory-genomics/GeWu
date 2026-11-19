@@ -6,8 +6,9 @@ test('a real agent turn calls the adapter and Plan does not advertise plugin too
   try {
     await page.goto(fixture.url);
     await openPreview(page);
-    await expect(page.getByRole('button',{name:'Open…',exact:true})).toBeVisible();
-    await page.getByRole('button',{name:'Open…',exact:true}).click();
+    const demo = page.locator('.plugin-row').filter({hasText:'Demo adapter'});
+    await expect(demo.getByRole('button',{name:'Open…',exact:true})).toBeVisible();
+    await demo.getByRole('button',{name:'Open…',exact:true}).click();
     await expect(page.frameLocator('iframe[title="Demo View"]').getByRole('heading')).toHaveText('GeWu connected');
     await page.getByRole('tab',{name:'FILES'}).click();
     const prompt=page.getByRole('textbox',{name:'Message'});
@@ -52,7 +53,7 @@ test('the conversation names a plugin tool and renders its result', async ({page
     // Plugin tools reach the agent, never a button wall in the panels. They
     // exist only while the application instance is open.
     await openPreview(page);
-    await page.getByRole('button',{name:'Open…',exact:true}).click();
+    await page.locator('.plugin-row').filter({hasText:'Demo adapter'}).getByRole('button',{name:'Open…',exact:true}).click();
     await expect(page.frameLocator('iframe[title="Demo View"]').getByRole('heading')).toHaveText('GeWu connected');
     const prompt=page.getByRole('textbox',{name:'Message'});
     await prompt.fill('call echo {"value":9}');

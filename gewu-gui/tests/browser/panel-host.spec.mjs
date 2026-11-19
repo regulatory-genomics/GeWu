@@ -9,7 +9,7 @@ test('binds an opaque frame, streams native HTTP, restores state and revokes sta
     await page.goto(fixture.url);
     await expect(page.getByRole('textbox',{name:'Message'})).toBeEnabled();
     await openPreview(page);
-    await page.getByRole('button',{name:'Open…',exact:true}).click();
+    await page.locator('.plugin-row').filter({hasText:'Demo adapter'}).getByRole('button',{name:'Open…',exact:true}).click();
     const frame=page.frameLocator('iframe[title="Demo View"]');
     await expect(frame.getByRole('heading')).toHaveText('GeWu connected');
     await expect(page.locator('iframe[title="Demo View"]')).toHaveAttribute('sandbox','allow-scripts');

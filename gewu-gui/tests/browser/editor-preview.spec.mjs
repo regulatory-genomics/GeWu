@@ -9,7 +9,7 @@ test('editor saves workspace text and refuses a stale second edit', async ({page
     await page.goto(fixture.url);
     await expect(page.getByRole('textbox',{name:'Message'})).toBeEnabled();
     await openPreview(page);
-    await page.getByRole('button',{name:'Open…',exact:true}).click();
+    await page.locator('.plugin-row').filter({hasText:'Demo adapter'}).getByRole('button',{name:'Open…',exact:true}).click();
     await expect(page.frameLocator('iframe[title="Demo View"]').getByRole('heading')).toHaveText('GeWu connected');
     await page.getByRole('button',{name:'Plugins',exact:true}).click();
     page.once('dialog',dialog=>dialog.accept('example.txt'));
