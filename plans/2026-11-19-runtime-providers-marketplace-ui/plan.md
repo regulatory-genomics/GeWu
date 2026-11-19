@@ -124,6 +124,8 @@ links to its signature for provenance.
 - [x] `./target/debug/gewu plugin runtime discover --json manimble` -> returns structured candidates with source, target, and availability/probe status.
 - [x] `./target/debug/gewu plugin marketplace-install manimble --dry-run` -> returns the selected typed provider and target without writing files.
 - [x] A failed external probe is rejected with a typed reason and leaves `active.json` unchanged (`plugin_install.rs`).
+- [x] A compatible existing Manimble Python is selected, installed, and activated without a bundled runtime; `doctor` records the external runtime identity.
+- [x] Real Manimble activation: `plugin check manimble --probe` -> `Ready: manimble (12 tools)`, and a real manim render produced `Demo.mp4`.
 - [ ] A managed runtime install creates a Host-owned generation, passes the real plugin probe, records runtime identity, and survives restart/rollback.
 - [x] A legacy bundled Paper release still installs, probes, and activates from the public v2 index.
 - [x] `python3 -m pytest -q publisher/tests` -> 4 passed, including provider-only and bad-plan cases.

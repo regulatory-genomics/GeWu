@@ -29,11 +29,12 @@ Task 7 — Implement the public Marketplace UI (see `plan.md`).
   `gewu-marketplace/plugin/web/index.html`.
 - Next: Define and test the new runtime-plan/provider contracts while keeping
   legacy v1 releases readable.
-- Did: Tasks 1–5. Added `runtime-plan.v1`, `release.v2`, `marketplace.v2`
-  schemas and Rust types; external/managed runtime providers; `install_release`
-  with runtime identity; CLI `plugin runtime discover|plan|probe`,
-  `marketplace-install --runtime --executable --dry-run`; publisher v2 support.
-- Verified: `cargo test -p gewu-protocol` 41+2+5 passed;
-  `cargo test -p gewu-server --test plugin_install` 3 passed (external reuse,
-  failed probe rolls back, legacy bundled); `pytest publisher/tests` 4 passed.
-- Next: Public Marketplace UI, then deployment and Manimble release record.
+- Did: Tasks 1–9 (implementation). Added provider contracts, resolution,
+  lifecycle integration, CLI/Agent actions, publisher v2, the public static UI,
+  atomic publishing, Manimble's external+managed runtime plan, and docs.
+- Verified: `cargo test -p gewu-protocol` passed; `cargo test -p gewu-server`
+  271 tests passed; `pytest publisher/tests` 4 passed; browser smoke test of the
+  public UI (2 cards, filters, no console errors); legacy Paper installs from
+  the public v2 index; dry-run and typed external failures.
+- Next: verify the managed runtime install and the full Manimble activation
+  probe, then close the remaining acceptance gates.
