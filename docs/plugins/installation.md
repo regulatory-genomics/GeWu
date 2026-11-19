@@ -123,5 +123,16 @@ managed services. `pluginHost` limits are `startupMs`, `callMs`, `shutdownMs`,
   Canvas documents, Paper outputs, and Manimble decks are never removed.
 - The bundled `gewu-marketplace` system plugin cannot be disabled or removed.
 
+The workspace-wide enable state and a session's own choice are separate. The
+Preview plugin manager's *Enable/Disable in this session* writes a per-session
+override that wins until you choose *Follow global setting*; a globally
+disabled plugin therefore stays openable from one session without re-enabling
+it everywhere. `gewu plugin enable|disable` changes the installation default
+used by a new GeWu process, not a running one.
+
+`gewu up` prints the WebSocket, TCP and HTTP endpoints it bound and writes the
+same record (with its `pid`) to `~/.gewu/server.json`, owner-readable only.
+Ports are ephemeral unless you pass `--ws-port/--tcp-port/--http-port`.
+
 An invalid installed package is shown as a blocked entry with its error instead
 of disappearing from the panel.
