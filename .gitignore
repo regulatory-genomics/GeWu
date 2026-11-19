@@ -9,3 +9,4 @@ gewu-core/truncation/
 
 # Local plans and evidence are not committed.
 plans/
+.worktrees/
