@@ -49,6 +49,12 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
         "plugin_close",
         "plugin_describe",
         "plugin_call",
+        "plugin_set_enabled",
+        "plugin_set_session",
+        "plugin_calls",
+        "plugin_call_status",
+        "plugin_cancel",
+        "plugin_focus",
     ] {
         assert!(names.contains(&expected), "missing {expected} in {names:?}");
     }
@@ -68,7 +74,7 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
         "conversation",
         HostAction::SetSession {
             plugin_id: "demo".into(),
-            enabled: true,
+            enabled: Some(true),
             profiles: vec!["workspace-basic".into(), "analysis-read".into(), "workflow-authoring".into()],
         },
     )
@@ -127,6 +133,45 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
         .await
         .is_err()
     );
+
+    // The agent-facing gateway can start a call asynchronously and poll it,
+    // instead of blocking a turn on a long-running application tool.
+    let gateway = |name: &'static str| {
+        selected
+            .iter()
+            .find(|tool| tool.name() == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    let started = gateway("plugin_call")
+        .execute(
+            json!({"instanceId": instance_id, "tool": "echo", "args": {"value": 3}, "async": true}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let async_id = serde_json::from_str::<Value>(&started.output).unwrap()["callId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let reply = gateway("plugin_call_status")
+                .execute(json!({"callId": async_id}), &ctx)
+                .await
+                .unwrap();
+            let value = serde_json::from_str::<Value>(&reply.output).unwrap();
+            if value["result"] != Value::Null {
+                break value["result"].clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(status["data"]["value"], 3);
+    let calls = gateway("plugin_calls").execute(json!({}), &ctx).await.unwrap();
+    assert!(calls.output.contains(&async_id));
+
     let result: anyhow::Result<ToolOutput> = now
         .invoke(
             "bad_output",

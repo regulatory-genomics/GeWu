@@ -73,11 +73,20 @@ pub fn wire_validator(definition: &str) -> Result<jsonschema::Validator> {
 }
 
 pub fn contained(root: &Path, path: &Path) -> Result<PathBuf> {
-    let path = root
-        .join(path)
-        .canonicalize()
-        .context("path does not exist")?;
-    ensure!(path.starts_with(root), "path escapes its root");
+    let candidate = root.join(path);
+    let path = candidate.canonicalize().with_context(|| {
+        format!(
+            "path does not exist: {} (workspace root: {})",
+            candidate.display(),
+            root.display()
+        )
+    })?;
+    ensure!(
+        path.starts_with(root),
+        "path escapes its root: {} is outside {}",
+        path.display(),
+        root.display()
+    );
     Ok(path)
 }
 

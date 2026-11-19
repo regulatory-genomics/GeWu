@@ -24,7 +24,10 @@ pub enum HostAction {
     },
     SetSession {
         plugin_id: String,
-        enabled: bool,
+        /// `null` follows the workspace-wide enable state; a boolean is an
+        /// explicit choice for this session.
+        #[serde(default)]
+        enabled: Option<bool>,
         #[serde(default)]
         profiles: Vec<String>,
     },
@@ -61,6 +64,11 @@ pub enum HostAction {
     },
     FocusView {
         view_id: Option<String>,
+    },
+    /// Move this session's focused view to an open instance. The GUI focuses
+    /// the view a user is looking at; agents need the same handle.
+    FocusInstance {
+        instance_id: String,
     },
     Detach {
         view_id: String,

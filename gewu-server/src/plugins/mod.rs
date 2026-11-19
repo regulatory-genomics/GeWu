@@ -45,6 +45,10 @@ pub struct PluginHost {
     /// `~/.gewu/plugin-state.json`: enabled overrides kept out of the user's
     /// config so enabling never rewrites comments or secrets.
     state_file: Option<PathBuf>,
+    /// Whether this host may read or write persistent enable state. Probes and
+    /// tests construct a host without a config path; they must never touch the
+    /// user's `~/.gewu`.
+    persist: bool,
     installation_root: Option<PathBuf>,
     runtimes: RwLock<BTreeMap<String, runtime::RuntimeBundle>>,
     protected: std::collections::BTreeSet<String>,
@@ -66,16 +70,33 @@ struct Slot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionPluginState {
-    pub enabled: bool,
+    /// `None` follows the global enable state; `Some` is an explicit choice
+    /// for this session. Explicit choices win, so a workspace-wide disable
+    /// does not silently close a plugin the user turned on for one session.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default = "default_profiles")]
     pub profiles: Vec<String>,
+}
+
+fn default_profiles() -> Vec<String> {
+    vec!["workspace-basic".into(), "analysis-read".into()]
 }
 
 impl Default for SessionPluginState {
     fn default() -> Self {
         Self {
-            enabled: true,
-            profiles: vec!["workspace-basic".into(), "analysis-read".into()],
+            enabled: None,
+            profiles: default_profiles(),
         }
+    }
+}
+
+impl SessionPluginState {
+    /// The state that actually applies: an explicit session choice, else the
+    /// plugin's workspace-wide enable state.
+    pub fn effective(&self, globally_enabled: bool) -> bool {
+        self.enabled.unwrap_or(globally_enabled)
     }
 }
 
@@ -132,12 +153,17 @@ impl PluginHost {
             installed,
             blocked,
             state_file,
+            persist: config_path.is_some(),
             installation_root: installation_root.clone(),
             runtimes: Default::default(),
             protected: Default::default(),
             ..Self::default()
         };
-        let overrides = host.enabled_overrides();
+        let overrides = if host.persist {
+            host.enabled_overrides()
+        } else {
+            BTreeMap::new()
+        };
         let base = config_path
             .and_then(Path::parent)
             .unwrap_or_else(|| Path::new("."));
@@ -168,6 +194,21 @@ impl PluginHost {
                 }
             } else {
                 entry.package = base.join(&entry.package);
+                // A config entry may point at an installed generation; the
+                // runtime bundle still belongs to that generation.
+                if let Some(root) = installation_root.as_ref()
+                    && let Some(plugin_state) = installation.plugins.get(id)
+                    && let Some(release_id) = plugin_state.active_generation.as_ref()
+                    && let Some(generation) = plugin_state.generations.get(release_id)
+                    && let Some(runtime_path) = generation.runtime_path.as_deref()
+                    && root.join(&generation.package_path) == entry.package
+                {
+                    let target = runtime::current_target()
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    let bundle = runtime::RuntimeBundle::load(root.join(runtime_path), id, &target)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    host.runtimes.write().unwrap().insert(id.clone(), bundle);
+                }
             }
             for path in entry.sources.values_mut() {
                 *path = base.join(&*path);
@@ -276,6 +317,9 @@ impl PluginHost {
     /// Record `enabled` for the next start. Best-effort: a read-only home must
     /// not fail the toggle that already took effect in memory.
     fn persist_enabled(&self, id: &str, enabled: bool) {
+        if !self.persist {
+            return;
+        }
         let Some(path) = &self.state_file else { return };
         let mut state = self.enabled_overrides();
         state.insert(id.into(), enabled);
@@ -347,14 +391,22 @@ impl PluginHost {
         let mut out: Vec<Value> = entries
             .iter()
             .map(|(id, (entry, package))| {
+                // A globally disabled plugin keeps its manifest metadata so the
+                // UI can offer a session-only enable instead of guessing from an
+                // empty row. Reading is cheap and only happens while disabled.
+                let meta = package
+                    .clone()
+                    .or_else(|| Package::read(&entry.package).ok());
                 json!({
                     "id":id, "enabled":package.is_some(), "configured":true,
+                    "available":meta.is_some(),
                     "builtin":self.protected.contains(id),
-                    "title":package.as_ref().map(|p| &p.manifest.title),
-                    "version":package.as_ref().map(|p| &p.manifest.version),
-                    "scope":package.as_ref().map(|p| p.manifest.scope),
-                    "views":package.as_ref().map(|p| &p.manifest.views),
+                    "title":meta.as_ref().map(|p| &p.manifest.title),
+                    "version":meta.as_ref().map(|p| &p.manifest.version),
+                    "scope":meta.as_ref().map(|p| p.manifest.scope),
+                    "views":meta.as_ref().map(|p| &p.manifest.views),
                     "package":entry.package, "sources":entry.sources,
+                    "reason":if meta.is_none() {"package unavailable"} else if package.is_some() {"enabled"} else {"disabled by default"},
                 })
             })
             .collect();
@@ -390,6 +442,13 @@ impl PluginHost {
             .unwrap()
             .values()
             .any(|(_, package)| package.is_some())
+    }
+
+    /// Whether the agent should be offered the plugin gateway at all. A
+    /// configured-but-disabled plugin still needs `plugin_list` and
+    /// `plugin_set_session` so it can be enabled for one session.
+    pub fn has_configured(&self) -> bool {
+        !self.entries.read().unwrap().is_empty()
     }
 
     async fn set_enabled(&self, id: &str, enabled: bool) -> Result<()> {
@@ -458,31 +517,70 @@ impl PluginHost {
             .get(id)
             .cloned()
             .context("unknown plugin")?;
-        let package = package.context("plugin is disabled")?;
+        // A workspace-wide disable must not itself close the door on a session
+        // override, so load the manifest for metadata and only fall back to the
+        // live package when the plugin is globally enabled.
+        let meta = match &package {
+            Some(package) => package.clone(),
+            None => Package::read(&entry.package).with_context(|| {
+                format!("plugin '{id}' is disabled and its package cannot be read")
+            })?,
+        };
         let root = root.canonicalize()?;
         ensure!(root.is_dir(), "workspace root is not a directory");
-        let session = match package.manifest.scope {
+        let session_key = session.filter(|session| !session.is_empty()).map(str::to_owned);
+        let state = match &session_key {
+            Some(session_id) => self.session_state(session_id, id).await?,
+            None => SessionPluginState::default(),
+        };
+        let globally_enabled = package.is_some();
+        ensure!(
+            state.effective(globally_enabled),
+            "plugin '{id}' is disabled in this session; enable it first (plugin_set_session)"
+        );
+        let package = match package {
+            Some(package) => package,
+            None => Package::read(&entry.package)
+                .with_context(|| format!("plugin '{id}' could not be loaded"))?,
+        };
+        // Only session-scoped plugins key their instance by session identity.
+        let session = match meta.manifest.scope {
             Scope::Session => Some(
-                session
-                    .filter(|session| !session.is_empty())
-                    .context("session-scoped plugin requires a session id")?
-                    .to_owned(),
+                session_key
+                    .clone()
+                    .context("session-scoped plugin requires a session id")?,
             ),
             _ => None,
         };
-        if let Some(session_id) = &session {
-            ensure!(
-                self.session_state(session_id, id).await?.enabled,
-                "plugin is disabled in this session"
-            );
-        }
-        let binding_resource = match (package.manifest.scope, binding_resource) {
+        let binding_resource = match (meta.manifest.scope, binding_resource) {
             (Scope::Resource, Some(mut resource)) => {
                 package::validate(
                     &package::wire_validator("ResourceRef")?,
                     &serde_json::to_value(&resource)?,
                 )?;
-                let path = workspace_path(&root, &resource.uri)?;
+                // A plain relative path is accepted at the boundary; resources
+                // are canonicalised to workspace:/// so adapters see one form.
+                if !resource.uri.starts_with("workspace:///") {
+                    let relative = resource.uri.trim_start_matches('/');
+                    ensure!(!relative.is_empty(), "binding resource must not be empty");
+                    resource.uri = format!(
+                        "workspace:///{}",
+                        relative
+                            .split('/')
+                            .map(|segment| percent_encoding::utf8_percent_encode(segment, &URI_ESCAPE)
+                                .to_string())
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    );
+                }
+                let path = workspace_path(&root, &resource.uri).with_context(|| {
+                    format!(
+                        "cannot bind '{}' ({}) under workspace root {}",
+                        resource.uri,
+                        resource.resource_type,
+                        root.display()
+                    )
+                })?;
                 let relative = path
                     .strip_prefix(&root)?
                     .to_str()
@@ -500,7 +598,15 @@ impl PluginHost {
             }
             (Scope::Workspace, None) => None,
             (Scope::Session, None) => None,
-            _ => bail!("binding resource does not match plugin scope"),
+            (scope, resource) => bail!(
+                "{} plugin does not accept bindingResource={}",
+                match scope {
+                    Scope::Workspace => "workspace-scoped",
+                    Scope::Session => "session-scoped",
+                    Scope::Resource => "resource-scoped",
+                },
+                resource.is_some()
+            ),
         };
         let key = InstanceKey {
             plugin: id.into(),
@@ -510,14 +616,6 @@ impl PluginHost {
         };
         let slot = self.slots.lock().unwrap().entry(key).or_default().clone();
         let mut state = slot.lock().await;
-        ensure!(
-            self.entries
-                .read()
-                .unwrap()
-                .get(id)
-                .is_some_and(|(_, p)| p.is_some()),
-            "plugin is disabled"
-        );
         ensure!(
             !state.blocked,
             "CLEANUP_INCOMPLETE: plugin instance requires administrator attention"

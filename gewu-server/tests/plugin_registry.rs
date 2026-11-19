@@ -146,7 +146,7 @@ async fn session_scoped_plugins_get_independent_instances_in_one_workspace() {
         "session-a",
         gewu_protocol::plugin::HostAction::SetSession {
             plugin_id: "demo".into(),
-            enabled: false,
+            enabled: Some(false),
             profiles: vec!["workspace-basic".into()],
         },
     )
@@ -191,4 +191,51 @@ async fn session_scoped_plugins_get_independent_instances_in_one_workspace() {
         .await
         .unwrap();
     assert!(view["viewId"].as_str().is_some());
+
+    // A workspace-wide disable must stay recoverable for one session, and the
+    // disabled plugin must keep enough metadata for the UI to offer that.
+    host.action(
+        "workspace",
+        workspace.path(),
+        "session-b",
+        gewu_protocol::plugin::HostAction::SetEnabled {
+            plugin_id: "demo".into(),
+            enabled: false,
+        },
+    )
+    .await
+    .unwrap();
+    let listed = host.catalog();
+    let demo = listed
+        .iter()
+        .find(|plugin| plugin["id"] == "demo")
+        .expect("demo is still configured");
+    assert_eq!(demo["enabled"], false);
+    assert_eq!(demo["title"], "Demo adapter");
+    assert!(host
+        .open_for_session("demo", "workspace", workspace.path(), None, Some("session-b"))
+        .await
+        .is_err());
+
+    host.action(
+        "workspace",
+        workspace.path(),
+        "session-b",
+        gewu_protocol::plugin::HostAction::SetSession {
+            plugin_id: "demo".into(),
+            enabled: Some(true),
+            profiles: vec!["workspace-basic".into()],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(host
+        .open_for_session("demo", "workspace", workspace.path(), None, Some("session-b"))
+        .await
+        .is_ok());
+    // session-a keeps its explicit "off", so the override stays session-local.
+    assert!(host
+        .open_for_session("demo", "workspace", workspace.path(), None, Some("session-a"))
+        .await
+        .is_err());
 }

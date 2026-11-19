@@ -191,11 +191,11 @@ pub async fn run(action: Action) -> Result<()> {
         }
         Action::Enable { id } => {
             state.set_enabled(&id, true)?;
-            println!("Enabled {id}");
+            println!("Enabled {id} (installation default; restart a running GeWu to apply)");
         }
         Action::Disable { id } => {
             state.set_enabled(&id, false)?;
-            println!("Disabled {id}");
+            println!("Disabled {id} (installation default; restart a running GeWu to apply)");
         }
         Action::Uninstall { id } => {
             state.uninstall(&id)?;

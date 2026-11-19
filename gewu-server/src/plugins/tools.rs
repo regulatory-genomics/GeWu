@@ -62,6 +62,12 @@ enum Gateway {
     Close,
     Describe,
     Call,
+    SetEnabled,
+    SetSession,
+    Calls,
+    CallStatus,
+    Cancel,
+    Focus,
 }
 
 /// Ordinary tools supplied to the existing Agent at the start of a turn.
@@ -73,7 +79,7 @@ impl PluginHost {
         session: &str,
         existing: &[Arc<dyn Tool>],
     ) -> Vec<Arc<dyn Tool>> {
-        if !self.has_enabled() {
+        if !self.has_configured() {
             return vec![];
         }
         let mut names: HashSet<_> = existing.iter().map(|t| t.name().to_owned()).collect();
@@ -110,9 +116,51 @@ impl PluginHost {
             (
                 Gateway::Call,
                 "plugin_call",
-                "Call an exposed application tool after reading its schema with plugin_describe.",
-                json!({"instanceId":{"type":"string"},"tool":{"type":"string"},"args":{"type":"object"}}),
+                "Call an exposed application tool after reading its schema with plugin_describe. Pass async:true to return a callId immediately and poll plugin_call_status.",
+                json!({"instanceId":{"type":"string"},"tool":{"type":"string"},"args":{"type":"object"},"async":{"type":"boolean"}}),
                 json!(["instanceId", "tool", "args"]),
+            ),
+            (
+                Gateway::SetEnabled,
+                "plugin_set_enabled",
+                "Enable or disable an application for this workspace. Disabling closes its running instances and is remembered across restarts.",
+                json!({"pluginId":{"type":"string"},"enabled":{"type":"boolean"}}),
+                json!(["pluginId", "enabled"]),
+            ),
+            (
+                Gateway::SetSession,
+                "plugin_set_session",
+                "Override an application's enable state for this session only. Pass enabled:null to follow the workspace-wide setting again, and profiles to choose which tool groups are exposed.",
+                json!({"pluginId":{"type":"string"},"enabled":{"type":["boolean","null"]},"profiles":{"type":"array","items":{"type":"string"}}}),
+                json!(["pluginId"]),
+            ),
+            (
+                Gateway::Calls,
+                "plugin_calls",
+                "List this session's application calls, including finished ones kept for inspection.",
+                json!({}),
+                json!([]),
+            ),
+            (
+                Gateway::CallStatus,
+                "plugin_call_status",
+                "Read one application call started by this session. Returns result once it settles, otherwise progress and status.",
+                json!({"callId":{"type":"string"}}),
+                json!(["callId"]),
+            ),
+            (
+                Gateway::Cancel,
+                "plugin_cancel",
+                "Request cancellation of a running application call started by this session.",
+                json!({"callId":{"type":"string"}}),
+                json!(["callId"]),
+            ),
+            (
+                Gateway::Focus,
+                "plugin_focus",
+                "Make an open application instance the focused view for this session, so later calls and context follow it.",
+                json!({"instanceId":{"type":"string"}}),
+                json!(["instanceId"]),
             ),
         ] {
             if names.insert(name.into()) {
@@ -249,7 +297,14 @@ impl Tool for PluginTool {
                                 Some(session),
                             )
                             .await?;
-                        json!({"id":i.activation.instance_id,"pluginId":i.package.manifest.id,"views":i.package.manifest.views,"tools":i.definitions().filter(|t|t.expose_to_agent).map(|t|&t.name).collect::<Vec<_>>()})
+                        json!({
+                            "id":i.activation.instance_id,
+                            "pluginId":i.package.manifest.id,
+                            "views":i.package.manifest.views,
+                            "tools":i.definitions().filter(|t|t.expose_to_agent).map(|t|&t.name).collect::<Vec<_>>(),
+                            "workspaceRoot":i.activation.workspace_root,
+                            "bindingResource":i.activation.binding_resource,
+                        })
                     }
                     Gateway::Close => {
                         host.close_for_session(
@@ -272,6 +327,29 @@ impl Tool for PluginTool {
                                 anyhow::anyhow!("plugin instance is not ready in this workspace")
                             })?;
                         if matches!(kind, Gateway::Call) {
+                            if args.get("async").and_then(Value::as_bool) == Some(true) {
+                                let call = host
+                                    .action(
+                                        workspace,
+                                        root,
+                                        session,
+                                        HostAction::Call {
+                                            instance_id: instance.activation.instance_id.clone(),
+                                            tool: tool.into(),
+                                            args: args
+                                                .get("args")
+                                                .and_then(Value::as_object)
+                                                .cloned()
+                                                .unwrap_or_default(),
+                                            view_id: None,
+                                        },
+                                    )
+                                    .await?;
+                                return Ok(ToolResult::new(
+                                    &self.name,
+                                    serde_json::to_string(&call)?,
+                                ));
+                            }
                             return Ok(invoke(
                                 host,
                                 &instance,
@@ -288,9 +366,93 @@ impl Tool for PluginTool {
                                 .ok_or_else(|| anyhow::anyhow!("tool is not exposed"))?,
                         )?
                     }
+                    Gateway::SetEnabled => {
+                        let enabled = args
+                            .get("enabled")
+                            .and_then(Value::as_bool)
+                            .ok_or_else(|| anyhow::anyhow!("missing enabled"))?;
+                        host.action(
+                            workspace,
+                            root,
+                            session,
+                            HostAction::SetEnabled {
+                                plugin_id: text("pluginId")?.into(),
+                                enabled,
+                            },
+                        )
+                        .await?
+                    }
+                    Gateway::SetSession => {
+                        let plugin_id = text("pluginId")?.to_owned();
+                        let enabled = args.get("enabled").and_then(Value::as_bool);
+                        if args
+                            .get("enabled")
+                            .is_some_and(|value| !value.is_null() && !value.is_boolean())
+                        {
+                            return Err(anyhow::anyhow!("enabled must be a boolean or null").into());
+                        }
+                        // Omitting profiles keeps the session's current ones; a
+                        // toggle must not silently drop workflow-authoring.
+                        let profiles = match args.get("profiles") {
+                            Some(value) => serde_json::from_value(value.clone())?,
+                            None => host
+                                .session_state_for(session, &plugin_id)
+                                .await
+                                .unwrap_or_default()
+                                .profiles,
+                        };
+                        host.action(
+                            workspace,
+                            root,
+                            session,
+                            HostAction::SetSession {
+                                plugin_id,
+                                enabled,
+                                profiles,
+                            },
+                        )
+                        .await?
+                    }
+                    Gateway::Calls => {
+                        host.action(workspace, root, session, HostAction::Calls)
+                            .await?
+                    }
+                    Gateway::CallStatus => {
+                        host.action(
+                            workspace,
+                            root,
+                            session,
+                            HostAction::CallStatus {
+                                call_id: text("callId")?.into(),
+                            },
+                        )
+                        .await?
+                    }
+                    Gateway::Cancel => {
+                        host.action(
+                            workspace,
+                            root,
+                            session,
+                            HostAction::Cancel {
+                                call_id: text("callId")?.into(),
+                            },
+                        )
+                        .await?
+                    }
+                    Gateway::Focus => {
+                        host.action(
+                            workspace,
+                            root,
+                            session,
+                            HostAction::FocusInstance {
+                                instance_id: text("instanceId")?.into(),
+                            },
+                        )
+                        .await?
+                    }
                 };
                 let text = serde_json::to_string(&data)?;
-                if text.len() > 8192 {
+                if text.len() > 16384 {
                     return Err(anyhow::anyhow!(
                         "catalog or schema exceeds the model context budget"
                     )

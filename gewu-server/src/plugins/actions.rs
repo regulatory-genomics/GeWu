@@ -1,5 +1,5 @@
 use super::{Instance, PluginHost, package, workspace_path};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use gewu_protocol::plugin::*;
 use serde_json::{Value, json};
 use std::{
@@ -228,7 +228,7 @@ impl PluginHost {
                     profiles,
                 };
                 self.persist_session_state(owner, &plugin_id, &state).await?;
-                if !enabled {
+                if state.enabled == Some(false) {
                     let ids: Vec<_> = self
                         .active_for_session(workspace, root, Some(owner))
                         .await
@@ -251,12 +251,37 @@ impl PluginHost {
                 for plugin in &mut plugins {
                     if let Some(id) = plugin["id"].as_str() {
                         let state = self.session_state(owner, id).await?;
-                        plugin["session"] = serde_json::to_value(state)?;
+                        let global = plugin["enabled"].as_bool().unwrap_or(false);
+                        plugin["session"] = json!({
+                            "override": state.enabled,
+                            "enabled": state.effective(global),
+                            "profiles": state.profiles,
+                        });
                     }
                 }
+                let focus_view = self
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .focus
+                    .get(&(workspace.to_string(), owner.to_string()))
+                    .cloned();
+                let focused = focus_view.and_then(|view_id| {
+                    self.calls
+                        .lock()
+                        .unwrap()
+                        .views
+                        .get(&view_id)
+                        .map(|view| view.instance.activation.instance_id.clone())
+                });
                 Ok(json!({
+                    "workspaceRoot": root.to_string_lossy(),
                     "plugins":plugins,
-                    "instances":self.active_for_session(workspace, root, Some(owner)).await.iter().map(|i| i.public_info()).collect::<Vec<_>>()
+                    "instances":self.active_for_session(workspace, root, Some(owner)).await.iter().map(|i| {
+                        let mut info = i.public_info();
+                        info["focused"] = json!(focused.as_deref() == Some(i.activation.instance_id.as_str()));
+                        info
+                    }).collect::<Vec<_>>()
                 }))
             }
             HostAction::Open {
@@ -551,6 +576,26 @@ impl PluginHost {
                     state.focus.remove(&key);
                 }
                 Ok(json!({"focused":true}))
+            }
+            HostAction::FocusInstance { instance_id } => {
+                let mut state = self.calls.lock().unwrap();
+                let found = state
+                    .views
+                    .iter()
+                    .find(|(_, v)| {
+                        v.owner == owner
+                            && v.instance.activation.instance_id == instance_id
+                            && v.ready
+                            && v.active.load(Ordering::Acquire)
+                    })
+                    .map(|(id, _)| id.clone());
+                let Some(view_id) = found else {
+                    bail!("instance '{instance_id}' has no open view in this session");
+                };
+                state
+                    .focus
+                    .insert((workspace.into(), owner.into()), view_id.clone());
+                Ok(json!({"focused":true,"viewId":view_id}))
             }
             HostAction::SaveState { view_id, state } => {
                 let view = self.view(workspace, owner, &view_id)?;

@@ -27,8 +27,13 @@ async fn installed_but_unconfigured_packages_are_listed_and_refuse_enabling() {
     .unwrap();
     // SAFETY: this binary has a single test, so no other thread reads the env.
     unsafe { std::env::set_var("HOME", home.path()) };
+    // A real config path is what marks this host as persistent; probes without
+    // one must never write the user's plugin state.
+    let config = home.path().join("config.json");
+    std::fs::write(&config, "{}").unwrap();
 
-    let host = PluginHost::from_config(&BTreeMap::new(), None, Limits::default()).unwrap();
+    let host =
+        PluginHost::from_config(&BTreeMap::new(), Some(&config), Limits::default()).unwrap();
     let catalog = host.catalog();
     let demo = catalog.iter().find(|entry| entry["id"] == "demo").unwrap();
     assert_eq!(demo["version"], "0.1.0");
@@ -62,7 +67,7 @@ async fn installed_but_unconfigured_packages_are_listed_and_refuse_enabling() {
         }))
         .unwrap(),
     )]);
-    let host = PluginHost::from_config(&entries, None, Limits::default()).unwrap();
+    let host = PluginHost::from_config(&entries, Some(&config), Limits::default()).unwrap();
     assert_eq!(host.catalog()[0]["enabled"], true);
     assert_eq!(host.catalog()[0]["package"], json!(installed));
     assert_eq!(host.catalog()[0]["sources"]["adapter"], json!(fixture()));
@@ -81,6 +86,6 @@ async fn installed_but_unconfigured_packages_are_listed_and_refuse_enabling() {
     let state = std::fs::read(home.path().join(".gewu/plugin-state.json")).unwrap();
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&state).unwrap()["demo"], false);
     let restarted =
-        PluginHost::from_config(&entries, None, Limits::default()).unwrap();
+        PluginHost::from_config(&entries, Some(&config), Limits::default()).unwrap();
     assert_eq!(restarted.catalog()[0]["enabled"], false);
 }
