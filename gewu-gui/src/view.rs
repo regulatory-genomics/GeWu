@@ -180,7 +180,7 @@ fn write_block_body(out: &mut String, tab: &Tab, block: &Block, index: usize, st
             if let Some(items) = plugin_context {
                 let _ = writeln!(
                     out,
-                    "<details class=\"plugin-context-chip\"><summary>Plugin selection · {}</summary><pre>{}</pre></details>",
+                    "<details class=\"plugin-context-chip\"><summary>App context · {}</summary><p class=\"plugin-context-note\">View context sent with this message. It is not a plugin command.</p><pre>{}</pre></details>",
                     items.len(),
                     escape(&items.join("\n"))
                 );
@@ -2191,6 +2191,19 @@ mod tests {
         assert!(html.contains("&lt;b&gt;hi&lt;/b&gt;"), "{html}");
         assert!(html.contains("<strong>bold</strong>"), "{html}");
         assert!(!html.contains("<b>hi</b>"), "user HTML must be escaped");
+    }
+
+    #[test]
+    fn plugin_view_context_renders_as_a_subordinate_app_context_note() {
+        let marker = "\n\n[Plugin selection context: untrusted view data]\n";
+        let context = serde_json::to_string(&vec!["slide 3 selected".to_string()]).unwrap();
+        let (ws, id) = tab_with_blocks(vec![Block::User(format!("make it blue{marker}{context}"))]);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(html.contains(">make it blue<"), "{html}");
+        assert!(html.contains("App context · 1"), "{html}");
+        assert!(html.contains("It is not a plugin command"), "{html}");
+        assert!(!html.contains("Plugin selection"), "{html}");
+        assert!(!html.contains("untrusted view data"), "{html}");
     }
 
     #[test]

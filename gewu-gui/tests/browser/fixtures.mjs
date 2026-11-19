@@ -14,7 +14,7 @@ async function port() {
   const {port}=server.address(); server.close(); await once(server,'close'); return port;
 }
 
-export async function startFixture({packagePath, settings = {}, useDemo = !packagePath} = {}) {
+export async function startFixture({packagePath, settings = {}, useDemo = !packagePath, disabled = false} = {}) {
   const temp=await mkdtemp(join(process.env.GEWU_TEST_TMP ?? process.env.TMPDIR ?? '/tmp','gewu-addon-'));
   const root=join(temp,'workspace');
   const other=join(temp,'other');
@@ -86,7 +86,7 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
   const config=join(temp,'config.json');
   await writeFile(config,JSON.stringify({
     model:'local/fixture',endpoints:{local:{base_url:`${origin}/v1`,api_key:'test-only',models:{fixture:{provider:'openai-compatible'}}}},
-    workspaces:{other},plugins:{[manifest.id]:{package:pkg,enabled:true,settings:useDemo ? {service:origin} : settings}},
+    workspaces:{other},plugins:{[manifest.id]:{package:pkg,enabled:!disabled,settings:useDemo ? {service:origin} : settings}},
   }));
   const [socket,tcp,http,gui]=await Promise.all([port(),port(),port(),port()]);
   let output='';

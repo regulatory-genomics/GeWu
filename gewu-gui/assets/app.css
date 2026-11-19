@@ -3049,11 +3049,13 @@ body {
 .file-context-menu button { display: block; width: 100%; padding: 7px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--text-dim); font: 12.5px var(--sans); text-align: left; cursor: pointer; }
 .file-context-menu button[hidden] { display: none; }
 .file-context-menu button:hover, .file-context-menu button:focus-visible { background: var(--bg-hover); color: var(--accent); outline: none; }
-.preview-overlay { position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column; margin-left: 8vw; padding: 0; background: var(--bg-panel); border-left: 1px solid var(--line); box-shadow: -12px 0 32px rgba(0,0,0,.45); }
-.preview-overlay.hidden { display: none; }
 .preview-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
 .preview-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font: 12px var(--mono); }
 .preview-content { flex: 1; overflow: auto; margin: 0; padding: 18px; color: var(--text); font: 12px/1.6 var(--mono); white-space: pre; }
+.preview-media { flex: 1 1 auto; min-height: 0; width: 100%; border: 0; object-fit: contain; background: #0d1420; }
+img.preview-media, video.preview-media { max-height: 100%; margin: auto; }
+audio.preview-media { flex: 0 0 auto; width: auto; align-self: center; margin: 18px; }
+iframe.preview-media { background: #101927; }
 .preview-truncated { margin: 0; padding: 8px 18px; color: var(--text-faint); border-top: 1px solid var(--line); font-size: 11px; }
 
 /* On narrow screens the sidebars overlay the transcript. */
@@ -3238,7 +3240,19 @@ body {
 .plugin-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
 .plugin-manager { overflow-y: auto; min-height: 0; flex: 1; }
 .plugin-manager h3 { margin: 12px 0 4px; font-size: 11px; letter-spacing: 0.08em; color: var(--text-faint); text-transform: uppercase; }
-.plugin-row { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; padding: 3px 0; }
+.plugin-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.plugin-head { display: flex; align-items: baseline; gap: 6px; width: 100%; }
+.plugin-head strong { font-size: 12px; }
+.plugin-head > span { color: var(--text-faint); font: 11px var(--mono); }
+.plugin-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; width: 100%; }
+.plugin-advanced { width: 100%; padding-left: 2px; }
+.plugin-advanced > summary { cursor: pointer; color: var(--text-faint); font: 10px var(--mono); letter-spacing: .06em; text-transform: uppercase; padding: 2px 0; }
+.plugin-advanced .plugin-profiles { display: flex; flex-wrap: wrap; gap: 10px; padding: 4px 0 4px 10px; color: var(--text-faint); font: 11px var(--mono); }
+.plugin-advanced .plugin-profiles label { display: inline-flex; align-items: center; gap: 4px; }
+.plugin-context-chip { margin-top: 6px; }
+.plugin-context-chip > summary { cursor: pointer; color: var(--text-faint); font: 10px var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+.plugin-context-chip pre { margin: 4px 0 0; color: var(--text-faint); font-size: 11px; white-space: pre-wrap; }
+.plugin-context-note { margin: 4px 0 0; color: var(--text-faint); font-size: 10px; }
 .plugin-row > code { color: var(--text-faint); word-break: break-all; }
 .plugin-tools { width: 100%; padding: 6px 10px; border-left: 2px solid var(--line); }
 .plugin-tools summary { cursor: pointer; color: var(--text-faint); padding: 3px 0; }

@@ -324,19 +324,20 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
       view.append(node('h3', 'Plugins'));
       for (const plugin of plugins) {
         const running = instances.filter((instance) => instance.pluginId === plugin.id);
-        const session = plugin.session ?? {enabled: true, profiles: ['workspace-basic', 'analysis-read']};
+        const session = plugin.session ?? {override: null, enabled: !!plugin.enabled, profiles: ['workspace-basic', 'analysis-read']};
+        const effective = !!session.enabled;
         const row = node('div');
         row.className = 'plugin-row';
-        const name = node('span', `${plugin.title ?? plugin.id}`);
+        const head = node('div');
+        head.className = 'plugin-head';
+        const name = node('strong', `${plugin.title ?? plugin.id}`);
         if (plugin.version) name.append(node('code', ` v${plugin.version}`));
-        row.append(name);
-        row.append(node('span', !plugin.configured
-          ? ' \u00b7 installed, not configured'
-          : !plugin.enabled
-            ? ' \u00b7 globally disabled'
-            : session.enabled
-              ? ' \u00b7 enabled in this session'
-              : ' \u00b7 disabled in this session'));
+        head.append(name, node('span', pluginStatus(plugin, session)));
+        row.append(head);
+        if (plugin.available === false && plugin.reason) row.append(node('p', plugin.reason));
+        const advanced = node('details');
+        advanced.className = 'plugin-advanced';
+        advanced.append(node('summary', 'Advanced'));
         const tools = [...new Map(running.flatMap(instance => instance.tools ?? []).map(tool => [tool.name, tool])).values()];
         const details = node('details');
         details.className = 'plugin-tools';
@@ -349,7 +350,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
           item.append(node('pre', JSON.stringify(tool.inputSchema, null, 2)));
           details.append(item);
         }
-        row.append(details);
+        advanced.append(details);
         if (plugin.package || Object.keys(plugin.sources ?? {}).length) {
           const source = node('details');
           source.className = 'plugin-tools';
@@ -360,28 +361,41 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
             line.append(node('code', path));
             source.append(line);
           }
-          row.append(source);
+          advanced.append(source);
         }
+        row.append(advanced);
         if (!plugin.configured) {
           if (plugin.package) row.append(node('code', plugin.package));
           row.append(node('span', ' add it to config.json to use it'));
           view.append(row);
           continue;
         }
-        row.append(button(plugin.enabled ? 'Disable globally' : 'Enable globally', async () => {
+        const actions = node('div');
+        actions.className = 'plugin-actions';
+        actions.append(button(plugin.enabled ? 'Disable globally' : 'Enable globally', async () => {
           try { await request({action: 'set_enabled', pluginId: plugin.id, enabled: !plugin.enabled}); await refresh(); }
           catch (error) { fail(view, error); }
         }));
-        if (plugin.enabled) row.append(button(session.enabled ? 'Disable in this session' : 'Enable in this session', async () => {
-          try {
-            await request({action: 'set_session', pluginId: plugin.id, enabled: !session.enabled, profiles: session.profiles});
-            await refresh();
-          } catch (error) { fail(view, error); }
-        }));
-        if (plugin.enabled && session.enabled) row.append(button('Open\u2026', async () => {
+        if (session.override === null) {
+          actions.append(button(effective ? 'Disable in this session' : 'Enable in this session', async () => {
+            try {
+              await request({action: 'set_session', pluginId: plugin.id, enabled: !effective, profiles: session.profiles});
+              await refresh();
+            } catch (error) { fail(view, error); }
+          }));
+        } else {
+          actions.append(button('Follow global setting', async () => {
+            try {
+              await request({action: 'set_session', pluginId: plugin.id, enabled: null, profiles: session.profiles});
+              await refresh();
+            } catch (error) { fail(view, error); }
+          }));
+        }
+        if (effective) actions.append(button('Open\u2026', async () => {
           try { await openPlugin(plugin); } catch (error) { fail(view, error); }
         }));
-        if (plugin.enabled && session.enabled && (plugin.id === 'tachyon' || plugin.scope === 'session')) {
+        row.append(actions);
+        if (effective && (plugin.id === 'tachyon' || plugin.scope === 'session')) {
           const profiles = node('span');
           profiles.className = 'plugin-profiles';
           for (const profile of ['workflow-authoring', 'references']) {
@@ -395,7 +409,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
                 : session.profiles.filter((item) => item !== profile);
               input.disabled = true;
               try {
-                await request({action: 'set_session', pluginId: plugin.id, enabled: session.enabled, profiles: next});
+                await request({action: 'set_session', pluginId: plugin.id, enabled: session.override, profiles: next});
                 await refresh();
               } catch (error) {
                 input.disabled = false;
@@ -406,7 +420,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
             label.append(input, node('span', profile));
             profiles.append(label);
           }
-          row.append(profiles);
+          advanced.append(profiles);
         }
         view.append(row);
         for (const instance of running) view.append(runningRow(instance, request, view));
@@ -414,6 +428,16 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
       managerSignature = instances.map((instance) => instance.id).join(',');
       manager.replaceChildren(view);
     } catch (error) { manager.replaceChildren(node('p', error.message)); }
+  }
+
+  function pluginStatus(plugin, session) {
+    if (!plugin.configured) return ' \u00b7 installed, not configured';
+    if (plugin.available === false) return ' \u00b7 package unavailable';
+    if (session.override === false) return ' \u00b7 disabled in this session';
+    if (session.override === true) {
+      return plugin.enabled ? ' \u00b7 enabled in this session' : ' \u00b7 enabled in this session (globally off)';
+    }
+    return plugin.enabled ? ' \u00b7 enabled' : ' \u00b7 globally disabled';
   }
 
   /// One compact line per running instance: where it is bound, its extra views,
@@ -468,5 +492,39 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
     refresh();
   }
 
-  return {switchTab, sync, editPath, agentResult, setVisible: (on) => { if (on) sync(); }};
+  /// Show a workspace file in the Preview sidecar: text files keep the
+  /// server-rendered preview, media renders its own element. Files clicks use
+  /// this instead of a full-screen overlay.
+  function showFile(kind, path, payload) {
+    const id = `file:${path}`;
+    let panel = panels.get(id);
+    if (!panel) {
+      panel = add(id, path.split('/').at(-1) || path, null, null);
+    }
+    panel.content.replaceChildren();
+    if (kind === 'text') {
+      panel.content.innerHTML = payload.html;
+      for (const close of panel.content.querySelectorAll('[data-preview-close]')) {
+        close.addEventListener('click', () => close(id));
+      }
+    } else {
+      const media = document.createElement(
+        kind === 'image' ? 'img'
+          : kind === 'video' ? 'video'
+          : kind === 'audio' ? 'audio'
+          : 'iframe');
+      if (kind === 'image') media.alt = path;
+      if (kind === 'video' || kind === 'audio') media.controls = true;
+      if (kind === 'pdf') media.title = path;
+      media.src = payload.url;
+      media.referrerPolicy = 'no-referrer';
+      media.className = 'preview-media';
+      panel.content.append(media);
+    }
+    active = id;
+    render();
+    onShow?.();
+  }
+
+  return {switchTab, sync, editPath, agentResult, showFile, setVisible: (on) => { if (on) sync(); }};
 }

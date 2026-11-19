@@ -37,7 +37,6 @@ import {panelHost} from './panels.mjs';
     sessionsExpand: document.getElementById("sessions-expand"),
     filesExpand: document.getElementById("files-expand"),
     drawerBackdrop: document.getElementById("drawer-backdrop"),
-    filePreview: document.getElementById("file-preview"),
     fileMenu: document.getElementById("file-menu"),
     workflowZoom: document.getElementById("workflow-zoom"),
     pluginHost: document.getElementById("plugin-host"),
@@ -67,6 +66,8 @@ import {panelHost} from './panels.mjs';
     workflowZoom: { runId: null, scale: 1, x: 0, y: 0 },
     fileMenu: { path: null, entry: null },
     previewWindow: null,
+    inlinePreview: null,
+    previewPath: null,
     sidebarTab: "files",
   };
 
@@ -563,6 +564,7 @@ import {panelHost} from './panels.mjs';
         break;
       case "error":
         state.loadingEarlier = false;
+        state.inlinePreview = null;
         closePendingPreview();
         if (isUnauthorized(message.message)) {
           handleUnauthorized();
@@ -599,8 +601,7 @@ import {panelHost} from './panels.mjs';
         break;
       }
       case "file_preview":
-        el.filePreview.innerHTML = message.html;
-        el.filePreview.classList.remove("hidden");
+        panels.showFile('text', state.previewPath, {html: message.html});
         break;
       case "download_ready": {
         if (typeof message.url !== "string" || !message.url.startsWith("/download/")) break;
@@ -609,6 +610,12 @@ import {panelHost} from './panels.mjs';
       }
       case "preview_ready": {
         if (typeof message.url !== "string" || !message.url.startsWith("/preview/")) break;
+        const inline = state.inlinePreview;
+        state.inlinePreview = null;
+        if (inline) {
+          panels.showFile(inline.kind, inline.path, {url: message.url});
+          break;
+        }
         const pending = state.previewWindow;
         state.previewWindow = null;
         if (pending && !pending.closed) {
@@ -625,10 +632,6 @@ import {panelHost} from './panels.mjs';
         opened.opener = null;
         break;
       }
-      case "close_preview":
-        el.filePreview.classList.add("hidden");
-        el.filePreview.textContent = "";
-        break;
       case "workflow_zoom": {
         const keep =
           !el.workflowZoom.classList.contains("hidden") &&
@@ -1035,8 +1038,6 @@ import {panelHost} from './panels.mjs';
     if (event.key === "Escape" && event.target.closest(".question-form")) return;
     if (event.key === "Escape" && !el.workflowZoom.classList.contains("hidden")) {
       send({ op: "close_workflow_zoom" });
-    } else if (event.key === "Escape" && !el.filePreview.classList.contains("hidden")) {
-      send({ op: "close_preview" });
     } else if (event.key === "Escape" && state.busy && el.login.classList.contains("hidden")) {
       send({ op: "interrupt", tab: state.active });
     } else if (
@@ -1266,6 +1267,34 @@ import {panelHost} from './panels.mjs';
     return entry.classList.contains("tree-file") && /\.html?$/i.test(entry.dataset.path || "");
   }
 
+  /// File types the preview route serves, grouped by the element that renders
+  /// them. Anything else falls back to the text reader.
+  const MEDIA_KINDS = {
+    png: "image", jpg: "image", jpeg: "image", gif: "image", webp: "image",
+    avif: "image", svg: "image",
+    pdf: "pdf",
+    mp4: "video", webm: "video", mov: "video",
+    mp3: "audio", wav: "audio", m4a: "audio", ogg: "audio", oga: "audio",
+  };
+
+  function previewKind(path) {
+    if (!path || !path.includes(".")) return null;
+    if (/\.html?$/i.test(path)) return "html";
+    return MEDIA_KINDS[path.split(".").pop().toLowerCase()] ?? null;
+  }
+
+  /// Open a tree file: media in the dock overlay, everything else as text.
+  function openFileEntry(path) {
+    const kind = previewKind(path);
+    if (!kind || kind === "html") {
+      state.previewPath = path;
+      send({ op: "read_file", path });
+      return;
+    }
+    state.inlinePreview = { kind, path };
+    send({ op: "preview_file", path });
+  }
+
   // The preview window is opened inside the click gesture because popup
   // blockers reject opens that follow an async round trip. Navigate it once
   // the ticket URL arrives; close it if the request fails or the socket drops.
@@ -1349,7 +1378,7 @@ import {panelHost} from './panels.mjs';
     const dir = event.target.closest("[data-path].tree-dir");
     if (dir) { send({ op: "toggle_dir", path: dir.dataset.path }); return; }
     const file = event.target.closest("[data-path].tree-file");
-    if (file) { send({ op: "read_file", path: file.dataset.path }); return; }
+    if (file) { openFileEntry(file.dataset.path); return; }
     if (event.target.closest("[data-tree-upload]")) {
       el.fileUpload.click();
       return;
@@ -1573,10 +1602,6 @@ import {panelHost} from './panels.mjs';
     el.pluginHost.hidden = name !== "preview";
     panels.setVisible(name === "preview");
   }
-
-  el.filePreview.addEventListener("click", (event) => {
-    if (event.target.closest("[data-preview-close]")) send({ op: "close_preview" });
-  });
 
   el.workflowZoom.addEventListener("click", (event) => {
     if (event.target.closest("[data-zoom-close]")) {

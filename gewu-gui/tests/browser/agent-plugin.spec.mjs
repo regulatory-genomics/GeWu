@@ -30,6 +30,28 @@ test('a real agent turn calls the adapter and Plan does not advertise plugin too
   } finally {await fixture.close();}
 });
 
+test('a globally disabled plugin can be enabled for this session only', async ({page})=>{
+  const fixture=await startFixture({disabled:true});
+  try {
+    await page.goto(fixture.url);
+    await expect(page.getByRole('textbox',{name:'Message'})).toBeEnabled();
+    await openPreview(page);
+    const demo = page.locator('.plugin-row').filter({hasText:'Demo adapter'});
+    await expect(demo).toContainText('globally disabled');
+    await expect(demo.getByRole('button',{name:'Open…',exact:true})).toHaveCount(0);
+    await demo.getByRole('button',{name:'Enable in this session'}).click();
+    await expect(demo).toContainText('enabled in this session');
+    await demo.getByRole('button',{name:'Open…',exact:true}).click();
+    await expect(page.frameLocator('iframe[title="Demo View"]').getByRole('heading')).toHaveText('GeWu connected');
+    await page.getByRole('button',{name:'Plugins',exact:true}).click();
+    await expect(demo).toContainText('enabled in this session');
+    // The override is a session choice, so the row offers going back to the
+    // workspace-wide setting instead of stacking another toggle.
+    await demo.getByRole('button',{name:'Follow global setting'}).click();
+    await expect(demo).toContainText('globally disabled');
+  } finally {await fixture.close();}
+});
+
 test('a conversation opens the application in Preview without manual setup', async ({page})=>{
   const fixture=await startFixture();
   try {

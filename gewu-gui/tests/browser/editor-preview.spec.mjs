@@ -3,6 +3,33 @@ import {readFile,writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {openPreview,startFixture} from './fixtures.mjs';
 
+test('a files click renders images in the dock instead of the text reader', async ({page})=>{
+  const fixture=await startFixture();
+  try {
+    // 1x1 transparent PNG.
+    await writeFile(join(fixture.root,'shot.png'),Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==','base64'));
+    await page.goto(fixture.url);
+    await expect(page.getByRole('textbox',{name:'Message'})).toBeEnabled();
+    await openPreview(page);
+    await page.getByRole('tab',{name:'FILES'}).click();
+    await page.getByRole('button',{name:'Refresh files'}).click();
+    await page.locator('[data-path="shot.png"]').click();
+    // The sidecar, not a full-screen overlay: a Preview tab titled with the file.
+    const preview = page.locator('.plugin-panel:not([hidden])');
+    await expect(preview.locator('img.preview-media')).toBeVisible();
+    await expect(page.getByRole('navigation',{name:'Application views'}).getByRole('button',{name:'shot.png',exact:true})).toHaveAttribute('aria-pressed','true');
+    const image = preview.locator('img.preview-media');
+    await expect(image).toHaveAttribute('src',/^\/preview\//);
+    // The binary never goes through the text protocol, so no protocol error.
+    await expect(page.getByText(/protocol error|binary files cannot be previewed/)).toHaveCount(0);
+    // Text files land in the same sidecar.
+    await page.getByRole('tab',{name:'FILES'}).click();
+    await page.locator('[data-path="example.txt"]').click();
+    await expect(page.locator('.plugin-panel:not([hidden]) pre.preview-content')).toContainText('original text');
+  } finally {await fixture.close();}
+});
+
 test('editor saves workspace text and refuses a stale second edit', async ({page})=>{
   const fixture=await startFixture();
   try {
