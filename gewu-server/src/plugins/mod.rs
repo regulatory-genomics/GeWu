@@ -5,6 +5,7 @@ mod changes;
 pub mod artifacts;
 pub mod marketplace;
 pub mod package;
+pub mod providers;
 pub mod resources;
 pub mod runtime;
 pub mod stdio;

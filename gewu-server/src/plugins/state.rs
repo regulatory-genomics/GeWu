@@ -14,6 +14,18 @@ const STATE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeIdentity {
+    pub provider: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GenerationState {
     pub release_id: String,
     pub package_path: String,
@@ -21,6 +33,9 @@ pub struct GenerationState {
     pub package_sha256: String,
     pub runtime_sha256: Option<String>,
     pub installed_at: String,
+    /// How the active runtime was acquired. Absent for legacy generations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

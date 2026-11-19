@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 fn generation(id: &str) -> GenerationState {
     GenerationState {
         release_id: id.into(), package_path: format!("plugins/paper/generations/{id}/package"), runtime_path: Some(format!("plugins/paper/generations/{id}/runtime")),
-        package_sha256: "a".repeat(64), runtime_sha256: Some("b".repeat(64)), installed_at: "2026-11-19T00:00:00Z".into(),
+        package_sha256: "a".repeat(64), runtime_sha256: Some("b".repeat(64)), installed_at: "2026-11-19T00:00:00Z".into(), runtime: None,
     }
 }
 

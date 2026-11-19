@@ -5,10 +5,14 @@
 //! `plugin.v1` adapter frames.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const RELEASE_SCHEMA: &str = include_str!("../schema/release.v1.schema.json");
+pub const RELEASE_V2_SCHEMA: &str = include_str!("../schema/release.v2.schema.json");
 pub const RUNTIME_SCHEMA: &str = include_str!("../schema/runtime.v1.schema.json");
+pub const RUNTIME_PLAN_SCHEMA: &str = include_str!("../schema/runtime-plan.v1.schema.json");
 pub const MARKETPLACE_SCHEMA: &str = include_str!("../schema/marketplace.v1.schema.json");
+pub const MARKETPLACE_V2_SCHEMA: &str = include_str!("../schema/marketplace.v2.schema.json");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -64,6 +68,101 @@ pub struct Revocation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutableHint {
+    pub env: Option<String>,
+    #[serde(default)]
+    pub commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProbeSpec {
+    pub args: Vec<String>,
+    pub timeout_seconds: Option<u64>,
+}
+
+/// Acquisition strategy for one runtime on one target. `kind` is the
+/// discriminator; the variants carry only typed, bounded data so an Agent can
+/// choose a provider without executing catalog text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum RuntimeProvider {
+    External {
+        id: String,
+        target: Target,
+        executable: ExecutableHint,
+        probe: ProbeSpec,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        binaries: BTreeMap<String, String>,
+    },
+    Managed {
+        id: String,
+        target: Target,
+        manager: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        channels: Vec<String>,
+        packages: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pip: Vec<String>,
+        probe: ProbeSpec,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        binaries: BTreeMap<String, String>,
+    },
+    Bundled {
+        id: String,
+        version: String,
+        target: Target,
+        artifact: Artifact,
+        manifest: Artifact,
+    },
+}
+
+impl RuntimeProvider {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::External { .. } => "external",
+            Self::Managed { .. } => "managed",
+            Self::Bundled { .. } => "bundled",
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        match self {
+            Self::External { id, .. } | Self::Managed { id, .. } | Self::Bundled { id, .. } => id,
+        }
+    }
+
+    pub fn target(&self) -> &Target {
+        match self {
+            Self::External { target, .. } | Self::Managed { target, .. } | Self::Bundled { target, .. } => target,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimePlan {
+    pub schema_version: String,
+    pub policies: Vec<String>,
+    pub providers: Vec<RuntimeProvider>,
+}
+
+impl RuntimePlan {
+    /// First provider compatible with `target` and `policy`, using the plan's
+    /// declared preference order when the policy is `auto`.
+    pub fn select(&self, policy: &str, target: &Target) -> Option<&RuntimeProvider> {
+        let kinds: Vec<&str> = match policy {
+            "external" | "managed" | "bundled" => vec![policy],
+            _ => self.policies.iter().map(String::as_str).collect(),
+        };
+        kinds.iter().find_map(|kind| {
+            self.providers.iter().find(|provider| provider.kind() == *kind && provider.target() == target)
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Release {
     pub schema_version: String,
     pub release_id: String,
@@ -72,7 +171,10 @@ pub struct Release {
     pub channel: String,
     pub gewu: GeWuCompatibility,
     pub package: Artifact,
+    #[serde(default)]
     pub runtimes: Vec<RuntimeRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_plan: Option<RuntimePlan>,
     pub capabilities: Vec<String>,
     pub permissions: Vec<String>,
     pub provenance: Provenance,
@@ -168,6 +270,24 @@ impl MarketplaceIndex {
         target: &Target,
         now: &str,
     ) -> Result<(&Release, &RuntimeRef), ReleaseSelectionError> {
+        let release = self.select_release_version(plugin, version, channel, now)?;
+        let runtime = release
+            .runtimes
+            .iter()
+            .find(|runtime| runtime.target == *target)
+            .ok_or(ReleaseSelectionError::RuntimeUnavailable)?;
+        Ok((release, runtime))
+    }
+
+    /// Select a release without requiring a bundled runtime. Provider-based
+    /// releases may carry only a runtime plan and no packed artifact.
+    pub fn select_release_version(
+        &self,
+        plugin: &str,
+        version: Option<&str>,
+        channel: &str,
+        now: &str,
+    ) -> Result<&Release, ReleaseSelectionError> {
         if now >= self.expires_at.as_str() {
             return Err(ReleaseSelectionError::Expired);
         }
@@ -182,11 +302,9 @@ impl MarketplaceIndex {
         if release.gewu.api != "gewu.plugin/v1" {
             return Err(ReleaseSelectionError::IncompatibleApi);
         }
-        let runtime = release
-            .runtimes
-            .iter()
-            .find(|runtime| runtime.target == *target)
-            .ok_or(ReleaseSelectionError::RuntimeUnavailable)?;
-        Ok((release, runtime))
+        if !matches!(release.schema_version.as_str(), "gewu.release/v1" | "gewu.release/v2") {
+            return Err(ReleaseSelectionError::IncompatibleApi);
+        }
+        Ok(release)
     }
 }

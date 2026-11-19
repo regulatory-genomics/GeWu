@@ -1,12 +1,14 @@
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use gewu_protocol::plugin::{Object, ResourceRef};
+use gewu_protocol::RuntimeProvider;
 use gewu_server::plugins::{
     PluginHost,
     artifacts::ArtifactStore,
-    lifecycle::InstallManager,
+    lifecycle::{InstallManager, RuntimeSelection},
     marketplace::{MarketplaceClient, MarketplaceRepository, now_rfc3339},
     package::{self, PluginEntry},
+    providers,
     runtime,
     state::{GenerationState, StateStore},
     stdio::Limits,
@@ -89,9 +91,69 @@ pub enum Action {
         version: Option<String>,
         #[arg(long)]
         offline: bool,
+        /// auto | external | managed | bundled
+        #[arg(long, default_value = "auto")]
+        runtime: String,
+        #[arg(long)]
+        executable: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Inspect and probe the runtime a release would use.
+    Runtime {
+        #[command(subcommand)]
+        action: RuntimeAction,
     },
     /// Install the release named by a gewu://plugin/install deep link.
     OpenLink { url: String },
+}
+
+#[derive(clap::Subcommand)]
+pub enum RuntimeAction {
+    /// List runtime providers and whether they are available on this host.
+    Discover {
+        id: String,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        /// Run each candidate's probe; slower but authoritative.
+        #[arg(long)]
+        probe: bool,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the provider a policy would select, without writing anything.
+    Plan {
+        id: String,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        /// auto | external | managed | bundled
+        #[arg(long, default_value = "auto")]
+        provider: String,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Probe one user-provided executable against the release's runtime plan.
+    Probe {
+        id: String,
+        #[arg(long)]
+        executable: PathBuf,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub async fn run(action: Action) -> Result<()> {
@@ -134,6 +196,7 @@ pub async fn run(action: Action) -> Result<()> {
                 package_sha256: "local-directory".into(),
                 runtime_sha256: None,
                 installed_at: "local".into(),
+                runtime: None,
             };
             let destination = state.stage_generation(&source.manifest.id, &generation, |stage| {
                 let package_root = stage.join("package");
@@ -246,12 +309,23 @@ pub async fn run(action: Action) -> Result<()> {
                 .await?;
             println!("Installed {} {}", release.plugin, release.version);
         }
-        Action::MarketplaceInstall { id, channel, version, offline } => {
-            marketplace_install(&state, &id, &channel, version.as_deref(), !offline).await?;
+        Action::MarketplaceInstall { id, channel, version, offline, runtime: policy, executable, dry_run } => {
+            marketplace_install(&state, &id, &channel, version.as_deref(), !offline, &policy, executable.as_deref(), dry_run).await?;
         }
+        Action::Runtime { action } => match action {
+            RuntimeAction::Discover { id, version, channel, probe, refresh, json } => {
+                runtime_discover(&state, &id, version.as_deref(), &channel, probe, refresh, json).await?;
+            }
+            RuntimeAction::Plan { id, version, channel, provider, refresh, json } => {
+                runtime_plan(&state, &id, version.as_deref(), &channel, &provider, refresh, json).await?;
+            }
+            RuntimeAction::Probe { id, executable, version, channel, refresh, json } => {
+                runtime_probe(&state, &id, version.as_deref(), &channel, &executable, refresh, json).await?;
+            }
+        },
         Action::OpenLink { url } => {
             let (id, version, channel) = parse_deep_link(&url)?;
-            marketplace_install(&state, &id, &channel, version.as_deref(), true).await?;
+            marketplace_install(&state, &id, &channel, version.as_deref(), true, "auto", None, false).await?;
         }
         Action::Check {
             id,
@@ -310,29 +384,217 @@ async fn marketplace_install(
     channel: &str,
     version: Option<&str>,
     refresh: bool,
+    policy: &str,
+    executable: Option<&std::path::Path>,
+    dry_run: bool,
 ) -> Result<()> {
+    ensure!(
+        matches!(policy, "auto" | "external" | "managed" | "bundled"),
+        "unknown runtime policy {policy}; expected auto, external, managed, or bundled"
+    );
     let client = official_client(state)?;
     let index = load_index(&client, refresh).await?;
     let target = runtime::current_target().map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let (release, runtime_ref) = index
-        .select_version(id, version, channel, &target, &now_rfc3339())
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let download_store = ArtifactStore::new(state.root().join("store"));
+    let release = index
+        .select_release_version(id, version, channel, &now_rfc3339())
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .clone();
+    let selection = RuntimeSelection::select(&release, policy, &target, executable)?;
+    if dry_run {
+        let value = serde_json::json!({
+            "release": release.release_id,
+            "plugin": release.plugin,
+            "version": release.version,
+            "target": runtime::target_label(&target),
+            "runtime": match &selection {
+                RuntimeSelection::Bundled(runtime) => serde_json::json!({"kind": "bundled", "provider": runtime.id}),
+                RuntimeSelection::External { provider, .. } => serde_json::json!({"kind": "external", "provider": provider.id()}),
+                RuntimeSelection::Managed { provider } => serde_json::json!({"kind": "managed", "provider": provider.id()}),
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    let store = ArtifactStore::new(state.root().join("store"));
     let package_archive = client
-        .download_artifact(&release.package, &download_store)
+        .download_artifact(&release.package, &store)
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let runtime_archive = client
-        .download_artifact(&runtime_ref.artifact, &download_store)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let release = release.clone();
+    let runtime_archive = match &selection {
+        RuntimeSelection::Bundled(runtime) => Some(
+            client
+                .download_artifact(&runtime.artifact, &store)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+        ),
+        _ => None,
+    };
     let workspace = std::env::current_dir()?;
-    InstallManager::new(state.root())
-        .install_archives(&release, &package_archive, &runtime_archive, &target, &workspace, Limits::default().startup)
+    let generation = InstallManager::new(state.root())
+        .install_release(
+            &release,
+            &package_archive,
+            runtime_archive.as_deref(),
+            selection,
+            &workspace,
+            Limits::default().startup,
+        )
         .await?;
-    println!("Installed {} {}", release.plugin, release.version);
+    let runtime = generation.runtime.as_ref().map(|runtime| format!(" via {} ({})", runtime.provider, runtime.kind)).unwrap_or_default();
+    println!("Installed {} {}{}", release.plugin, release.version, runtime);
     Ok(())
+}
+
+async fn runtime_discover(
+    state: &StateStore,
+    id: &str,
+    version: Option<&str>,
+    channel: &str,
+    probe: bool,
+    refresh: bool,
+    json: bool,
+) -> Result<()> {
+    let client = official_client(state)?;
+    let index = load_index(&client, refresh).await?;
+    let release = index
+        .select_release_version(id, version, channel, &now_rfc3339())
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let target = runtime::current_target().map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let mut rows = Vec::new();
+    if let Some(plan) = &release.runtime_plan {
+        for provider in &plan.providers {
+            if provider.target() != &target {
+                continue;
+            }
+            let mut row = serde_json::json!({"provider": provider.id(), "kind": provider.kind(), "available": false, "detail": ""});
+            match provider {
+                RuntimeProvider::External { probe: spec, .. } => match providers::resolve_external(provider, None) {
+                    Ok(path) => {
+                        row["available"] = true.into();
+                        row["detail"] = path.display().to_string().into();
+                        row["executable"] = path.display().to_string().into();
+                        if probe {
+                            match providers::probe_executable(&path, spec).await {
+                                Ok(()) => row["probe"] = "ok".into(),
+                                Err(error) => {
+                                    row["available"] = false.into();
+                                    row["detail"] = error.to_string().into();
+                                    row["probe"] = error.to_string().into();
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => row["detail"] = error.to_string().into(),
+                },
+                RuntimeProvider::Managed { manager, .. } => {
+                    let available = std::env::var_os("GEWU_MICROMAMBA")
+                        .map(std::path::PathBuf::from)
+                        .filter(|path| providers::is_executable(path))
+                        .or_else(|| providers::find_command(manager))
+                        .is_some();
+                    row["available"] = available.into();
+                    row["detail"] = if available { format!("{manager} is installed") } else { format!("{manager} is not installed") }.into();
+                }
+                RuntimeProvider::Bundled { artifact, .. } => {
+                    row["available"] = true.into();
+                    row["detail"] = format!("downloads {} bytes", artifact.bytes).into();
+                }
+            }
+            rows.push(row);
+        }
+    }
+    for runtime_ref in &release.runtimes {
+        if runtime_ref.target == target {
+            rows.push(serde_json::json!({"provider": runtime_ref.id, "kind": "bundled", "available": true, "detail": format!("downloads {} bytes", runtime_ref.artifact.bytes)}));
+        }
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        for row in rows {
+            println!("{}\t{}\t{}\t{}", row["provider"].as_str().unwrap_or_default(), row["kind"].as_str().unwrap_or_default(), if row["available"].as_bool().unwrap_or(false) { "available" } else { "unavailable" }, row["detail"].as_str().unwrap_or_default());
+        }
+    }
+    Ok(())
+}
+
+async fn runtime_plan(
+    state: &StateStore,
+    id: &str,
+    version: Option<&str>,
+    channel: &str,
+    policy: &str,
+    refresh: bool,
+    json: bool,
+) -> Result<()> {
+    ensure!(
+        matches!(policy, "auto" | "external" | "managed" | "bundled"),
+        "unknown runtime policy {policy}; expected auto, external, managed, or bundled"
+    );
+    let client = official_client(state)?;
+    let index = load_index(&client, refresh).await?;
+    let release = index
+        .select_release_version(id, version, channel, &now_rfc3339())
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let target = runtime::current_target().map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let provider = release
+        .runtime_plan
+        .as_ref()
+        .and_then(|plan| plan.select(policy, &target))
+        .ok_or_else(|| anyhow::anyhow!("release {} has no compatible runtime plan for {}", release.release_id, runtime::target_label(&target)))?;
+    let value = serde_json::json!({
+        "release": release.release_id,
+        "target": runtime::target_label(&target),
+        "policy": policy,
+        "provider": provider,
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("{}\t{}\t{}", release.release_id, provider.kind(), provider.id());
+    }
+    Ok(())
+}
+
+async fn runtime_probe(
+    state: &StateStore,
+    id: &str,
+    version: Option<&str>,
+    channel: &str,
+    executable: &std::path::Path,
+    refresh: bool,
+    json: bool,
+) -> Result<()> {
+    let client = official_client(state)?;
+    let index = load_index(&client, refresh).await?;
+    let release = index
+        .select_release_version(id, version, channel, &now_rfc3339())
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let target = runtime::current_target().map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let provider = release
+        .runtime_plan
+        .as_ref()
+        .and_then(|plan| plan.providers.iter().find(|provider| provider.kind() == "external" && provider.target() == &target))
+        .ok_or_else(|| anyhow::anyhow!("release {} has no external runtime provider for {}", release.release_id, runtime::target_label(&target)))?;
+    let resolved = providers::resolve_external(provider, Some(executable))
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let spec = match provider {
+        RuntimeProvider::External { probe, .. } => probe,
+        _ => unreachable!("provider is external"),
+    };
+    let result = providers::probe_executable(&resolved, spec).await;
+    let value = serde_json::json!({
+        "release": release.release_id,
+        "executable": resolved.display().to_string(),
+        "ok": result.is_ok(),
+        "detail": match &result { Ok(()) => "probe passed".to_string(), Err(error) => error.to_string() },
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else if result.is_ok() {
+        println!("Ready: {} ({})", id, resolved.display());
+    }
+    result.map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
 /// `gewu://plugin/install?repo=official&id=paper&version=0.2.0&channel=stable`

@@ -2,29 +2,70 @@
 
 ## From the signed marketplace (preferred)
 
-GeWu ships the official Ed25519 public key and the internal Gitea catalog URL:
+GeWu ships the official Ed25519 public key and the public catalog:
 
 ```sh
-gewu plugin search tachyon
-gewu plugin info tachyon --version 0.1.0
-gewu plugin marketplace-install tachyon --version 0.1.0
+gewu plugin search manimble
+gewu plugin info manimble --version 0.2.0
+gewu plugin marketplace-install manimble
 gewu plugin doctor
-gewu plugin rollback tachyon
-gewu plugin disable tachyon
-gewu plugin enable tachyon
-gewu plugin uninstall tachyon
+gewu plugin rollback manimble
+gewu plugin disable manimble
+gewu plugin enable manimble
+gewu plugin uninstall manimble
 ```
 
-The host downloads the package and the matching packed runtime, verifies both
-SHA-256 digests, rejects unsafe archives, validates `plugin.json` and
-`runtime.json`, runs the runtime probe, and only then switches `active.json`.
-A failed download, digest, or probe leaves the previous generation active.
+The host downloads the package, verifies its SHA-256, rejects unsafe archives,
+validates `plugin.json`, resolves a runtime, runs the runtime probe, and only
+then switches `active.json`. A failed download, digest, provider install, or
+probe leaves the previous generation active.
+
+## Runtime policies
+
+A release may advertise a signed runtime plan instead of a packed runtime.
+Choose a policy with `--runtime`:
+
+```sh
+# Reuse a compatible interpreter already on this host
+gewu plugin runtime discover manimble --probe
+gewu plugin runtime probe manimble --executable /path/to/python
+gewu plugin marketplace-install manimble --runtime external --executable /path/to/python
+
+# Let GeWu create a host-owned environment from the plan
+gewu plugin marketplace-install manimble --runtime managed
+
+# Download the packed runtime (legacy or explicit fallback)
+gewu plugin marketplace-install paper --runtime bundled
+
+# Inspect the choice without writing anything
+gewu plugin marketplace-install manimble --dry-run
+gewu plugin runtime plan manimble --provider external --json
+```
+
+`auto` (the default) follows the release's declared order, normally
+`external`, then `managed`, then `bundled`. External and managed runtimes are
+materialized as the same `runtime.json` + launcher + probe layout a packed
+runtime uses, so verification and rollback are unchanged. The resolved provider,
+executable or prefix, target, and probe result are recorded in
+`plugins/state.json`.
+
+Managed installations never modify your system Python or conda base. GeWu
+creates a prefix under its own installation root. Set `GEWU_MICROMAMBA` to
+choose a micromamba binary and `GEWU_PIP_INDEX_URL` to choose a pip mirror.
+
+```sh
+GEWU_PIP_INDEX_URL=https://pypi.org/simple gewu plugin marketplace-install manimble --runtime managed
+```
+
+The public Marketplace UI is at <https://plugin.regulogen.cn/>. It shows
+capabilities, provenance, runtime providers, and the exact install command for
+each release; installation is always performed by the host.
 
 The GUI exposes the same path in the **Marketplace** tab of the Applications
 panel. A website or launcher can hand one release to the same installer with:
 
 ```sh
-gewu plugin open-link 'gewu://plugin/install?repo=official&id=tachyon&version=0.1.0'
+gewu plugin open-link 'gewu://plugin/install?repo=official&id=paper&version=0.2.0'
 ```
 
 Deep links accept only `repo=official`, `id`, `version`, and `channel`; local

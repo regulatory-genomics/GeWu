@@ -56,8 +56,9 @@ pub mod plugin;
 pub mod release;
 
 pub use release::{
-    Artifact, GeWuCompatibility, MarketplaceIndex, MarketplaceSignature, Provenance, Release,
-    ReleaseSelectionError, Revocation, RuntimeManifest, RuntimeRef, SignedMarketplaceIndex, Target,
+    Artifact, ExecutableHint, GeWuCompatibility, MarketplaceIndex, MarketplaceSignature, ProbeSpec,
+    Provenance, Release, ReleaseSelectionError, Revocation, RuntimeManifest, RuntimePlan,
+    RuntimeProvider, RuntimeRef, SignedMarketplaceIndex, Target,
 };
 
 pub use gewu_core::question::{Question, QuestionOption};

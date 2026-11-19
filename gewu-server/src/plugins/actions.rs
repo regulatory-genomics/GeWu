@@ -719,20 +719,26 @@ impl PluginHost {
                 let (client, index) = self.marketplace_index(true).await?;
                 let target = super::runtime::current_target()
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                let (release, runtime_ref) = index
-                    .select_version(&plugin_id, version.as_deref(), &channel, &target, &super::marketplace::now_rfc3339())
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                let release = index
+                    .select_release_version(&plugin_id, version.as_deref(), &channel, &super::marketplace::now_rfc3339())
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?
+                    .clone();
+                let selection = super::lifecycle::RuntimeSelection::select(&release, "auto", &target, None)?;
                 let store = super::artifacts::ArtifactStore::new(root.join("store"));
                 let package = client.download_artifact(&release.package, &store).await
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                let runtime_archive = client.download_artifact(&runtime_ref.artifact, &store).await
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                let release = release.clone();
-                super::lifecycle::InstallManager::new(&root)
-                    .install_archives(&release, &package, &runtime_archive, &target, &root, std::time::Duration::from_secs(60))
+                let runtime_archive = match &selection {
+                    super::lifecycle::RuntimeSelection::Bundled(runtime_ref) => Some(
+                        client.download_artifact(&runtime_ref.artifact, &store).await
+                            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+                    ),
+                    _ => None,
+                };
+                let runtime = super::lifecycle::InstallManager::new(&root)
+                    .install_release(&release, &package, runtime_archive.as_deref(), selection, &root, std::time::Duration::from_secs(60))
                     .await?;
                 self.refresh_installation(&plugin_id)?;
-                Ok(json!({"installed": plugin_id, "version": release.version}))
+                Ok(json!({"installed": plugin_id, "version": release.version, "runtime": runtime.runtime}))
             }
             HostAction::MarketplaceRollback { plugin_id } => {
                 let root = self.installation_root.clone().context("host has no installation root")?;
