@@ -33,14 +33,23 @@ paths, tokens, and runtime executables are never accepted.
 Overrides for a mirror or a test key:
 
 ```text
-GEWU_MARKETPLACE_BASE_URL   index directory URL
-GEWU_MARKETPLACE_PUBLIC_KEY base64 raw Ed25519 public key
+GEWU_MARKETPLACE_BASE_URL     index directory URL
+GEWU_MARKETPLACE_PUBLIC_KEY   base64 raw Ed25519 public key
+GEWU_MARKETPLACE_ASSET_ORIGIN rewrite only scheme/host/port of artifact URLs
 ```
 
-The current Gitea instance is LAN-only. On a machine that cannot reach it
-directly (for example this development workstation), point
-`GEWU_MARKETPLACE_BASE_URL` at a tunnel or mirror that serves the same signed
-index and assets.
+`GEWU_MARKETPLACE_ASSET_ORIGIN` is for a tunnel or mirror. The artifact path and
+its SHA-256 stay authoritative, so a rewritten URL cannot change content.
+
+The current Gitea instance is LAN-only and its marketplace repository is
+public-read. On a machine that cannot reach it directly, tunnel port 3000 and
+set both variables:
+
+```sh
+ssh -N -L 19080:127.0.0.1:3000 rpi-ubuntu &
+export GEWU_MARKETPLACE_BASE_URL=http://127.0.0.1:19080/gilbert/gewu-marketplace/raw/branch/master/public
+export GEWU_MARKETPLACE_ASSET_ORIGIN=http://127.0.0.1:19080
+```
 
 ## From a local package directory
 
@@ -67,9 +76,25 @@ marketplace install.
 
 ## Configuration notes
 
-Marketplace-installed plugins do not need a `package` path in `config.json`.
-Explicit `plugins` entries still win and keep their legacy settings. A
-development entry still looks like this:
+Marketplace-installed plugins do not need a `package` path in `config.json`,
+and an entry may omit `package` entirely to use the active generation. This is
+the normal way to give a marketplace plugin its settings:
+
+```json
+{
+  "plugins": {
+    "tachyon": {
+      "enabled": true,
+      "settings": {
+        "dataset": "my_project",
+        "service": {"kind": "managed", "endpoint": "http://127.0.0.1:8321"}
+      }
+    }
+  }
+}
+```
+
+An explicit `package` path still wins and keeps legacy development settings:
 
 ```json
 {

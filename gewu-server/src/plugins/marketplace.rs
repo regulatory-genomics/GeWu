@@ -121,7 +121,11 @@ impl MarketplaceClient {
             .timeout(Duration::from_secs(120))
             .build()
             .map_err(|e| MarketplaceError::Network(e.to_string()))?;
-        let bytes = fetch_bounded(&client, &artifact.url, self.max_bytes.min(artifact.bytes as usize + 1)).await?;
+        let url = match std::env::var("GEWU_MARKETPLACE_ASSET_ORIGIN") {
+            Ok(origin) if !origin.trim().is_empty() => rewrite_origin(&artifact.url, origin.trim())?,
+            _ => artifact.url.clone(),
+        };
+        let bytes = fetch_bounded(&client, &url, self.max_bytes.min(artifact.bytes as usize + 1)).await?;
         if bytes.len() as u64 != artifact.bytes {
             return Err(MarketplaceError::InvalidIndex("artifact size does not match its metadata".into()));
         }
@@ -146,6 +150,23 @@ impl MarketplaceClient {
 
 pub fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
+}
+
+/// A mirror or tunnel substitutes only scheme/host/port. The artifact path and
+/// its SHA-256 stay authoritative, so a rewritten URL cannot change content.
+pub fn rewrite_origin(value: &str, origin: &str) -> Result<String, MarketplaceError> {
+    let mut parsed = url::Url::parse(value).map_err(|e| MarketplaceError::InvalidIndex(e.to_string()))?;
+    let base = url::Url::parse(origin).map_err(|e| MarketplaceError::InvalidIndex(e.to_string()))?;
+    parsed
+        .set_scheme(base.scheme())
+        .map_err(|_| MarketplaceError::InvalidIndex("unsupported mirror scheme".into()))?;
+    parsed
+        .set_host(base.host_str())
+        .map_err(|_| MarketplaceError::InvalidIndex("unsupported mirror host".into()))?;
+    parsed
+        .set_port(base.port())
+        .map_err(|_| MarketplaceError::InvalidIndex("unsupported mirror port".into()))?;
+    Ok(parsed.to_string())
 }
 
 async fn fetch_bounded(client: &reqwest::Client, url: &str, limit: usize) -> Result<Vec<u8>, MarketplaceError> {

@@ -35,3 +35,16 @@ fn oversized_cache_and_wrong_key_are_blocked() {
     assert!(client.cache(&index, &signature).is_err());
     let _ = sha256_bytes(&index);
 }
+
+#[test]
+fn artifact_origin_rewrite_changes_only_scheme_host_and_port() {
+    let rewritten = gewu_server::plugins::marketplace::rewrite_origin(
+        "http://172.16.211.53:3000/gilbert/gewu-marketplace/releases/download/a/b.zip",
+        "http://127.0.0.1:19080",
+    )
+    .unwrap();
+    assert_eq!(
+        rewritten,
+        "http://127.0.0.1:19080/gilbert/gewu-marketplace/releases/download/a/b.zip"
+    );
+}

@@ -143,7 +143,32 @@ impl PluginHost {
             .unwrap_or_else(|| Path::new("."));
         for (id, entry) in entries {
             let mut entry = entry.clone();
-            entry.package = base.join(&entry.package);
+            if entry.package.as_os_str().is_empty() {
+                let plugin_state = installation.plugins.get(id).with_context(|| {
+                    format!("'{id}' has no installed generation; run `gewu plugin marketplace-install {id}`")
+                })?;
+                let release_id = plugin_state
+                    .active_generation
+                    .as_ref()
+                    .with_context(|| format!("'{id}' has no active generation"))?;
+                let generation = plugin_state
+                    .generations
+                    .get(release_id)
+                    .with_context(|| format!("active generation for '{id}' is missing"))?;
+                let root = installation_root
+                    .as_ref()
+                    .context("host has no installation root")?;
+                entry.package = root.join(&generation.package_path);
+                if let Some(runtime_path) = generation.runtime_path.as_deref() {
+                    let target = runtime::current_target()
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    let bundle = runtime::RuntimeBundle::load(root.join(runtime_path), id, &target)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    host.runtimes.write().unwrap().insert(id.clone(), bundle);
+                }
+            } else {
+                entry.package = base.join(&entry.package);
+            }
             for path in entry.sources.values_mut() {
                 *path = base.join(&*path);
             }

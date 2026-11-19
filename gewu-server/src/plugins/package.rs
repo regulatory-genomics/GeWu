@@ -14,6 +14,8 @@ use super::runtime::RuntimeEnvironment;
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginEntry {
+    /// An empty package path means "use the active marketplace generation".
+    #[serde(default)]
     pub package: PathBuf,
     #[serde(default)]
     pub enabled: bool,
