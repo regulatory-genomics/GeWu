@@ -117,7 +117,10 @@ impl MarketplaceClient {
     pub async fn download_artifact(&self, artifact: &Artifact, store: &ArtifactStore) -> Result<PathBuf, MarketplaceError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(120))
+            // Artifacts can be hundreds of megabytes on a slow uplink. Bound
+            // the connection attempt, not the whole transfer.
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(1800))
             .build()
             .map_err(|e| MarketplaceError::Network(e.to_string()))?;
         let url = match std::env::var("GEWU_MARKETPLACE_ASSET_ORIGIN") {
