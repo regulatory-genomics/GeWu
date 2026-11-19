@@ -125,7 +125,11 @@ impl MarketplaceClient {
             Ok(origin) if !origin.trim().is_empty() => rewrite_origin(&artifact.url, origin.trim())?,
             _ => artifact.url.clone(),
         };
-        let bytes = fetch_bounded(&client, &url, self.max_bytes.min(artifact.bytes as usize + 1)).await?;
+        let limit = usize::try_from(artifact.bytes.saturating_add(1))
+            .ok()
+            .filter(|limit| *limit <= 4 * 1024 * 1024 * 1024)
+            .ok_or_else(|| MarketplaceError::InvalidIndex("artifact size is out of range".into()))?;
+        let bytes = fetch_bounded(&client, &url, limit).await?;
         if bytes.len() as u64 != artifact.bytes {
             return Err(MarketplaceError::InvalidIndex("artifact size does not match its metadata".into()));
         }
