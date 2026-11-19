@@ -39,6 +39,8 @@ pub enum Action {
         resource: Option<String>,
         #[arg(long, requires = "resource")]
         resource_type: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Remove an installed package version.
     Remove {
@@ -335,6 +337,7 @@ pub async fn run(action: Action) -> Result<()> {
             settings,
             resource,
             resource_type,
+            session,
         } => {
             let package = select(&id, version.as_deref())?;
             if !probe {
@@ -367,7 +370,10 @@ pub async fn run(action: Action) -> Result<()> {
                 None,
                 Limits::default(),
             )?;
-            let got = host.open(&id, "probe", &workspace, binding).await?;
+            let got = match session.as_deref() {
+                Some(session) => host.open_for_session(&id, "probe", &workspace, binding, Some(session)).await?,
+                None => host.open(&id, "probe", &workspace, binding).await?,
+            };
             println!("Ready: {id} ({} tools)", got.definitions().count());
             if let Err(error) = host.close_all().await {
                 bail!("Probe shutdown failed: {error}");
