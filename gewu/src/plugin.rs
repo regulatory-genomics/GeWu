@@ -487,11 +487,7 @@ async fn runtime_discover(
                     Err(error) => row["detail"] = error.to_string().into(),
                 },
                 RuntimeProvider::Managed { manager, .. } => {
-                    let available = std::env::var_os("GEWU_MICROMAMBA")
-                        .map(std::path::PathBuf::from)
-                        .filter(|path| providers::is_executable(path))
-                        .or_else(|| providers::find_command(manager))
-                        .is_some();
+                    let available = providers::managed_available(manager);
                     row["available"] = available.into();
                     row["detail"] = if available { format!("{manager} is installed") } else { format!("{manager} is not installed") }.into();
                 }

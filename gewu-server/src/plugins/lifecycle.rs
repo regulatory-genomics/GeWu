@@ -39,8 +39,32 @@ impl<'a> RuntimeSelection<'a> {
         if policy != "bundled"
             && let Some(plan) = &release.runtime_plan
         {
-            let effective = if policy == "auto" { "auto" } else { policy };
-            if let Some(provider) = plan.select(effective, target) {
+            if policy == "auto" {
+                // Prefer the first provider that is actually usable on this
+                // host, so auto falls through instead of failing on a stale
+                // Python or a missing micromamba.
+                for kind in &plan.policies {
+                    for provider in plan.providers.iter().filter(|p| p.kind() == kind && p.target() == target) {
+                        match provider {
+                            RuntimeProvider::External { .. } => {
+                                if providers::resolve_external(provider, executable).is_ok() {
+                                    return Ok(Self::External { provider, executable });
+                                }
+                            }
+                            RuntimeProvider::Managed { manager, .. } => {
+                                if providers::managed_available(manager) {
+                                    return Ok(Self::Managed { provider });
+                                }
+                            }
+                            RuntimeProvider::Bundled { .. } => {
+                                if let Some(runtime) = release.runtimes.iter().find(|runtime| runtime.target == *target) {
+                                    return Ok(Self::Bundled(runtime));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(provider) = plan.select(policy, target) {
                 return Ok(match provider {
                     RuntimeProvider::External { .. } => Self::External { provider, executable },
                     RuntimeProvider::Managed { .. } => Self::Managed { provider },
@@ -53,8 +77,7 @@ impl<'a> RuntimeSelection<'a> {
                             .context("bundled provider has no matching runtime reference")?,
                     ),
                 });
-            }
-            if policy != "auto" {
+            } else {
                 anyhow::bail!(
                     "release {} has no {policy} runtime for {}",
                     release.release_id,
@@ -236,4 +259,100 @@ impl InstallManager {
 fn sha256_bytes(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gewu_protocol::{
+        Artifact, ExecutableHint, GeWuCompatibility, ProbeSpec, Provenance, RuntimePlan, RuntimeProvider, RuntimeRef,
+    };
+
+    fn target() -> Target {
+        Target { os: "linux".into(), arch: "x86_64".into(), libc: Some("glibc".into()) }
+    }
+
+    fn artifact(name: &str) -> Artifact {
+        Artifact { url: format!("https://example.invalid/{name}"), sha256: "a".repeat(64), bytes: 1 }
+    }
+
+    fn release(plan: RuntimePlan, runtimes: Vec<RuntimeRef>) -> Release {
+        Release {
+            schema_version: "gewu.release/v2".into(),
+            release_id: "demo-1.0.0".into(),
+            plugin: "demo".into(),
+            version: "1.0.0".into(),
+            channel: "stable".into(),
+            gewu: GeWuCompatibility { api: "gewu.plugin/v1".into(), host: ">=0.1.0".into() },
+            package: artifact("demo.package.zip"),
+            runtimes,
+            runtime_plan: Some(plan),
+            capabilities: vec![],
+            permissions: vec![],
+            provenance: Provenance {
+                builder: "test".into(),
+                source: "fixture".into(),
+                source_commit: "a".repeat(40),
+                build_inputs: vec![],
+                sbom: None,
+                created_at: "2026-11-19T00:00:00Z".into(),
+            },
+            release_notes: None,
+            revocation: None,
+        }
+    }
+
+    fn external(id: &str, commands: Vec<&str>) -> RuntimeProvider {
+        RuntimeProvider::External {
+            id: id.into(),
+            target: target(),
+            executable: ExecutableHint { env: None, commands: commands.into_iter().map(str::to_string).collect() },
+            probe: ProbeSpec { args: vec![], timeout_seconds: None },
+            binaries: Default::default(),
+        }
+    }
+
+    #[test]
+    fn auto_skips_unavailable_providers_and_uses_bundled() {
+        let plan = RuntimePlan {
+            schema_version: "gewu.runtime-plan/v1".into(),
+            policies: vec!["external".into(), "managed".into(), "bundled".into()],
+            providers: vec![
+                external("missing-python", vec!["definitely-missing-python-xyz"]),
+                RuntimeProvider::Managed {
+                    id: "missing-manager".into(),
+                    target: target(),
+                    manager: "definitely-missing-manager-xyz".into(),
+                    channels: vec![],
+                    packages: vec!["python".into()],
+                    pip: vec![],
+                    pip_index: None,
+                    pip_extra_index: None,
+                    probe: ProbeSpec { args: vec![], timeout_seconds: None },
+                    binaries: Default::default(),
+                },
+                RuntimeProvider::Bundled {
+                    id: "demo-runtime".into(),
+                    version: "1.0.0".into(),
+                    target: target(),
+                    artifact: artifact("demo.runtime.zip"),
+                    manifest: artifact("demo.runtime.zip.json"),
+                },
+            ],
+        };
+        let runtime = RuntimeRef { id: "demo-runtime".into(), version: "1.0.0".into(), target: target(), artifact: artifact("demo.runtime.zip"), manifest: artifact("demo.runtime.zip.json") };
+        let release = release(plan, vec![runtime]);
+        assert!(matches!(RuntimeSelection::select(&release, "auto", &target(), None).unwrap(), RuntimeSelection::Bundled(_)));
+    }
+
+    #[test]
+    fn auto_uses_a_usable_external_interpreter() {
+        let plan = RuntimePlan {
+            schema_version: "gewu.runtime-plan/v1".into(),
+            policies: vec!["external".into(), "bundled".into()],
+            providers: vec![external("host-python", vec!["python3"])],
+        };
+        let release = release(plan, vec![]);
+        assert!(matches!(RuntimeSelection::select(&release, "auto", &target(), None).unwrap(), RuntimeSelection::External { .. }));
+    }
 }

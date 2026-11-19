@@ -57,8 +57,7 @@ pub fn find_command(command: &str) -> Option<PathBuf> {
     std::env::split_paths(&path).map(|dir| dir.join(command)).find(|candidate| is_executable(candidate))
 }
 
-pub fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
+pub fn is_executable(path: &Path) -> bool {    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         path.metadata().is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
@@ -67,6 +66,15 @@ pub fn is_executable(path: &Path) -> bool {
     {
         path.is_file()
     }
+}
+
+/// Whether a managed provider's toolchain is present on this host.
+pub fn managed_available(manager: &str) -> bool {
+    std::env::var_os("GEWU_MICROMAMBA")
+        .map(PathBuf::from)
+        .filter(|path| is_executable(path))
+        .or_else(|| find_command(manager))
+        .is_some()
 }
 
 /// Resolve an external provider's interpreter. An explicit `override_path`
