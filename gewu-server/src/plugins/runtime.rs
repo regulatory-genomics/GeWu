@@ -107,6 +107,11 @@ impl RuntimeBundle {
         };
         let mut command = Command::new(&self.probe);
         command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).env_clear().current_dir(workspace_root);
+        for key in ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
         for (key, value) in environment.variables() { command.env(key, value); }
         let output = timeout(deadline, command.output()).await.map_err(|_| RuntimeError::ProbeFailed("probe timed out".into()))?
             .map_err(|e| RuntimeError::ProbeFailed(e.to_string()))?;
