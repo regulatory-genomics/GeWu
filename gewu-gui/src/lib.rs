@@ -12,6 +12,7 @@
 
 pub mod cli;
 mod download;
+mod plugins;
 mod protocol;
 mod server;
 mod session;

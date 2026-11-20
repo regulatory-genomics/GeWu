@@ -34,6 +34,7 @@ struct Conn {
     observer: Option<Client>,
     observing: bool,
     task: Option<JoinHandle<()>>,
+    plugin_views: Vec<String>,
     /// When the streaming Markdown body was last pushed, throttling
     /// re-renders to [`STREAM_INTERVAL`]. `None` means the next delta is due.
     last_stream_render: Option<Instant>,
@@ -933,6 +934,60 @@ impl GuiSession {
         tab_tx: &mpsc::UnboundedSender<TabEvent>,
     ) -> Result<()> {
         match msg {
+            ClientMsg::Plugin {
+                tab,
+                request,
+                plugin,
+            } => {
+                use gewu_protocol::plugin::HostAction;
+                let attaching = matches!(&plugin, HostAction::Attach { .. });
+                let detaching = if let HostAction::Detach { view_id } = &plugin {
+                    Some(view_id.clone())
+                } else {
+                    None
+                };
+                let response = async {
+                    self.ensure_session(tab).await?;
+                    let ws = self
+                        .workspace
+                        .tab(tab)
+                        .expect("known tab")
+                        .workspace
+                        .clone();
+                    self.client(tab).expect("ensured").plugin(ws, plugin).await
+                }
+                .await;
+                if let Ok(result) = &response
+                    && let Some(conn) = self.conns.get_mut(&tab)
+                {
+                    if attaching
+                        && let Some(id) = result.get("viewId").and_then(serde_json::Value::as_str)
+                    {
+                        conn.plugin_views.push(id.into());
+                    }
+                    if let Some(id) = detaching {
+                        conn.plugin_views.retain(|saved| saved != &id);
+                    }
+                }
+                let session_id = self
+                    .workspace
+                    .tab(tab)
+                    .and_then(|tab| tab.model.session_id.clone());
+                let (result, error) = match response {
+                    Ok(result) => (Some(result), None),
+                    Err(error) => (None, Some(error.to_string())),
+                };
+                send_msg(
+                    sender,
+                    &ServerMsg::Plugin {
+                        request,
+                        result,
+                        error,
+                        session_id,
+                    },
+                )
+                .await?;
+            }
             ClientMsg::RevertChat { tab, block, undo } => {
                 self.close_zoom_for_tab(tab, sender).await?;
                 let Some(tab_state) = self.workspace.tab(tab) else {
@@ -1073,6 +1128,9 @@ impl GuiSession {
                 }
                 if let Err(e) = self.ensure_session(tab).await {
                     return self.send_error(sender, e.to_string()).await;
+                }
+                if let Some(conn) = self.conns.get_mut(&tab) {
+                    detach_views(conn).await;
                 }
                 let client = self.client(tab).expect("ensured");
                 match client.switch_workspace(workspace.clone()).await {
@@ -1789,6 +1847,7 @@ impl GuiSession {
 
     async fn stop_tab(&mut self, tab_id: u64) {
         if let Some(mut conn) = self.conns.remove(&tab_id) {
+            detach_views(&mut conn).await;
             if let Some(task) = conn.task.take() {
                 if let Some(client) = &conn.client {
                     let _ = client.interrupt().await;
@@ -2262,6 +2321,7 @@ impl GuiSession {
 
     async fn shutdown(&mut self) {
         for (_, mut conn) in self.conns.drain() {
+            detach_views(&mut conn).await;
             if let Some(task) = conn.task.take() {
                 task.abort();
             }
@@ -2273,6 +2333,21 @@ impl GuiSession {
             }
         }
         self.admin.close().await;
+    }
+}
+
+async fn detach_views(conn: &mut Conn) {
+    if let Some(client) = &conn.client {
+        for view_id in conn.plugin_views.drain(..) {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.plugin(
+                    "cwd".into(),
+                    gewu_protocol::plugin::HostAction::Detach { view_id },
+                ),
+            )
+            .await;
+        }
     }
 }
 

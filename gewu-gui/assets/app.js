@@ -4,6 +4,8 @@
 // applies snapshots/deltas, and forwards user actions. Model-authored text is
 // inserted with textContent, never innerHTML.
 
+import {panelHost} from './panels.mjs';
+
 (() => {
   "use strict";
 
@@ -38,6 +40,8 @@
     filePreview: document.getElementById("file-preview"),
     fileMenu: document.getElementById("file-menu"),
     workflowZoom: document.getElementById("workflow-zoom"),
+    pluginHost: document.getElementById("plugin-host"),
+    sidebarResizer: document.getElementById("sidebar-resizer"),
   };
 
   const state = {
@@ -63,6 +67,7 @@
     workflowZoom: { runId: null, scale: 1, x: 0, y: 0 },
     fileMenu: { path: null, entry: null },
     previewWindow: null,
+    sidebarTab: "files",
     // Files attached to the next ask: {name, mime_type, data?|path?} with
     // base64 `data` for inline media or a workspace-relative `path` for
     // uploaded references.
@@ -133,6 +138,69 @@
     } catch {
       // The state still applies to this page.
     }
+  }
+
+  const PANEL_WIDTH_KEY = "gewu-gui-panel-width";
+  const PANEL_MIN = 240;
+  const PANEL_APP_MIN = 720;
+
+  // The dock can never eat the composer: the transcript keeps its own room,
+  // and hiding the sessions sidebar gives the dock what it frees.
+  const TRANSCRIPT_MIN = 320;
+
+  function panelWidthMax() {
+    const sessions = parseFloat(getComputedStyle(el.app).getPropertyValue("--session-sidebar-width")) || 0;
+    return Math.max(PANEL_MIN, Math.round(window.innerWidth - sessions - TRANSCRIPT_MIN));
+  }
+
+  function setPanelWidth(px, remember) {
+    const width = Math.min(Math.max(PANEL_MIN, Math.round(px)), panelWidthMax());
+    el.app.style.setProperty("--panel-width", `${width}px`);
+    if (!remember) return;
+    try {
+      localStorage.setItem(PANEL_WIDTH_KEY, String(width));
+    } catch {
+      // The width still applies to this page.
+    }
+  }
+
+  function loadPanelWidth() {
+    const saved = Number(localStorage.getItem(PANEL_WIDTH_KEY));
+    return Number.isFinite(saved) && saved >= PANEL_MIN ? saved : 240;
+  }
+
+  function installSidebarResizer() {
+    setPanelWidth(loadPanelWidth(), false);
+    const handle = el.sidebarResizer;
+    if (!handle) return;
+    let startX = 0;
+    let startWidth = 0;
+    const move = (event) => {
+      setPanelWidth(startWidth + (startX - event.clientX), false);
+    };
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      handle.classList.remove("dragging");
+      el.app.classList.remove("resizing");
+      setPanelWidth(parseFloat(getComputedStyle(el.app).getPropertyValue("--panel-width")) || 420, true);
+    };
+    handle.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      startX = event.clientX;
+      startWidth = el.sidebar.getBoundingClientRect().width;
+      handle.classList.add("dragging");
+      el.app.classList.add("resizing");
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", stop, {once: true});
+    });
+    handle.addEventListener("keydown", (event) => {
+      const current = el.sidebar.getBoundingClientRect().width;
+      if (event.key === "ArrowLeft") setPanelWidth(current + 24, true);
+      else if (event.key === "ArrowRight") setPanelWidth(current - 24, true);
+      else return;
+      event.preventDefault();
+    });
   }
 
   function setSessionsOpen(open, remember) {
@@ -276,6 +344,8 @@
       if (state.ws !== ws) return;
       state.connected = true;
       state.ready = false;
+      for (const entry of pluginPending.values()) entry.reject(Error('Disconnected'));
+      pluginPending.clear();
       state.attempt = 0;
       state.follow.clear();
       state.loadingEarlier = false;
@@ -366,6 +436,74 @@
     return true;
   }
 
+  const pluginPending = new Map();
+  let pluginRequest = 0;
+  let pluginTabs = [];
+  let panelSyncTimer;
+  // Bundled runtimes can be hundreds of MB and managed environments may solve
+  // packages for several minutes; the host request remains transactional while
+  // it installs, so the GUI must not discard the response after 65 seconds.
+  const MARKETPLACE_INSTALL_TIMEOUT_MS = 30 * 60 * 1000;
+  const panels = panelHost(document.getElementById('plugin-host'), (tab, plugin) => {
+    return new Promise((resolve,reject) => {
+      if (!Number.isSafeInteger(tab) || !state.ready) {reject(Error('No connected workspace'));return;}
+      const request=++pluginRequest;
+      const timeout = plugin.action === 'marketplace_install' ? MARKETPLACE_INSTALL_TIMEOUT_MS : 65000;
+      const timer=setTimeout(()=>{pluginPending.delete(request);reject(Error(timeout === MARKETPLACE_INSTALL_TIMEOUT_MS ? 'Marketplace install timed out; the host may still be finishing the transaction' : 'Plugin request timed out'));},timeout);
+      pluginPending.set(request,{tab,resolve:value=>{clearTimeout(timer);resolve(value);},reject:error=>{clearTimeout(timer);reject(error);}});
+      if (!send({op:'plugin',tab,request,plugin})) {
+        pluginPending.get(request).reject(Error('Disconnected'));
+        pluginPending.delete(request);
+      }
+    });
+  }, {
+    onShow: () => {
+      setSidebarOpen(true, false);
+      setSidebarTab("preview");
+      // An application needs room: at the default Files width its canvas is
+      // unusable. On a narrow window the session list steps aside, since the
+      // application is what the reader just opened. A width the user chose on
+      // purpose is left alone.
+      if (panelWidthMax() < PANEL_APP_MIN) setSessionsOpen(false, false);
+      const dock = parseFloat(getComputedStyle(el.app).getPropertyValue("--panel-width")) || 0;
+      if (dock <= 440) setPanelWidth(Math.min(900, panelWidthMax()), true);
+    },
+    onHide: () => setSidebarTab("files"),
+  });
+
+  // Replacing or moving an iframe's ancestors reloads it and loses its port.
+  // Keep Preview mounted; snapshots only replace the server-rendered panes.
+  function updateSidebar(html) {
+    if (!el.sidebar.querySelector('#sidebar-preview')) {
+      el.sidebar.innerHTML = html;
+      return;
+    }
+    const next = document.createElement('template');
+    next.innerHTML = html;
+    for (const selector of ['.sidebar-head', '#sidebar-files', '#sidebar-tools']) {
+      const current = el.sidebar.querySelector(selector);
+      const fresh = next.content.querySelector(selector);
+      if (current && fresh) current.replaceWith(fresh);
+    }
+  }
+
+  function mountPanels() {
+    const slot = el.sidebar.querySelector('#sidebar-preview');
+    const host = el.pluginHost;
+    if (!slot || !host) return;
+    if (host.parentNode !== slot) slot.append(host);
+    host.hidden = false;
+    setSidebarTab(state.sidebarTab || 'files');
+  }
+
+  function syncPanels(message) {
+    pluginTabs = message.tabs;
+    panels.switchTab(pluginTabs.find(tab=>tab.id===message.active));
+    mountPanels();
+    clearTimeout(panelSyncTimer);
+    panelSyncTimer = setTimeout(() => panels.sync(), 120);
+  }
+
   // -- server messages ----------------------------------------------------
 
   function handle(message) {
@@ -377,9 +515,10 @@
         state.loadingEarlier = false;
         setTranscript(message.transcript, true);
         setStatus(message.status);
-        el.sidebar.innerHTML = message.sidebar || "";
+        updateSidebar(message.sidebar || "");
         setSessionSidebarHtml(message.session_sidebar);
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
+        syncPanels(message);
         break;
       case "tabs": {
         if (state.active !== message.active) {
@@ -395,6 +534,20 @@
           if (!alive.has(id)) state.follow.delete(id);
         }
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
+        syncPanels(message);
+        break;
+      }
+      case 'plugin': {
+        const entry=pluginPending.get(message.request);
+        if (!entry) break;
+        pluginPending.delete(message.request);
+        const tab=pluginTabs.find(tab=>tab.id===entry.tab);
+        if (tab && !tab.session_id && message.session_id) {
+          const bound={...tab,session_id:message.session_id};
+          pluginTabs=pluginTabs.map(item=>item.id===bound.id ? bound : item);
+          if (state.active===entry.tab) panels.switchTab(bound);
+        }
+        if (message.error) entry.reject(Error(message.error)); else entry.resolve(message.result);
         break;
       }
       case "session_sidebar":
@@ -955,6 +1108,8 @@
   });
 
   el.transcript.addEventListener("click", (event) => {
+    const pluginResult=event.target.closest('[data-plugin-result]');
+    if (pluginResult) { panels.agentResult(pluginResult.dataset.pluginResult); return; }
     const loadEarlier = event.target.closest("[data-load-earlier]");
     if (loadEarlier) {
       if (state.loadingEarlier) return;
@@ -1574,18 +1729,22 @@
   });
 
   function setSidebarTab(name) {
+    state.sidebarTab = name;
     const tabs = el.sidebar.querySelectorAll("[data-sidebar-tab]");
-    const panels = el.sidebar.querySelectorAll(".sidebar-panel");
+    const panes = el.sidebar.querySelectorAll(".sidebar-panel");
     for (const tab of tabs) {
       const active = tab.dataset.sidebarTab === name;
       tab.classList.toggle("active", active);
       tab.setAttribute("aria-selected", String(active));
     }
-    for (const panel of panels) {
-      const active = panel.id === `sidebar-${name}`;
-      panel.classList.toggle("active", active);
-      panel.hidden = !active;
+    for (const pane of panes) {
+      const active = pane.id === `sidebar-${name}`;
+      pane.classList.toggle("active", active);
+      pane.hidden = !active;
     }
+    el.app.classList.toggle("preview-open", name === "preview");
+    el.pluginHost.hidden = name !== "preview";
+    panels.setVisible(name === "preview");
   }
 
   el.filePreview.addEventListener("click", (event) => {
@@ -1854,9 +2013,9 @@
 
   setSessionsOpen(loadSessionsOpen(), false);
   setSidebarOpen(loadSidebarOpen(), false);
+  installSidebarResizer();
   requestAnimationFrame(() => {
     requestAnimationFrame(() => el.app.classList.remove("preload"));
   });
   boot();
 })();
-

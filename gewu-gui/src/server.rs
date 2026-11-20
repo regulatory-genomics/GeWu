@@ -110,8 +110,35 @@ pub fn router(state: AppState) -> Router {
         .route("/api/config", get(config))
         .route("/download/{ticket}", get(download).head(download_head))
         .route("/preview/{ticket}", get(preview))
+        .route(
+            "/plugin-data/{ticket}/{*path}",
+            axum::routing::any(crate::plugins::proxy),
+        )
+        .route(
+            "/panels.mjs",
+            get(|| js_module(include_str!("../assets/panels.mjs"))),
+        )
+        .route(
+            "/plugin-bridge.mjs",
+            get(|| js_module(include_str!("../assets/plugin-bridge.mjs"))),
+        )
+        .route(
+            "/editor.mjs",
+            get(|| js_module(include_str!("../assets/editor.mjs"))),
+        )
         .route("/ws", get(ws_handler))
         .with_state(state)
+}
+
+async fn js_module(source: &'static str) -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        source,
+    )
 }
 
 #[derive(Serialize)]

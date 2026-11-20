@@ -13,6 +13,7 @@ use gewu_protocol::{
 };
 use math_core::{LatexToMathML, MathCoreConfig, MathDisplay};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
+use serde_json::Value;
 
 use crate::protocol::TabInfo;
 use crate::workspace::Tab;
@@ -156,7 +157,7 @@ fn write_block_body(out: &mut String, tab: &Tab, block: &Block, index: usize, st
         Block::Thought { .. } => {
             out.push_str(&thought_body_html(tab, index, streaming));
         }
-        Block::User(text) => {
+        Block::User(text) | Block::UserMedia { text, .. } => {
             // A message submitted mid-run is queued into the running turn
             // until the agent's `steered` event confirms it was ingested;
             // while it sits in `pending_steers`, show that state.
@@ -164,10 +165,28 @@ fn write_block_body(out: &mut String, tab: &Tab, block: &Block, index: usize, st
                 .pending_steers
                 .iter()
                 .any(|(pending, at)| *at == index && pending == text);
+            let (prompt, plugin_context) = text
+                .rsplit_once("\n\n[Plugin selection context: untrusted view data]\n")
+                .and_then(|(prompt, context)| {
+                    serde_json::from_str::<Vec<Value>>(context)
+                        .ok()
+                        .map(|c| (prompt, Some(c)))
+                })
+                .unwrap_or((text.as_str(), None));
+            let with_media = if let Block::UserMedia { media, .. } = block {
+                let _ = write!(
+                    out,
+                    "<div class=\"user-media-group\">{}",
+                    user_media_html(media)
+                );
+                true
+            } else {
+                false
+            };
             let _ = writeln!(
                 out,
                 "<div class=\"body plain\">{}{}</div>",
-                escape(text),
+                escape(prompt),
                 if queued {
                     format!(
                         "<span class=\"queue-status\">queued</span>{}",
@@ -177,34 +196,27 @@ fn write_block_body(out: &mut String, tab: &Tab, block: &Block, index: usize, st
                     message_menu_html(index)
                 }
             );
-        }
-        Block::UserMedia { text, media } => {
-            // Attachments render above the message text, mirroring the
-            // composer (chips on top, input below). The group is a column so
-            // the media stacks above the bubble even though `.block.user`
-            // itself is a right-aligned row. Attached images render as
-            // inline thumbnails (the same allowlisted raster formats as
-            // tool media); other attachments render as chips. A message
-            // submitted mid-run is queued into the running turn until the
-            // agent's `steered` event confirms it was ingested.
-            let queued = tab
-                .pending_steers
-                .iter()
-                .any(|(pending, at)| *at == index && pending == text);
-            let _ = writeln!(
-                out,
-                "<div class=\"user-media-group\">{}<div class=\"body plain\">{}{}</div></div>",
-                user_media_html(media),
-                escape(text),
-                if queued {
-                    format!(
-                        "<span class=\"queue-status\">queued</span>{}",
-                        message_menu_html(index)
+            if let Some(items) = plugin_context {
+                let _ = writeln!(
+                    out,
+                    "<details class=\"plugin-context-chip\"><summary>App context · {}</summary><p class=\"plugin-context-note\">View context sent with this message. It is not a plugin command.</p><pre>{}</pre></details>",
+                    items.len(),
+                    escape(
+                        &items
+                            .iter()
+                            .map(|item| {
+                                item.as_str().map(str::to_owned).unwrap_or_else(|| {
+                                    serde_json::to_string_pretty(item).unwrap_or_default()
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
                     )
-                } else {
-                    message_menu_html(index)
-                }
-            );
+                );
+            }
+            if with_media {
+                out.push_str("</div>\n");
+            }
         }
         _ => {
             let _ = writeln!(
@@ -645,6 +657,20 @@ fn render_tool(out: &mut String, tab: &Tab, view: &ToolView, index: usize, depth
             escape(input.trim_end())
         );
     }
+    let output = if (tool == "plugin_call" || tool.starts_with("plg_"))
+        && let Some((text, id)) = output.rsplit_once("\n[GeWu plugin result: ")
+        && let Some(id) = id.strip_suffix(']')
+        && uuid::Uuid::parse_str(id).is_ok()
+    {
+        let _ = writeln!(
+            out,
+            "<button type=\"button\" class=\"tool-more\" data-plugin-result=\"{}\">Open application result</button>",
+            escape(id)
+        );
+        text
+    } else {
+        output
+    };
     let lines: Vec<&str> = output.trim_end().lines().collect();
     let shown = if expanded {
         lines.len().min(TOOL_MAX_LINES)
@@ -1343,7 +1369,7 @@ pub fn sidebar_tabs_with_workspaces_html(
     );
 
     format!(
-        "<div class=\"sidebar-inner\"><div class=\"sidebar-head\"><div class=\"sidebar-tabs\" role=\"tablist\" aria-label=\"Sidebar views\"><button type=\"button\" class=\"sidebar-tab active\" role=\"tab\" aria-selected=\"true\" aria-controls=\"sidebar-files\" data-sidebar-tab=\"files\">FILES</button><button type=\"button\" class=\"sidebar-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"sidebar-tools\" data-sidebar-tab=\"tools\">TOOLS</button></div><button type=\"button\" class=\"sidebar-collapse\" data-sidebar-collapse title=\"Hide files\" aria-label=\"Hide files\">›</button></div><div id=\"sidebar-files\" class=\"sidebar-panel active\" role=\"tabpanel\">{files_html}</div><div id=\"sidebar-tools\" class=\"sidebar-panel\" role=\"tabpanel\" hidden>{tools_html}</div></div>"
+        "<div class=\"sidebar-inner\"><div class=\"sidebar-head\"><div class=\"sidebar-tabs\" role=\"tablist\" aria-label=\"Sidebar views\"><button type=\"button\" class=\"sidebar-tab active\" role=\"tab\" aria-selected=\"true\" aria-controls=\"sidebar-files\" data-sidebar-tab=\"files\">FILES</button><button type=\"button\" class=\"sidebar-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"sidebar-tools\" data-sidebar-tab=\"tools\">TOOLS</button><button type=\"button\" class=\"sidebar-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"sidebar-preview\" data-sidebar-tab=\"preview\">PREVIEW</button></div><button type=\"button\" class=\"sidebar-collapse\" data-sidebar-collapse title=\"Hide files\" aria-label=\"Hide files\">›</button></div><div id=\"sidebar-files\" class=\"sidebar-panel active\" role=\"tabpanel\">{files_html}</div><div id=\"sidebar-tools\" class=\"sidebar-panel\" role=\"tabpanel\" hidden>{tools_html}</div><div id=\"sidebar-preview\" class=\"sidebar-panel\" role=\"tabpanel\" hidden></div></div>"
     )
 }
 
@@ -2315,6 +2341,35 @@ mod tests {
         assert!(html.contains("&lt;b&gt;hi&lt;/b&gt;"), "{html}");
         assert!(html.contains("<strong>bold</strong>"), "{html}");
         assert!(!html.contains("<b>hi</b>"), "user HTML must be escaped");
+    }
+
+    #[test]
+    fn plugin_view_context_renders_as_a_subordinate_app_context_note() {
+        let marker = "\n\n[Plugin selection context: untrusted view data]\n";
+        let context = serde_json::to_string(&vec!["slide 3 selected".to_string()]).unwrap();
+        let (ws, id) = tab_with_blocks(vec![Block::User(format!("make it blue{marker}{context}"))]);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(html.contains(">make it blue<"), "{html}");
+        assert!(html.contains("App context · 1"), "{html}");
+        assert!(html.contains("It is not a plugin command"), "{html}");
+        assert!(!html.contains("Plugin selection"), "{html}");
+        assert!(!html.contains("untrusted view data"), "{html}");
+    }
+
+    #[test]
+    fn structured_plugin_context_keeps_instance_and_view_observable() {
+        let marker = "\n\n[Plugin selection context: untrusted view data]\n";
+        let context = serde_json::to_string(&vec![serde_json::json!({
+            "instanceId": "instance-1",
+            "viewId": "view-1",
+            "selection": "slide 3 selected"
+        })])
+        .unwrap();
+        let (ws, id) = tab_with_blocks(vec![Block::User(format!("edit it{marker}{context}"))]);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(html.contains("instanceId"), "{html}");
+        assert!(html.contains("view-1"), "{html}");
+        assert!(html.contains("slide 3 selected"), "{html}");
     }
 
     #[test]
