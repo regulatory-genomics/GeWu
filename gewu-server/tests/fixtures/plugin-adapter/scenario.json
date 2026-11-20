@@ -1,0 +1,13 @@
+[
+  {"send":{"id":"r0","op":"activate","params":{"apiVersion":"gewu.plugin/v1","instanceId":"i","generation":1,"workspaceId":"w","workspaceRoot":"${workspace}","settings":"${settings}"}}},
+  {"expect":{"type":"result","id":"r0"}},
+  {"send":{"id":"r1","op":"call","params":{"tool":"echo","args":{"value":7},"context":{"instanceId":"i","generation":1,"workspaceId":"w","callId":"c1"}}}},
+  {"expect":{"type":"result","id":"r1","result":{"ok":true,"data":{"value":7},"resources":[]}}},
+  {"send":{"id":"r2","op":"call","params":{"tool":"wait","args":{},"context":{"instanceId":"i","generation":1,"workspaceId":"w","callId":"c2"}}}},
+  {"expect":{"type":"event","id":"r2","event":{"type":"progress","callId":"c2"}}},
+  {"send":{"id":"r3","op":"cancel","params":{"callId":"c2"}}},
+  {"expect":{"type":"result","id":"r3","result":{"state":"requested"}}},
+  {"expect":{"type":"result","id":"r2","result":{"ok":false,"error":{"code":"CANCELLED"}}}},
+  {"send":{"id":"r4","op":"deactivate","params":{"reason":"test"}}},
+  {"expect":{"type":"result","id":"r4","result":{"stopped":true}}}
+]

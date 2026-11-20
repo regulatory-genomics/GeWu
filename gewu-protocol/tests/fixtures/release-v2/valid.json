@@ -1,0 +1,54 @@
+{
+  "schemaVersion": "gewu.release/v2",
+  "releaseId": "manimble-0.2.0",
+  "plugin": "manimble",
+  "version": "0.2.0",
+  "channel": "stable",
+  "gewu": {"api": "gewu.plugin/v1", "host": ">=0.1.0"},
+  "package": {
+    "url": "https://plugin.regulogen.cn/releases/download/manimble-0.2.0/manimble-0.2.0.package.zip",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "bytes": 25492
+  },
+  "runtimePlan": {
+    "schemaVersion": "gewu.runtime-plan/v1",
+    "policies": ["external", "managed"],
+    "providers": [
+      {
+        "kind": "external",
+        "id": "manimble-python",
+        "target": {"os": "linux", "arch": "x86_64", "libc": "glibc"},
+        "executable": {"env": "MANIMBLE_PYTHON", "commands": ["python3.11", "python3"]},
+        "probe": {
+          "args": ["-c", "import manim, manim_slides, PIL, pptx"],
+          "timeoutSeconds": 120
+        },
+        "binaries": {"python3": "{executable}", "launch": "{executable}"}
+      },
+      {
+        "kind": "managed",
+        "id": "manimble-micromamba",
+        "target": {"os": "linux", "arch": "x86_64", "libc": "glibc"},
+        "manager": "micromamba",
+        "channels": ["conda-forge"],
+        "packages": ["python=3.11", "cairo", "pango", "ffmpeg"],
+        "pip": ["manim==0.21.0", "manim-slides==5.7.0", "python-pptx"],
+        "probe": {
+          "args": ["-c", "import manim, manim_slides, PIL, pptx"],
+          "timeoutSeconds": 300
+        },
+        "binaries": {"python3": "{executable}", "launch": "{executable}"}
+      }
+    ]
+  },
+  "capabilities": ["deck", "render", "export"],
+  "permissions": [],
+  "provenance": {
+    "builder": "gewu-plugin-release",
+    "source": "ssh://git@172.16.211.53:2222/gilbert/manimble.git",
+    "sourceCommit": "9147f021234567890abcdef0123456789abcdef0",
+    "buildInputs": ["manim-0.21.0", "manim-slides-5.7.0", "python-pptx"],
+    "createdAt": "2026-11-19T00:00:00Z"
+  },
+  "releaseNotes": "Manimble slides and PPTX export with external or managed runtime"
+}

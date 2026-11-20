@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:gewu:runtime-plan:v1",
+  "$ref": "#/$defs/RuntimePlan",
+  "$defs": {
+    "Version": {"const": "gewu.runtime-plan/v1"},
+    "Id": {"type": "string", "pattern": "^[a-z][a-z0-9.-]{0,127}$"},
+    "Semver": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"},
+    "Digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "Url": {"type": "string", "pattern": "^https?://[^\\s]+$"},
+    "Artifact": {"type": "object", "additionalProperties": false, "required": ["url", "sha256", "bytes"], "properties": {
+      "url": {"$ref": "#/$defs/Url"},
+      "sha256": {"$ref": "#/$defs/Digest"},
+      "bytes": {"type": "integer", "minimum": 1}
+    }},
+    "Target": {"type": "object", "additionalProperties": false, "required": ["os", "arch"], "properties": {
+      "os": {"enum": ["linux", "macos"]},
+      "arch": {"enum": ["x86_64", "aarch64"]},
+      "libc": {"type": "string", "minLength": 1}
+    }},
+    "Probe": {"type": "object", "additionalProperties": false, "required": ["args"], "properties": {
+      "args": {"type": "array", "items": {"type": "string"}, "maxItems": 64},
+      "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 3600}
+    }},
+    "ExecutableHint": {"type": "object", "additionalProperties": false, "properties": {
+      "env": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$"},
+      "commands": {"type": "array", "items": {"type": "string", "minLength": 1}, "maxItems": 16}
+    }},
+    "Binaries": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1},
+      "description": "runtime-root/bin entries; {executable} expands to the resolved interpreter"},
+    "External": {"type": "object", "additionalProperties": false,
+      "required": ["kind", "id", "target", "executable", "probe"],
+      "properties": {
+        "kind": {"const": "external"},
+        "id": {"$ref": "#/$defs/Id"},
+        "target": {"$ref": "#/$defs/Target"},
+        "executable": {"$ref": "#/$defs/ExecutableHint"},
+        "probe": {"$ref": "#/$defs/Probe"},
+        "binaries": {"$ref": "#/$defs/Binaries"}
+      }},
+    "Managed": {"type": "object", "additionalProperties": false,
+      "required": ["kind", "id", "target", "manager", "packages", "probe"],
+      "properties": {
+        "kind": {"const": "managed"},
+        "id": {"$ref": "#/$defs/Id"},
+        "target": {"$ref": "#/$defs/Target"},
+        "manager": {"enum": ["micromamba"]},
+        "channels": {"type": "array", "items": {"type": "string", "minLength": 1}, "maxItems": 16},
+        "packages": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}, "maxItems": 256},
+        "pip": {"type": "array", "items": {"type": "string", "minLength": 1}, "maxItems": 256},
+        "pipIndex": {"$ref": "#/$defs/Url"},
+        "pipExtraIndex": {"$ref": "#/$defs/Url"},
+        "probe": {"$ref": "#/$defs/Probe"},
+        "binaries": {"$ref": "#/$defs/Binaries"}
+      }},
+    "Bundled": {"type": "object", "additionalProperties": false,
+      "required": ["kind", "id", "version", "target", "artifact", "manifest"],
+      "properties": {
+        "kind": {"const": "bundled"},
+        "id": {"$ref": "#/$defs/Id"},
+        "version": {"$ref": "#/$defs/Semver"},
+        "target": {"$ref": "#/$defs/Target"},
+        "artifact": {"$ref": "#/$defs/Artifact"},
+        "manifest": {"$ref": "#/$defs/Artifact"}
+      }},
+    "Provider": {"oneOf": [
+      {"$ref": "#/$defs/External"},
+      {"$ref": "#/$defs/Managed"},
+      {"$ref": "#/$defs/Bundled"}
+    ]},
+    "RuntimePlan": {"type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "policies", "providers"],
+      "properties": {
+        "schemaVersion": {"$ref": "#/$defs/Version"},
+        "policies": {"type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"enum": ["external", "managed", "bundled"]}},
+        "providers": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/Provider"}}
+      }}
+  }
+}
