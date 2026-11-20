@@ -278,7 +278,8 @@ async fn install_managed_with_binary(
         .tempdir_in(parent)
         .map_err(|error| ProviderError::Invalid(error.to_string()))?;
     let work = temporary.path().join("prefix");
-    std::fs::create_dir_all(&work).map_err(|error| ProviderError::Invalid(error.to_string()))?;
+    // micromamba refuses an existing prefix ("Non-conda folder exists"), so it
+    // must create the directory itself.
     let deadline = Duration::from_secs(timeout_seconds);
     let mut create = Command::new(binary);
     create.arg("create").arg("--yes").arg("--prefix").arg(&work);
@@ -534,6 +535,37 @@ mod tests {
             managed_prefix_key("demo", &first).unwrap(),
             managed_prefix_key("demo", &second).unwrap()
         );
+    }
+
+    /// libmamba refuses a prefix that already exists, even when empty
+    /// ("Non-conda folder exists at prefix"). The host must let micromamba
+    /// create the directory itself.
+    #[tokio::test]
+    async fn managed_install_lets_micromamba_create_the_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = temp.path().join("micromamba");
+        write_executable(
+            &manager,
+            "#!/bin/sh\nset -eu\nif [ \"$1\" = create ]; then\n  prefix=\"\"\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = --prefix ]; then prefix=$2; shift 2; else shift; fi\n  done\n  if [ -e \"$prefix\" ]; then\n    echo \"Non-conda folder exists at prefix\" >&2\n    exit 1\n  fi\n  mkdir -p \"$prefix/bin\"\n  printf '#!/bin/sh\\nexit 0\\n' > \"$prefix/bin/python3\"\n  chmod +x \"$prefix/bin/python3\"\nfi\n",
+        )
+        .unwrap();
+        let provider = RuntimeProvider::Managed {
+            id: "demo".into(),
+            target: target(),
+            manager: "micromamba".into(),
+            channels: vec![],
+            packages: vec!["python=3.11".into()],
+            pip: vec![],
+            pip_index: None,
+            pip_extra_index: None,
+            probe: ProbeSpec { args: vec![], timeout_seconds: Some(1) },
+            binaries: Default::default(),
+        };
+        let prefix = temp.path().join("runtime");
+        install_managed_with_binary(&provider, &prefix, 5, &manager)
+            .await
+            .expect("micromamba must be allowed to create the prefix");
+        assert!(prefix.join(".gewu-complete").is_file());
     }
 
     #[tokio::test]
