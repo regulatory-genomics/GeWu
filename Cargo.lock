@@ -1113,14 +1113,20 @@ name = "gewu"
 version = "0.1.7"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
+ "dirs",
  "dotenvy",
  "gewu-client",
  "gewu-gui",
+ "gewu-protocol",
  "gewu-server",
  "gewu-update",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
