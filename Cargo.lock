@@ -1279,6 +1279,7 @@ dependencies = [
  "ignore",
  "image",
  "json-strip-comments",
+ "jsonschema",
  "percent-encoding",
  "schemars",
  "serde",
