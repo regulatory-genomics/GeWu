@@ -334,11 +334,12 @@ fn test_agent_event_content_delta() {
 #[test]
 fn test_agent_event_tool_start() {
     let event = AgentEvent::ToolStart {
+        call_id: "call-1".into(),
         tool: "bash".to_string(),
         input: "{}".to_string(),
     };
 
-    if let AgentEvent::ToolStart { tool, input } = event {
+    if let AgentEvent::ToolStart { tool, input, .. } = event {
         assert_eq!(tool, "bash");
         assert_eq!(input, "{}");
     }
@@ -347,6 +348,7 @@ fn test_agent_event_tool_start() {
 #[test]
 fn test_agent_event_tool_finish() {
     let event = AgentEvent::ToolFinish {
+        call_id: "call-1".into(),
         tool: "bash".to_string(),
         title: "Directory listing".to_string(),
         output: "files...".to_string(),
@@ -358,6 +360,7 @@ fn test_agent_event_tool_finish() {
         title,
         output,
         metadata,
+        ..
     } = event
     {
         assert_eq!(tool, "bash");
@@ -382,6 +385,7 @@ fn test_agent_event_tool_finish_deserializes_legacy_shape() {
             title,
             output,
             metadata,
+            ..
         } => {
             assert_eq!(tool, "bash");
             assert!(title.is_empty());

@@ -553,7 +553,6 @@ impl Agent {
 
                     let plan = plan_tool_call(call, &mut doom_loop);
                     if let ToolCallPlan::Stop(ref error) = plan {
-                        yield AgentEvent::Error { error: error.clone() };
                         // Close out every announced call of this turn so the
                         // UI has no eternally "running" tool cards.
                         let not_executed = "Error: not executed because a doom loop was detected \
@@ -561,6 +560,7 @@ impl Agent {
                             .to_string();
                         for announced_call in announced.drain(..) {
                             yield AgentEvent::ToolFinish {
+                                call_id: announced_call.id.clone(),
                                 tool: announced_call.function.name.clone(),
                                 title: announced_call.function.name.clone(),
                                 output: not_executed.clone(),
@@ -578,6 +578,7 @@ impl Agent {
                             })
                             .await;
                         }
+                        yield AgentEvent::Error { error: error.clone() };
                         return;
                     }
                     if let ToolCallPlan::Reject(result) = plan {
@@ -586,7 +587,9 @@ impl Agent {
                         continue;
                     }
 
-                    yield AgentEvent::ToolStart { tool: tool_name.clone(), input: args.clone() };
+                    yield AgentEvent::ToolStart {
+                        call_id: call.id.clone(), tool: tool_name.clone(), input: args.clone(),
+                    };
                     announced.push(call.clone());
                     pending.push((index, call.clone(), Uuid::new_v4().to_string()));
                 }
@@ -2025,6 +2028,44 @@ mod tests {
         // The third identical call triggers the detector before it is
         // announced, so exactly threshold - 1 starts happen.
         assert_eq!(starts, 2);
+        assert!(events.iter().filter_map(|event| match event {
+            AgentEvent::ToolFinish { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        }).all(|id| id == "call_1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_events_carry_the_same_ids_as_history() -> Result<()> {
+        let mut turn = Vec::new();
+        for (id, args) in [("call_a", "{\"n\":1}"), ("call_b", "{\"n\":2}")] {
+            turn.push(ProviderEvent::ToolCallStart {
+                id: id.into(),
+                name: "missing_tool".into(),
+            });
+            turn.push(ProviderEvent::ToolCallDelta { id: id.into(), delta: args.into() });
+        }
+        turn.push(ProviderEvent::Finish { reason: Some("tool_calls".into()) });
+        let provider = MockProvider::new(vec![turn, vec![ProviderEvent::Finish { reason: Some("stop".into()) }]]);
+        let mut agent = Agent::builder().llm(Arc::new(provider)).build()?;
+
+        let events = agent.ask("run both calls").collect::<Vec<_>>().await;
+        for kind in ["ToolStart", "ToolFinish"] {
+            let ids = events.iter().filter_map(|event| {
+                let event = event.as_ref().unwrap();
+                let matches_kind = match kind {
+                    "ToolStart" => matches!(event, AgentEvent::ToolStart { .. }),
+                    _ => matches!(event, AgentEvent::ToolFinish { .. }),
+                };
+                matches_kind.then(|| serde_json::to_value(event).unwrap()["call_id"].clone())
+            }).collect::<Vec<_>>();
+            assert_eq!(ids, vec!["call_a", "call_b"], "{kind}");
+        }
+        let ids = agent.memory.messages().iter().filter_map(|message| match message {
+            Message::Tool { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(ids, vec!["call_a", "call_b"]);
         Ok(())
     }
 

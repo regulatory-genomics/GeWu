@@ -250,6 +250,7 @@ pub(super) fn normalize_tool_result(
         ),
     };
     let finish = AgentEvent::ToolFinish {
+        call_id: call.id.clone(),
         tool: tool_name.clone(),
         title: result.title,
         output: result.output.clone(),
@@ -463,7 +464,7 @@ mod tests {
             let normalized = normalize_tool_result(&call("tool", "{}"), Some(Ok(result)));
             assert!(normalized.error.is_none());
             assert!(
-                matches!(normalized.finish, AgentEvent::ToolFinish { tool, title, output: raw, metadata }
+                matches!(normalized.finish, AgentEvent::ToolFinish { tool, title, output: raw, metadata, .. }
                 if tool == "tool" && title == "image title" && raw == output && metadata["key"] == 1)
             );
             assert!(

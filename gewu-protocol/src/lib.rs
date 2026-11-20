@@ -1914,6 +1914,7 @@ mod tests {
     #[test]
     fn event_messages_round_trip_through_deserialize() {
         let agent_event = AgentEvent::ToolStart {
+            call_id: "call-1".into(),
             tool: "bash".to_string(),
             input: r#"{"command":"ls"}"#.to_string(),
         };
@@ -1929,6 +1930,7 @@ mod tests {
     #[test]
     fn serializes_tool_events() {
         let agent_event = AgentEvent::ToolStart {
+            call_id: "call-1".into(),
             tool: "bash".to_string(),
             input: r#"{"command":"ls"}"#.to_string(),
         };

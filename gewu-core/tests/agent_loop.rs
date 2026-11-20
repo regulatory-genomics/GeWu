@@ -156,6 +156,7 @@ async fn test_agent_loop() {
                 title,
                 output,
                 metadata,
+                ..
             } => tool_finish = Some((tool, title, output, metadata)),
             AgentEvent::ContentDelta { delta } => result.push_str(&delta),
             AgentEvent::Finish { response } => result = response,
@@ -275,6 +276,7 @@ async fn test_apply_patch_metadata_through_agent_loop() {
             title,
             output,
             metadata,
+            ..
         } = event.unwrap()
         {
             finish = Some((tool, title, output, metadata));

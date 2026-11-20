@@ -222,9 +222,18 @@ pub enum AgentEvent {
     /// A delta of text content from the model.
     ContentDelta { delta: String },
     /// The agent has started executing a tool.
-    ToolStart { tool: String, input: String },
+    ToolStart {
+        /// The provider's tool-call ID, also used in the tool history message.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        call_id: String,
+        tool: String,
+        input: String,
+    },
     /// A tool has finished executing.
     ToolFinish {
+        /// Same call ID as the corresponding `ToolStart` and history message.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        call_id: String,
         tool: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         title: String,

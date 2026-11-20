@@ -229,7 +229,7 @@ impl SessionModel {
                 }
                 Some(idx)
             }
-            AgentEvent::ToolStart { tool, input } => {
+            AgentEvent::ToolStart { tool, input, .. } => {
                 self.end_thought();
                 self.blocks.push(Block::Tool {
                     tool: tool.clone(),
@@ -825,10 +825,12 @@ mod tests {
     fn tool_start_then_finish_fills_output() {
         let mut m = model();
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: "call-1".into(),
             tool: "bash".into(),
             input: r#"{"command":"ls"}"#.into(),
         });
         let _ = m.apply_event(&AgentEvent::ToolFinish {
+            call_id: "call-1".into(),
             tool: "bash".into(),
             title: String::new(),
             output: "file.rs".into(),
@@ -864,6 +866,7 @@ mod tests {
     fn question_events_attach_to_the_question_card_and_resolve() {
         let mut m = model();
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: "call-1".into(),
             tool: "question".into(),
             input: r#"{"questions":[{"question":"Which database?","header":"Database"}]}"#.into(),
         });
@@ -901,6 +904,7 @@ mod tests {
 
         // The tool result still lands in the same card.
         let _ = m.apply_event(&AgentEvent::ToolFinish {
+            call_id: "call-1".into(),
             tool: "question".into(),
             title: "question".into(),
             output: "answered".into(),
@@ -922,6 +926,7 @@ mod tests {
         let mut m = model();
         for _ in 0..2 {
             let _ = m.apply_event(&AgentEvent::ToolStart {
+                call_id: "call-1".into(),
                 tool: "question".into(),
                 input: "{}".into(),
             });
@@ -966,6 +971,7 @@ mod tests {
     fn finishing_an_ask_settles_a_still_pending_question() {
         let mut m = model();
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: "call-1".into(),
             tool: "question".into(),
             input: "{}".into(),
         });
@@ -990,6 +996,7 @@ mod tests {
         let mut m = model();
         for header in ["First", "Second"] {
             let _ = m.apply_event(&AgentEvent::ToolStart {
+                call_id: "call-1".into(),
                 tool: "question".into(),
                 input: format!(r#"{{"questions":[{{"question":"?","header":"{header}"}}]}}"#),
             });
@@ -1027,6 +1034,7 @@ mod tests {
     fn finishing_an_ask_closes_a_question_announced_without_a_form() {
         let mut m = model();
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: "call-1".into(),
             tool: "question".into(),
             input: r#"{"questions":[{"question":"?","header":"Stale"}]}"#.into(),
         });
@@ -1042,6 +1050,7 @@ mod tests {
 
         // A later turn's form attaches to its own card, not the stale one.
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: "call-1".into(),
             tool: "question".into(),
             input: r#"{"questions":[{"question":"?","header":"Fresh"}]}"#.into(),
         });
@@ -1066,6 +1075,7 @@ mod tests {
     fn dismissed_questions_keep_their_questions_for_the_summary() {
         let mut m = model();
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: "call-1".into(),
             tool: "question".into(),
             input: "{}".into(),
         });
@@ -1093,6 +1103,7 @@ mod tests {
         // output must land in the original block, not in a duplicate.
         let mut m = model();
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: "call-1".into(),
             tool: "bash".into(),
             input: r#"{"command":"ls"}"#.into(),
         });
@@ -1100,6 +1111,7 @@ mod tests {
             text: "focus on tests".into(),
         });
         let affected = m.apply_event(&AgentEvent::ToolFinish {
+            call_id: "call-1".into(),
             tool: "bash".into(),
             title: String::new(),
             output: "file.rs".into(),
@@ -1128,6 +1140,7 @@ mod tests {
         let mut m = model();
         for _ in 0..2 {
             let _ = m.apply_event(&AgentEvent::ToolStart {
+                call_id: "call-1".into(),
                 tool: "bash".into(),
                 input: "{}".into(),
             });
@@ -1135,6 +1148,7 @@ mod tests {
         let _ = m.apply_event(&AgentEvent::Steered { text: "go".into() });
         assert_eq!(
             m.apply_event(&AgentEvent::ToolFinish {
+                call_id: "call-1".into(),
                 tool: "bash".into(),
                 title: String::new(),
                 output: "first".into(),
@@ -1144,6 +1158,7 @@ mod tests {
         );
         assert_eq!(
             m.apply_event(&AgentEvent::ToolFinish {
+                call_id: "call-1".into(),
                 tool: "bash".into(),
                 title: String::new(),
                 output: "second".into(),
@@ -1174,10 +1189,12 @@ mod tests {
             .join("\n");
         assert!(output.len() > 400);
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: "call-1".into(),
             tool: "bash".into(),
             input: r#"{"command":"seq 60"}"#.into(),
         });
         let _ = m.apply_event(&AgentEvent::ToolFinish {
+            call_id: "call-1".into(),
             tool: "bash".into(),
             title: String::new(),
             output: output.clone(),
@@ -1201,10 +1218,12 @@ mod tests {
             delta: "let me check".into(),
         });
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: "call-1".into(),
             tool: "bash".into(),
             input: "{}".into(),
         });
         let _ = m.apply_event(&AgentEvent::ToolFinish {
+            call_id: "call-1".into(),
             tool: "bash".into(),
             title: String::new(),
             output: "ok".into(),
@@ -1309,6 +1328,7 @@ mod tests {
         m.apply_event(&AgentEvent::ReasoningDelta { delta: "hm".into() });
 
         m.apply_event(&AgentEvent::ToolStart {
+            call_id: "call-1".into(),
             tool: "bash".into(),
             input: "{}".into(),
         });
@@ -1333,6 +1353,7 @@ mod tests {
         assert_eq!(m.take_collapsed(), None);
         assert_eq!(
             m.apply_event(&AgentEvent::ToolStart {
+                call_id: "call-1".into(),
                 tool: "bash".into(),
                 input: "{}".into(),
             }),
@@ -1341,6 +1362,7 @@ mod tests {
         assert_eq!(m.take_collapsed(), Some(1));
         // Taken once: the next event without a collapse reports nothing.
         m.apply_event(&AgentEvent::ToolFinish {
+            call_id: "call-1".into(),
             tool: "bash".into(),
             title: String::new(),
             output: "ok".into(),
@@ -1404,6 +1426,7 @@ mod tests {
         // ToolStart appends block 1; its ToolFinish fills it.
         assert_eq!(
             m.apply_event(&AgentEvent::ToolStart {
+                call_id: "call-1".into(),
                 tool: "bash".into(),
                 input: "{}".into(),
             }),
@@ -1411,6 +1434,7 @@ mod tests {
         );
         assert_eq!(
             m.apply_event(&AgentEvent::ToolFinish {
+                call_id: "call-1".into(),
                 tool: "bash".into(),
                 title: String::new(),
                 output: "ok".into(),
@@ -1432,6 +1456,7 @@ mod tests {
         // A second ToolStart appends into the same run (block 2).
         assert_eq!(
             m.apply_event(&AgentEvent::ToolStart {
+                call_id: "call-1".into(),
                 tool: "grep".into(),
                 input: "{}".into(),
             }),
@@ -1604,10 +1629,12 @@ mod tests {
     fn tool_finish_keeps_image_media_out_of_the_output_text() {
         let mut m = model();
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: "call-1".into(),
             tool: "read_file".into(),
             input: r#"{"file_path":"shot.png"}"#.into(),
         });
         let _ = m.apply_event(&AgentEvent::ToolFinish {
+            call_id: "call-1".into(),
             tool: "read_file".into(),
             title: "read_file".into(),
             output: IMAGE_PAYLOAD.into(),
@@ -1702,10 +1729,12 @@ mod tests {
     fn non_media_tool_output_is_unchanged() {
         let mut m = model();
         let _ = m.apply_event(&AgentEvent::ToolStart {
+            call_id: "call-1".into(),
             tool: "bash".into(),
             input: r#"{"command":"ls"}"#.into(),
         });
         let _ = m.apply_event(&AgentEvent::ToolFinish {
+            call_id: "call-1".into(),
             tool: "bash".into(),
             title: String::new(),
             output: r#"{"type":"media-ish"}"#.into(),
@@ -1722,6 +1751,7 @@ mod tests {
     fn tool_progress_updates_the_open_tool_block_in_place() {
         let mut m = model();
         m.apply_event(&AgentEvent::ToolStart {
+            call_id: "call-1".into(),
             tool: "task".into(),
             input: r#"{"description":"explore","prompt":"p"}"#.into(),
         });
@@ -1770,6 +1800,7 @@ mod tests {
     fn tool_finish_clears_the_status_and_progress_after_finish_is_ignored() {
         let mut m = model();
         m.apply_event(&AgentEvent::ToolStart {
+            call_id: "call-1".into(),
             tool: "task".into(),
             input: "{}".into(),
         });
@@ -1779,6 +1810,7 @@ mod tests {
         });
         assert_eq!(
             m.apply_event(&AgentEvent::ToolFinish {
+                call_id: "call-1".into(),
                 tool: "task".into(),
                 title: String::new(),
                 output: "done".into(),
@@ -1810,6 +1842,7 @@ mod tests {
         let mut m = model();
         for _ in 0..2 {
             m.apply_event(&AgentEvent::ToolStart {
+                call_id: "call-1".into(),
                 tool: "task".into(),
                 input: "{}".into(),
             });
