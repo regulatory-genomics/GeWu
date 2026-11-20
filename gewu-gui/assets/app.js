@@ -247,15 +247,15 @@ import {panelHost} from './panels.mjs';
   }
 
   function setSessionSidebarHtml(html) {
-    // The sidebar is server-rendered and swaps the whole subtree; carry the
-    // session list's scroll position across so switching tabs (which resends
-    // the active highlight) does not jump the reader back to the top.
-    const scroller = el.sessionSidebar.querySelector(".session-workspace-groups");
-    const scrollTop = scroller ? scroller.scrollTop : 0;
-    el.sessionSidebar.innerHTML = html || "";
+    const next = html || "";
+    // Replacing the markup rebuilds the scroll container, so keep the user's
+    // place in a long session list instead of snapping back to the top.
+    const groups = el.sessionSidebar.querySelector(".session-workspace-groups");
+    const scrollTop = groups ? groups.scrollTop : 0;
+    if (el.sessionSidebar.innerHTML !== next) el.sessionSidebar.innerHTML = next;
     applyWorkspaceCollapseState();
-    const replaced = el.sessionSidebar.querySelector(".session-workspace-groups");
-    if (replaced) replaced.scrollTop = scrollTop;
+    const rebuilt = el.sessionSidebar.querySelector(".session-workspace-groups");
+    if (rebuilt) rebuilt.scrollTop = scrollTop;
   }
 
   function toggleWorkspaceGroup(id) {
