@@ -43,13 +43,15 @@ pub use reminder::Reminder;
 mod execution;
 mod experiences;
 mod media;
+mod policy;
 mod steering;
 mod tools;
 
 pub use compaction::CompactionError;
 pub use experiences::SearchExperiencesTool;
 pub use media::extract_media_parts;
-pub use steering::{BackgroundNotification, InboxMessage, Steering};
+pub use policy::ToolPolicy;
+pub use steering::{BackgroundJob, BackgroundNotification, IdleAction, InboxMessage, Steering};
 pub use tools::execute_tool_with_panic_recovery;
 
 use crate::middleware::TruncationService;
@@ -113,10 +115,10 @@ pub struct Agent {
     /// (every completed LLM request, including compaction requests).
     provider_usage: TokenUsage,
     reminder: Reminder,
+    /// Tools that stay advertised but must not execute in this mode.
+    tool_policy: ToolPolicy,
     /// Per-session key/value state shared with tools on every [`ToolContext`].
     session_state: SessionState,
-    /// Buffer for steering messages injected while the agent runs.
-    steering: Steering,
     /// Session-selected filesystem root, when supplied by the host.
     working_directory: Option<PathBuf>,
     /// Shared with every tool context of the active run.
@@ -164,6 +166,8 @@ pub struct AgentBuilder {
     /// System prompt (defaults to empty).
     system_prompt: String,
     reminder: Reminder,
+    /// Advertised tools that must not execute (defaults to allow-all).
+    tool_policy: ToolPolicy,
     /// Maximum turns limit (optional).
     max_turns: Option<usize>,
     /// Memory store (defaults to in-memory Vec).
@@ -216,6 +220,7 @@ impl Default for AgentBuilder {
             tools: Arc::new(Vec::new()),
             system_prompt: String::new(),
             reminder: Reminder::default(),
+            tool_policy: ToolPolicy::allow_all(),
             max_turns: None,
             memory: None,
             context_limit: 256_000,
@@ -237,10 +242,12 @@ impl Agent {
         system_prompt: String,
         tools: Vec<Arc<dyn Tool>>,
         reminder: Reminder,
+        tool_policy: ToolPolicy,
     ) {
         self.system_prompt = system_prompt;
         self.tools = Arc::new(tools);
         self.reminder = reminder;
+        self.tool_policy = tool_policy;
     }
 
     /// Swap the LLM provider while retaining memory and all other runtime
@@ -269,6 +276,17 @@ impl Agent {
     pub fn set_reminder(&mut self, reminder: Reminder) {
         self.reminder = reminder;
     }
+
+    /// The execution policy applied to the advertised tools.
+    pub fn tool_policy(&self) -> &ToolPolicy {
+        &self.tool_policy
+    }
+
+    /// Replace the tool execution policy. The caller must ensure the agent
+    /// is idle.
+    pub fn set_tool_policy(&mut self, tool_policy: ToolPolicy) {
+        self.tool_policy = tool_policy;
+    }
     /// Creates a new `AgentBuilder` for constructing `Agent` instances.
     pub fn builder() -> AgentBuilder {
         AgentBuilder::default()
@@ -293,7 +311,7 @@ impl Agent {
         }
     }
 
-    /// Processes a user message and returns a stream of agent events.
+    /// Processes a user message with a fresh inbox and returns a stream of agent events.
     ///
     /// This method implements the main agent loop:
     ///
@@ -321,11 +339,26 @@ impl Agent {
         &'a mut self,
         user_message: &'a str,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
-        self.run_inner(Some(user_message), RunOptions::default())
+        self.ask_with_inbox(user_message, Steering::new())
+    }
+
+    pub fn ask_with_inbox<'a>(
+        &'a mut self,
+        user_message: &'a str,
+        inbox: Steering,
+    ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
+        self.run_inner(Some(user_message), RunOptions::default(), inbox)
     }
 
     pub fn resume(&mut self) -> impl Stream<Item = Result<AgentEvent>> + '_ {
-        self.run_inner(None, RunOptions::default())
+        self.resume_with_inbox(Steering::new())
+    }
+
+    pub fn resume_with_inbox(
+        &mut self,
+        inbox: Steering,
+    ) -> impl Stream<Item = Result<AgentEvent>> + '_ {
+        self.run_inner(None, RunOptions::default(), inbox)
     }
 
     /// Runs one turn with explicit budgets and cancellation.
@@ -338,13 +371,14 @@ impl Agent {
         user_message: &'a str,
         options: RunOptions,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
-        self.run_inner(Some(user_message), options)
+        self.run_inner(Some(user_message), options, Steering::new())
     }
 
     fn run_inner<'a>(
         &'a mut self,
         user_message: Option<&'a str>,
         options: RunOptions,
+        inbox: Steering,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
         async_stream::try_stream! {
             self.run_abort.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -353,27 +387,30 @@ impl Agent {
             let max_turns = options.max_turns.or(self.max_turns);
             let max_tool_calls = options.max_tool_calls;
             let deadline = options.deadline.map(|limit| std::time::Instant::now() + limit);
-            if user_message.is_some() {
-                self.steering.unpause();
-            }
             if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
                 self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
             }
 
             // Messages steered while the agent was idle join the transcript
             // ahead of this run's own prompt, preserving send order.
-            for event in self.ingest_steered().await {
+            for event in self.ingest_steered(&inbox).await {
                 yield event;
             }
 
             if let Some(user_message) = user_message {
-                self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await;
                 self.reminder.on_user_turn();
+                // A due mode reminder becomes part of the message before it is
+                // stored, so it is durable and every request in this turn — and
+                // later turns — still carries it instead of only the first
+                // provider call.
+                let mut message = Message::User {
+                    content: vec![ContentPart::Text {
+                        text: user_message.to_string(),
+                    }],
+                };
+                self.reminder.apply_to(&mut message);
+                self.memory.add_message(message).await;
             }
-            // Due mode reminders become part of conversation history, so
-            // every request in this turn — and later turns — still carries
-            // them instead of only the first provider call.
-            self.reminder.apply(self.memory.messages_mut());
 
             let mut turn = 0;
             let mut tool_calls_made = 0usize;
@@ -403,7 +440,7 @@ impl Agent {
                 // the only safe spot: all tool results of the previous
                 // round are in history, so a user message never lands
                 // between an assistant turn and its tool results.
-                for event in self.ingest_steered().await {
+                for event in self.ingest_steered(&inbox).await {
                     yield event;
                 }
 
@@ -562,7 +599,7 @@ impl Agent {
                     tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
                 }).await;
 
-                let turn_disposition = classify_turn(&tool_calls, self.steering.is_pending());
+                let turn_disposition = classify_turn(&tool_calls, inbox.is_pending());
                 if turn_disposition != TurnDisposition::Tools {
                     // A steer arriving while the model streams its final
                     // answer must still be answered in this run: continue
@@ -720,6 +757,9 @@ impl Agent {
                     tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
                 let mut executing = 0usize;
                 for (index, call, message_id) in pending {
+                    // Advertised tools can be refused per mode; check before
+                    // dispatching so the tool never runs.
+                    let denied = self.tool_policy.check(&call.function.name).err();
                     let tool = self
                         .tools
                         .iter()
@@ -730,7 +770,7 @@ impl Agent {
                     let enforcement = self.enforcement;
                     let truncation = self.truncation.clone();
                     let semaphore = semaphore.clone();
-                    let inbox = self.steering.clone();
+                    let inbox = inbox.clone();
                     let working_directory = self.working_directory.clone();
                     let progress_tx = progress_tx.clone();
                     let run_id = run_id.clone();
@@ -754,7 +794,9 @@ impl Agent {
                         if let Some(working_directory) = working_directory {
                             ctx = ctx.with_working_directory(working_directory);
                         }
-                        let result = if let Some(t) = tool {
+                        let result = if let Some(reason) = denied {
+                            Err(anyhow::anyhow!(reason))
+                        } else if let Some(t) = tool {
                             execute_tool_call(t, call, ctx, &truncation).await
                         } else {
                             Ok(ToolResult::new(
@@ -864,32 +906,30 @@ impl Agent {
         &self.session_state
     }
 
-    /// Handle for queuing steering messages into this agent's runs.
-    ///
-    /// Clone it before calling [`ask`](Agent::ask) (the ask stream borrows
-    /// the agent exclusively) and send from any task while the run is in
-    /// progress. Messages queued while the agent is idle are delivered at
-    /// the start of the next ask.
-    pub fn steering(&self) -> &Steering {
-        &self.steering
-    }
-
     /// Drains queued steering messages into conversation history as user
     /// messages, applying the same reminder treatment as an ordinary prompt.
-    async fn ingest_steered(&mut self) -> Vec<AgentEvent> {
-        let messages = self.steering.drain_messages();
+    async fn ingest_steered(&mut self, inbox: &Steering) -> Vec<AgentEvent> {
+        let messages = inbox.drain_messages();
         let mut events = Vec::new();
-        let mut user_turn = false;
-        for message in messages {
+        // Steered user messages advance the cadence once per drain; a due
+        // reminder attaches to the last of them before it is stored.
+        let last_user = messages
+            .iter()
+            .rposition(|message| matches!(message, InboxMessage::User(_)));
+        if last_user.is_some() {
+            self.reminder.on_user_turn();
+        }
+        for (index, message) in messages.into_iter().enumerate() {
             match message {
                 InboxMessage::User(text) => {
-                    self.memory
-                        .add_message(Message::User {
-                            content: vec![ContentPart::Text { text: text.clone() }],
-                        })
-                        .await;
+                    let mut user = Message::User {
+                        content: vec![ContentPart::Text { text: text.clone() }],
+                    };
+                    if Some(index) == last_user {
+                        self.reminder.apply_to(&mut user);
+                    }
+                    self.memory.add_message(user).await;
                     events.push(AgentEvent::Steered { text });
-                    user_turn = true;
                 }
                 InboxMessage::Background(notification) => {
                     let message = notification.text();
@@ -903,10 +943,6 @@ impl Agent {
                     events.push(AgentEvent::Status { message });
                 }
             }
-        }
-        if user_turn {
-            self.reminder.on_user_turn();
-            self.reminder.apply(self.memory.messages_mut());
         }
         events
     }
@@ -928,6 +964,7 @@ impl Agent {
             llm: Arc::clone(&self.llm),
             tools: Arc::clone(&self.tools),
             system_prompt: self.system_prompt.clone(),
+            tool_policy: self.tool_policy.clone(),
             max_turns: self.max_turns,
             context_limit: self.context_limit,
             truncation: self.truncation.clone(),
@@ -951,6 +988,7 @@ pub struct AgentTemplate {
     llm: Arc<dyn LlmProvider>,
     tools: Arc<Vec<Arc<dyn Tool>>>,
     system_prompt: String,
+    tool_policy: ToolPolicy,
     max_turns: Option<usize>,
     context_limit: usize,
     truncation: TruncationService,
@@ -990,6 +1028,17 @@ impl AgentTemplate {
         self
     }
 
+    /// Replaces the tool execution policy of spawned agents.
+    pub fn with_tool_policy(mut self, tool_policy: ToolPolicy) -> Self {
+        self.tool_policy = tool_policy;
+        self
+    }
+
+    /// The tool execution policy spawned agents run with.
+    pub fn tool_policy(&self) -> &ToolPolicy {
+        &self.tool_policy
+    }
+
     /// Replaces the context limit of spawned agents.
     pub fn with_context_limit(mut self, context_limit: usize) -> Self {
         self.context_limit = context_limit;
@@ -1015,6 +1064,7 @@ impl AgentTemplate {
             llm: self.llm,
             tools: self.tools,
             system_prompt: self.system_prompt,
+            tool_policy: self.tool_policy,
             max_turns: self.max_turns,
             memory,
             context_limit: self.context_limit,
@@ -1026,7 +1076,6 @@ impl AgentTemplate {
             session_state: self.session_state,
             provider_usage: TokenUsage::default(),
             reminder,
-            steering: Steering::new(),
             working_directory: self.working_directory,
             run_abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -1041,6 +1090,9 @@ impl ToolRegistry for Agent {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        self.tool_policy
+            .check(name)
+            .map_err(|reason| -> Box<dyn Error + Send + Sync> { reason.into() })?;
         let tool = self.tools.iter().find(|t| t.name() == name);
         match tool {
             Some(t) => t.execute(args, ctx).await,
@@ -1082,6 +1134,16 @@ impl AgentBuilder {
     /// Configure mode reminders for a newly created agent.
     pub fn with_reminder(mut self, reminder: Reminder) -> Self {
         self.reminder = reminder;
+        self
+    }
+
+    /// Configure which advertised tools may not execute.
+    ///
+    /// Denied tools stay in the tool list — so request prefixes remain stable
+    /// across modes — but calls to them fail with the policy's message.
+    /// Defaults to [`ToolPolicy::allow_all`].
+    pub fn with_tool_policy(mut self, tool_policy: ToolPolicy) -> Self {
+        self.tool_policy = tool_policy;
         self
     }
 
@@ -1192,8 +1254,8 @@ impl AgentBuilder {
             enforcement: self.enforcement,
             provider_usage: TokenUsage::default(),
             reminder: self.reminder,
+            tool_policy: self.tool_policy,
             session_state: self.session_state.unwrap_or_else(SessionState::in_memory),
-            steering: Steering::new(),
             working_directory: self.working_directory,
             run_abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -1411,6 +1473,67 @@ mod tests {
             .collect()
     }
 
+    /// Wraps a `Vec<Message>` and records each message at `add_message` time,
+    /// so tests can assert what a persistence backend actually received.
+    #[derive(Default)]
+    struct RecordingMemory {
+        messages: Vec<Message>,
+        added: Arc<Mutex<Vec<Message>>>,
+    }
+
+    #[async_trait]
+    impl Memory for RecordingMemory {
+        fn messages(&self) -> &[Message] {
+            &self.messages
+        }
+
+        async fn add_message(&mut self, message: Message) {
+            self.added.lock().unwrap().push(message.clone());
+            self.messages.push(message);
+        }
+
+        async fn clear(&mut self) {
+            self.messages.clear();
+        }
+
+        async fn replace(&mut self, messages: Vec<Message>) {
+            self.messages = messages;
+        }
+    }
+
+    #[tokio::test]
+    async fn reminders_are_applied_before_messages_are_stored() -> Result<()> {
+        let added = Arc::new(Mutex::new(Vec::new()));
+        let memory = RecordingMemory {
+            messages: Vec::new(),
+            added: added.clone(),
+        };
+        let mut agent = Agent::builder()
+            .llm(Arc::new(MockProvider::single_content("ok")))
+            .with_reminder(Reminder::switch("FULL MODE REMINDER", None))
+            .memory(Box::new(memory))
+            .build()?;
+        for event in agent.ask("hello").collect::<Vec<_>>().await {
+            event?;
+        }
+        let added = added.lock().unwrap();
+        let user = added
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => Some(content),
+                _ => None,
+            })
+            .expect("the user message must be stored");
+        assert!(
+            user.iter().any(|part| matches!(
+                part,
+                ContentPart::Reminder { text } if text == "FULL MODE REMINDER"
+            )),
+            "the backend stored an undecorated user message: {user:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn reminders_persist_in_history_across_requests() -> Result<()> {
         let response = vec![
@@ -1442,7 +1565,12 @@ mod tests {
         let memory = serde_json::to_string(agent.memory.messages())?;
         assert!(memory.contains("FULL MODE REMINDER"));
         assert!(memory.contains("SPARSE MODE REMINDER"));
-        agent.set_profile(String::new(), Vec::new(), Reminder::default());
+        agent.set_profile(
+            String::new(),
+            Vec::new(),
+            Reminder::default(),
+            ToolPolicy::allow_all(),
+        );
         Ok(())
     }
 
@@ -1632,6 +1760,7 @@ mod tests {
             "new profile".into(),
             vec![],
             Reminder::switch("NEW MODE REMINDER", None),
+            ToolPolicy::allow_all(),
         );
         {
             let events = agent.ask("next step");
@@ -1702,7 +1831,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_summary_does_not_append_compaction() -> Result<()> {
+    async fn empty_summary_does_not_add_a_checkpoint() -> Result<()> {
         let mut agent = Agent::builder()
             .llm(Arc::new(MockProvider::single_content("")))
             .context_limit(20_100)
@@ -2194,6 +2323,79 @@ mod tests {
                 .read::<Vec<String>>("sess-2", "probe")
                 .await?,
             None
+        );
+        Ok(())
+    }
+
+    /// A tool can stay advertised (stable request prefix) while the agent's
+    /// policy refuses to execute it.
+    #[tokio::test]
+    async fn tool_policy_refuses_execution_without_hiding_the_tool() -> Result<()> {
+        let provider = MockProvider::new(vec![
+            vec![
+                ProviderEvent::ToolCallStart {
+                    id: "call_1".to_string(),
+                    name: "state_probe".to_string(),
+                },
+                ProviderEvent::ToolCallDelta {
+                    id: "call_1".to_string(),
+                    delta: r#"{"value":"one"}"#.to_string(),
+                },
+                ProviderEvent::Finish {
+                    reason: Some("tool_calls".to_string()),
+                },
+            ],
+            vec![
+                ProviderEvent::ContentDelta {
+                    delta: "done".to_string(),
+                },
+                ProviderEvent::Finish {
+                    reason: Some("end_turn".to_string()),
+                },
+            ],
+        ]);
+        let mut agent = Agent::builder()
+            .llm(Arc::new(provider))
+            .with_tools(vec![Arc::new(StateProbeTool)])
+            .session_id("sess-1")
+            .with_tool_policy(ToolPolicy::deny(["state_probe"], "read-only mode"))
+            .build()?;
+
+        assert!(agent.list_tools().iter().any(|name| name == "state_probe"));
+
+        let ctx = ToolContext::new("sess-1", "msg");
+        let error = ToolRegistry::execute(
+            &agent,
+            "state_probe",
+            serde_json::json!({"value": "one"}),
+            &ctx,
+        )
+        .await
+        .expect_err("the policy must refuse the call");
+        assert!(error.to_string().contains("read-only mode"), "{error}");
+
+        let events = agent.ask("probe please").collect::<Vec<_>>().await;
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Ok(AgentEvent::Error { error }) if error.contains("read-only mode")
+            )),
+            "{events:?}"
+        );
+        assert!(
+            agent.memory.messages().iter().any(|message| matches!(
+                message,
+                Message::Tool { content, .. } if content.contains("Error: read-only mode")
+            )),
+            "the model must see the refusal"
+        );
+        assert_eq!(
+            agent
+                .session_state()
+                .read::<Vec<String>>("sess-1", "probe")
+                .await?,
+            None,
+            "the refused tool must not run"
         );
         Ok(())
     }

@@ -226,8 +226,9 @@ impl Client {
         }
     }
     /// Change the explicit reasoning effort on an idle session. `None`
-    /// selects the model's configured default. Returns the session id and the
-    /// effort the server applied.
+    /// selects the model's configured default; passing
+    /// [`gewu_protocol::PROVIDER_DEFAULT_EFFORT`] lets the provider choose.
+    /// Returns the session id and the effort the server applied.
     pub async fn switch_reasoning_effort(
         &self,
         effort: Option<&str>,
@@ -577,6 +578,13 @@ impl Client {
             .await
             .ok()?;
         rx.await.ok().flatten()
+    }
+
+    /// Whether the connection actor has stopped — e.g. the upstream server
+    /// restarted or the socket dropped. Calls on a closed client fail with
+    /// [`Error::Connection`]; drop the handle and reconnect.
+    pub fn is_closed(&self) -> bool {
+        self.commands.is_closed()
     }
 
     /// Close the connection, detaching from any server-owned turn. Other `Client`

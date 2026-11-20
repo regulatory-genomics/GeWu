@@ -640,6 +640,24 @@ impl SessionModel {
         }
     }
 
+    /// Whether the running turn is blocked on a user-facing form.
+    ///
+    /// Live-only: question forms are never replayed from stored history, and
+    /// [`finish_ask`](Self::finish_ask) settles a still-pending form when the
+    /// turn ends, so an idle or resumed session never reports waiting.
+    pub fn has_pending_question(&self) -> bool {
+        self.blocks.iter().any(|block| {
+            matches!(
+                block,
+                Block::Tool {
+                    tool,
+                    question: Some(QuestionState::Pending { .. }),
+                    ..
+                } if tool == "question"
+            )
+        })
+    }
+
     /// Record the session id; `None` is ignored so a known id is sticky.
     pub fn set_session(&mut self, session_id: Option<String>) {
         if session_id.is_some() {
@@ -870,6 +888,7 @@ mod tests {
                 ..
             } if request_id == "que_1"
         ));
+        assert!(m.has_pending_question());
 
         assert_eq!(
             m.apply_event(&AgentEvent::QuestionResolved {
@@ -885,6 +904,7 @@ mod tests {
                 ..
             } if answers == &vec![vec!["SQLite".to_string()]]
         ));
+        assert!(!m.has_pending_question());
 
         // The tool result still lands in the same card.
         let _ = m.apply_event(&AgentEvent::ToolFinish {
@@ -942,6 +962,13 @@ mod tests {
                 ..
             } if request_id == "que_b"
         ));
+        // The first question is still open, so the turn is still blocked.
+        assert!(m.has_pending_question());
+        let _ = m.apply_event(&AgentEvent::QuestionResolved {
+            request_id: "que_a".into(),
+            answers: None,
+        });
+        assert!(!m.has_pending_question());
     }
 
     #[test]
@@ -956,7 +983,9 @@ mod tests {
             request_id: "que_1".into(),
             questions: vec![question()],
         });
+        assert!(m.has_pending_question());
         m.finish_ask();
+        assert!(!m.has_pending_question());
         assert!(matches!(
             &m.blocks[0],
             Block::Tool {

@@ -10,9 +10,9 @@ use gewu_tools::workflow::{
     RunProgress, WorkflowCancelTool, WorkflowManager, WorkflowStartTool, WorkflowStatusTool,
 };
 use gewu_tools::{
-    ApplyPatchTool, BashTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool, ImageLimits,
-    ListTool, QuestionTool, ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoReadTool,
-    TodoWriteTool, WebFetchTool, WebSearchTool, WriteFileTool,
+    ApplyPatchTool, BashTool, EditFileTool, GlobTool, GrepTool, ImageLimits, QuestionTool,
+    ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoReadTool, TodoWriteTool, WebFetchTool,
+    WebSearchTool, WriteFileTool,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -21,6 +21,7 @@ use std::error::Error;
 use std::sync::{Arc, Mutex};
 
 use crate::config::AgentEntry;
+use crate::tool_policy;
 
 const RESERVED_ADDITIONAL_TOOL_NAMES: &[&str] = &[
     "apply_patch",
@@ -112,8 +113,29 @@ pub fn list_agent_names() -> Vec<String> {
 /// Primary eligibility shared by session creation, listing and profile switches.
 pub fn primary_agent_names(agents: &BTreeMap<String, AgentEntry>) -> Vec<String> {
     let mut names = list_agent_names();
-    names.extend(agents.iter().filter(|(_, a)| a.primary).map(|(name, _)| name.clone()));
+    names.extend(
+        agents
+            .iter()
+            .filter(|(_, a)| a.primary)
+            .map(|(name, _)| name.clone()),
+    );
     names
+}
+
+/// The execution policy for a profile or config-defined agent.
+///
+/// Config-defined agents inherit the mode policy of the profile they are
+/// based on.
+pub fn profile_tool_policy(
+    name: &str,
+    agents: &BTreeMap<String, AgentEntry>,
+    external: &[Arc<dyn Tool>],
+) -> gewu_core::agent::ToolPolicy {
+    let base = agents
+        .get(name)
+        .map(|entry| entry.base.as_str())
+        .unwrap_or(name);
+    tool_policy::policy_for(base).execution_policy(external)
 }
 
 struct ToolRegistryImpl {
@@ -310,7 +332,7 @@ impl SqliteAgentFactory {
                     inherited
                 }
             };
-            let effort = effort.filter(|effort| entry.effort_providers.contains_key(effort));
+            let effort = effort.filter(|effort| entry.supports_effort(effort));
             let provider = entry.provider_for(effort.as_deref()).ok_or_else(|| {
                 format!("reasoning effort is unavailable for subagent model: {selector}")
             })?;
@@ -394,6 +416,7 @@ impl SqliteAgentFactory {
             .system_prompt(&system_prompt)
             .working_directory(working_directory)
             .with_enforcement(self.enforcement)
+            .with_tool_policy(profile_tool_policy(profile, &self.agents, &[]))
             .with_session_state(session_state)
             .build()?
             .template();
@@ -435,26 +458,31 @@ fn agent_factory(
     })
 }
 
-/// Builds the task tool wired to the CLI registry. `allowed` filters which
-/// subagent types are advertised and permitted; empty means all of them.
-/// Config-defined agents are advertised alongside the built-ins (still
-/// subject to `allowed`, so restricted profiles like plan never see them).
+/// Builds the task tool wired to the CLI registry.
+///
+/// Every mode advertises the same subagents (built-in and config-defined) so
+/// the tool definition stays mode-independent; `allowlist` restricts which of
+/// them may actually be spawned, with `None` allowing all.
 fn task_tool(
     factory: Arc<SqliteAgentFactory>,
     agents: Arc<BTreeMap<String, AgentEntry>>,
-    allowed: &[&str],
+    allowlist: Option<&[&str]>,
 ) -> TaskTool {
+    // Every mode advertises the same subagents so the task tool's definition
+    // (and the request prefix) does not change when the mode switches; the
+    // allow-list enforces a mode's delegation rules at execution time.
     let mut advertised: Vec<(String, String)> = list_available_agents()
         .into_iter()
-        .filter(|a| allowed.is_empty() || allowed.contains(&a.name.as_str()))
         .map(|a| (a.name, a.description))
         .collect();
     for (name, entry) in agents.iter() {
-        if allowed.is_empty() || allowed.contains(&name.as_str()) {
-            advertised.push((name.clone(), entry.description.clone()));
-        }
+        advertised.push((name.clone(), entry.description.clone()));
     }
-    TaskTool::new(factory, advertised)
+    let allowed = match allowlist {
+        Some(allowed) => allowed.iter().map(|name| name.to_string()).collect(),
+        None => advertised.iter().map(|(name, _)| name.clone()).collect(),
+    };
+    TaskTool::new_with_allowlist(factory, advertised, allowed)
 }
 
 /// One workflow manager per profile: it validates specs, spawns runs, and
@@ -488,8 +516,9 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
         question_broker,
         ..
     } = inputs;
+    let policy = tool_policy::policy_for(name);
     let mut tools: Vec<Box<dyn Tool>> = match *name {
-        "build" => {
+        "build" | "plan" | "general" => {
             let factory = agent_factory(
                 inputs.model_catalog.clone(),
                 provider.clone(),
@@ -504,7 +533,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
             );
             let workflows = workflow_manager(factory.clone(), workflow_progress.clone());
             vec![
-                Box::new(task_tool(factory, agents.clone(), &[])),
+                Box::new(task_tool(factory, agents.clone(), policy.task_allowlist)),
                 Box::new(WorkflowStartTool::new(workflows.clone())),
                 Box::new(WorkflowStatusTool::new(workflows.clone())),
                 Box::new(WorkflowCancelTool::new(workflows)),
@@ -530,51 +559,6 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 }),
                 Box::new(GrepTool {
                     working_directory: working_directory.clone(),
-                }),
-                Box::new(WebFetchTool::default()),
-                Box::new(ListTool {
-                    working_directory: working_directory.clone(),
-                }),
-                Box::new(CodeSearchTool),
-                Box::new(WebSearchTool),
-                Box::new(TodoWriteTool),
-                Box::new(TodoReadTool),
-            ]
-        }
-        "plan" => {
-            vec![
-                Box::new(task_tool(
-                    agent_factory(
-                        inputs.model_catalog.clone(),
-                        provider.clone(),
-                        pool.clone(),
-                        skills.clone(),
-                        working_directory.clone(),
-                        *enforcement,
-                        *image_limits,
-                        *context_limit,
-                        agents.clone(),
-                        workflow_progress.clone(),
-                    ),
-                    agents.clone(),
-                    &["explore"],
-                )),
-                Box::new(ReadFileTool {
-                    working_directory: working_directory.clone(),
-                    image_limits: *image_limits,
-                }),
-                Box::new(GlobTool {
-                    working_directory: working_directory.clone(),
-                }),
-                Box::new(GrepTool {
-                    working_directory: working_directory.clone(),
-                }),
-                Box::new(ListTool {
-                    working_directory: working_directory.clone(),
-                }),
-                Box::new(BashTool {
-                    working_directory: working_directory.clone(),
-                    safe_mode: false,
                 }),
                 Box::new(WebFetchTool::default()),
                 Box::new(WebSearchTool),
@@ -599,63 +583,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                     working_directory: working_directory.clone(),
                 }),
                 Box::new(WebFetchTool::default()),
-                Box::new(ListTool {
-                    working_directory: working_directory.clone(),
-                }),
-                Box::new(CodeSearchTool),
                 Box::new(WebSearchTool),
-            ]
-        }
-        "general" => {
-            let factory = agent_factory(
-                inputs.model_catalog.clone(),
-                provider.clone(),
-                pool.clone(),
-                skills.clone(),
-                working_directory.clone(),
-                *enforcement,
-                *image_limits,
-                *context_limit,
-                agents.clone(),
-                workflow_progress.clone(),
-            );
-            let workflows = workflow_manager(factory.clone(), workflow_progress.clone());
-            vec![
-                Box::new(task_tool(factory, agents.clone(), &[])),
-                Box::new(WorkflowStartTool::new(workflows.clone())),
-                Box::new(WorkflowStatusTool::new(workflows.clone())),
-                Box::new(WorkflowCancelTool::new(workflows)),
-                Box::new(ReadFileTool {
-                    working_directory: working_directory.clone(),
-                    image_limits: *image_limits,
-                }),
-                Box::new(ApplyPatchTool {
-                    working_directory: working_directory.clone(),
-                }),
-                Box::new(WriteFileTool {
-                    working_directory: working_directory.clone(),
-                }),
-                Box::new(EditFileTool {
-                    working_directory: working_directory.clone(),
-                }),
-                Box::new(GlobTool {
-                    working_directory: working_directory.clone(),
-                }),
-                Box::new(BashTool {
-                    working_directory: working_directory.clone(),
-                    safe_mode: false,
-                }),
-                Box::new(GrepTool {
-                    working_directory: working_directory.clone(),
-                }),
-                Box::new(WebFetchTool::default()),
-                Box::new(ListTool {
-                    working_directory: working_directory.clone(),
-                }),
-                Box::new(CodeSearchTool),
-                Box::new(WebSearchTool),
-                Box::new(TodoWriteTool),
-                Box::new(TodoReadTool),
             ]
         }
         _ => {
@@ -673,7 +601,9 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
     if !skills.is_empty() {
         tools.push(Box::new(SkillTool::new(skills.clone())));
     }
-    // Only broker-backed top-level profiles can ask; subagent factories pass None.
+    // Only top-level build/plan/general sessions can ask: subagent templates
+    // and config-defined agents are built with `question_broker: None`, since
+    // no front-end would render their questions.
     if let Some(broker) = question_broker
         && matches!(*name, "build" | "plan" | "general")
     {
@@ -700,11 +630,10 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
             tool.name()
         );
     }
-    // Additional tools (including MCP) have no read-only capability contract.
-    // Never expose them in Plan, even indirectly through BatchTool.
-    if *name != "plan" {
-        tools_arc.extend(additional_tools.iter().cloned());
-    }
+    // Additional tools (including MCP) are advertised in every mode so the
+    // tool prefix stays stable; a mode policy that denies external tools
+    // refuses to execute them instead.
+    tools_arc.extend(additional_tools.iter().cloned());
 
     let registry: Arc<dyn ToolRegistry> = Arc::new(ToolRegistryImpl {
         tools: Arc::new(tools_arc.clone()),
@@ -730,14 +659,14 @@ fn build_custom_agent_tools(
         provider: inputs.provider.clone(),
         pool: inputs.pool.clone(),
         working_directory: inputs.working_directory.clone(),
-        additional_tools: if entry.primary { inputs.additional_tools.clone() } else { Vec::new() },
+        additional_tools: Vec::new(),
         skills: inputs.skills.clone(),
         enforcement: inputs.enforcement,
         image_limits: inputs.image_limits,
         context_limit: inputs.context_limit,
         agents: inputs.agents.clone(),
         workflow_progress: inputs.workflow_progress.clone(),
-        question_broker: if entry.primary { inputs.question_broker.clone() } else { None },
+        question_broker: None,
         session_id: inputs.session_id,
     })?;
     let tools: Vec<Arc<dyn Tool>> = match &entry.tools {
@@ -791,6 +720,7 @@ pub async fn create_agent(
     } = inputs;
 
     let memory = SqliteMemory::new(pool.clone(), session_id.to_string()).await?;
+    let tool_policy = profile_tool_policy(name, &agents, &additional_tools);
 
     let (all_tools, system_prompt, registry) = agent_profile(ProfileInputs {
         model_catalog,
@@ -815,6 +745,7 @@ pub async fn create_agent(
         .system_prompt(&system_prompt)
         .working_directory(working_directory)
         .with_enforcement(enforcement)
+        .with_tool_policy(tool_policy)
         // Tools observe the real conversation identity (e.g. the task tool
         // records subagent lineage against it), not a random UUID.
         .session_id(session_id)
@@ -904,16 +835,14 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
     Ok((tools_arc, system_prompt, registry))
 }
 
-/// The built-in system prompt for a profile name. `build` and `general`
-/// extend the shared base with the background-workflow note (their profiles
-/// carry the workflow tools; `plan` does not).
+/// The built-in system prompt for a profile name. `build` and `plan` share
+/// one prompt so switching modes keeps the system prefix stable; workflow
+/// guidance lives in the `workflow_start` tool description instead.
 fn base_profile_prompt(name: &str) -> Result<String> {
-    const WORKFLOW_NOTE: &str = include_str!("prompts/workflow-note.txt");
     Ok(match name {
-        "build" => format!("{}\n\n{WORKFLOW_NOTE}", include_str!("prompts/build.txt")),
-        "plan" => include_str!("prompts/build.txt").to_string(),
+        "build" | "plan" => include_str!("prompts/build.txt").to_string(),
         "explore" => include_str!("prompts/explore.txt").to_string(),
-        "general" => format!("{}\n\n{WORKFLOW_NOTE}", include_str!("prompts/general.txt")),
+        "general" => include_str!("prompts/general.txt").to_string(),
         _ => return Err(anyhow!("Unknown agent type: {}", name)),
     })
 }
@@ -1046,15 +975,6 @@ mod tests {
         .unwrap();
         assert!(!tools.iter().any(|tool| tool.name() == "question"));
 
-        let mut entry = custom_entry("general", None, Some(&["question"]));
-        entry.primary = true;
-        let (_, tools) = build_tool_registry_and_list(&ProfileInputs {
-            agents: Arc::new(BTreeMap::from([("benchmark".to_string(), entry)])),
-            question_broker: Some(broker),
-            ..test_inputs("benchmark", provider.clone(), pool.clone(), dir.path().to_path_buf(), vec![], vec![], "session")
-        }).unwrap();
-        assert!(tools.iter().any(|tool| tool.name() == "question"), "opted-in primary profiles must be able to ask supervised questions");
-
         let (_, tools) = build_tool_registry_and_list(&test_inputs(
             "build",
             provider,
@@ -1102,11 +1022,11 @@ mod tests {
     /// A config-defined agent entry for tests.
     fn custom_entry(base: &str, instructions: Option<&str>, tools: Option<&[&str]>) -> AgentEntry {
         AgentEntry {
-            primary: false,
             base: base.to_string(),
             description: "test agent".to_string(),
             instructions: instructions.map(str::to_string),
             tools: tools.map(|list| list.iter().map(|t| t.to_string()).collect()),
+            primary: false,
         }
     }
 
@@ -1143,7 +1063,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_and_plan_share_base_prompt() {
+    async fn build_and_plan_share_the_same_prompt() {
         let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
         let dir = tempfile::tempdir().unwrap();
         let mut prompts = Vec::new();
@@ -1160,7 +1080,7 @@ mod tests {
             .unwrap();
             prompts.push(prompt);
         }
-        assert!(prompts[0].starts_with(prompts[1].as_str()));
+        assert_eq!(prompts[0], prompts[1]);
     }
 
     #[test]
@@ -1174,9 +1094,9 @@ mod tests {
         ] {
             let mut reminder = profile_reminder(previous, target);
             reminder.on_user_turn();
-            let mut messages = vec![Message::User { content: vec![] }];
-            reminder.apply(&mut messages);
-            let Message::User { content } = &messages[0] else {
+            let mut message = Message::User { content: vec![] };
+            reminder.apply_to(&mut message);
+            let Message::User { content } = &message else {
                 unreachable!()
             };
             match expected {
@@ -1186,69 +1106,68 @@ mod tests {
                 None => assert!(content.is_empty()),
             }
             reminder.on_user_turn();
-            let mut next = vec![Message::User { content: vec![] }];
-            reminder.apply(&mut next);
-            assert_eq!(next, vec![Message::User { content: vec![] }]);
+            let mut next = Message::User { content: vec![] };
+            reminder.apply_to(&mut next);
+            assert_eq!(next, Message::User { content: vec![] });
         }
     }
 
     #[tokio::test]
-    async fn plan_has_no_editing_tools() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
+    async fn build_and_plan_advertise_identical_tool_definitions() {
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let (_, tools) = build_tool_registry_and_list(&test_inputs(
-            "plan",
-            Arc::new(DummyLlm),
-            pool,
-            dir.path().to_path_buf(),
-            vec![Arc::new(NamedTool("external_mutator"))],
-            vec![],
-            "session",
-        ))
-        .unwrap();
-        let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
-        for expected in [
+        let inputs = |name: &'static str| {
+            test_inputs(
+                name,
+                Arc::new(DummyLlm),
+                pool.clone(),
+                dir.path().to_path_buf(),
+                vec![Arc::new(NamedTool("external_mutator"))],
+                vec![],
+                "session",
+            )
+        };
+        let (_, build_tools) = build_tool_registry_and_list(&inputs("build")).unwrap();
+        let (_, plan_tools) = build_tool_registry_and_list(&inputs("plan")).unwrap();
+
+        // Tools precede the system prompt on the wire, so a mode switch must
+        // keep both identical to preserve the provider's prompt cache prefix.
+        let definitions = |tools: &[Arc<dyn Tool>]| {
+            tools
+                .iter()
+                .map(|tool| {
+                    (
+                        tool.name().to_string(),
+                        tool.description().to_string(),
+                        serde_json::to_value(tool.schema()).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            definitions(&build_tools),
+            definitions(&plan_tools),
+            "modes must advertise identical tool definitions"
+        );
+
+        // Plan advertises what it refuses, including external tools; the
+        // policy refuses them at execution time instead.
+        let names: Vec<_> = plan_tools.iter().map(|tool| tool.name()).collect();
+        for advertised in [
             "read_file",
-            "glob",
-            "grep",
-            "list",
-            "webfetch",
-            "websearch",
-            "bash",
-            "task",
-            "todowrite",
-            "todoread",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "workflow_start",
+            "external_mutator",
         ] {
-            assert!(names.contains(&expected), "Plan is missing {expected}");
+            assert!(names.contains(&advertised), "plan is missing {advertised}");
         }
-        for forbidden in ["write_file", "edit_file", "apply_patch", "external_mutator"] {
-            assert!(!names.contains(&forbidden), "Plan exposes {forbidden}");
-        }
-        // Delegation is restricted to the read-only explore subagent.
-        let task = tools
-            .iter()
-            .find(|tool| tool.name() == "task")
-            .expect("plan should expose the task tool");
-        let description = task.description();
-        assert!(
-            description.contains("\"explore\""),
-            "plan task tool should advertise explore"
-        );
-        assert!(
-            !description.contains("\"build\""),
-            "plan task tool must not advertise build"
-        );
-        assert!(
-            !description.contains("\"general\""),
-            "plan task tool must not advertise general"
-        );
+
         // Bash is unrestricted (prompt-restricted to read-only, like
         // opencode's plan mode): a command outside the old safe-mode
         // allow-list executes instead of being refused.
-        let bash = tools
+        let bash = plan_tools
             .iter()
             .find(|tool| tool.name() == "bash")
             .expect("plan should expose bash");
@@ -1267,6 +1186,83 @@ mod tests {
         assert!(
             dir.path().join("plan_probe").exists(),
             "plan bash should execute commands outside the safe-mode allow-list"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_policy_refuses_mutations_and_delegation_at_execution() {
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _) = create_agent(
+            test_inputs(
+                "plan",
+                Arc::new(DummyLlm),
+                pool,
+                dir.path().to_path_buf(),
+                vec![Arc::new(NamedTool("external_mutator"))],
+                vec![],
+                "session",
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        let advertised = agent.list_tools();
+        for name in [
+            "apply_patch",
+            "write_file",
+            "edit_file",
+            "workflow_start",
+            "workflow_status",
+            "workflow_cancel",
+            "external_mutator",
+        ] {
+            assert!(
+                advertised.iter().any(|tool| tool == name),
+                "plan must advertise {name} for prefix stability"
+            );
+            let error = agent
+                .execute(
+                    name,
+                    serde_json::json!({}),
+                    &ToolContext::new("session", "message"),
+                )
+                .await
+                .expect_err("plan must refuse to execute the tool");
+            assert!(error.to_string().contains("read-only"), "{name}: {error}");
+        }
+        let target = dir.path().join("probe.txt");
+        let error = agent
+            .execute(
+                "write_file",
+                serde_json::json!({
+                    "file_path": target.to_str().unwrap(),
+                    "content": "nope",
+                }),
+                &ToolContext::new("session", "message"),
+            )
+            .await
+            .expect_err("plan must refuse write_file");
+        assert!(error.to_string().contains("read-only"), "{error}");
+        assert!(!target.exists());
+
+        // Every subagent is advertised, but plan may only spawn explore.
+        let result = agent
+            .execute(
+                "task",
+                serde_json::json!({
+                    "subagent_type": "general",
+                    "description": "delegate",
+                    "prompt": "do work",
+                }),
+                &ToolContext::new("session", "message"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains("not available"),
+            "plan must refuse to spawn build agents: {}",
+            result.output
         );
     }
 
@@ -1376,12 +1372,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_patch_is_only_in_mutating_profiles() {
+    async fn apply_patch_is_advertised_in_every_delegating_profile() {
         let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
         let directory = tempdir().unwrap();
         let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
 
-        for profile in ["build", "general"] {
+        for profile in ["build", "plan", "general"] {
             let (_, tools) = build_tool_registry_and_list(&test_inputs(
                 profile,
                 provider.clone(),
@@ -1392,7 +1388,10 @@ mod tests {
                 "session",
             ))
             .unwrap();
-            assert!(tools.iter().any(|tool| tool.name() == "apply_patch"));
+            assert!(
+                tools.iter().any(|tool| tool.name() == "apply_patch"),
+                "{profile} should advertise apply_patch"
+            );
         }
 
         let (_, tools) = build_tool_registry_and_list(&test_inputs(
@@ -1588,7 +1587,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_agents_are_advertised_to_delegating_profiles_only() {
+    async fn custom_agents_are_advertised_in_every_mode_but_plan_refuses_them() {
         let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
         let dir = tempdir().unwrap();
         let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
@@ -1640,8 +1639,24 @@ mod tests {
             .find(|tool| tool.name() == "task")
             .expect("plan exposes task");
         assert!(
-            !task.description().contains("\"reviewer\""),
-            "plan's task tool must not advertise config agents"
+            task.description().contains("\"reviewer\""),
+            "plan advertises config agents too, keeping the task definition mode-independent"
+        );
+        let result = task
+            .execute(
+                serde_json::json!({
+                    "subagent_type": "reviewer",
+                    "description": "review",
+                    "prompt": "review it",
+                }),
+                &ToolContext::new("session", "message"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains("not available"),
+            "plan must refuse config agents: {}",
+            result.output
         );
     }
 
@@ -1889,12 +1904,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_tools_are_only_in_delegating_profiles() {
+    async fn workflow_tools_are_advertised_in_every_mode_but_plan_refuses_them() {
         let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
         let dir = tempdir().unwrap();
         let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
 
-        for profile in ["build", "general"] {
+        for profile in ["build", "plan", "general"] {
             let (_, tools) = build_tool_registry_and_list(&test_inputs(
                 profile,
                 provider.clone(),
@@ -1913,23 +1928,31 @@ mod tests {
             }
         }
 
-        for profile in ["explore", "plan"] {
-            let (_, tools) = build_tool_registry_and_list(&test_inputs(
-                profile,
-                provider.clone(),
-                pool.clone(),
-                dir.path().to_path_buf(),
-                vec![],
-                vec![],
-                "session",
-            ))
-            .unwrap();
-            for forbidden in ["workflow_start", "workflow_status", "workflow_cancel"] {
-                assert!(
-                    !tools.iter().any(|tool| tool.name() == forbidden),
-                    "{profile} exposes {forbidden}"
-                );
-            }
+        // Explore keeps its own read-only set rather than the shared one.
+        let (_, tools) = build_tool_registry_and_list(&test_inputs(
+            "explore",
+            provider,
+            pool,
+            dir.path().to_path_buf(),
+            vec![],
+            vec![],
+            "session",
+        ))
+        .unwrap();
+        for forbidden in ["workflow_start", "workflow_status", "workflow_cancel"] {
+            assert!(
+                !tools.iter().any(|tool| tool.name() == forbidden),
+                "explore exposes {forbidden}"
+            );
+        }
+
+        let agents: BTreeMap<String, AgentEntry> = BTreeMap::new();
+        let policy = profile_tool_policy("plan", &agents, &[]);
+        for denied in ["workflow_start", "workflow_status", "workflow_cancel"] {
+            assert!(
+                policy.check(denied).is_err(),
+                "plan must refuse {denied} at execution"
+            );
         }
     }
 

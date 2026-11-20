@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use gewu_core::traits::{LlmProvider, RequestLog};
 use gewu_core::types::PathEnforcement;
-use gewu_protocol::REASONING_EFFORTS;
+use gewu_protocol::{PROVIDER_DEFAULT_EFFORT, REASONING_EFFORTS};
 use gewu_providers::{
     AnthropicProvider, ChatCompletionsProvider, DeepSeekProvider, GlmProvider, MoonshotProvider,
     OpenAIProvider, ProviderProfile,
@@ -81,12 +81,22 @@ pub struct ModelEntry {
 
 impl ModelEntry {
     /// The provider for an explicit effort, or the configured default when
-    /// `effort` is `None`. Returns `None` for an unsupported effort.
+    /// `effort` is `None`. [`PROVIDER_DEFAULT_EFFORT`] selects the provider
+    /// built without an effort field. Returns `None` for an unsupported effort.
     pub fn provider_for(&self, effort: Option<&str>) -> Option<Arc<dyn LlmProvider>> {
         match effort {
             None => Some(self.provider.clone()),
+            // The configured effort's provider is the default one.
+            Some(effort) if self.default_effort.as_deref() == Some(effort) => {
+                Some(self.provider.clone())
+            }
             Some(effort) => self.effort_providers.get(effort).cloned(),
         }
+    }
+
+    /// Whether `effort` can be selected for this model at runtime.
+    pub fn supports_effort(&self, effort: &str) -> bool {
+        self.default_effort.as_deref() == Some(effort) || self.effort_providers.contains_key(effort)
     }
 }
 
@@ -370,17 +380,23 @@ pub fn build_model_catalog(
                 continue;
             };
             let label = model_config.model.clone().unwrap_or_else(|| key.clone());
+            // A configured `provider-default` is the same as configuring no
+            // effort; never send the sentinel to the provider.
+            let configured_effort = model_config
+                .reasoning_effort
+                .as_deref()
+                .filter(|effort| *effort != PROVIDER_DEFAULT_EFFORT);
             match construct_provider(
                 profile,
                 &api_key,
                 &settings.base_url,
                 &label,
                 model_config.max_tokens,
-                model_config.reasoning_effort.as_deref(),
+                configured_effort,
                 model_config.reasoning_summary,
             ) {
                 Ok(provider) => {
-                    let default_effort = model_config.reasoning_effort.clone();
+                    let default_effort = configured_effort.map(str::to_string);
                     // OpenAI-family and Anthropic models expose the control
                     // by default; other services opt in through config.
                     let supports_reasoning_effort = default_effort.is_some()
@@ -392,6 +408,17 @@ pub fn build_model_catalog(
                         );
                     let mut effort_providers = BTreeMap::new();
                     if supports_reasoning_effort {
+                        if let Ok(provider) = construct_provider(
+                            profile,
+                            &api_key,
+                            &settings.base_url,
+                            &label,
+                            model_config.max_tokens,
+                            None,
+                            model_config.reasoning_summary,
+                        ) {
+                            effort_providers.insert(PROVIDER_DEFAULT_EFFORT.to_string(), provider);
+                        }
                         for effort in REASONING_EFFORTS {
                             match construct_provider(
                                 profile,
@@ -800,7 +827,21 @@ mod tests {
         assert!(catalog["west/fast"].supports_reasoning_effort);
         assert_eq!(
             catalog["west/fast"].effort_providers.len(),
-            REASONING_EFFORTS.len()
+            REASONING_EFFORTS.len() + 1
+        );
+        assert!(
+            catalog["west/fast"].supports_effort(PROVIDER_DEFAULT_EFFORT),
+            "the provider default is always selectable when effort is supported"
+        );
+        assert!(
+            catalog["west/fast"]
+                .provider_for(Some(PROVIDER_DEFAULT_EFFORT))
+                .unwrap()
+                .build(&[], &[])
+                .unwrap()["reasoning"]
+                .get("effort")
+                .is_none(),
+            "the provider default sends no reasoning effort"
         );
         assert_eq!(
             catalog["west/fast"]

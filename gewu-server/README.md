@@ -60,10 +60,10 @@ curl -fL "http://127.0.0.1:8422/download?session_id=s1&path=src/main.rs" -o main
 
 `path` is resolved against that session's workspace with the same containment
 rules as the file tools. Files are served as attachments; directories become
-a ZIP whose root is the directory itself and whose entries mirror the visible
-file tree (hidden and gitignored entries are skipped, symlinks are not
-followed). A folder download is capped at 20,000 entries and 2 GiB
-uncompressed. When the server runs with `--token`, send
+a ZIP whose root is the directory itself and whose entries mirror the file
+tree (hidden entries are skipped, ignore rules such as `.gitignore` are not
+applied, symlinks are not followed). A folder download is capped at 20,000
+entries and 2 GiB uncompressed. When the server runs with `--token`, send
 `Authorization: Bearer <token>`.
 
 #### Authentication

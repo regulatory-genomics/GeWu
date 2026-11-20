@@ -5,10 +5,9 @@
 - Searches are performed automatically within a single API call
 
 Usage notes:
-  - Supports live crawling modes: 'fallback' (backup if cached unavailable) or 'preferred' (prioritize live crawling)
-  - Search types: 'auto' (balanced), 'fast' (quick results), 'deep' (comprehensive search)
-  - Configurable context length for optimal LLM integration
-  - Domain filtering and advanced search options available
+  - Describe the ideal page, not keywords. "blog post comparing React and Vue performance" not "React vs Vue"
+  - Optional objective: state which documents should rank first, which should be excluded, and what specific facts or figures to pull from them
+  - Configurable result count via numResults (default 8)
 
 The current year is 2026. You MUST use this year when searching for recent information or current events
 - Example: If the current year is 2026 and the user asks for "latest AI news", search for "AI news 2026", NOT "AI news 2025"

@@ -29,6 +29,7 @@ mod openai;
 mod profile;
 mod providers;
 mod responses;
+mod schema;
 mod services;
 
 pub use profile::ProviderProfile;

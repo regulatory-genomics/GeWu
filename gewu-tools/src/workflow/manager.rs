@@ -191,6 +191,10 @@ impl WorkflowManager {
             }
         }
 
+        let background_job = inbox
+            .as_ref()
+            .map(|inbox| inbox.begin_background_job().ok_or("agent inbox is closed"))
+            .transpose()?;
         let run_id = uuid::Uuid::new_v4().to_string();
         // Seed the node order synchronously so even the first progress
         // snapshot lists every node (the engine repeats this when it runs).
@@ -220,6 +224,7 @@ impl WorkflowManager {
         let completion_id = run_id.clone();
         let handle = tokio::spawn(async move {
             use futures_util::FutureExt;
+            let _background_job = background_job;
             let result = std::panic::AssertUnwindSafe(run).catch_unwind().await;
             let mut state = completion_state.lock().expect("run state mutex poisoned");
             if result.is_err() {
@@ -481,6 +486,24 @@ mod tests {
             manager.status(&run_id, OWNER).unwrap().status,
             RunStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_the_background_job() {
+        use gewu_core::agent::{IdleAction, Steering};
+
+        let (manager, _) = setup(Duration::from_secs(60));
+        let inbox = Steering::new();
+        let run_id = manager
+            .start_with_inbox(spec_value(), OWNER, Some(inbox.clone()))
+            .await
+            .unwrap();
+        assert_eq!(inbox.idle_action(), IdleAction::Wait);
+        manager.cancel(&run_id, OWNER).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), inbox.notified())
+            .await
+            .unwrap();
+        assert_eq!(inbox.idle_action(), IdleAction::Finish);
     }
 
     fn spec_value() -> serde_json::Value {

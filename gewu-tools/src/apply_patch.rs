@@ -332,6 +332,10 @@ fn parse_patch(input: &str) -> Result<Vec<PatchOperation>> {
                 None
             };
             let mut chunks = Vec::new();
+            // A bare `@@` followed by a single context line is a common way
+            // models spell "anchor the next chunk here". Fold it into the
+            // next chunk's anchor instead of rejecting the update.
+            let mut pending_anchor: Option<(String, usize)> = None;
 
             while index < end && !is_file_header(lines[index]) {
                 if lines[index].is_empty() && index + 1 < end && is_file_header(lines[index + 1]) {
@@ -398,11 +402,36 @@ fn parse_patch(input: &str) -> Result<Vec<PatchOperation>> {
                     index += 1;
                 }
 
-                anyhow::ensure!(
-                    changed,
-                    "Update chunk at line {} does not change any lines",
-                    patch_line
-                );
+                if !changed {
+                    anyhow::ensure!(
+                        anchor.is_none() && old_lines.len() == 1 && !end_of_file,
+                        "Update chunk at line {patch_line} does not change any lines. Put the \
+                         anchor on the @@ line (`@@ <context line>`) and include at least one \
+                         + or - line."
+                    );
+                    anyhow::ensure!(
+                        pending_anchor.is_none(),
+                        "Context-only chunks at lines {} and {patch_line} are consecutive; \
+                         each anchor must be followed by a chunk with + or - lines.",
+                        pending_anchor
+                            .as_ref()
+                            .map(|(_, line)| *line)
+                            .unwrap_or_default()
+                    );
+                    pending_anchor = Some((old_lines.remove(0), patch_line));
+                    continue;
+                }
+                let anchor = match pending_anchor.take() {
+                    Some((line, anchor_line)) => {
+                        anyhow::ensure!(
+                            anchor.is_none(),
+                            "Chunk at line {patch_line} has its own @@ anchor but follows the \
+                             context-only chunk at line {anchor_line}; keep only one anchor."
+                        );
+                        Some(line)
+                    }
+                    None => anchor,
+                };
                 chunk_count += 1;
                 anyhow::ensure!(
                     chunk_count <= MAX_CHUNKS,
@@ -425,6 +454,14 @@ fn parse_patch(input: &str) -> Result<Vec<PatchOperation>> {
                 });
             }
 
+            anyhow::ensure!(
+                pending_anchor.is_none(),
+                "Context-only chunk at line {} is not followed by a chunk with + or - lines",
+                pending_anchor
+                    .as_ref()
+                    .map(|(_, line)| *line)
+                    .unwrap_or_default()
+            );
             anyhow::ensure!(
                 !chunks.is_empty() || move_to.is_some(),
                 "Update for {path} must contain a chunk or Move to directive"
@@ -928,14 +965,15 @@ fn apply_chunks(input: &str, chunks: &[UpdateChunk], label: &str) -> Result<Stri
 
     for chunk in chunks {
         let start = if let Some(anchor) = &chunk.anchor {
-            seek_unique(&text.lines, std::slice::from_ref(anchor), cursor, false).with_context(
-                || {
-                    format!(
-                        "Failed to find context {:?} in {label} for patch line {}",
-                        anchor, chunk.patch_line
-                    )
-                },
-            )? + 1
+            let pattern = std::slice::from_ref(anchor);
+            seek_unique(&text.lines, pattern, cursor, false).with_context(|| {
+                format!(
+                    "Failed to find context {:?} in {label} for patch line {}{}",
+                    anchor,
+                    chunk.patch_line,
+                    missing_context_hint(&text.lines, pattern, cursor)
+                )
+            })? + 1
         } else {
             cursor
         };
@@ -947,15 +985,21 @@ fn apply_chunks(input: &str, chunks: &[UpdateChunk], label: &str) -> Result<Stri
                 start
             }
         } else {
-            seek_unique(&text.lines, &chunk.old_lines, start, chunk.end_of_file).with_context(
-                || {
-                    format!(
-                        "Failed to find expected lines in {label} for patch line {}:\n{}",
-                        chunk.patch_line,
-                        chunk.old_lines.join("\n")
-                    )
-                },
-            )?
+            let found = if chunk.anchor.is_some() {
+                // The anchor selects the region; the first matching context
+                // line after it wins.
+                seek_first(&text.lines, &chunk.old_lines, start, chunk.end_of_file)
+            } else {
+                seek_unique(&text.lines, &chunk.old_lines, start, chunk.end_of_file)
+            };
+            found.with_context(|| {
+                format!(
+                    "Failed to find expected lines in {label} for patch line {}:\n{}{}",
+                    chunk.patch_line,
+                    chunk.old_lines.join("\n"),
+                    missing_context_hint(&text.lines, &chunk.old_lines, start)
+                )
+            })?
         };
 
         let mut replacement = chunk.new_lines.clone();
@@ -981,6 +1025,27 @@ fn seek_unique(
     pattern: &[String],
     start: usize,
     end_of_file: bool,
+) -> Result<usize> {
+    seek(lines, pattern, start, end_of_file, true)
+}
+
+/// Find the first match at or after `start`; used for anchored chunks, where
+/// the anchor selects the region and the context line may repeat after it.
+fn seek_first(
+    lines: &[String],
+    pattern: &[String],
+    start: usize,
+    end_of_file: bool,
+) -> Result<usize> {
+    seek(lines, pattern, start, end_of_file, false)
+}
+
+fn seek(
+    lines: &[String],
+    pattern: &[String],
+    start: usize,
+    end_of_file: bool,
+    unique: bool,
 ) -> Result<usize> {
     anyhow::ensure!(
         !pattern.is_empty(),
@@ -1024,14 +1089,72 @@ fn seek_unique(
             })
             .collect::<Vec<_>>();
 
-        match matches.as_slice() {
-            [position] => return Ok(*position),
-            [] => {}
-            _ => anyhow::bail!("Patch context is ambiguous; add a more specific @@ anchor"),
+        if unique {
+            match matches.as_slice() {
+                [position] => return Ok(*position),
+                [] => {}
+                _ => anyhow::bail!("Patch context is ambiguous; add a more specific @@ anchor"),
+            }
+        } else if let Some(position) = matches.first() {
+            return Ok(*position);
         }
     }
 
     anyhow::bail!("Line sequence was not found")
+}
+
+/// Extra diagnostics for a context miss: say whether the chunk is out of
+/// order or the file moved on, and show the closest current region.
+fn missing_context_hint(lines: &[String], pattern: &[String], start: usize) -> String {
+    let before = &lines[..start.min(lines.len())];
+    if start > 0 && closest_context(before, pattern).is_some() {
+        return "\nThe context appears earlier in the file; update chunks must be ordered \
+                top-to-bottom."
+            .to_string();
+    }
+    match closest_context(lines, pattern) {
+        Some((position, _)) => {
+            let begin = position.saturating_sub(2);
+            let end = (position + pattern.len().min(4) + 2).min(lines.len());
+            let snippet = (begin..end)
+                .map(|index| format!("{:>6}: {}", index + 1, lines[index]))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "\nClosest current content (line {}):\n{snippet}\n\
+                 The file may have changed since it was read; re-read it and regenerate the patch.",
+                position + 1
+            )
+        }
+        None => {
+            "\nThe file may have changed since it was read; re-read it and regenerate the patch."
+                .to_string()
+        }
+    }
+}
+
+fn closest_context(lines: &[String], pattern: &[String]) -> Option<(usize, usize)> {
+    let first = pattern.first()?;
+    let expected = pattern
+        .iter()
+        .map(|line| normalize_unicode(line))
+        .collect::<Vec<_>>();
+    let first = normalize_unicode(first);
+    let mut best: Option<(usize, usize)> = None;
+    for (position, line) in lines.iter().enumerate() {
+        if normalize_unicode(line) != first {
+            continue;
+        }
+        let matched = expected
+            .iter()
+            .zip(&lines[position..])
+            .take_while(|(expected, actual)| **expected == normalize_unicode(actual))
+            .count();
+        if best.is_none_or(|(_, best_matched)| matched > best_matched) {
+            best = Some((position, matched));
+        }
+    }
+    best
 }
 
 fn normalize_unicode(line: &str) -> String {
@@ -1833,6 +1956,41 @@ mod tests {
     }
 
     #[test]
+    fn folds_a_context_only_chunk_into_the_next_chunk_anchor() {
+        let operations = parse_patch(
+            "*** Begin Patch\n*** Update File: file.txt\n@@\n fn start() {\n@@\n }\n+added\n*** End Patch",
+        )
+        .unwrap();
+        let PatchOperation::Update { chunks, .. } = &operations[0] else {
+            panic!("expected update");
+        };
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].anchor.as_deref(), Some("fn start() {"));
+        assert_eq!(chunks[0].old_lines, vec!["}"]);
+        assert_eq!(chunks[0].new_lines, vec!["}", "added"]);
+    }
+
+    #[test]
+    fn rejects_context_only_chunks_that_cannot_be_folded() {
+        let error = parse_patch(
+            "*** Begin Patch\n*** Update File: file.txt\n@@\n a\n b\n@@\n-old\n+new\n*** End Patch",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not change any lines"),
+            "{error:#}"
+        );
+
+        let error =
+            parse_patch("*** Begin Patch\n*** Update File: file.txt\n@@\n }\n*** End Patch")
+                .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not followed by a chunk"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn parser_does_not_panic_on_generated_utf8() {
         let alphabet = [
             'a', '*', '+', '-', '@', ':', ' ', '\n', '\r', '\0', '“', '—', '中', '\'', '"',
@@ -1932,6 +2090,69 @@ mod tests {
         };
         let output = apply_chunks("first\nvalue\nsecond\nvalue\n", &[chunk], "file.txt").unwrap();
         assert_eq!(output, "first\nvalue\nsecond\nupdated\n");
+    }
+
+    #[test]
+    fn anchored_chunks_take_the_first_match_after_the_anchor() {
+        let chunk = UpdateChunk {
+            anchor: Some("fn second() {".to_string()),
+            old_lines: vec!["}".to_string()],
+            new_lines: vec!["}".to_string(), " added".to_string()],
+            context_positions: Vec::new(),
+            end_of_file: false,
+            patch_line: 3,
+        };
+        let output = apply_chunks(
+            "fn first() {\n}\n\nfn second() {\n}\n\nfn third() {\n}\n",
+            &[chunk],
+            "file.txt",
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            "fn first() {\n}\n\nfn second() {\n}\n added\n\nfn third() {\n}\n"
+        );
+    }
+
+    #[test]
+    fn missing_context_hint_flags_out_of_order_chunks() {
+        let chunks = vec![
+            UpdateChunk {
+                anchor: None,
+                old_lines: vec!["c".to_string()],
+                new_lines: vec!["C".to_string()],
+                context_positions: Vec::new(),
+                end_of_file: false,
+                patch_line: 3,
+            },
+            UpdateChunk {
+                anchor: None,
+                old_lines: vec!["a".to_string()],
+                new_lines: vec!["A".to_string()],
+                context_positions: Vec::new(),
+                end_of_file: false,
+                patch_line: 6,
+            },
+        ];
+        let error = apply_chunks("a\nb\nc\n", &chunks, "file.txt").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("ordered top-to-bottom"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn missing_context_hint_suggests_a_reread() {
+        let chunk = UpdateChunk {
+            anchor: None,
+            old_lines: vec!["gone".to_string()],
+            new_lines: vec!["here".to_string()],
+            context_positions: Vec::new(),
+            end_of_file: false,
+            patch_line: 3,
+        };
+        let error = apply_chunks("alpha\nbeta\n", &[chunk], "file.txt").unwrap_err();
+        assert!(format!("{error:#}").contains("re-read"), "{error:#}");
     }
 
     #[test]
@@ -2894,6 +3115,31 @@ mod tests {
             "ONE\ntwo\nanchor\ninserted\nthree\nFOUR\n"
         );
         assert!(patch_artifacts(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn folded_context_anchor_inserts_after_the_matching_brace() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("file.txt"),
+            "fn first() {\n}\n\nfn second() {\n}\n",
+        )
+        .await
+        .unwrap();
+
+        run_patch(
+            dir.path(),
+            "*** Begin Patch\n*** Update File: file.txt\n@@\n fn second() {\n@@\n }\n+    tail\n*** End Patch",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("file.txt"))
+                .await
+                .unwrap(),
+            "fn first() {\n}\n\nfn second() {\n}\n    tail\n"
+        );
     }
 
     #[tokio::test]

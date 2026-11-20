@@ -1,0 +1,15 @@
+:root { color-scheme: light dark; font: 16px system-ui, sans-serif; }
+body { margin: 0; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 1rem 2rem; border-bottom: 1px solid GrayText; font-weight: 700; }
+main { padding: 1rem 2rem; }
+button { font: inherit; color: inherit; cursor: pointer; }
+.projects { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 14rem), 1fr)); gap: 1rem; }
+.tasks { display: grid; grid-template-columns: repeat(6, minmax(12rem, 1fr)); gap: .75rem; overflow-x: auto; padding-bottom: 1rem; }
+.column { padding: .75rem; border-radius: .6rem; background: color-mix(in srgb, CanvasText 6%, Canvas); }
+.card { padding: .85rem; border: 1px solid GrayText; border-radius: .5rem; background: Canvas; overflow-wrap: anywhere; }
+.card + .card { margin-top: .75rem; }
+.project { display: grid; gap: .35rem; text-align: left; }
+.project:hover { border-color: Highlight; }
+h2, h3 { font-size: 1rem; margin: 0 0 .5rem; }
+.card p { margin: .4rem 0 0; white-space: pre-wrap; }
+.muted, .project span { font-size: .875rem; }

@@ -128,7 +128,8 @@ pub enum Op {
         model: String,
     },
     /// Change the connection session's reasoning effort. `None` selects the
-    /// model's configured default.
+    /// model's configured default; [`PROVIDER_DEFAULT_EFFORT`] leaves the
+    /// choice to the provider.
     SwitchReasoningEffort {
         effort: Option<String>,
     },
@@ -350,7 +351,8 @@ impl ClientRequest {
         )
     }
     /// Build a `switch_reasoning_effort` request. `None` selects the model's
-    /// configured default effort.
+    /// configured default effort; [`PROVIDER_DEFAULT_EFFORT`] leaves the
+    /// choice to the provider.
     pub fn switch_reasoning_effort(id: impl Into<Value>, effort: Option<String>) -> Self {
         Self::simple(id, Op::SwitchReasoningEffort { effort })
     }
@@ -903,6 +905,7 @@ pub struct ModelSummary {
     #[serde(default)]
     pub supports_reasoning_effort: bool,
     /// The effort the model runs with when no explicit effort is selected.
+    /// [`PROVIDER_DEFAULT_EFFORT`] instead leaves the choice to the provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_effort: Option<String>,
 }
@@ -911,6 +914,11 @@ pub struct ModelSummary {
 /// [`ModelSummary::supports_reasoning_effort`]; the model's configured default
 /// remains selectable separately.
 pub const REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "max"];
+
+/// Explicit effort value that leaves the choice to the provider: the request
+/// carries no effort field. Distinct from `None`, which means the model's
+/// configured default (also what older clients send to reset an override).
+pub const PROVIDER_DEFAULT_EFFORT: &str = "provider-default";
 
 /// Live progress of one workflow node, as shown in a run's graph.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -961,7 +969,8 @@ pub enum ServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
         /// The session's explicit reasoning effort; absent means the model's
-        /// configured default.
+        /// configured default, and [`PROVIDER_DEFAULT_EFFORT`] means the
+        /// provider's own default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
     },
@@ -992,7 +1001,8 @@ pub enum ServerMessage {
         id: Value,
         /// Session the switch applied to.
         session_id: String,
-        /// The session's explicit effort; `None` means the model default.
+        /// The session's explicit effort; `None` means the model default, and
+        /// [`PROVIDER_DEFAULT_EFFORT`] means the provider's own default.
         effort: Option<String>,
     },
     /// Reply after changing the session's active filesystem root.

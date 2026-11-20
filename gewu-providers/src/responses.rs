@@ -464,6 +464,48 @@ mod tests {
         assert_eq!(*retry_after, Some(Duration::from_secs(322)));
     }
 
+    #[derive(schemars::JsonSchema)]
+    struct AllOptionalArgs {
+        #[allow(dead_code)]
+        path: Option<String>,
+    }
+
+    struct OptionalArgsTool;
+
+    #[async_trait]
+    impl Tool for OptionalArgsTool {
+        fn name(&self) -> &str {
+            "list"
+        }
+        fn description(&self) -> &str {
+            "List directory entries"
+        }
+        fn schema(&self) -> schemars::schema::RootSchema {
+            schemars::schema_for!(AllOptionalArgs)
+        }
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: &gewu_core::types::ToolContext,
+        ) -> Result<gewu_core::types::ToolResult, Failure> {
+            Ok(gewu_core::types::ToolResult::new("list", "ok"))
+        }
+    }
+
+    #[test]
+    fn tool_parameters_are_wire_compatible() {
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(OptionalArgsTool)];
+
+        let request = OpenAIProvider::new("key", "gpt")
+            .build(&[], &tools)
+            .unwrap();
+
+        let parameters = &request["tools"][0]["parameters"];
+        assert!(parameters.get("$schema").is_none(), "{parameters}");
+        assert!(parameters.get("definitions").is_none(), "{parameters}");
+        assert_eq!(parameters["required"], json!([]));
+    }
+
     #[test]
     fn summary_defaults_and_effort_are_independent() {
         let default = OpenAIProvider::new("key", "gpt").build(&[], &[]).unwrap();
@@ -712,10 +754,12 @@ impl LlmProvider for OpenAIProvider {
         let functions = tools
             .iter()
             .map(|tool| {
-                json!({"type":"function", "name":tool.name(),
-            "description":tool.description(), "parameters":tool.schema(), "strict":false})
+                let parameters = crate::schema::tool_schema_value(&tool.schema())
+                    .map_err(|e| crate::openai::OpenAIError::Build(e.to_string()))?;
+                Ok(json!({"type":"function", "name":tool.name(),
+            "description":tool.description(), "parameters":parameters, "strict":false}))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, Failure>>()?;
         let mut request = json!({"model":self.model, "input":input, "stream":true, "store":false,
             "include":["reasoning.encrypted_content"]});
         if !instructions.is_empty() {

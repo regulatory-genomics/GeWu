@@ -42,11 +42,11 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinSet};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{info, warn};
 
@@ -132,6 +132,7 @@ struct LiveTurn {
     done: Arc<tokio::sync::Notify>,
     subscribers: Vec<Subscriber>,
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    interrupted: bool,
     terminal: Option<ServerMessage>,
 }
 
@@ -219,6 +220,7 @@ async fn attach_subscriber(
         done: Arc::new(tokio::sync::Notify::new()),
         subscribers: Vec::new(),
         cancel: None,
+        interrupted: false,
         terminal: None,
     }));
     // Hold the fresh turn's lock across the snapshot/replay/registration
@@ -352,7 +354,7 @@ struct ConnectionSession {
     /// The session's provider (the catalog entry for `model`).
     provider: Arc<dyn gewu_core::traits::LlmProvider>,
     /// The session's explicit reasoning effort; `None` uses the model's
-    /// configured default.
+    /// configured default, `provider-default` the provider's own default.
     reasoning_effort: Option<String>,
     /// Resolved context window (tokens) of the session's model.
     context_limit: usize,
@@ -360,12 +362,29 @@ struct ConnectionSession {
     /// fixed for the life of the session, so `list_tools` can be answered
     /// without locking the agent (which would block while an ask runs).
     tools: Vec<String>,
-    /// The running turn's steering handle, published by `execute_ask` while
-    /// the agent lock is held so `steer` requests can inject messages
-    /// without touching the agent. `None` while idle.
-    steering: Arc<Mutex<Option<gewu_core::Steering>>>,
+    inbox: Arc<SessionInbox>,
     /// The session's selected filesystem root.
     workspace: WorkspaceSummary,
+}
+
+#[derive(Default)]
+struct SessionInbox {
+    steering: gewu_core::Steering,
+    watcher: OnceLock<AbortHandle>,
+}
+
+impl SessionInbox {
+    fn stop(&self) {
+        if let Some(watcher) = self.watcher.get() {
+            watcher.abort();
+        }
+    }
+}
+
+impl Drop for SessionInbox {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// A currently running ask on a connection.
@@ -414,7 +433,6 @@ pub async fn serve(
         questions: Arc::new(gewu_core::QuestionBroker::new()),
         lifecycle: Mutex::new(()),
     });
-    tokio::spawn(forward_workflow_progress(state.clone(), workflow_rx));
 
     info!("gewu server listening:");
     info!("  WebSocket: ws://{}", ws_addr);
@@ -427,21 +445,16 @@ pub async fn serve(
     // Per-connection handlers are spawned into a shared tracking set so
     // shutdown can abort and drain them together with the listeners.
     let mut connections: JoinSet<()> = JoinSet::new();
-    let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<JoinHandle<()>>();
+    let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
 
     let mut tasks = JoinSet::new();
+    tasks.spawn(forward_workflow_progress(state.clone(), workflow_rx));
     tasks.spawn(accept_loop(
         ws_listener,
-        state.clone(),
         Transport::WebSocket,
         conn_tx.clone(),
     ));
-    tasks.spawn(accept_loop(
-        tcp_listener,
-        state.clone(),
-        Transport::Tcp,
-        conn_tx.clone(),
-    ));
+    tasks.spawn(accept_loop(tcp_listener, Transport::Tcp, conn_tx.clone()));
     let http_router = download::router(state.clone()).merge(state.bootstrap.plugins.data_router());
     tasks.spawn(async move {
         if let Err(error) = axum::serve(http_listener, http_router).await {
@@ -450,9 +463,7 @@ pub async fn serve(
     });
     drop(conn_tx); // accept loops hold the remaining senders
 
-    // Run until Ctrl+C (or until both accept loops exit). Connection
-    // handles arriving from the accept loops are moved into the tracking
-    // set as they are created.
+    // Run until Ctrl+C (or until both accept loops exit).
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     loop {
@@ -462,11 +473,18 @@ pub async fn serve(
                 info!("Received Ctrl+C, shutting down");
                 break;
             }
-            handle = conn_rx.recv() => {
-                match handle {
-                    Some(handle) => {
+            connection = conn_rx.recv() => {
+                match connection {
+                    Some((stream, peer, transport)) => {
+                        let state = state.clone();
                         connections.spawn(async move {
-                            let _ = handle.await;
+                            let result = match transport {
+                                Transport::WebSocket => handle_ws_connection(stream, peer, state).await,
+                                Transport::Tcp => handle_tcp_connection(stream, peer, state).await,
+                            };
+                            if let Err(e) = result {
+                                warn!("Connection {} error: {}", peer, e);
+                            }
                         });
                     }
                     // Both accept loops are gone; nothing left to serve.
@@ -494,28 +512,18 @@ enum Transport {
     Tcp,
 }
 
-/// Accept connections on one listener forever, forwarding each connection
-/// task's handle to the tracker.
+/// Accept connections on one listener forever, forwarding each stream to the tracker.
 async fn accept_loop(
     listener: TcpListener,
-    state: Arc<ServerState>,
     transport: Transport,
-    conn_tx: mpsc::UnboundedSender<JoinHandle<()>>,
+    conn_tx: mpsc::UnboundedSender<(TcpStream, SocketAddr, Transport)>,
 ) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
-                let state = state.clone();
-                let handle = tokio::spawn(async move {
-                    let result = match transport {
-                        Transport::WebSocket => handle_ws_connection(stream, peer, state).await,
-                        Transport::Tcp => handle_tcp_connection(stream, peer, state).await,
-                    };
-                    if let Err(e) = result {
-                        warn!("Connection {} error: {}", peer, e);
-                    }
-                });
-                let _ = conn_tx.send(handle);
+                if conn_tx.send((stream, peer, transport)).is_err() {
+                    break;
+                }
             }
             Err(e) => {
                 warn!("Accept failed: {}", e);
@@ -639,7 +647,7 @@ impl ServerState {
     /// request naming a *different* `session_id` or `agent` is rejected so
     /// mismatches surface as errors instead of being silently ignored.
     async fn get_or_create_session(
-        &self,
+        self: &Arc<Self>,
         current: &mut Option<ConnectionSession>,
         session_id: Option<String>,
         agent_name: Option<String>,
@@ -651,7 +659,7 @@ impl ServerState {
     /// Get or create a session, optionally selecting its workspace at creation
     /// time. The workspace hint is ignored once the session already exists.
     async fn get_or_create_session_with_workspace(
-        &self,
+        self: &Arc<Self>,
         current: &mut Option<ConnectionSession>,
         session_id: Option<String>,
         agent_name: Option<String>,
@@ -745,7 +753,7 @@ impl ServerState {
         let stored_effort =
             gewu_storage::session_reasoning_effort(&self.bootstrap.pool, &session_id).await?;
         let reasoning_effort = stored_effort.and_then(|effort| {
-            if entry.effort_providers.contains_key(&effort) {
+            if entry.supports_effort(&effort) {
                 Some(effort)
             } else {
                 warn!(
@@ -792,7 +800,6 @@ impl ServerState {
             reasoning_effort.as_deref().unwrap_or("default")
         );
 
-        let steering = agent.steering().clone();
         let agent = Arc::new(Mutex::new(agent));
         {
             let mut agent = agent.lock().await;
@@ -815,11 +822,20 @@ impl ServerState {
             reasoning_effort,
             context_limit: entry.context_limit,
             tools,
-            steering: Arc::new(Mutex::new(Some(steering))),
+            inbox: Arc::new(SessionInbox::default()),
             workspace,
         };
         *current = Some(entry.clone());
         sessions.insert(entry.session_id.clone(), entry.clone());
+        entry.inbox.watcher.get_or_init(|| {
+            tokio::spawn(watch_inbox(
+                Arc::downgrade(self),
+                entry.session_id.clone(),
+                Arc::downgrade(&entry.inbox),
+                entry.inbox.steering.clone(),
+            ))
+            .abort_handle()
+        });
         Ok(entry)
     }
 
@@ -832,21 +848,36 @@ impl ServerState {
             .insert(session_id.to_string())
     }
 
-    /// Release a session claim after its ask finished, failed, or was
-    /// interrupted. Idempotent.
+    /// Release a session claim and recheck any steering queued while busy.
     async fn release_session(&self, session_id: &str) {
-        self.busy_sessions.lock().await.remove(session_id);
+        let sessions = self.sessions.lock().await;
+        if self.busy_sessions.lock().await.remove(session_id)
+            && let Some(session) = sessions.get(session_id)
+        {
+            session.inbox.steering.wake();
+        }
     }
 
     async fn cancel_turn(&self, session_id: &str) -> Option<String> {
-        if let Some(session) = self.sessions.lock().await.get(session_id)
-            && let Some(inbox) = session.steering.lock().await.as_ref()
-        {
-            inbox.pause();
-        }
-        let turn = self.turns.lock().await.get(session_id).cloned()?;
+        let inbox = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .map(|session| session.inbox.steering.clone());
+        let turn = self.turns.lock().await.get(session_id).cloned();
+        let Some(turn) = turn else {
+            if let Some(inbox) = inbox {
+                inbox.pause();
+            }
+            return None;
+        };
         let request_id = {
             let mut turn = turn.lock().await;
+            if let Some(inbox) = inbox {
+                inbox.pause();
+                turn.interrupted = true;
+            }
             if !turn.busy {
                 return None;
             }
@@ -873,6 +904,10 @@ impl ServerState {
     }
 
     async fn shutdown_turns(&self) {
+        let _lifecycle = self.lifecycle.lock().await;
+        for session in self.sessions.lock().await.values() {
+            session.inbox.stop();
+        }
         let ids: Vec<_> = self.turns.lock().await.keys().cloned().collect();
         for id in ids {
             self.cancel_turn(&id).await;
@@ -1002,7 +1037,7 @@ fn resolve_workspace_path(
 /// repairs the conversation history, guaranteeing the agent lock is
 /// released before any subsequent request is handled.
 async fn handle_request(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     session: &mut Option<ConnectionSession>,
     running: &mut Option<RunningAsk>,
     request: ClientRequest,
@@ -1259,7 +1294,12 @@ async fn handle_request(
                         let mut agent = current.agent.lock().await;
                         let reminder =
                             registry::profile_reminder(Some(&current.agent_name), &target);
-                        agent.set_profile(prompt, tools, reminder);
+                        let policy = registry::profile_tool_policy(
+                            &target,
+                            &state.bootstrap.agents,
+                            &state.bootstrap.mcp_tools,
+                        );
+                        agent.set_profile(prompt, tools, reminder, policy);
                         if let Err(e) = gewu_storage::set_reminder(
                             &state.bootstrap.pool,
                             &current.session_id,
@@ -1279,7 +1319,7 @@ async fn handle_request(
                             reasoning_effort: current.reasoning_effort.clone(),
                             context_limit: current.context_limit,
                             tools: tools.clone(),
-                            steering: current.steering.clone(),
+                            inbox: current.inbox.clone(),
                             workspace: current.workspace.clone(),
                         });
                         state.sessions.lock().await.insert(
@@ -1297,7 +1337,7 @@ async fn handle_request(
                 },
                 Err(e) => Err(RequestError::Failed(e.to_string())),
             };
-            state.busy_sessions.lock().await.remove(&current.session_id);
+            state.release_session(&current.session_id).await;
             result
         }
         Op::SwitchWorkspace { workspace: target } => {
@@ -1439,7 +1479,7 @@ async fn handle_request(
                     let reasoning_effort = current
                         .reasoning_effort
                         .clone()
-                        .filter(|effort| entry.effort_providers.contains_key(effort));
+                        .filter(|effort| entry.supports_effort(effort));
                     let Some(provider) = entry.provider_for(reasoning_effort.as_deref()) else {
                         state.release_session(&current.session_id).await;
                         return Err(RequestError::Invalid(format!(
@@ -1475,7 +1515,7 @@ async fn handle_request(
                                     reasoning_effort: reasoning_effort.clone(),
                                     context_limit: entry.context_limit,
                                     tools: current.tools.clone(),
-                                    steering: current.steering.clone(),
+                                    inbox: current.inbox.clone(),
                                     workspace: current.workspace.clone(),
                                 };
                                 *session = Some(replacement.clone());
@@ -1506,7 +1546,7 @@ async fn handle_request(
                 }
                 None => Err(RequestError::Invalid(format!("unknown model: {target}"))),
             };
-            state.busy_sessions.lock().await.remove(&current.session_id);
+            state.release_session(&current.session_id).await;
             result
         }
         Op::SwitchReasoningEffort { effort } => {
@@ -1533,7 +1573,7 @@ async fn handle_request(
                 }
                 Some(entry) => {
                     if let Some(effort) = &effort
-                        && !protocol::REASONING_EFFORTS.contains(&effort.as_str())
+                        && !entry.supports_effort(effort)
                     {
                         Err(RequestError::Invalid(format!(
                             "unknown reasoning effort: {effort}"
@@ -1558,7 +1598,7 @@ async fn handle_request(
                                         reasoning_effort: effort.clone(),
                                         context_limit: current.context_limit,
                                         tools: current.tools.clone(),
-                                        steering: current.steering.clone(),
+                                        inbox: current.inbox.clone(),
                                         workspace: current.workspace.clone(),
                                     };
                                     *session = Some(replacement.clone());
@@ -1743,11 +1783,15 @@ async fn handle_request(
                 }
             };
             let mut entries = Vec::new();
+            // Only dotfiles are hidden here; ignore rules (`.gitignore`,
+            // `.ignore`, git excludes) must not filter the file tree.
             for entry in ignore::WalkBuilder::new(&dir)
                 .max_depth(Some(1))
                 .hidden(true)
-                .git_ignore(true)
-                .require_git(false)
+                .git_ignore(false)
+                .git_global(false)
+                .git_exclude(false)
+                .ignore(false)
                 .build()
                 .skip(1)
             {
@@ -1913,7 +1957,9 @@ async fn handle_request(
                 .await
                 .map_err(|e| RequestError::Failed(e.to_string()));
             if deleted.is_ok() {
-                state.sessions.lock().await.remove(&session_id);
+                if let Some(session) = state.sessions.lock().await.remove(&session_id) {
+                    session.inbox.stop();
+                }
                 state.turns.lock().await.remove(&session_id);
                 state.workflows.lock().await.remove(&session_id);
             }
@@ -1993,42 +2039,20 @@ async fn handle_request(
                     "no session: send 'ask' before steering".to_string(),
                 ));
             };
-            let slot = state
-                .sessions
-                .lock()
-                .await
-                .get(&target)
-                .map(|entry| entry.steering.clone());
-            let Some(slot) = slot else {
+            let sessions = state.sessions.lock().await;
+            let Some(session) = sessions.get(&target) else {
                 return Err(RequestError::Failed(format!("unknown session '{target}'")));
             };
-            let cached = { slot.lock().await.clone() };
-            let steering = if let Some(handle) = cached {
-                Some(handle)
-            } else {
-                state.sessions.lock().await.get(&target).and_then(|entry| {
-                    entry
-                        .agent
-                        .try_lock()
-                        .ok()
-                        .map(|agent| agent.steering().clone())
-                })
-            };
-            match steering {
-                Some(steering) => {
-                    steering
-                        .send(text.clone())
-                        .map_err(|e| RequestError::Failed(format!("steering failed: {e}")))?;
-                    Ok(Handled::Reply(ServerMessage::Steered {
-                        id: request.id,
-                        session_id: target,
-                        text,
-                    }))
-                }
-                None => Err(RequestError::Failed(
-                    "no ask is in progress on this session".to_string(),
-                )),
-            }
+            session
+                .inbox
+                .steering
+                .send(text.clone())
+                .map_err(|e| RequestError::Failed(format!("steering failed: {e}")))?;
+            Ok(Handled::Reply(ServerMessage::Steered {
+                id: request.id,
+                session_id: target,
+                text,
+            }))
         }
 
         Op::Ask { prompt } => {
@@ -2110,19 +2134,15 @@ async fn execute_ask<E, Fut>(
     // Repair any history left inconsistent by a previous interrupt.
     patch_dangling_tool_calls(&mut agent).await;
 
-    // Publish the steering handle for `steer` requests while this turn
-    // holds the agent lock; cleared again when the turn ends or aborts.
-    *session.steering.lock().await = Some(agent.steering().clone());
-
     let mut client_gone = false;
     let mut terminal_sent = false;
     {
         let mut stream: std::pin::Pin<
             Box<dyn futures::Stream<Item = anyhow::Result<AgentEvent>> + Send + '_>,
         > = if prompt.is_empty() {
-            Box::pin(agent.resume())
+            Box::pin(agent.resume_with_inbox(session.inbox.steering.clone()))
         } else {
-            Box::pin(agent.ask(prompt))
+            Box::pin(agent.ask_with_inbox(prompt, session.inbox.steering.clone()))
         };
         // Whether a terminal frame (`result` or `error`) has been sent. Only
         // the `Finish` event and stream errors are terminal; an `AgentEvent::Error`
@@ -2219,6 +2239,7 @@ async fn start_session_turn(
     };
     let mut prompt = prompt;
     if !prompt.is_empty() {
+        session.inbox.steering.unpause();
         let selected = state
             .bootstrap
             .plugins
@@ -2246,20 +2267,26 @@ async fn start_session_turn(
         done: Arc::new(tokio::sync::Notify::new()),
         subscribers: vec![],
         cancel: Some(cancel),
+        interrupted: false,
         terminal: None,
     }));
+    let previous = state.turns.lock().await.get(&session.session_id).cloned();
+    let previous = match previous {
+        Some(previous) => Some(previous.lock_owned().await),
+        None => None,
+    };
+    let mut new_turn = live.lock().await;
     // Register execution before acknowledging it: a failed socket write does
     // not strand a claimed session without its worker.
-    let previous = state
+    state
         .turns
         .lock()
         .await
         .insert(session.session_id.clone(), live.clone());
-    if let Some(previous) = previous {
-        let mut previous = previous.lock().await;
+    if let Some(mut previous) = previous {
         let snapshot = ServerMessage::SessionSnapshot {
             session_id: session.session_id.clone(),
-            messages: live.lock().await.messages.clone(),
+            messages: new_turn.messages.clone(),
             frames: vec![],
             busy: true,
             seq: 0,
@@ -2277,15 +2304,16 @@ async fn start_session_turn(
                 .is_none_or(|s| !observer.out.same_channel(&s.out))
                 && observer.send(&snapshot)
             {
-                live.lock().await.subscribers.push(observer);
+                new_turn.subscribers.push(observer);
             }
         }
     }
     if let Some(subscriber) = subscriber
         && subscriber.send(&ready.to_line())
     {
-        live.lock().await.subscribers.push(subscriber);
+        new_turn.subscribers.push(subscriber);
     }
+    drop(new_turn);
     let worker_pool = state.bootstrap.pool.clone();
     tokio::spawn(async move {
         let worker_session = session.clone();
@@ -2336,20 +2364,23 @@ async fn start_session_turn(
 
             if failure.is_some() {
                 drop_dangling_prompt(&mut agent).await;
-                agent.steering().pause();
                 // The aborted tool tasks are dropped asynchronously; remove
                 // their pending questions now so the session leaves no stale
                 // requests behind once the interrupt returns.
                 state.questions.cancel_session(&session.session_id);
             }
             let mut live = live.lock().await;
+            if failure.is_some() && !live.interrupted {
+                session.inbox.steering.pause();
+            }
             let terminal = failure
                 .map(|error| ServerMessage::Error { id: None, error })
                 .or_else(|| live.terminal.take());
             live.messages = agent.memory.messages().to_vec();
             live.frames.clear();
             live.bytes = 0;
-            state.release_session(&session.session_id).await;
+            let mut busy_sessions = state.busy_sessions.lock().await;
+            busy_sessions.remove(&session.session_id);
             live.busy = false;
             live.cancel = None;
             // Wake any interrupt awaiting finalization (see `cancel_turn`).
@@ -2359,70 +2390,66 @@ async fn start_session_turn(
             }
             live.frames.clear();
             live.bytes = 0;
-            let pending = agent.steering().should_resume();
+            let pending = session.inbox.steering.should_resume();
             live.subscribers
                 .retain(|s| (s.persistent || pending) && !s.out.is_closed());
-            agent.steering().wake();
+            drop(busy_sessions);
+            session.inbox.steering.wake();
         }
     });
 }
 
-async fn watch_inbox(state: &Arc<ServerState>, session: &ConnectionSession) {
-    let cached = { session.steering.lock().await.clone() };
-    let inbox = match cached {
-        Some(inbox) => inbox,
-        None => session.agent.lock().await.steering().clone(),
-    };
-    *session.steering.lock().await = Some(inbox.clone());
-    if !inbox.claim_watcher() {
-        return;
-    }
-    let state = Arc::downgrade(state);
-    let session_id = session.session_id.clone();
-    tokio::spawn(async move {
-        loop {
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(30), inbox.notified()).await;
-            let Some(state) = state.upgrade() else { return };
-            if !inbox.should_resume() {
-                continue;
-            }
-            let _lifecycle = state.lifecycle.lock().await;
-            let Some(session) = state.sessions.lock().await.get(&session_id).cloned() else {
-                return;
-            };
-            if !state.claim_session(&session.session_id).await {
-                continue;
-            }
-            if !inbox.should_resume() {
-                state.release_session(&session.session_id).await;
-                continue;
-            }
-            if gewu_storage::commit_chat_revert(&state.bootstrap.pool, &session_id)
-                .await
-                .is_err()
-            {
-                inbox.pause();
-                state.release_session(&session_id).await;
-                continue;
-            }
-            start_session_turn(
-                state.clone(),
-                session.clone(),
-                crate::bootstrap::new_session_id(),
-                String::new(),
-                ServerMessage::Ready {
-                    id: Value::Null,
-                    request_id: String::new(),
-                    session_id: session.session_id.clone(),
-                    agent: session.agent_name.clone(),
-                },
-                None,
-                true,
-            )
-            .await;
+async fn watch_inbox(
+    state: Weak<ServerState>,
+    session_id: String,
+    owner: Weak<SessionInbox>,
+    inbox: gewu_core::Steering,
+) {
+    loop {
+        inbox.notified().await;
+        let Some(state) = state.upgrade() else { return };
+        if !inbox.should_resume() {
+            continue;
         }
-    });
+        let _lifecycle = state.lifecycle.lock().await;
+        let Some(session) = state.sessions.lock().await.get(&session_id).cloned() else {
+            return;
+        };
+        if owner.as_ptr() != Arc::as_ptr(&session.inbox) {
+            return;
+        }
+        if !state.claim_session(&session.session_id).await {
+            continue;
+        }
+        if !inbox.should_resume() {
+            state.release_session(&session.session_id).await;
+            continue;
+        }
+        if gewu_storage::commit_chat_revert(&state.bootstrap.pool, &session_id)
+            .await
+            .is_err()
+        {
+            inbox.pause();
+            state.release_session(&session_id).await;
+            continue;
+        }
+        let ready = ServerMessage::Ready {
+            id: Value::Null,
+            request_id: String::new(),
+            session_id: session.session_id.clone(),
+            agent: session.agent_name.clone(),
+        };
+        start_session_turn(
+            state.clone(),
+            session,
+            crate::bootstrap::new_session_id(),
+            String::new(),
+            ready,
+            None,
+            true,
+        )
+        .await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2444,9 +2471,6 @@ async fn drive_connection(
     // Token-protected servers require an `auth` request first.
     let mut authenticated = state.token.is_none();
     let (failed, mut failure) = tokio::sync::watch::channel(false);
-    // Completion signals from ask tasks. The loop-side sender keeps this
-    // channel open when no ask is running, so recv() simply stays pending.
-    let (_done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
 
     let result = loop {
         tokio::select! {
@@ -2520,9 +2544,6 @@ async fn drive_connection(
                     }
                 }
                 let handled = handle_request(&state, &mut session, &mut running, request).await;
-                if let Some(session) = &session {
-                    watch_inbox(&state, session).await;
-                }
                 match handled {
                     Ok(Handled::Reply(msg)) => {
                         out.send(msg.to_line()).await?;
@@ -2562,12 +2583,6 @@ async fn drive_connection(
                         )
                         .await?;
                     }
-                }
-            }
-            _ = done_rx.recv() => {
-                // The running ask finished on its own; release its claim.
-                if let Some(running) = running.take() {
-                    state.release_session(&running.session_id).await;
                 }
             }
             _ = failure.changed() => {
@@ -3135,7 +3150,7 @@ mod tests {
             reasoning_effort: None,
             context_limit: 256_000,
             tools,
-            steering: Arc::new(Mutex::new(None)),
+            inbox: Arc::new(SessionInbox::default()),
             workspace: WorkspaceSummary {
                 id: "cwd".into(),
                 path: "/tmp/gewu-test".into(),
@@ -3161,7 +3176,7 @@ mod tests {
             reasoning_effort: None,
             context_limit: 256_000,
             tools,
-            steering: Arc::new(Mutex::new(None)),
+            inbox: Arc::new(SessionInbox::default()),
             workspace: WorkspaceSummary {
                 id: "cwd".into(),
                 path: "/tmp/gewu-test".into(),
@@ -3394,7 +3409,7 @@ mod tests {
     ) -> (
         mpsc::Sender<String>,
         mpsc::Receiver<String>,
-        JoinHandle<Result<()>>,
+        tokio::task::JoinHandle<Result<()>>,
     ) {
         let (in_tx, in_rx) = mpsc::channel::<String>(16);
         let (out_tx, out_rx) = mpsc::channel::<String>(256);
@@ -3919,6 +3934,10 @@ mod tests {
                             effort_providers: protocol::REASONING_EFFORTS
                                 .iter()
                                 .map(|effort| (effort.to_string(), provider.clone()))
+                                .chain(std::iter::once((
+                                    protocol::PROVIDER_DEFAULT_EFFORT.to_string(),
+                                    provider.clone(),
+                                )))
                                 .collect(),
                             supports_reasoning_effort: true,
                         },
@@ -3992,7 +4011,36 @@ mod tests {
         assert_eq!(snapshot["type"], "session_snapshot");
         assert_eq!(snapshot["reasoning_effort"], "low");
 
-        // Selecting default clears the explicit effort.
+        // The provider default is its own explicit, durable selection.
+        input
+            .send(r#"{"id":8,"op":"switch_reasoning_effort","effort":"provider-default"}"#.into())
+            .await
+            .unwrap();
+        let reply = recv_json(&mut output).await;
+        assert_eq!(reply["type"], "reasoning_effort_switched");
+        assert_eq!(reply["effort"], "provider-default");
+        assert_eq!(
+            gewu_storage::session_reasoning_effort(&state.bootstrap.pool, "eff")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("provider-default")
+        );
+        let session = state.sessions.lock().await.get("eff").unwrap().clone();
+        assert_eq!(
+            session.reasoning_effort.as_deref(),
+            Some("provider-default")
+        );
+
+        input
+            .send(ClientRequest::subscribe_session(9, "eff").to_line())
+            .await
+            .unwrap();
+        assert_eq!(recv_json(&mut output).await["type"], "ready");
+        let snapshot = recv_json(&mut output).await;
+        assert_eq!(snapshot["reasoning_effort"], "provider-default");
+
+        // A null effort clears the explicit selection (configured default).
         input
             .send(r#"{"id":4,"op":"switch_reasoning_effort","effort":null}"#.into())
             .await
@@ -4334,6 +4382,45 @@ mod tests {
             Handled::Reply(ServerMessage::FileContent { ref content, .. })
                 if content == "frontend root"
         ));
+    }
+
+    #[tokio::test]
+    async fn list_files_shows_ignored_entries_but_not_dotfiles() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join(".gitignore"), "ignored.txt\nlogs/\n").unwrap();
+        std::fs::write(cwd.path().join("ignored.txt"), "ignored\n").unwrap();
+        std::fs::write(cwd.path().join(".ignore"), "*.tmp\n").unwrap();
+        std::fs::write(cwd.path().join("scratch.tmp"), "scratch\n").unwrap();
+        std::fs::write(cwd.path().join("visible.txt"), "visible\n").unwrap();
+        std::fs::write(cwd.path().join(".hidden"), "hidden\n").unwrap();
+        std::fs::create_dir(cwd.path().join("logs")).unwrap();
+        std::fs::create_dir(cwd.path().join(".hiddendir")).unwrap();
+
+        let mut state = server_state_with(TestLlm::plain());
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .bootstrap
+            .working_directory = cwd.path().to_string_lossy().to_string();
+        let mut session = None;
+        let mut running = None;
+        let result = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::list_files(1, ""),
+        )
+        .await
+        .unwrap();
+        let entries = match result {
+            Handled::Reply(ServerMessage::Files { entries, .. }) => entries,
+            _ => panic!("expected files reply"),
+        };
+        let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["logs", "ignored.txt", "scratch.tmp", "visible.txt"],
+            "{names:?}"
+        );
     }
 
     #[tokio::test]
@@ -4688,11 +4775,12 @@ mod tests {
                 .any(|t| t == "task")
         );
         assert!(
-            !plan["tools"]
+            plan["tools"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|t| t == "write_file")
+                .any(|t| t == "write_file"),
+            "plan advertises editing tools and refuses them at execution"
         );
         assert_eq!(
             gewu_storage::session_agent(&state.bootstrap.pool, &id)
@@ -4712,6 +4800,10 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|t| t == "bash")
+        );
+        assert_eq!(
+            build["tools"], plan["tools"],
+            "mode switches must keep the tool prefix identical"
         );
         tx.send(ClientRequest::switch_agent(3, "unknown").to_line())
             .await
@@ -5296,7 +5388,7 @@ mod tests {
             let id = ready["session_id"].as_str().unwrap();
             assert_eq!(recv_json(&mut out_rx).await["type"], "session_snapshot");
             let session = state.sessions.lock().await.get(id).unwrap().clone();
-            let inbox = session.steering.lock().await.clone().unwrap();
+            let inbox = session.inbox.steering.clone();
             inbox.notify(gewu_core::agent::BackgroundNotification {
                 source: "workflow".into(),
                 id: "completed-run".into(),
@@ -5316,6 +5408,59 @@ mod tests {
         })
         .await
         .expect("idle background notification timed out");
+    }
+
+    #[tokio::test]
+    async fn steer_queued_during_interrupt_cleanup_resumes() {
+        let llm = RecordingLlm::gated();
+        let state = server_state_with(llm.clone());
+        let (input, mut output, connection) = spawn_connection(state.clone()).await;
+        input
+            .send(r#"{"id":1,"op":"ask","prompt":"cancel this"}"#.into())
+            .await
+            .unwrap();
+        let ready = recv_json(&mut output).await;
+        let id = ready["session_id"].as_str().unwrap();
+        let session = state.sessions.lock().await[id].clone();
+        llm.wait_for_first_send().await;
+
+        let agent_lock = session.agent.lock();
+        tokio::pin!(agent_lock);
+        assert!(futures::poll!(&mut agent_lock).is_pending());
+        session.inbox.steering.send("discard this steer").unwrap();
+        input
+            .send(r#"{"id":2,"op":"interrupt"}"#.into())
+            .await
+            .unwrap();
+        let agent = tokio::time::timeout(std::time::Duration::from_secs(5), agent_lock)
+            .await
+            .expect("interrupt did not release the worker's agent lock");
+        assert!(!session.inbox.steering.is_pending());
+        session.inbox.steering.send("keep this steer").unwrap();
+        drop(agent);
+
+        loop {
+            let message = recv_json(&mut output).await;
+            if message["type"] == "result" {
+                assert_ne!(message["request_id"], ready["request_id"]);
+                break;
+            }
+        }
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1]
+                .iter()
+                .any(|text| text.contains("keep this steer"))
+        );
+        assert!(
+            !requests[1]
+                .iter()
+                .any(|text| text.contains("discard this steer"))
+        );
+
+        drop(input);
+        connection.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -5455,7 +5600,7 @@ mod tests {
             reasoning_effort: None,
             context_limit: 256_000,
             tools: vec!["echo".to_string()],
-            steering: Arc::new(Mutex::new(None)),
+            inbox: Arc::new(SessionInbox::default()),
             workspace: WorkspaceSummary {
                 id: "cwd".into(),
                 path: "/tmp/gewu-test".into(),

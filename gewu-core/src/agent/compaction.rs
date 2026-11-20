@@ -130,7 +130,7 @@ impl Agent {
         }
 
         self.memory
-            .append_compaction(summary_text.trim().to_string(), plan.recent)
+            .add_checkpoint(summary_text.trim().to_string(), plan.recent)
             .await?;
         Ok(true)
     }

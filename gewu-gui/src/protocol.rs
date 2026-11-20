@@ -11,6 +11,9 @@ pub struct TabInfo {
     pub id: u64,
     pub label: String,
     pub busy: bool,
+    /// Busy on a user-facing form; the sidebar pulse turns amber.
+    #[serde(default)]
+    pub waiting: bool,
     pub session_id: Option<String>,
     #[serde(default)]
     pub workspace: String,
@@ -398,6 +401,7 @@ mod tests {
                 id: 1,
                 label: "new".to_string(),
                 busy: false,
+                waiting: false,
                 session_id: None,
                 workspace: "cwd".into(),
             }],

@@ -6,11 +6,12 @@ pub use gewu_server::plugins;
 mod memory_view;
 pub mod registry;
 pub mod server;
+pub mod tool_policy;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
-use gewu_core::types::AgentEvent;
+use gewu_core::{Steering, types::AgentEvent};
 use std::io::{Read, Write};
 use tracing::{error, info};
 
@@ -39,10 +40,10 @@ fn stop_spinner(spinner_active: &mut bool, is_tty: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
+async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str, inbox: &Steering) -> Result<()> {
     let is_tty = atty::is(atty::Stream::Stdout);
 
-    let mut stream = Box::pin(agent.ask(prompt));
+    let mut stream = Box::pin(agent.ask_with_inbox(prompt, inbox.clone()));
     let mut spinner_active = false;
     let mut spinner_frame: usize = 0;
     let mut content_started = false;
@@ -321,6 +322,7 @@ async fn run(cli: RunArgs) -> Result<()> {
     )
     .await?;
     info!("Initialized agent: {}", cli.common.agent);
+    let inbox = Steering::new();
 
     // Determine the prompt: from args, from stdin, or error
     let prompt_from_args = cli.prompt.clone();
@@ -349,7 +351,7 @@ async fn run(cli: RunArgs) -> Result<()> {
         let prompt = prompt_parts.join(" ");
         if !prompt.is_empty() {
             println!("> {}", prompt);
-            if let Err(e) = run_agent(&mut agent, &prompt).await {
+            if let Err(e) = run_agent(&mut agent, &prompt, &inbox).await {
                 error!("Error: {}", e);
             }
         }
@@ -366,7 +368,7 @@ async fn run(cli: RunArgs) -> Result<()> {
             } else {
                 println!("> {}", trimmed);
             }
-            if let Err(e) = run_agent(&mut agent, trimmed).await {
+            if let Err(e) = run_agent(&mut agent, trimmed, &inbox).await {
                 error!("Error: {}", e);
             }
         }
@@ -394,7 +396,7 @@ async fn run(cli: RunArgs) -> Result<()> {
                 break;
             }
 
-            if let Err(e) = run_agent(&mut agent, input).await {
+            if let Err(e) = run_agent(&mut agent, input, &inbox).await {
                 error!("Error processing message: {}", e);
             }
         }

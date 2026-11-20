@@ -18,11 +18,11 @@ use crate::workflow::WfSnapshot;
 const MAX_LABEL: usize = 200;
 
 /// Blocks rendered on first load and after eviction.
-pub const TRANSCRIPT_WINDOW_BLOCKS: usize = 200;
+pub const TRANSCRIPT_WINDOW_BLOCKS: usize = 100;
 /// Older blocks loaded per page.
-pub const TRANSCRIPT_PAGE_BLOCKS: usize = 100;
+pub const TRANSCRIPT_PAGE_BLOCKS: usize = 50;
 /// Rendered-window size that triggers eviction while following output.
-pub const TRANSCRIPT_MAX_BLOCKS: usize = 300;
+pub const TRANSCRIPT_MAX_BLOCKS: usize = 150;
 
 /// One tab: a conversation plus its view state.
 #[derive(Debug)]
@@ -141,6 +141,7 @@ impl Tab {
             id: self.id,
             label: tab_title(self),
             busy: self.busy(),
+            waiting: self.busy() && self.model.has_pending_question(),
             session_id: self.model.session_id.clone(),
             workspace: self.workspace.clone(),
         }
@@ -304,7 +305,7 @@ pub fn short_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gewu_protocol::ContentPart;
+    use gewu_protocol::{AgentEvent, ContentPart};
 
     fn user_message(text: &str) -> Message {
         Message::User {
@@ -364,7 +365,7 @@ mod tests {
     #[test]
     fn load_earlier_moves_back_a_page_and_stops_at_zero() {
         let mut ws = Workspace::new();
-        let messages: Vec<Message> = (0..250)
+        let messages: Vec<Message> = (0..120)
             .map(|n| user_message(&format!("message {n}")))
             .collect();
         let id = ws.open_session("s1", &messages);
@@ -387,7 +388,7 @@ mod tests {
             .collect();
 
         assert!(tab.evict_overflow());
-        assert_eq!(tab.transcript_start, 200);
+        assert_eq!(tab.transcript_start, 400 - TRANSCRIPT_WINDOW_BLOCKS);
         assert!(!tab.evict_overflow());
     }
 
@@ -501,6 +502,30 @@ mod tests {
         let info = tab.info();
         assert_eq!(info.id, id);
         assert!(info.busy);
+        assert!(!info.waiting);
         assert_eq!(info.session_id.as_deref(), Some("s1"));
+
+        let _ = tab.model.apply_event(&AgentEvent::ToolStart {
+            call_id: String::new(),
+            tool: "question".into(),
+            input: "{}".into(),
+        });
+        let _ = tab.model.apply_event(&AgentEvent::QuestionAsked {
+            request_id: "que_1".into(),
+            questions: vec![gewu_protocol::Question {
+                question: "Which database?".into(),
+                header: "Database".into(),
+                options: Vec::new(),
+                multiple: false,
+                custom: true,
+            }],
+        });
+        assert!(tab.info().waiting);
+
+        let _ = tab.model.apply_event(&AgentEvent::QuestionResolved {
+            request_id: "que_1".into(),
+            answers: None,
+        });
+        assert!(!tab.info().waiting);
     }
 }

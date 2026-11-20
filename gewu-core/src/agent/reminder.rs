@@ -80,21 +80,13 @@ impl Reminder {
         }
     }
 
-    /// Append a due reminder to the conversation history's last user
-    /// message. The reminder becomes part of history, so every later
-    /// provider request — including further tool rounds within the same
-    /// turn — still carries it. If there is no user message, retain the
-    /// reminder for a later call. History is written back through
-    /// [`crate::traits::Memory::messages_mut`].
-    pub fn apply(&mut self, messages: &mut [Message]) {
-        if self.pending.is_none() {
-            return;
-        }
-        let Some(Message::User { content }) = messages
-            .iter_mut()
-            .rev()
-            .find(|message| matches!(message, Message::User { .. }))
-        else {
+    /// Append a due reminder to a user message. The reminder becomes part of
+    /// the message before it is stored, so every later provider request —
+    /// including further tool rounds within the same turn — still carries it.
+    /// Non-user messages are left untouched and keep the reminder pending for
+    /// the next user turn.
+    pub fn apply_to(&mut self, message: &mut Message) {
+        let Message::User { content } = message else {
             return;
         };
         if let Some(text) = self.pending.take() {
@@ -112,16 +104,17 @@ mod tests {
     }
 
     #[test]
-    fn cadence_applies_to_history_and_persists() {
+    fn cadence_applies_to_the_turn_message_and_persists() {
         let mut reminder = Reminder::switch("full", Some("sparse".into()));
         let mut history: Vec<Message> = Vec::new();
         for turn in 1..=50 {
-            history.push(user());
             reminder.on_user_turn();
-            reminder.apply(&mut history);
-            // A second apply in the same turn (the next tool round) must not
-            // duplicate the reminder: pending is consumed on first apply.
-            reminder.apply(&mut history);
+            let mut message = user();
+            reminder.apply_to(&mut message);
+            // A second application in the same turn (the next tool round)
+            // must not duplicate the reminder: pending is consumed on first
+            // application.
+            reminder.apply_to(&mut message);
             let expected = if turn == 1 || turn % 25 == 0 {
                 Some("full")
             } else if turn % 5 == 0 {
@@ -129,7 +122,7 @@ mod tests {
             } else {
                 None
             };
-            let Message::User { content } = &history[turn - 1] else {
+            let Message::User { content } = &message else {
                 unreachable!()
             };
             assert_eq!(
@@ -139,6 +132,7 @@ mod tests {
                     .as_ref(),
                 "turn {turn}"
             );
+            history.push(message);
             // Applied reminders stay in history for later requests: the
             // turn-1 switch reminder must still be present in later turns.
             if turn > 1 {
@@ -151,19 +145,24 @@ mod tests {
     }
 
     #[test]
-    fn absent_user_defers_and_targets_last_user() {
+    fn non_user_messages_keep_the_reminder_pending() {
         let mut reminder = Reminder::switch("full", None);
         reminder.on_user_turn();
-        reminder.apply(&mut []);
-        let mut messages = vec![user(), user()];
-        reminder.apply(&mut messages);
-        assert_eq!(messages[0], user());
-        assert_ne!(messages[1], user());
+        let mut system = Message::System {
+            content: "prompt".into(),
+        };
+        reminder.apply_to(&mut system);
+        assert_eq!(reminder.pending(), Some("full"));
+        let mut message = user();
+        reminder.apply_to(&mut message);
+        assert_eq!(reminder.pending(), None);
+        assert_ne!(message, user());
+        // With no sparse reminder configured, later turns stay silent.
         for _ in 0..30 {
             reminder.on_user_turn();
-            let mut messages = vec![user()];
-            reminder.apply(&mut messages);
-            assert_eq!(messages, vec![user()]);
+            let mut message = user();
+            reminder.apply_to(&mut message);
+            assert_eq!(message, user());
         }
     }
 
@@ -172,9 +171,9 @@ mod tests {
         let mut reminder = Reminder::default();
         for _ in 0..30 {
             reminder.on_user_turn();
-            let mut messages = vec![user()];
-            reminder.apply(&mut messages);
-            assert_eq!(messages, vec![user()]);
+            let mut message = user();
+            reminder.apply_to(&mut message);
+            assert_eq!(message, user());
         }
     }
 }

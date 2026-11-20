@@ -160,14 +160,28 @@ impl TaskTool {
     /// error result, so restricting the list (e.g. to read-only agents)
     /// actually restricts delegation.
     pub fn new(factory: Arc<dyn AgentFactory>, agents: Vec<(String, String)>) -> Self {
-        let agent_list = agents
+        let allowed = agents.iter().map(|(name, _)| name.clone()).collect();
+        Self::new_with_allowlist(factory, agents, allowed)
+    }
+
+    /// Creates a task tool that advertises `advertised` but only spawns
+    /// `allowed`.
+    ///
+    /// Modes share one tool definition (so request prefixes stay stable),
+    /// while the allow-list enforces the mode's delegation rules at
+    /// execution time.
+    pub fn new_with_allowlist(
+        factory: Arc<dyn AgentFactory>,
+        advertised: Vec<(String, String)>,
+        allowed: Vec<String>,
+    ) -> Self {
+        let agent_list = advertised
             .iter()
             .map(|(name, description)| format!("- \"{}\": {}", name, description))
             .collect::<Vec<_>>()
             .join("\n");
 
         let description = include_str!("prompts/task.txt").replace("{agents}", &agent_list);
-        let allowed = agents.into_iter().map(|(name, _)| name).collect();
         Self {
             factory,
             description,
@@ -405,6 +419,43 @@ mod tests {
             value["task_id"] = serde_json::json!(id);
         }
         value
+    }
+
+    #[tokio::test]
+    async fn allowlist_restricts_execution_but_not_the_advertised_list() {
+        let factory = Arc::new(MockFactory::new(content_finish_events()));
+        let tool = TaskTool::new_with_allowlist(
+            factory.clone(),
+            vec![
+                ("build".to_string(), "Builds the project".to_string()),
+                ("explore".to_string(), "Explores the codebase".to_string()),
+            ],
+            vec!["explore".to_string()],
+        );
+
+        // Every advertised subagent stays in the description, so the tool
+        // definition is identical across modes.
+        assert!(tool.description().contains("\"build\""));
+        assert!(tool.description().contains("\"explore\""));
+
+        let denied = tool
+            .execute(
+                args("Check files", "build", None),
+                &ToolContext::new("s", "m"),
+            )
+            .await
+            .expect("a refusal is a tool result");
+        assert!(denied.output.contains("not available"), "{}", denied.output);
+        assert!(factory.requests.lock().unwrap().is_empty());
+
+        let allowed = tool
+            .execute(
+                args("Explore", "explore", None),
+                &ToolContext::new("s", "m"),
+            )
+            .await
+            .expect("an allowed subagent runs");
+        assert!(allowed.output.contains("working"));
     }
 
     #[tokio::test]

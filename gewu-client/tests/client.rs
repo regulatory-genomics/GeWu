@@ -25,6 +25,49 @@ async fn ping_round_trip() {
     server.stop().await;
 }
 
+/// Waits until `client.is_closed()` flips — the actor exits one poll after
+/// the failing reply is delivered, so the flag is only eventually consistent.
+async fn eventually_closed(client: &Client) -> bool {
+    for _ in 0..100 {
+        if client.is_closed() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    client.is_closed()
+}
+
+#[tokio::test]
+async fn is_closed_tracks_connection_death() {
+    let server = fake::spawn(|| VecDeque::from([Step::Reply(vec![fake::pong_line("1")])])).await;
+    let client = connect(&server).await;
+    assert!(!client.is_closed());
+
+    client.ping().await.expect("pong");
+
+    // The script is exhausted: the fake now closes the connection the way a
+    // server restart does to its clients.
+    assert!(client.ping().await.is_err());
+    assert!(eventually_closed(&client).await, "client must be closed");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn close_marks_all_clones_closed() {
+    let server = fake::spawn(|| VecDeque::from([Step::Reply(vec![fake::pong_line("1")])])).await;
+    let client = connect(&server).await;
+    let clone = client.clone();
+
+    client.close().await;
+    assert!(
+        eventually_closed(&client).await && eventually_closed(&clone).await,
+        "closing one handle must close every clone"
+    );
+
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn question_reply_and_reject_round_trip() {
     let server = fake::spawn(|| {

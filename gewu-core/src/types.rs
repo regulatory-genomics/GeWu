@@ -808,7 +808,7 @@ pub fn summarize_tool_input(tool: &str, input: &str) -> String {
             .get("file_path")
             .and_then(|p| p.as_str())
             .map(str::to_string),
-        "glob" | "list" | "grep" => value
+        "glob" | "grep" => value
             .get("pattern")
             .and_then(|p| p.as_str())
             .map(str::to_string),

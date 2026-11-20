@@ -504,9 +504,8 @@ impl OpenAIProvider {
     ) -> Result<Vec<ChatCompletionTools>, Box<dyn Error + Send + Sync>> {
         let mut openai_tools: Vec<ChatCompletionTools> = Vec::new();
         for tool in tools {
-            let schema = tool.schema();
-            let parameters = serde_json::to_value(&schema)
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+            let parameters = crate::schema::tool_schema_value(&tool.schema())
+                .map_err(|e| OpenAIError::Build(e.to_string()))?;
             let function = FunctionObjectArgs::default()
                 .name(tool.name())
                 .description(tool.description())
@@ -1204,9 +1203,8 @@ impl AnthropicProvider {
     ) -> Result<Vec<AnthropicTool>, Box<dyn Error + Send + Sync>> {
         let mut anthropic_tools: Vec<AnthropicTool> = Vec::new();
         for tool in tools {
-            let schema = tool.schema();
-            let parameters = serde_json::to_value(&schema)
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+            let parameters = crate::schema::tool_schema_value(&tool.schema())
+                .map_err(|e| OpenAIError::Build(e.to_string()))?;
             anthropic_tools.push(AnthropicTool {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
@@ -1747,7 +1745,7 @@ mod tests {
     #[tokio::test]
     async fn anthropic_replays_ordered_signed_and_redacted_blocks() {
         let events = [
-            serde_json::json!({"type":"content_block_start", "index":0,"content_block":{"type":"thinking","thinking":"consider", "signature":""}}),
+            serde_json::json!({"type":"content_block_start", "index":0,"content_block":{"type":"thinking","thinking":"consider"}}),
             serde_json::json!({"type":"content_block_delta", "index":0,"delta":{"type":"signature_delta","signature":"sig-"}}),
             serde_json::json!({"type":"content_block_delta", "index":0,"delta":{"type":"signature_delta","signature":"123"}}),
             serde_json::json!({"type":"content_block_start", "index":1,"content_block":{"type":"redacted_thinking","data":"opaque"}}),
@@ -2336,6 +2334,49 @@ mod tests {
         }
     }
 
+    #[derive(schemars::JsonSchema)]
+    struct AllOptionalArgs {
+        #[allow(dead_code)]
+        path: Option<String>,
+    }
+
+    struct OptionalArgsTool;
+
+    #[async_trait]
+    impl Tool for OptionalArgsTool {
+        fn name(&self) -> &str {
+            "list"
+        }
+        fn description(&self) -> &str {
+            "List directory entries"
+        }
+        fn schema(&self) -> RootSchema {
+            schemars::schema_for!(AllOptionalArgs)
+        }
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+            Ok(ToolResult::new("list", "ok"))
+        }
+    }
+
+    /// Asserts the invariants Anthropic's draft 2020-12 validation enforces.
+    fn assert_wire_compatible(schema: &Value) {
+        assert!(
+            schema.get("$schema").is_none(),
+            "tool schemas must not declare a dialect: {schema}"
+        );
+        assert!(schema.get("definitions").is_none());
+        if schema.get("properties").is_some() {
+            assert!(
+                schema["required"].is_array(),
+                "properties without required is rejected: {schema}"
+            );
+        }
+    }
+
     #[test]
     fn openai_convert_tools() {
         let provider = OpenAIProvider::new("test-key", "gpt-4");
@@ -2394,16 +2435,26 @@ mod tests {
                 text: "hello".to_string(),
             }],
         }];
-        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool::new("get_weather", "Get weather"))];
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockTool::new("get_weather", "Get weather")),
+            Arc::new(OptionalArgsTool),
+        ];
 
         let request = provider.build(&messages, &tools).expect("build success");
 
         assert_eq!(request["model"], "claude-3-5-sonnet");
         assert_eq!(request["stream"], true);
         let wire_tools = request["tools"].as_array().unwrap();
-        assert_eq!(wire_tools.len(), 1);
+        assert_eq!(wire_tools.len(), 2);
         assert_eq!(wire_tools[0]["name"], "get_weather");
         assert!(wire_tools[0]["input_schema"].is_object());
+        for tool in wire_tools {
+            assert_wire_compatible(&tool["input_schema"]);
+        }
+        assert_eq!(
+            wire_tools[1]["input_schema"]["required"],
+            serde_json::json!([])
+        );
     }
 
     /// A request-log handle over a shared in-memory buffer.

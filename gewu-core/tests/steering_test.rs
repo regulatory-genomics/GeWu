@@ -16,6 +16,8 @@ use gewu_core::types::{
 use serde_json::Value;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::Barrier;
 
 /// Streams scripted assistant messages and captures every request's
 /// message list for assertions.
@@ -98,16 +100,16 @@ impl LlmProvider for ScriptedLlm {
     }
 }
 
-/// Sleeps for `ms` milliseconds, then echoes its id.
-struct SlowTool;
+/// Sends a steer from one of two synchronized tool calls.
+struct SteeringTool(Barrier);
 
 #[async_trait]
-impl Tool for SlowTool {
+impl Tool for SteeringTool {
     fn name(&self) -> &str {
-        "slow_tool"
+        "steering_tool"
     }
     fn description(&self) -> &str {
-        "Sleeps then echoes its id"
+        "Sends a steer from the first call and waits for the other call"
     }
     fn schema(&self) -> schemars::schema::RootSchema {
         schemars::schema_for!(serde_json::Value)
@@ -115,12 +117,15 @@ impl Tool for SlowTool {
     async fn execute(
         &self,
         args: Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
-        let ms = args["ms"].as_u64().unwrap_or(0);
-        let id = args["id"].as_u64().unwrap_or(0);
-        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-        Ok(ToolResult::new("slow", format!("result-{id}")))
+        let id = args["id"].as_u64().unwrap();
+        let inbox = ctx.inbox.as_ref().unwrap();
+        if id == 1 {
+            inbox.send("focus on the fast path")?;
+        }
+        self.0.wait().await;
+        Ok(ToolResult::new("steering", format!("result-{id}")))
     }
 }
 
@@ -138,15 +143,14 @@ async fn background_resume_is_user_level_data() {
             .system_prompt("System")
             .build()
             .unwrap();
-        agent
-            .steering()
-            .notify(gewu_core::agent::BackgroundNotification {
-                source: "workflow".into(),
-                id: "run".into(),
-                status: "completed".into(),
-                output: "untrusted result".into(),
-            });
-        let events: Vec<_> = agent.resume().collect().await;
+        let inbox = Steering::new();
+        inbox.notify(gewu_core::agent::BackgroundNotification {
+            source: "workflow".into(),
+            id: "run".into(),
+            status: "completed".into(),
+            output: "untrusted result".into(),
+        });
+        let events: Vec<_> = agent.resume_with_inbox(inbox).collect().await;
         assert!(events.iter().all(Result::is_ok));
         let requests = llm.requests();
         assert_eq!(roles(&requests[0]), vec!["system", "user"]);
@@ -202,8 +206,9 @@ async fn background_delivery_at_finish_boundary_resumes_without_user_input() {
         .system_prompt("System")
         .build()
         .unwrap();
-    let inbox = agent.steering().clone();
-    let mut stream = Box::pin(agent.ask("start"));
+    let inbox = Steering::new();
+    inbox.pause();
+    let mut stream = Box::pin(agent.ask_with_inbox("start", inbox.clone()));
     while let Some(event) = stream.next().await {
         if matches!(event.unwrap(), AgentEvent::Finish { .. }) {
             break;
@@ -216,7 +221,10 @@ async fn background_delivery_at_finish_boundary_resumes_without_user_input() {
         output: "result".into(),
     });
     drop(stream);
-    let mut stream = Box::pin(agent.resume());
+    assert!(!inbox.should_resume());
+    inbox.unpause();
+    assert!(inbox.should_resume());
+    let mut stream = Box::pin(agent.resume_with_inbox(inbox.clone()));
     while let Some(event) = stream.next().await {
         event.unwrap();
     }
@@ -234,13 +242,13 @@ async fn background_delivery_at_finish_boundary_resumes_without_user_input() {
     assert!(!inbox.is_pending());
 }
 
-fn tool_call(name: &str, arguments: Value) -> ToolCall {
+fn tool_call(id: u64) -> ToolCall {
     ToolCall {
-        id: "call_1".to_string(),
+        id: format!("call_{id}"),
         r#type: "function".to_string(),
         function: FunctionCall {
-            name: name.to_string(),
-            arguments: arguments.to_string(),
+            name: "steering_tool".to_string(),
+            arguments: serde_json::json!({ "id": id }).to_string(),
         },
     }
 }
@@ -250,16 +258,13 @@ fn tool_call(name: &str, arguments: Value) -> ToolCall {
 /// sees the tool result, then the steered user message — never a user
 /// message wedged between the assistant turn and its tool results.
 #[tokio::test]
-async fn steer_during_tool_execution_injects_at_round_boundary() {
+async fn steer_during_parallel_tool_execution_injects_at_round_boundary() {
     let llm = ScriptedLlm::new(vec![
         Message::Assistant {
             content: None,
             reasoning: None,
             replay: None,
-            tool_calls: Some(vec![tool_call(
-                "slow_tool",
-                serde_json::json!({ "id": 1, "ms": 250 }),
-            )]),
+            tool_calls: Some(vec![tool_call(1), tool_call(2)]),
         },
         Message::Assistant {
             content: Some("steered answer".to_string()),
@@ -271,31 +276,26 @@ async fn steer_during_tool_execution_injects_at_round_boundary() {
 
     let mut agent = AgentBuilder::default()
         .llm(llm.clone())
-        .with_tools(vec![Arc::new(SlowTool) as Arc<dyn Tool>])
+        .with_tools(vec![Arc::new(SteeringTool(Barrier::new(2)))])
         .system_prompt("System")
         .build()
         .unwrap();
 
-    let steering: Steering = agent.steering().clone();
-    let mut stream = Box::pin(agent.ask("run the tool"));
-
-    // Advance until the tool is executing.
-    loop {
-        match stream.next().await {
-            Some(Ok(AgentEvent::ToolStart { tool, .. })) if tool == "slow_tool" => break,
-            Some(Ok(_)) => {}
-            Some(Err(e)) => panic!("agent error before ToolStart: {e}"),
-            None => panic!("stream ended before ToolStart"),
-        }
-    }
-    steering.send("focus on the fast path").unwrap();
-
+    let events = tokio::time::timeout(
+        Duration::from_secs(5),
+        agent
+            .ask_with_inbox("run the tools", Steering::new())
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("parallel tool calls timed out");
     let mut steered = Vec::new();
     let mut finish = None;
-    while let Some(event) = stream.next().await {
+    for event in events {
         match event.unwrap() {
             AgentEvent::Steered { text } => steered.push(text),
             AgentEvent::Finish { response } => finish = Some(response),
+            AgentEvent::Error { error } => panic!("agent error: {error}"),
             _ => {}
         }
     }
@@ -303,21 +303,35 @@ async fn steer_during_tool_execution_injects_at_round_boundary() {
     assert_eq!(steered, vec!["focus on the fast path"]);
     assert_eq!(finish.as_deref(), Some("steered answer"));
 
-    drop(stream);
-
     let requests = llm.requests();
     assert_eq!(requests.len(), 2);
-    // The steered message rides AFTER the tool result, never inside it.
+    // The steered message follows every tool result.
     assert_eq!(
         roles(&requests[1]),
-        vec!["system", "user", "assistant", "tool", "user"]
+        vec!["system", "user", "assistant", "tool", "tool", "user"]
     );
+    let tool_ids: Vec<_> = requests[1]
+        .iter()
+        .filter_map(|message| match message {
+            Message::Tool { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_ids, ["call_1", "call_2"]);
     assert_eq!(user_texts(&requests[1])[1], "focus on the fast path");
 
     // And it is persisted as part of the transcript.
     assert_eq!(
         roles(agent.memory.messages()),
-        vec!["system", "user", "assistant", "tool", "user", "assistant"]
+        vec![
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "tool",
+            "user",
+            "assistant"
+        ]
     );
 }
 
@@ -347,8 +361,8 @@ async fn steer_during_final_answer_extends_the_run() {
         .build()
         .unwrap();
 
-    let steering = agent.steering().clone();
-    let mut stream = Box::pin(agent.ask("start"));
+    let steering = Steering::new();
+    let mut stream = Box::pin(agent.ask_with_inbox("start", steering.clone()));
 
     // First content delta is delivered; the stream still holds the Finish
     // event, so steering now lands before the run's completion check.
@@ -401,11 +415,12 @@ async fn steer_while_idle_is_delivered_at_next_ask_start() {
         .build()
         .unwrap();
 
-    agent.steering().send("earlier question").unwrap();
+    let inbox = Steering::new();
+    inbox.send("earlier question").unwrap();
 
     let mut steered = Vec::new();
     let mut finish = None;
-    let mut stream = Box::pin(agent.ask("main question"));
+    let mut stream = Box::pin(agent.ask_with_inbox("main question", inbox));
     while let Some(event) = stream.next().await {
         match event.unwrap() {
             AgentEvent::Steered { text } => steered.push(text),

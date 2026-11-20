@@ -551,7 +551,11 @@ pub enum ContentBlockStart {
         input: Option<Value>,
     },
     Thinking {
+        #[serde(default)]
         thinking: String,
+        // Anthropic sends the signature as `signature_delta` events; the
+        // start block may omit it entirely. Proxies may also include it.
+        #[serde(default)]
         signature: String,
     },
     RedactedThinking {
@@ -734,6 +738,33 @@ mod tests {
                 assert_eq!(chunk.delta.stop_reason.as_deref(), Some("max_tokens"));
             }
             other => panic!("expected MessageDelta, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_block_start_without_signature_parses() {
+        // Regression: real Anthropic streams deliver the signature through
+        // `signature_delta`; requiring it on `content_block_start` failed
+        // every extended-thinking request with an SSE parse error.
+        let sse = concat!(
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            "\n\n",
+        );
+        let events = collect(vec![Bytes::from_static(sse.as_bytes())]).await;
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AnthropicChunk::ContentBlockStart(chunk) => match &chunk.content_block {
+                ContentBlockStart::Thinking {
+                    thinking,
+                    signature,
+                } => {
+                    assert!(thinking.is_empty());
+                    assert!(signature.is_empty());
+                }
+                other => panic!("expected Thinking, got {other:?}"),
+            },
+            other => panic!("expected ContentBlockStart, got {other:?}"),
         }
     }
 

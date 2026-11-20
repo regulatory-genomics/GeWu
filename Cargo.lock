@@ -1217,28 +1217,21 @@ dependencies = [
 
 [[package]]
 name = "gewu-lab"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum",
  "clap",
- "dirs",
  "futures",
  "gewu-core",
- "gewu-providers",
- "glob",
- "regex",
+ "gewu-server",
  "schemars",
  "serde",
  "serde_json",
- "sqlx",
  "subtle",
- "tempfile",
- "thiserror 2.0.18",
  "tokio",
- "tower",
- "uuid",
+ "tokio-tungstenite 0.28.0",
 ]
 
 [[package]]

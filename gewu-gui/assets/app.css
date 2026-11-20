@@ -1950,6 +1950,17 @@ body {
   animation: pulse 1s ease-in-out infinite;
 }
 
+.status .phase.waiting {
+  color: var(--warn);
+}
+
+/* Blocked on the user, not working: amber with a slowed pulse. */
+.status .phase.waiting .dot {
+  background: var(--warn);
+  box-shadow: 0 0 8px var(--warn);
+  animation: pulse 2s ease-in-out infinite;
+}
+
 .status .kv {
   display: inline-flex;
   align-items: baseline;
@@ -2901,6 +2912,13 @@ body {
   background: var(--accent);
   box-shadow: 0 0 8px var(--accent);
   animation: pulse 1s ease-in-out infinite;
+}
+
+/* Blocked on the user, not working: amber with a slowed pulse. */
+.session-row.waiting .session-spinner {
+  background: var(--warn);
+  box-shadow: 0 0 8px var(--warn);
+  animation: pulse 2s ease-in-out infinite;
 }
 
 .sidebar-head {

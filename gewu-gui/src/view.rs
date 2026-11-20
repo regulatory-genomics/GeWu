@@ -8,7 +8,8 @@ use std::fmt::Write as _;
 
 use gewu_client::session::{Block, Phase, QuestionState};
 use gewu_protocol::{
-    ContentPart, DirectoryEntry, FileEntry, ModelSummary, REASONING_EFFORTS, WorkspaceSummary,
+    ContentPart, DirectoryEntry, FileEntry, ModelSummary, PROVIDER_DEFAULT_EFFORT,
+    REASONING_EFFORTS, WorkspaceSummary,
 };
 use math_core::{LatexToMathML, MathCoreConfig, MathDisplay};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
@@ -1123,6 +1124,14 @@ fn selected_model<'a>(tab: &Tab, models: &'a [ModelSummary]) -> Option<&'a Model
     }
 }
 
+/// Whether an effort can be sent for `model`; mirrors the server's
+/// `ModelEntry::supports_effort`.
+fn selectable_effort(model: &ModelSummary, effort: &str) -> bool {
+    effort == PROVIDER_DEFAULT_EFFORT
+        || REASONING_EFFORTS.contains(&effort)
+        || model.default_effort.as_deref() == Some(effort)
+}
+
 /// The status line: a telemetry strip with phase, model, key hints,
 /// and context usage on the right. With more than one switchable model,
 /// the model entry becomes a picker.
@@ -1173,28 +1182,19 @@ pub fn status_html(tab: &Tab, models: &[ModelSummary]) -> String {
         let selected = tab
             .reasoning_effort
             .as_deref()
-            .filter(|effort| REASONING_EFFORTS.contains(effort))
-            .or_else(|| {
-                model
-                    .default_effort
-                    .as_deref()
-                    .filter(|effort| REASONING_EFFORTS.contains(effort))
-            })
-            .unwrap_or("default");
+            .filter(|effort| selectable_effort(model, effort))
+            .or(model.default_effort.as_deref())
+            .unwrap_or(PROVIDER_DEFAULT_EFFORT);
         let _ = write!(
             out,
             "<label class=\"kv\"><select class=\"effort-picker\" data-effort-picker data-tab=\"{}\" aria-label=\"reasoning effort\" title=\"Reasoning effort\"{}>",
             tab.id,
             if disabled { " disabled" } else { "" }
         );
-        let default_title = match &model.default_effort {
-            Some(effort) => format!(" title=\"configured default: {}\"", escape(effort)),
-            None => String::new(),
-        };
         let _ = write!(
             out,
-            "<option value=\"default\"{default_title}{}>default</option>",
-            if selected == "default" {
+            "<option value=\"{PROVIDER_DEFAULT_EFFORT}\" title=\"provider default\"{}>default</option>",
+            if selected == PROVIDER_DEFAULT_EFFORT {
                 " selected"
             } else {
                 ""
@@ -1207,10 +1207,29 @@ pub fn status_html(tab: &Tab, models: &[ModelSummary]) -> String {
                 if selected == *effort { " selected" } else { "" }
             );
         }
+        // A configured effort outside the known list stays selectable, so
+        // choosing the provider default can be undone.
+        if let Some(effort) = &model.default_effort
+            && !REASONING_EFFORTS.contains(&effort.as_str())
+            && effort != PROVIDER_DEFAULT_EFFORT
+        {
+            let _ = write!(
+                out,
+                "<option value=\"{}\" title=\"configured default\"{}>{}</option>",
+                escape(effort),
+                if selected == effort { " selected" } else { "" },
+                escape(effort)
+            );
+        }
         out.push_str("</select></label>");
     }
     match (&tab.model.phase, tab.model.status.as_deref()) {
         (Phase::Idle, _) => out.push_str("<span class=\"phase\"><i class=\"dot\"></i>idle</span>"),
+        // A pending `question` form blocks the turn on the user: show it as a
+        // distinct phase instead of "thinking…".
+        (Phase::Busy, _) if tab.model.has_pending_question() => {
+            out.push_str("<span class=\"phase waiting\"><i class=\"dot\"></i>waiting…</span>");
+        }
         // A transient status (e.g. LLM retry backoff) replaces the plain
         // "thinking…" so a rate-limit wait is visible in the browser.
         (Phase::Busy, Some(status)) => {
@@ -1399,17 +1418,26 @@ pub fn session_sidebar_html_with_update(
         for tab in group_tabs {
             let active_class = if tab.id == active { " active" } else { "" };
             let busy = if tab.busy { " busy" } else { "" };
+            let waiting = if tab.waiting { " waiting" } else { "" };
+            let spinner = if tab.busy {
+                format!(
+                    "<span class=\"session-spinner\" aria-label=\"{}\"></span>",
+                    if tab.waiting {
+                        "waiting for input"
+                    } else {
+                        "working"
+                    }
+                )
+            } else {
+                String::new()
+            };
             let _ = write!(
                 out,
-                "<div class=\"session-row{active_class}{busy}\"><button type=\"button\" class=\"session-select\" data-session-tab=\"{}\" title=\"{}\"><span class=\"session-label\">{}</span>{}</button><button type=\"button\" class=\"session-close\" data-session-close=\"{}\" title=\"Close session\" aria-label=\"Close {}\">×</button></div>",
+                "<div class=\"session-row{active_class}{busy}{waiting}\"><button type=\"button\" class=\"session-select\" data-session-tab=\"{}\" title=\"{}\"><span class=\"session-label\">{}</span>{}</button><button type=\"button\" class=\"session-close\" data-session-close=\"{}\" title=\"Close session\" aria-label=\"Close {}\">×</button></div>",
                 tab.id,
                 escape(&tab.label),
                 escape(&tab.label),
-                if tab.busy {
-                    "<span class=\"session-spinner\" aria-label=\"working\"></span>"
-                } else {
-                    ""
-                },
+                spinner,
                 tab.id,
                 escape(&tab.label),
             );
@@ -1650,7 +1678,7 @@ pub fn file_preview_html(path: &str, content: &str, truncated: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace::Workspace;
+    use crate::workspace::{TRANSCRIPT_WINDOW_BLOCKS, Workspace};
     use gewu_protocol::AgentEvent;
     use gewu_protocol::TokenUsage;
 
@@ -1894,6 +1922,7 @@ mod tests {
                     id: 1,
                     label: "tachyon work".into(),
                     busy: false,
+                    waiting: false,
                     session_id: Some("session-1".into()),
                     workspace: "tachyon".into(),
                 },
@@ -1901,6 +1930,7 @@ mod tests {
                     id: 2,
                     label: "wiki notes".into(),
                     busy: true,
+                    waiting: true,
                     session_id: Some("session-2".into()),
                     workspace: "wiki".into(),
                 },
@@ -1973,6 +2003,16 @@ mod tests {
         assert!(html.contains("id=\"session-list-1\""), "{html}");
         assert!(html.contains("aria-expanded=\"true\""), "{html}");
         assert!(html.contains("session-row active"), "{html}");
+        assert!(
+            html.contains("class=\"session-row active busy waiting\""),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "<span class=\"session-spinner\" aria-label=\"waiting for input\"></span>"
+            ),
+            "{html}"
+        );
         assert!(html.contains("data-session-close=\"2\""), "{html}");
         assert!(
             html.contains("class=\"session-add\" data-session-new-workspace=\"tachyon\""),
@@ -2145,11 +2185,15 @@ mod tests {
         let (mut ws, id) = tab_with_blocks(blocks);
         let tab = ws.tab_mut(id).unwrap();
         tab.reset_transcript_window();
+        let start = 250 - TRANSCRIPT_WINDOW_BLOCKS;
 
         let html = transcript_html(tab);
 
-        assert!(html.contains("data-block=\"50\""), "{html}");
-        assert!(!html.contains("data-block=\"49\""), "{html}");
+        assert!(html.contains(&format!("data-block=\"{start}\"")), "{html}");
+        assert!(
+            !html.contains(&format!("data-block=\"{}\"", start - 1)),
+            "{html}"
+        );
         assert!(html.contains("data-load-earlier"), "{html}");
         assert!(html.contains("Load earlier messages"), "{html}");
     }
@@ -3153,7 +3197,7 @@ mod tests {
         assert!(!html.contains("class=\"k\">effort"), "{html}");
         assert!(
             html.contains(
-                "<option value=\"default\" title=\"configured default: high\">default</option>"
+                "<option value=\"provider-default\" title=\"provider default\">default</option>"
             ),
             "{html}"
         );
@@ -3191,9 +3235,24 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains("<option value=\"default\" selected>default</option>"),
+            html.contains(
+                "<option value=\"provider-default\" title=\"provider default\" selected>default</option>"
+            ),
             "{html}"
         );
+
+        // Choosing the provider default sticks as its own selection.
+        let tab = ws.tab_mut(id).unwrap();
+        tab.model_selector = Some("west/reasoning".into());
+        tab.reasoning_effort = Some(PROVIDER_DEFAULT_EFFORT.into());
+        let html = status_html(ws.tab(id).unwrap(), &models);
+        assert!(
+            html.contains(
+                "<option value=\"provider-default\" title=\"provider default\" selected>default</option>"
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("<option value=\"high\" selected>"), "{html}");
     }
 
     #[test]
@@ -3209,11 +3268,16 @@ mod tests {
         let html = status_html(ws.tab(id).unwrap(), &models);
         assert!(
             html.contains(
-                "<option value=\"default\" title=\"configured default: vendor-defined\" selected>default</option>"
+                "<option value=\"vendor-defined\" title=\"configured default\" selected>vendor-defined</option>"
             ),
             "{html}"
         );
-        assert!(!html.contains("value=\"vendor-defined\""), "{html}");
+        assert!(
+            html.contains(
+                "<option value=\"provider-default\" title=\"provider default\">default</option>"
+            ),
+            "{html}"
+        );
     }
 
     #[test]
@@ -3252,6 +3316,54 @@ mod tests {
         let html = status_html(ws.tab(id).unwrap(), &[]);
         assert!(html.contains("thinking…"), "{html}");
         assert!(!html.contains("Esc interrupt"), "{html}");
+    }
+
+    #[test]
+    fn busy_status_shows_waiting_phase_for_a_pending_question() {
+        let state = QuestionState::Pending {
+            request_id: "que_1".into(),
+            questions: vec![sample_question()],
+        };
+        let (mut ws, id) = tab_with_blocks(vec![question_block(state)]);
+        ws.tab_mut(id).unwrap().model.submit("ask me".into());
+        let html = status_html(ws.tab(id).unwrap(), &[]);
+        assert!(html.contains("class=\"phase waiting\""), "{html}");
+        assert!(html.contains("waiting…"), "{html}");
+        assert!(!html.contains("thinking…"), "{html}");
+    }
+
+    #[test]
+    fn answered_or_dismissed_question_restores_the_thinking_phase() {
+        for state in [
+            QuestionState::Answered {
+                request_id: "que_1".into(),
+                questions: vec![sample_question()],
+                answers: vec![vec!["SQLite".into()]],
+            },
+            QuestionState::Dismissed {
+                request_id: "que_1".into(),
+                questions: vec![sample_question()],
+            },
+        ] {
+            let (mut ws, id) = tab_with_blocks(vec![question_block(state)]);
+            ws.tab_mut(id).unwrap().model.submit("ask me".into());
+            let html = status_html(ws.tab(id).unwrap(), &[]);
+            assert!(html.contains("class=\"phase busy\""), "{html}");
+            assert!(html.contains("thinking…"), "{html}");
+            assert!(!html.contains("waiting…"), "{html}");
+        }
+    }
+
+    #[test]
+    fn idle_status_ignores_a_stale_pending_question() {
+        let state = QuestionState::Pending {
+            request_id: "que_1".into(),
+            questions: vec![sample_question()],
+        };
+        let (ws, id) = tab_with_blocks(vec![question_block(state)]);
+        let html = status_html(ws.tab(id).unwrap(), &[]);
+        assert!(html.contains("idle"), "{html}");
+        assert!(!html.contains("waiting…"), "{html}");
     }
 
     #[test]

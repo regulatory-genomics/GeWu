@@ -777,7 +777,7 @@ impl SqliteMemory {
 
 #[async_trait]
 impl Memory for SqliteMemory {
-    async fn append_compaction(&mut self, summary: String, recent: String) -> anyhow::Result<()> {
+    async fn add_checkpoint(&mut self, summary: String, recent: String) -> anyhow::Result<()> {
         let message = Message::Compaction { summary, recent };
         let content = serde_json::to_string(&message)?;
         sqlx::query("INSERT INTO memory_messages (session_id, content) VALUES (?, ?)")
@@ -792,18 +792,12 @@ impl Memory for SqliteMemory {
         &self.messages
     }
 
-    fn messages_mut(&mut self) -> &mut [Message] {
-        &mut self.messages
-    }
-
-    /// Adds a message to both the in-memory cache and the database.
+    /// Adds a message to the database and then to the in-memory cache.
     ///
-    /// The message is:
-    /// 1. Added to the in-memory vector immediately
-    /// 2. Asynchronously persisted to SQLite
-    ///
-    /// If serialization fails, the in-memory cache is updated but
-    /// the database write fails silently (logged as error).
+    /// Persistence happens first: if serializing or writing the row fails,
+    /// the message is dropped from both the database and the cache and the
+    /// failure is logged. This keeps the cache a faithful copy of durable
+    /// history.
     async fn add_message(&mut self, message: Message) {
         let session_id = self.session_id.clone();
         let pool = self.pool.clone();
@@ -1033,7 +1027,7 @@ mod tests {
         memory.add_message(user("first")).await;
         memory.add_message(user("second")).await;
         memory
-            .append_compaction("summary".into(), "tail".into())
+            .add_checkpoint("summary".into(), "tail".into())
             .await?;
         memory.add_message(user("third")).await;
         let original = memory.messages().to_vec();
@@ -1071,10 +1065,10 @@ mod tests {
                 .fetch_one(&pool)
                 .await?;
         memory
-            .append_compaction("first".into(), "recent".into())
+            .add_checkpoint("first".into(), "recent".into())
             .await?;
         memory
-            .append_compaction("latest".into(), "tail".into())
+            .add_checkpoint("latest".into(), "tail".into())
             .await?;
         let loaded = SqliteMemory::new(pool.clone(), "compact".into()).await?;
         assert_eq!(loaded.messages().len(), 3);
@@ -1093,7 +1087,7 @@ mod tests {
         pool.close().await;
         assert!(
             memory
-                .append_compaction("failed".into(), "".into())
+                .add_checkpoint("failed".into(), "".into())
                 .await
                 .is_err()
         );
@@ -1136,6 +1130,27 @@ mod tests {
             _ => panic!("Wrong type"),
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reminder_parts_round_trip_with_the_message() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        let mut memory = SqliteMemory::new(pool.clone(), "reminders".into()).await?;
+        memory
+            .add_message(Message::User {
+                content: vec![
+                    ContentPart::Text {
+                        text: "Update README.md".into(),
+                    },
+                    ContentPart::Reminder {
+                        text: "Plan mode is active".into(),
+                    },
+                ],
+            })
+            .await;
+        let reloaded = SqliteMemory::new(pool, "reminders".into()).await?;
+        assert_eq!(reloaded.messages(), memory.messages());
         Ok(())
     }
 

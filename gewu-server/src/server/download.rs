@@ -1,9 +1,9 @@
 //! HTTP file downloads.
 //!
 //! Files are streamed as attachments. Folders are packaged into a ZIP that
-//! mirrors the visible file tree (hidden and gitignored entries are skipped,
-//! symlinks are not followed) and streamed from a temporary file, so memory
-//! use stays bounded regardless of folder size.
+//! mirrors the file tree (hidden entries are skipped, ignore rules such as
+//! `.gitignore` are not applied, symlinks are not followed) and streamed from
+//! a temporary file, so memory use stays bounded regardless of folder size.
 
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
@@ -196,10 +196,14 @@ fn build_zip(root: &Path, folder_name: &str) -> Result<(std::fs::File, u64), Dow
 
     let mut entries = 1usize;
     let mut total = 0u64;
+    // Hidden entries stay out, but ignore rules must not filter the archive:
+    // a directory the file tree shows must download completely.
     for entry in ignore::WalkBuilder::new(root)
         .hidden(true)
-        .git_ignore(true)
-        .require_git(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
         .follow_links(false)
         .sort_by_file_path(|a, b| a.cmp(b))
         .build()
@@ -325,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_mirrors_the_visible_tree() {
+    fn archive_skips_hidden_entries_but_keeps_ignored_files() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("project");
         std::fs::create_dir_all(root.join("src/nested")).unwrap();
@@ -335,6 +339,8 @@ mod tests {
         std::fs::write(root.join(".hidden"), "no\n").unwrap();
         std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
         std::fs::write(root.join("ignored.log"), "no\n").unwrap();
+        std::fs::write(root.join(".ignore"), "*.tmp\n").unwrap();
+        std::fs::write(root.join("scratch.tmp"), "no\n").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("README.md"), root.join("link.md")).unwrap();
 
@@ -362,11 +368,22 @@ mod tests {
             entries.remove("project/src/nested/deep.txt").as_deref(),
             Some("deep\n")
         );
+        // Ignore rules must not filter the archive; only dotfiles and
+        // symlinks stay out.
+        assert_eq!(
+            entries.remove("project/ignored.log").as_deref(),
+            Some("no\n")
+        );
+        assert_eq!(
+            entries.remove("project/scratch.tmp").as_deref(),
+            Some("no\n")
+        );
         assert!(entries.contains_key("project/src/"), "{entries:?}");
         assert!(entries.contains_key("project/src/nested/"), "{entries:?}");
         assert!(
-            !entries.keys().any(|name| name.contains(".hidden")
-                || name.contains("ignored.log")
+            !entries.keys().any(|name| name.starts_with("project/.hid")
+                || name.starts_with("project/.git")
+                || name.starts_with("project/.ign")
                 || name.contains("link.md")),
             "{entries:?}"
         );

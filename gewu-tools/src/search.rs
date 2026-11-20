@@ -1,8 +1,7 @@
 //! Search Tools
 //!
-//! This module implements tools for semantic code search and web search, powered by Exa (formerly Metaphor).
+//! This module implements tools for web search, powered by Exa (formerly Metaphor).
 //!
-//! - `CodeSearchTool`: Finds relevant code snippets using semantic embedding search.
 //! - `WebSearchTool`: Performs general web searches to retrieve external information.
 
 use crate::fs_utils::into_tool_error;
@@ -19,19 +18,9 @@ use std::time::Duration;
 const EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
 
 #[derive(Deserialize, schemars::JsonSchema)]
-pub struct CodeSearchArgs {
-    query: String,
-    #[serde(rename = "tokensNum", default = "default_tokens")]
-    tokens_num: u32,
-}
-
-fn default_tokens() -> u32 {
-    5000
-}
-
-#[derive(Deserialize, schemars::JsonSchema)]
 pub struct WebSearchArgs {
     query: String,
+    objective: Option<String>,
     #[serde(rename = "numResults", default = "default_num_results")]
     num_results: u32,
 }
@@ -39,8 +28,6 @@ pub struct WebSearchArgs {
 fn default_num_results() -> u32 {
     8
 }
-
-pub struct CodeSearchTool;
 
 pub struct WebSearchTool;
 
@@ -174,39 +161,6 @@ async fn call_exa_tool(
 }
 
 #[async_trait]
-impl Tool for CodeSearchTool {
-    fn name(&self) -> &str {
-        "codesearch"
-    }
-
-    fn description(&self) -> &str {
-        include_str!("prompts/codesearch.txt")
-    }
-
-    fn schema(&self) -> RootSchema {
-        schemars::schema_for!(CodeSearchArgs)
-    }
-
-    async fn execute(
-        &self,
-        args: serde_json::Value,
-        _ctx: &ToolContext,
-    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
-        let input: CodeSearchArgs = serde_json::from_value(args).map_err(into_tool_error)?;
-
-        call_exa_tool(
-            "codesearch",
-            "get_code_context_exa",
-            serde_json::json!({
-                "query": input.query,
-                "tokensNum": input.tokens_num
-            }),
-        )
-        .await
-    }
-}
-
-#[async_trait]
 impl Tool for WebSearchTool {
     fn name(&self) -> &str {
         "websearch"
@@ -226,15 +180,15 @@ impl Tool for WebSearchTool {
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: WebSearchArgs = serde_json::from_value(args).map_err(into_tool_error)?;
+        let objective = input.objective.unwrap_or_else(|| input.query.clone());
 
         call_exa_tool(
             "websearch",
             "web_search_exa",
             serde_json::json!({
                 "query": input.query,
-                "numResults": input.num_results,
-                "type": "auto",
-                "livecrawl": "fallback"
+                "objective": objective,
+                "numResults": input.num_results
             }),
         )
         .await

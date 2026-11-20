@@ -14,6 +14,19 @@ The patch must use this format:
 *** Delete File: path/to/obsolete.txt
 *** End Patch
 
+Every `@@` starts a new chunk. A chunk must contain at least one `+` or `-`
+line. To anchor a chunk, put a unique context line on the header itself
+(`@@ <context line>`), never a bare `@@` followed by a context line. Chunks in
+one file are applied top to bottom, so submit them in file order.
+
+Example insertion:
+*** Begin Patch
+*** Update File: src/lib.rs
+@@     pub fn existing(&self) {
+     }
++    pub fn added(&self) {}
+*** End Patch
+
 Supported operations are Add File, Update File, Delete File, and an optional Move to immediately after Update File. Use *** End of File after an update chunk to require an EOF match. Related changes should be submitted in one patch so the complete change can be validated before files are modified.
 
 The patch may be supplied directly or wrapped in a `cat <<'PATCH'`/`<<PATCH` heredoc. A chunk containing only added lines appends them to the end of the file.
