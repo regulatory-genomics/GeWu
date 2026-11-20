@@ -1,4 +1,4 @@
-use super::{Instance, PluginHost, actions::clip};
+use super::{Instance, PluginHost, actions::clip, invocation};
 use gewu_core::{
     traits::Tool,
     types::{ToolContext, ToolResult},
@@ -169,13 +169,13 @@ impl PluginHost {
                     name: name.into(),
                     description: description.into(),
                     schema,
-                action: Action::Gateway(
-                    self.clone(),
-                    workspace.into(),
-                    root.clone(),
-                    session.into(),
-                    kind,
-                ),
+                    action: Action::Gateway(
+                        self.clone(),
+                        workspace.into(),
+                        root.clone(),
+                        session.into(),
+                        kind,
+                    ),
                 }));
             }
         }
@@ -279,9 +279,9 @@ impl Tool for PluginTool {
                 };
                 let live = || host.active_for_session(workspace, root, Some(session));
                 let data = match kind {
-                    Gateway::List => {
-                        json!({"plugins":host.catalog(),"instances":live().await.iter().map(|i|json!({"id":i.activation.instance_id,"pluginId":i.package.manifest.id,"bindingResource":i.activation.binding_resource})).collect::<Vec<_>>()})
-                    }
+                    Gateway::List => host
+                        .action(workspace, root, session, HostAction::List)
+                        .await?,
                     Gateway::Open => {
                         let resource = args
                             .get("bindingResource")
@@ -307,13 +307,8 @@ impl Tool for PluginTool {
                         })
                     }
                     Gateway::Close => {
-                        host.close_for_session(
-                            workspace,
-                            root,
-                            text("instanceId")?,
-                            Some(session),
-                        )
-                        .await?;
+                        host.close_for_session(workspace, root, text("instanceId")?, Some(session))
+                            .await?;
                         json!({"closed":true})
                     }
                     Gateway::Describe | Gateway::Call => {
@@ -395,11 +390,12 @@ impl Tool for PluginTool {
                         // toggle must not silently drop workflow-authoring.
                         let profiles = match args.get("profiles") {
                             Some(value) => serde_json::from_value(value.clone())?,
-                            None => host
-                                .session_state_for(session, &plugin_id)
-                                .await
-                                .unwrap_or_default()
-                                .profiles,
+                            None => {
+                                host.session_state_for(session, &plugin_id)
+                                    .await
+                                    .unwrap_or_default()
+                                    .profiles
+                            }
                         };
                         host.action(
                             workspace,
@@ -503,15 +499,28 @@ async fn invoke(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("tool args must be an object"))?;
     let id = uuid::Uuid::new_v4().to_string();
-    let mut context = instance.context(id.clone(), Some(ctx.session_id.clone()));
-    context.run_id = Some(ctx.run_id.clone());
-    host.selected_view(instance, &ctx.session_id, &mut context);
+    let app_context = host.resolve_context(
+        &instance.activation.workspace_id,
+        &ctx.session_id,
+        instance,
+        None,
+    )?;
+    let context = app_context.call_context(id.clone(), Some(ctx.run_id.clone()));
     let (tx, mut rx) = mpsc::channel(8);
     let mut guard = CancelOnDrop {
         adapter: Some(instance.adapter.clone()),
         id: id.clone(),
     };
-    let work = instance.invoke(tool, args, context, Some(tx), true, false);
+    let work = invocation::invoke_adapter(
+        &app_context,
+        instance,
+        tool,
+        args,
+        context,
+        Some(tx),
+        true,
+        false,
+    );
     tokio::pin!(work);
     let output = loop {
         tokio::select! {
@@ -531,6 +540,8 @@ async fn invoke(
     }
     let output = output?;
     let data = serde_json::to_value(output)?;
+    let mut metadata = data.clone();
+    metadata["context"] = serde_json::to_value(&app_context)?;
     let text = serde_json::to_string(&data)?;
     let mut result = ToolResult::new(
         tool,
@@ -541,7 +552,7 @@ async fn invoke(
         },
     );
     let stored = json!({"workspaceId":instance.activation.workspace_id,"pluginId":instance.package.manifest.id,
-        "bindingResource":instance.activation.binding_resource,"result":data});
+        "bindingResource":instance.activation.binding_resource,"context":app_context,"result":data});
     match ctx
         .session_state
         .write(
@@ -556,7 +567,7 @@ async fn invoke(
             .push_str(&format!("\n[GeWu plugin result: {id}]")),
         Err(error) => tracing::warn!("could not persist plugin tool output: {error}"),
     }
-    result.metadata.insert("gewu.plugin".into(), data);
+    result.metadata.insert("gewu.plugin".into(), metadata);
     result.metadata.insert(
         "gewu.plugin.instanceId".into(),
         instance.activation.instance_id.clone().into(),
