@@ -26,9 +26,25 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: Install plugin test dependencies
+        run: |
+          python -m pip install jsonschema
+          npm --prefix gewu-gui/tests/browser ci
+          npm --prefix gewu-gui/tests/browser exec -- playwright install --with-deps chromium
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
@@ -43,4 +59,4 @@ jobs:
         run: cargo build --workspace --locked
 
       - name: Test workspace
-        run: cargo test --workspace --locked
+        run: bash scripts/check-plugin-host.sh --contracts --browser

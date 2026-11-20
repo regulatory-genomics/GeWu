@@ -60,6 +60,7 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
     const askedCall = /^call\s+(\S+)\s+(\{[\s\S]*\})$/.exec(asked.trim());
     if (askedCall && !afterTool) {
       const name = turn.tools?.find(t => t.function.name === askedCall[1]
+        || t.function.name.endsWith(`.${askedCall[1]}`)
         || (t.function.name.startsWith('plg_') && t.function.name.includes(`_${askedCall[1]}_`)))?.function.name;
       if (name) {
         send({role:'assistant',tool_calls:[{index:0,id:'call-1',type:'function',function:{name,arguments:askedCall[2]}}]});
