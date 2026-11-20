@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail, ensure};
 use gewu_protocol::plugin::*;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::Path,
     sync::{
         Arc,
@@ -711,16 +711,26 @@ impl PluginHost {
             HostAction::MarketplaceSearch { query, refresh } => {
                 let (client, index) = self.marketplace_index(refresh).await?;
                 let query = query.unwrap_or_default();
-                let releases = super::marketplace::MarketplaceClient::search(&index, &query);
+                let target = super::runtime::current_target()
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                let releases = super::marketplace::MarketplaceClient::search(&index, &query)
+                    .into_iter()
+                    .map(|release| {
+                        let mut value = serde_json::to_value(release)?;
+                        value["runtimeOptions"] = json!(self.marketplace_runtime_options(release, &target));
+                        Ok::<_, anyhow::Error>(value)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(json!({
                     "repository": index.repository,
                     "indexUrl": client.repository().index_url,
                     "generatedAt": index.generated_at,
                     "expiresAt": index.expires_at,
                     "releases": releases,
+                    "installed": self.marketplace_installations(),
                 }))
             }
-            HostAction::MarketplaceInstall { plugin_id, version, channel } => {
+            HostAction::MarketplaceInstall { plugin_id, version, channel, runtime } => {
                 let root = self.installation_root.clone().context("host has no installation root")?;
                 let (client, index) = self.marketplace_index(true).await?;
                 let target = super::runtime::current_target()
@@ -732,7 +742,11 @@ impl PluginHost {
                 let store = super::artifacts::ArtifactStore::new(root.join("store"));
                 let package = client.download_artifact(&release.package, &store).await
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                let selections = super::lifecycle::RuntimeSelection::auto_candidates(&release, &target, None).await?;
+                let selections = if runtime == "auto" {
+                    super::lifecycle::RuntimeSelection::auto_candidates(&release, &target, None).await?
+                } else {
+                    vec![super::lifecycle::RuntimeSelection::select(&release, &runtime, &target, None)?]
+                };
                 let manager = super::lifecycle::InstallManager::new(&root);
                 let mut failures = Vec::new();
                 for selection in selections {
@@ -771,6 +785,100 @@ impl PluginHost {
                 Ok(json!(state.plugins))
             }
         }
+    }
+
+    fn marketplace_runtime_options(
+        &self,
+        release: &gewu_protocol::release::Release,
+        target: &gewu_protocol::release::Target,
+    ) -> Vec<Value> {
+        let Some(plan) = &release.runtime_plan else {
+            return release
+                .runtimes
+                .iter()
+                .filter(|runtime| runtime.target == *target)
+                .map(|runtime| {
+                    json!({
+                        "id": runtime.id,
+                        "kind": "bundled",
+                        "available": true,
+                        "detail": format!("downloads {} MB", runtime.artifact.bytes.div_ceil(1_000_000)),
+                    })
+                })
+                .collect();
+        };
+        plan.providers
+            .iter()
+            .filter(|provider| provider.target() == target)
+            .map(|provider| match provider {
+                gewu_protocol::release::RuntimeProvider::External { .. } => {
+                    match super::providers::resolve_external(provider, None) {
+                        Ok(_) => json!({
+                            "id": provider.id(),
+                            "kind": provider.kind(),
+                            "available": true,
+                            "detail": "executable found; compatibility checked during install",
+                        }),
+                        Err(error) => json!({
+                            "id": provider.id(),
+                            "kind": provider.kind(),
+                            "available": false,
+                            "detail": error.to_string(),
+                        }),
+                    }
+                }
+                gewu_protocol::release::RuntimeProvider::Managed { manager, .. } => {
+                    let available = super::providers::managed_available(manager);
+                    json!({
+                        "id": provider.id(),
+                        "kind": provider.kind(),
+                        "available": available,
+                        "detail": if available { format!("{manager} detected") } else { format!("{manager} is not installed") },
+                    })
+                }
+                gewu_protocol::release::RuntimeProvider::Bundled { .. } => {
+                    let available = release.runtimes.iter().any(|runtime| {
+                        runtime.id == provider.id() && runtime.target == *target
+                    });
+                    json!({
+                        "id": provider.id(),
+                        "kind": provider.kind(),
+                        "available": available,
+                        "detail": if available { "download on install" } else { "no matching artifact" },
+                    })
+                }
+            })
+            .collect()
+    }
+
+    fn marketplace_installations(&self) -> Value {
+        let mut installed = BTreeMap::new();
+        if let Some(root) = &self.installation_root
+            && let Ok(state) = super::state::StateStore::new(root).load()
+        {
+            for (id, plugin) in state.plugins {
+                installed.insert(
+                    id,
+                    json!({
+                        "state": "installed",
+                        "activeGeneration": plugin.active_generation,
+                        "previousGeneration": plugin.previous_generation,
+                        "runtime": plugin.active_generation.as_ref().and_then(|generation| plugin.generations.get(generation)).and_then(|generation| generation.runtime.clone()),
+                    }),
+                );
+            }
+        }
+        for plugin in self.catalog() {
+            let Some(id) = plugin["id"].as_str() else { continue };
+            let entry = installed.entry(id.to_string()).or_insert_with(|| {
+                json!({"state": "local"})
+            });
+            if entry["state"] == "local" {
+                entry["version"] = plugin["version"].clone();
+                entry["configured"] = plugin["configured"].clone();
+            }
+        }
+        json!(installed)
     }
 
     async fn marketplace_index(

@@ -8,6 +8,8 @@ pub const SCHEMA: &str = include_str!("../schema/plugin.v1.schema.json");
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub type Object = Map<String, Value>;
 
+fn default_runtime_policy() -> String { "auto".into() }
+
 /// UI/client commands. These are intentionally not part of the adapter wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -109,6 +111,10 @@ pub enum HostAction {
         plugin_id: String,
         version: Option<String>,
         channel: String,
+        /// Runtime acquisition policy. Older clients omit this field and use
+        /// `auto`, preserving the original Marketplace action contract.
+        #[serde(default = "default_runtime_policy")]
+        runtime: String,
     },
     MarketplaceRollback {
         plugin_id: String,

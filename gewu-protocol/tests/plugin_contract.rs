@@ -70,3 +70,18 @@ fn rejects_bad_frames_and_mismatched_or_repeated_terminals() {
     pending.receive(&right).unwrap();
     assert!(pending.receive(&right).is_err());
 }
+
+#[test]
+fn marketplace_install_defaults_to_auto_for_older_clients() {
+    let action: HostAction = serde_json::from_value(json!({
+        "action": "marketplace_install",
+        "pluginId": "paper",
+        "version": "0.2.0",
+        "channel": "stable"
+    }))
+    .unwrap();
+    assert!(matches!(
+        action,
+        HostAction::MarketplaceInstall { runtime, .. } if runtime == "auto"
+    ));
+}

@@ -48,6 +48,14 @@ pub struct Candidate {
 /// Search-path lookup without a shell. Absolute or relative commands that
 /// contain a separator are checked directly.
 pub fn find_command(command: &str) -> Option<PathBuf> {
+    find_command_in(command, std::env::var_os("PATH"), dirs::home_dir())
+}
+
+fn find_command_in(
+    command: &str,
+    path: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
     if command.is_empty() || command.contains('\0') {
         return None;
     }
@@ -55,8 +63,23 @@ pub fn find_command(command: &str) -> Option<PathBuf> {
         let path = PathBuf::from(command);
         return is_executable(&path).then_some(path);
     }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|dir| dir.join(command)).find(|candidate| is_executable(candidate))
+    let mut directories = path
+        .as_deref()
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if let Some(home) = home {
+        for directory in [home.join(".local/bin"), home.join("bin"), home.join("micromamba/bin")] {
+            if !directories.contains(&directory) {
+                directories.push(directory);
+            }
+        }
+    }
+    directories
+        .into_iter()
+        .map(|dir| dir.join(command))
+        .find(|candidate| is_executable(candidate))
 }
 
 pub fn is_executable(path: &Path) -> bool {    #[cfg(unix)]
@@ -474,6 +497,19 @@ mod tests {
             binaries: Default::default(),
         };
         assert!(matches!(resolve_external(&provider, None), Err(ProviderError::Unavailable(_))));
+    }
+
+    #[test]
+    fn command_discovery_checks_the_user_local_bin_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let executable = bin.join("micromamba");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        assert_eq!(
+            find_command_in("micromamba", Some(std::ffi::OsString::new()), Some(temp.path().to_path_buf())),
+            Some(executable)
+        );
     }
 
     #[test]

@@ -34,6 +34,7 @@ async fn marketplace_search_reads_the_signed_offline_cache() {
         .unwrap();
     assert_eq!(value["repository"], "official");
     assert_eq!(value["releases"], serde_json::json!([]));
+    assert!(value["installed"].is_object());
 }
 
 #[tokio::test]

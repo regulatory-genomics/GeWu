@@ -4,6 +4,23 @@ import {button, changes, editor, node, preview} from './editor.mjs';
 export const dismissedKey = (scope) => `gewu.dismissed.v1:${JSON.stringify([scope.workspace, scope.session_id ?? scope.id])}`;
 export const stateKey = (scope, instance, view) => `gewu.viewstate.v2:${JSON.stringify([scope.workspace, scope.session_id ?? scope.id, instance.pluginId, instance.bindingResource?.uri ?? '', view.id])}`;
 
+export function runtimeOptionLabel(provider) {
+  if (provider.kind === 'auto') return 'Auto · first compatible option';
+  const kind = provider.kind ? provider.kind[0].toUpperCase() + provider.kind.slice(1) : 'Runtime';
+  const name = provider.manager ?? provider.id ?? provider.kind;
+  const detail = provider.detail ? ` · ${provider.detail}` : '';
+  return `${kind} · ${name}${detail}`;
+}
+
+export function marketplaceStatus(release, installed = {}, catalog = []) {
+  const state = installed[release.plugin];
+  if (state?.activeGeneration === release.releaseId) {
+    return state.runtime?.kind ? `Installed · ${state.runtime.kind}` : 'Package installed · runtime not verified';
+  }
+  const local = catalog.find((plugin) => plugin.id === release.plugin && plugin.version === release.version);
+  return local ? `Installed locally · ${release.version}` : '';
+}
+
 /// The right-dock host: a Plugins manager plus one tab per open application
 /// view. Server instances are the source of truth, so a reload attaches to a
 /// live instance and never starts a stopped one.
@@ -217,7 +234,12 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
     pane.append(list);
     marketplaceView.replaceChildren(pane);
     try {
-      const data = await request({action: 'marketplace_search', query, refresh: true});
+      const [data, inventory] = await Promise.all([
+        request({action: 'marketplace_search', query, refresh: true}),
+        request({action: 'list'}).catch(() => ({plugins: []})),
+      ]);
+      const installed = data.installed ?? {};
+      const catalog = inventory.plugins ?? [];
       list.replaceChildren();
       list.append(node('p', `${data.releases.length} release(s) · ${data.repository} · expires ${data.expiresAt}`));
       list.append(node('p', `Catalog: ${data.indexUrl}`));
@@ -227,23 +249,66 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
         row.className = 'plugin-row';
         row.append(node('span', `${release.plugin} ${release.version} (${release.channel})`));
         if (release.releaseNotes) row.append(node('p', release.releaseNotes));
-        const runtime = release.runtimes?.[0];
-        if (runtime) {
-          const mb = Math.round((runtime.artifact.bytes + release.package.bytes) / 1e6);
-          row.append(node('code', `${runtime.target.os}-${runtime.target.arch} · ${mb} MB`));
+        const statusText = marketplaceStatus(release, installed, catalog);
+        const state = installed[release.plugin];
+        const packageInstalled = state?.activeGeneration === release.releaseId
+          || catalog.some((plugin) => plugin.id === release.plugin && plugin.version === release.version);
+        const runtimeReady = state?.activeGeneration === release.releaseId && Boolean(state.runtime?.kind);
+        if (statusText) row.append(node('strong', statusText));
+
+        const runtimePlan = release.runtimePlan?.providers ?? [];
+        const runtimeOptions = release.runtimeOptions ?? [];
+        const runtimeInfo = new Map(runtimeOptions.map((option) => [`${option.kind}:${option.id}`, option]));
+        const runtimeSelect = node('select');
+        runtimeSelect.setAttribute('aria-label', `Runtime for ${release.plugin}`);
+        const auto = node('option', runtimeOptionLabel({kind: 'auto'}));
+        auto.value = 'auto';
+        auto.disabled = runtimeOptions.length > 0 && !runtimeOptions.some((option) => option.available);
+        runtimeSelect.append(auto);
+        for (const provider of runtimePlan) {
+          const info = runtimeInfo.get(`${provider.kind}:${provider.id}`);
+          const option = node('option', runtimeOptionLabel({...provider, ...(info ?? {})}));
+          option.value = provider.kind;
+          option.disabled = info?.available === false;
+          runtimeSelect.append(option);
         }
-        row.append(button('Install', async () => {
+        if (!runtimePlan.length) {
+          for (const runtime of release.runtimes ?? []) {
+            const option = node('option', runtimeOptionLabel({kind: 'bundled', id: runtime.id, detail: `${Math.round(runtime.artifact.bytes / 1e6)} MB`}));
+            option.value = 'bundled';
+            runtimeSelect.append(option);
+          }
+        }
+        row.append(runtimeSelect);
+
+        const status = node('p', '');
+        status.setAttribute('role', 'status');
+        const install = button(runtimeReady ? 'Installed' : packageInstalled ? 'Install runtime' : 'Install', async () => {
+          const policy = runtimeSelect.value;
+          install.disabled = true;
+          runtimeSelect.disabled = true;
+          status.textContent = `Installing via ${runtimeOptionLabel({kind: policy})}… large runtimes may take several minutes.`;
           try {
-            const result = await request({action: 'marketplace_install', pluginId: release.plugin, version: release.version, channel: release.channel});
-            row.append(node('p', `Installed ${result.version}. Restart or reopen the plugin to use it.`));
-          } catch (error) { fail(row, error); }
-        }));
-        row.append(button('Rollback', async () => {
+            const result = await request({action: 'marketplace_install', pluginId: release.plugin, version: release.version, channel: release.channel, runtime: policy});
+            const selected = result.runtime?.kind ? ` via ${result.runtime.kind}` : '';
+            status.textContent = `Installed ${result.version}${selected}. Restart or reopen the plugin to use it.`;
+            install.textContent = 'Installed';
+          } catch (error) {
+            status.textContent = `Install failed: ${error.message}`;
+            install.disabled = false;
+            runtimeSelect.disabled = false;
+          }
+        });
+        install.disabled = runtimeReady;
+        row.append(install, status);
+        const rollback = button('Rollback', async () => {
           try {
             const result = await request({action: 'marketplace_rollback', pluginId: release.plugin});
-            row.append(node('p', `Rolled back to ${result.release}.`));
-          } catch (error) { fail(row, error); }
-        }));
+            status.textContent = `Rolled back to ${result.release}.`;
+          } catch (error) { status.textContent = `Rollback failed: ${error.message}`; }
+        });
+        rollback.disabled = state?.state !== 'installed';
+        row.append(rollback);
         list.append(row);
       }
     } catch (error) { list.replaceChildren(); fail(list, error); }

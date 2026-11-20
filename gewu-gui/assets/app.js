@@ -429,11 +429,16 @@ import {panelHost} from './panels.mjs';
   let pluginRequest = 0;
   let pluginTabs = [];
   let panelSyncTimer;
+  // Bundled runtimes can be hundreds of MB and managed environments may solve
+  // packages for several minutes; the host request remains transactional while
+  // it installs, so the GUI must not discard the response after 65 seconds.
+  const MARKETPLACE_INSTALL_TIMEOUT_MS = 30 * 60 * 1000;
   const panels = panelHost(document.getElementById('plugin-host'), (tab, plugin) => {
     return new Promise((resolve,reject) => {
       if (!Number.isSafeInteger(tab) || !state.ready) {reject(Error('No connected workspace'));return;}
       const request=++pluginRequest;
-      const timer=setTimeout(()=>{pluginPending.delete(request);reject(Error('Plugin request timed out'));},65000);
+      const timeout = plugin.action === 'marketplace_install' ? MARKETPLACE_INSTALL_TIMEOUT_MS : 65000;
+      const timer=setTimeout(()=>{pluginPending.delete(request);reject(Error(timeout === MARKETPLACE_INSTALL_TIMEOUT_MS ? 'Marketplace install timed out; the host may still be finishing the transaction' : 'Plugin request timed out'));},timeout);
       pluginPending.set(request,{tab,resolve:value=>{clearTimeout(timer);resolve(value);},reject:error=>{clearTimeout(timer);reject(error);}});
       if (!send({op:'plugin',tab,request,plugin})) {
         pluginPending.get(request).reject(Error('Disconnected'));
