@@ -118,6 +118,13 @@ pub enum Op {
         path: String,
         content_base64: String,
     },
+    /// Store a base64-encoded file in the session's attachment store (a
+    /// server-owned directory outside any workspace). Attached asks
+    /// reference the stored file by name.
+    UploadAttachment {
+        name: String,
+        content_base64: String,
+    },
     /// List the available agent profiles (build/explore/general).
     ListAgents,
     /// List the model selectors available for [`Op::SwitchModel`].
@@ -167,6 +174,27 @@ pub enum Op {
     },
 }
 
+/// One file attached to an [`Op::Ask`].
+///
+/// An attachment carries either inline base64 `data` (small screenshots and
+/// PDFs, sent as model-visible media) or a workspace-relative `path` (files
+/// already uploaded to the workspace; oversized or non-inlineable files are
+/// passed to the agent as a path reference it can `read_file`). Exactly one
+/// of the two must be set.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AskAttachment {
+    /// Display name (e.g. the original file name).
+    pub name: String,
+    /// MIME type, e.g. `image/png` or `application/pdf`.
+    pub mime_type: String,
+    /// Inline base64-encoded file body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// Workspace-relative path of an already-uploaded file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
 /// A request sent by a client, or received by the server.
 ///
 /// Construct requests with the associated functions (`ask`, `interrupt`, ...)
@@ -186,6 +214,8 @@ pub struct ClientRequest {
     /// Optional workspace id, honored only when the connection creates a new
     /// session. Existing sessions keep their persisted workspace.
     pub workspace: Option<String>,
+    /// Files attached to an [`Op::Ask`]; empty for every other operation.
+    pub attachments: Vec<AskAttachment>,
 }
 
 /// Serialize in the protocol's wire format, e.g.
@@ -210,6 +240,7 @@ impl Serialize for ClientRequest {
             )) as usize
             + self.agent.is_some() as usize
             + self.workspace.is_some() as usize
+            + (!self.attachments.is_empty()) as usize
             + matches!(
                 self.op,
                 Op::Ask { .. }
@@ -219,6 +250,7 @@ impl Serialize for ClientRequest {
                     | Op::ListFiles { .. }
                     | Op::ReadFile { .. }
                     | Op::WriteFile { .. }
+                    | Op::UploadAttachment { .. }
             ) as usize
             + if matches!(
                 self.op,
@@ -267,6 +299,9 @@ impl Serialize for ClientRequest {
             Op::Ask { prompt } => {
                 map.serialize_entry("op", "ask")?;
                 map.serialize_entry("prompt", prompt)?;
+                if !self.attachments.is_empty() {
+                    map.serialize_entry("attachments", &self.attachments)?;
+                }
             }
             Op::QuestionReply {
                 request_id,
@@ -298,6 +333,14 @@ impl Serialize for ClientRequest {
             } => {
                 map.serialize_entry("op", "write_file")?;
                 map.serialize_entry("path", path)?;
+                map.serialize_entry("content_base64", content_base64)?;
+            }
+            Op::UploadAttachment {
+                name,
+                content_base64,
+            } => {
+                map.serialize_entry("op", "upload_attachment")?;
+                map.serialize_entry("name", name)?;
                 map.serialize_entry("content_base64", content_base64)?;
             }
             Op::Interrupt => map.serialize_entry("op", "interrupt")?,
@@ -380,7 +423,19 @@ impl ClientRequest {
             session_id: None,
             agent: None,
             workspace: None,
+            attachments: Vec::new(),
         }
+    }
+
+    /// Build an `ask` request with file attachments.
+    pub fn ask_with_attachments(
+        id: impl Into<Value>,
+        prompt: impl Into<String>,
+        attachments: Vec<AskAttachment>,
+    ) -> Self {
+        let mut request = Self::ask(id, prompt);
+        request.attachments = attachments;
+        request
     }
 
     /// Build a `question_reply` request. `answers` holds one label list per
@@ -455,6 +510,7 @@ impl ClientRequest {
             session_id: None,
             agent: None,
             workspace: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -465,6 +521,7 @@ impl ClientRequest {
             session_id: None,
             agent: None,
             workspace: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -485,6 +542,27 @@ impl ClientRequest {
             session_id: None,
             agent: None,
             workspace: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// Build an `upload_attachment` request: `content_base64` is the
+    /// base64-encoded file body stored in the session's attachment store.
+    pub fn upload_attachment(
+        id: impl Into<Value>,
+        name: impl Into<String>,
+        content_base64: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            op: Op::UploadAttachment {
+                name: name.into(),
+                content_base64: content_base64.into(),
+            },
+            session_id: None,
+            agent: None,
+            workspace: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -542,6 +620,7 @@ impl ClientRequest {
             session_id: None,
             agent: None,
             workspace: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -552,6 +631,7 @@ impl ClientRequest {
             session_id: None,
             agent: None,
             workspace: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -598,6 +678,50 @@ fn parse_answers(value: Option<&Value>) -> Option<Vec<Vec<String>>> {
     Some(answers)
 }
 
+/// Parse the optional `attachments` array of an `ask` request. Each entry
+/// must carry a `name`, a `mime_type`, and exactly one of inline `data`
+/// (base64) or a workspace-relative `path`.
+fn parse_attachments(value: Option<&Value>) -> Result<Vec<AskAttachment>, RequestError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| RequestError::Invalid("attachments must be an array".into()))?;
+    let mut attachments = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let obj = entry
+            .as_object()
+            .ok_or_else(|| RequestError::Invalid("each attachment must be an object".into()))?;
+        let name = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RequestError::Invalid("attachment requires a 'name' string".into()))?
+            .to_string();
+        let mime_type = obj
+            .get("mime_type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                RequestError::Invalid("attachment requires a 'mime_type' string".into())
+            })?
+            .to_string();
+        let data = obj.get("data").and_then(Value::as_str).map(str::to_string);
+        let path = obj.get("path").and_then(Value::as_str).map(str::to_string);
+        if data.is_some() == path.is_some() {
+            return Err(RequestError::Invalid(
+                "attachment requires exactly one of 'data' or 'path'".into(),
+            ));
+        }
+        attachments.push(AskAttachment {
+            name,
+            mime_type,
+            data,
+            path,
+        });
+    }
+    Ok(attachments)
+}
+
 /// Parse one client message (a JSON object) into a [`ClientRequest`].
 pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
     let value: Value = serde_json::from_str(line)
@@ -617,6 +741,7 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
         .and_then(Value::as_str)
         .ok_or_else(|| RequestError::Invalid("missing required field 'op'".to_string()))?;
 
+    let mut attachments: Vec<AskAttachment> = Vec::new();
     let op = match op_str {
         "revert_chat" => {
             let turn = match obj.get("turn") {
@@ -693,6 +818,7 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
                     RequestError::Invalid("op 'ask' requires a 'prompt' string".to_string())
                 })?
                 .to_string();
+            attachments = parse_attachments(obj.get("attachments"))?;
             Op::Ask { prompt }
         }
         "question_reply" => {
@@ -780,6 +906,30 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
                 content_base64,
             }
         }
+        "upload_attachment" => {
+            let name = obj
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RequestError::Invalid(
+                        "op 'upload_attachment' requires a 'name' string".to_string(),
+                    )
+                })?
+                .to_string();
+            let content_base64 = obj
+                .get("content_base64")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RequestError::Invalid(
+                        "op 'upload_attachment' requires a 'content_base64' string".to_string(),
+                    )
+                })?
+                .to_string();
+            Op::UploadAttachment {
+                name,
+                content_base64,
+            }
+        }
         "list_sessions" => Op::ListSessions,
         "get_session" => {
             if obj.get("session_id").and_then(Value::as_str).is_none() {
@@ -832,6 +982,7 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
         session_id,
         agent,
         workspace,
+        attachments,
     })
 }
 
@@ -1191,6 +1342,19 @@ pub enum ServerMessage {
         /// Number of bytes written.
         bytes: u64,
     },
+    /// Reply to an `upload_attachment` request: the file is stored in the
+    /// session's attachment store. Asks reference it by name.
+    AttachmentStored {
+        /// Echo of the client request id.
+        id: Value,
+        /// The stored file's (sanitized) name.
+        name: String,
+        /// Absolute path of the stored file (for display; asks reference
+        /// the file by name).
+        path: String,
+        /// Number of bytes stored.
+        bytes: u64,
+    },
     /// Reply to a `list_agents` request.
     Agents {
         /// Echo of the client request id.
@@ -1265,6 +1429,7 @@ impl ServerMessage {
             ServerMessage::Files { .. } => "files",
             ServerMessage::FileContent { .. } => "file_content",
             ServerMessage::FileWritten { .. } => "file_written",
+            ServerMessage::AttachmentStored { .. } => "attachment_stored",
             ServerMessage::Agents { .. } => "agents",
             ServerMessage::Models { .. } => "models",
             ServerMessage::Sessions { .. } => "sessions",
@@ -1295,6 +1460,7 @@ impl ServerMessage {
             | ServerMessage::Files { id, .. }
             | ServerMessage::FileContent { id, .. }
             | ServerMessage::FileWritten { id, .. }
+            | ServerMessage::AttachmentStored { id, .. }
             | ServerMessage::Agents { id, .. }
             | ServerMessage::Models { id, .. }
             | ServerMessage::Sessions { id, .. }
@@ -1554,6 +1720,82 @@ mod tests {
         );
         assert_eq!(req.session_id, None);
         assert_eq!(req.agent, None);
+        // A frame without attachments (every client predating the field)
+        // parses with an empty list.
+        assert_eq!(req.attachments, Vec::new());
+    }
+
+    #[test]
+    fn ask_attachments_round_trip() {
+        let request = ClientRequest::ask_with_attachments(
+            7,
+            "describe this",
+            vec![
+                AskAttachment {
+                    name: "shot.png".into(),
+                    mime_type: "image/png".into(),
+                    data: Some("aGk=".into()),
+                    path: None,
+                },
+                AskAttachment {
+                    name: "paper.pdf".into(),
+                    mime_type: "application/pdf".into(),
+                    data: None,
+                    path: Some("papers/paper.pdf".into()),
+                },
+            ],
+        );
+        assert_eq!(parse_request(&request.to_line()).unwrap(), request);
+
+        // The wire line carries the attachments; a text-only ask does not.
+        assert!(request.to_line().contains("\"attachments\""));
+        assert!(
+            !ClientRequest::ask(1, "hi")
+                .to_line()
+                .contains("attachments")
+        );
+    }
+
+    #[test]
+    fn upload_attachment_round_trip() {
+        let request = ClientRequest::upload_attachment(9, "notes.csv", "aGk=");
+        assert_eq!(parse_request(&request.to_line()).unwrap(), request);
+        let reply = ServerMessage::AttachmentStored {
+            id: 9.into(),
+            name: "notes.csv".into(),
+            path: "/store/sess-1/notes.csv".into(),
+            bytes: 2,
+        };
+        assert_eq!(reply.kind(), "attachment_stored");
+        assert_eq!(reply.correlation_id(), Some(&Value::from(9)));
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&reply.to_line()).unwrap(),
+            reply
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_ask_attachments() {
+        // Both data and path set.
+        let both = r#"{"id":1,"op":"ask","prompt":"hi","attachments":[
+            {"name":"a.png","mime_type":"image/png","data":"aGk=","path":"a.png"}]}"#;
+        assert!(parse_request(both).is_err());
+        // Neither set.
+        let neither = r#"{"id":1,"op":"ask","prompt":"hi","attachments":[
+            {"name":"a.png","mime_type":"image/png"}]}"#;
+        assert!(parse_request(neither).is_err());
+        // Missing name.
+        let unnamed = r#"{"id":1,"op":"ask","prompt":"hi","attachments":[
+            {"mime_type":"image/png","data":"aGk="}]}"#;
+        assert!(parse_request(unnamed).is_err());
+        // Missing mime type.
+        let untyped = r#"{"id":1,"op":"ask","prompt":"hi","attachments":[
+            {"name":"a.png","data":"aGk="}]}"#;
+        assert!(parse_request(untyped).is_err());
+        // Not an array.
+        assert!(
+            parse_request(r#"{"id":1,"op":"ask","prompt":"hi","attachments":"nope"}"#).is_err()
+        );
     }
 
     #[test]

@@ -1259,8 +1259,13 @@ impl GuiSession {
             }
             // Auth is consumed by the transport before the session starts.
             ClientMsg::Auth { .. } => {}
-            ClientMsg::Ask { tab, prompt } => {
-                self.handle_ask(tab, prompt, sender, tab_tx).await?;
+            ClientMsg::Ask {
+                tab,
+                prompt,
+                attachments,
+            } => {
+                self.handle_ask(tab, prompt, attachments, sender, tab_tx)
+                    .await?;
             }
             ClientMsg::AnswerQuestion {
                 tab,
@@ -1516,6 +1521,40 @@ impl GuiSession {
                     self.send_error(sender, failures.join("; ")).await?;
                 }
             }
+            ClientMsg::AttachFiles { files } => {
+                let client = self.file_client().await?;
+                let mut stored = Vec::new();
+                let mut failures = Vec::new();
+                for file in files {
+                    let Some(name) = sanitize_upload_name(&file.name) else {
+                        failures.push(format!("'{}' is not a valid file name", file.name));
+                        continue;
+                    };
+                    use base64::Engine as _;
+                    let bytes = match base64::engine::general_purpose::STANDARD
+                        .decode(file.content_base64.as_bytes())
+                    {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            failures.push(format!("'{name}' is not valid base64"));
+                            continue;
+                        }
+                    };
+                    match client.upload_attachment(name.clone(), &bytes).await {
+                        Ok((_, _path)) => {
+                            stored.push(format!("{name} ({} kB)", bytes.len() / 1024))
+                        }
+                        Err(e) => failures.push(format!("could not attach '{name}': {e}")),
+                    }
+                }
+                if !stored.is_empty() {
+                    self.send_notice(sender, format!("Attached {}", stored.join(", ")))
+                        .await?;
+                }
+                if !failures.is_empty() {
+                    self.send_error(sender, failures.join("; ")).await?;
+                }
+            }
             ClientMsg::ReadFile { path } => {
                 match self.file_client().await?.read_file(path.clone()).await {
                     Ok((content, truncated)) => {
@@ -1600,11 +1639,12 @@ impl GuiSession {
         &mut self,
         tab_id: u64,
         prompt: String,
+        attachments: Vec<gewu_protocol::AskAttachment>,
         sender: &mut Sender,
         tab_tx: &mpsc::UnboundedSender<TabEvent>,
     ) -> Result<()> {
         let prompt = prompt.trim().to_string();
-        if prompt.is_empty() {
+        if prompt.is_empty() && attachments.is_empty() {
             return self.send_error(sender, "prompt is empty").await;
         }
         let Some(tab) = self.workspace.tab(tab_id) else {
@@ -1620,6 +1660,14 @@ impl GuiSession {
         // existing blocks in place. The pending entry lets the later
         // `steered` event confirm the block instead of duplicating it.
         if tab.model.phase != Phase::Idle {
+            if !attachments.is_empty() {
+                return self
+                    .send_error(
+                        sender,
+                        "attachments are only supported on a new message; wait for the current turn to finish",
+                    )
+                    .await;
+            }
             if let Err(e) = self.ensure_client(tab_id).await {
                 return self
                     .send_error(sender, format!("could not connect: {e}"))
@@ -1677,6 +1725,9 @@ impl GuiSession {
         let client = self.client(tab_id).expect("just ensured");
         let workspace = self.workspace.tab(tab_id).map(|tab| tab.workspace.clone());
         let mut builder = client.ask(prompt.clone());
+        if !attachments.is_empty() {
+            builder = builder.attachments(attachments.clone());
+        }
         if let Some(session_id) = session_id {
             builder = builder.session_id(session_id);
         }
@@ -1694,7 +1745,8 @@ impl GuiSession {
                 }
                 let user_block = {
                     let tab = self.workspace.tab_mut(tab_id).expect("tab exists");
-                    tab.model.submit(prompt);
+                    tab.model
+                        .submit_with_media(prompt, local_media_parts(&attachments));
                     tab.model.blocks.len() - 1
                 };
                 let task = spawn_ask_forwarder(tab_id, stream, tab_tx.clone());
@@ -2322,6 +2374,33 @@ fn toggle(set: &mut std::collections::HashSet<usize>, value: usize) {
     if !set.remove(&value) {
         set.insert(value);
     }
+}
+
+/// Map an ask's inline attachments to the media parts the local preview
+/// block renders. The server performs the authoritative resolution (path
+/// references, size caps); this local mapping mirrors it for inline data so
+/// the initiating connection shows thumbnails immediately. Non-media
+/// attachments have no local preview.
+fn local_media_parts(
+    attachments: &[gewu_protocol::AskAttachment],
+) -> Vec<gewu_protocol::ContentPart> {
+    attachments
+        .iter()
+        .filter_map(|attachment| {
+            let data = attachment.data.as_ref()?;
+            match attachment.mime_type.as_str() {
+                "application/pdf" => Some(gewu_protocol::ContentPart::File {
+                    data: data.clone(),
+                    mime_type: attachment.mime_type.clone(),
+                }),
+                mime if mime.starts_with("image/") => Some(gewu_protocol::ContentPart::Image {
+                    data: data.clone(),
+                    mime_type: mime.to_string(),
+                }),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Forward one tab's ask frames into the event loop, so background tabs keep

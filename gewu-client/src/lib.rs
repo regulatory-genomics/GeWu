@@ -48,8 +48,8 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use gewu_protocol::{
-    ClientRequest, DirectoryEntry, FileEntry, Message, ServerMessage, SessionSummary, TokenUsage,
-    WorkspaceSummary,
+    AskAttachment, ClientRequest, DirectoryEntry, FileEntry, Message, ServerMessage,
+    SessionSummary, TokenUsage, WorkspaceSummary,
 };
 use inner::Command;
 
@@ -131,6 +131,7 @@ pub struct AskBuilder<'a> {
     session_id: Option<String>,
     agent: Option<String>,
     workspace: Option<String>,
+    attachments: Vec<AskAttachment>,
 }
 
 impl Client {
@@ -304,6 +305,7 @@ impl Client {
             session_id: None,
             agent: None,
             workspace: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -373,6 +375,7 @@ impl Client {
             session_id: None,
             agent: None,
             workspace: Some(workspace),
+            attachments: Vec::new(),
         };
         match self.request(request).await? {
             ServerMessage::Plugin { result, .. } => Ok(result),
@@ -411,6 +414,23 @@ impl Client {
         match self.request(request).await? {
             ServerMessage::FileWritten { path, bytes, .. } => Ok((path, bytes)),
             other => Err(unexpected(other, "file_written")),
+        }
+    }
+
+    /// Store a file in the session's attachment store (outside every
+    /// workspace); asks reference the returned name.
+    pub async fn upload_attachment(
+        &self,
+        name: impl Into<String>,
+        bytes: &[u8],
+    ) -> Result<(String, String)> {
+        use base64::Engine as _;
+        let content_base64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let request =
+            ClientRequest::upload_attachment(self.next_correlation_id(), name, content_base64);
+        match self.request(request).await? {
+            ServerMessage::AttachmentStored { name, path, .. } => Ok((name, path)),
+            other => Err(unexpected(other, "attachment_stored")),
         }
     }
 
@@ -636,6 +656,13 @@ impl AskBuilder<'_> {
         self
     }
 
+    /// Attach files to this ask (inline base64 or workspace paths). The
+    /// server resolves them into model-visible media parts.
+    pub fn attachments(mut self, attachments: Vec<AskAttachment>) -> Self {
+        self.attachments = attachments;
+        self
+    }
+
     /// Start the ask and return its event stream.
     pub async fn send(self) -> Result<AskStream> {
         let request = ClientRequest::ask(self.client.next_correlation_id(), self.prompt);
@@ -643,6 +670,7 @@ impl AskBuilder<'_> {
             session_id: self.session_id,
             agent: self.agent,
             workspace: self.workspace,
+            attachments: self.attachments,
             ..request
         };
         let (tx, rx) = oneshot::channel();

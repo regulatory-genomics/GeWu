@@ -120,7 +120,7 @@ fn render_block(out: &mut String, tab: &Tab, block: &Block, index: usize, stream
         return;
     }
     let class = match block {
-        Block::User(_) => "user",
+        Block::User(_) | Block::UserMedia { .. } => "user",
         Block::Assistant(_) => "assistant",
         Block::Thought { .. } => "thought",
         Block::Error(_) => "error",
@@ -130,13 +130,17 @@ fn render_block(out: &mut String, tab: &Tab, block: &Block, index: usize, stream
     };
     let _ = writeln!(out, "<div class=\"block {class}\" data-block=\"{index}\">");
     write_block_body(out, tab, block, index, streaming);
-    if matches!(block, Block::User(_)) {
-        let _ = write!(
-            out,
-            "<button type=\"button\" class=\"message-menu-trigger\" aria-label=\"Message actions\" aria-haspopup=\"menu\" aria-expanded=\"false\" aria-controls=\"message-menu-{index}\"></button><div id=\"message-menu-{index}\" class=\"message-menu\" role=\"menu\" hidden><button type=\"button\" role=\"menuitem\" class=\"chat-revert\" data-revert-block=\"{index}\" title=\"Revert conversation from here; files are not undone\">Revert chat</button></div>"
-        );
-    }
     out.push_str("</div>\n");
+}
+
+/// The message-actions trigger and its menu, written inside the message
+/// bubble it belongs to (`.body.plain` is the positioning context, so the
+/// trigger anchors to the message rather than to the whole block — which a
+/// media attachment can widen).
+fn message_menu_html(index: usize) -> String {
+    format!(
+        "<button type=\"button\" class=\"message-menu-trigger\" aria-label=\"Message actions\" aria-haspopup=\"menu\" aria-expanded=\"false\" aria-controls=\"message-menu-{index}\"></button><div id=\"message-menu-{index}\" class=\"message-menu\" role=\"menu\" hidden><button type=\"button\" role=\"menuitem\" class=\"chat-revert\" data-revert-block=\"{index}\" title=\"Revert conversation from here; files are not undone\">Revert chat</button></div>"
+    )
 }
 
 /// Render the inner `.body` div of one block (between the `.block` wrapper).
@@ -156,7 +160,7 @@ fn write_block_body(out: &mut String, tab: &Tab, block: &Block, index: usize, st
         Block::Thought { .. } => {
             out.push_str(&thought_body_html(tab, index, streaming));
         }
-        Block::User(text) => {
+        Block::User(text) | Block::UserMedia { text, .. } => {
             // A message submitted mid-run is queued into the running turn
             // until the agent's `steered` event confirms it was ingested;
             // while it sits in `pending_steers`, show that state.
@@ -172,14 +176,23 @@ fn write_block_body(out: &mut String, tab: &Tab, block: &Block, index: usize, st
                         .map(|c| (prompt, Some(c)))
                 })
                 .unwrap_or((text.as_str(), None));
+            let with_media = if let Block::UserMedia { media, .. } = block {
+                let _ = write!(out, "<div class=\"user-media-group\">{}", user_media_html(media));
+                true
+            } else {
+                false
+            };
             let _ = writeln!(
                 out,
                 "<div class=\"body plain\">{}{}</div>",
                 escape(prompt),
                 if queued {
-                    "<span class=\"queue-status\">queued</span>"
+                    format!(
+                        "<span class=\"queue-status\">queued</span>{}",
+                        message_menu_html(index)
+                    )
                 } else {
-                    ""
+                    message_menu_html(index)
                 }
             );
             if let Some(items) = plugin_context {
@@ -200,6 +213,9 @@ fn write_block_body(out: &mut String, tab: &Tab, block: &Block, index: usize, st
                     )
                 );
             }
+            if with_media {
+                out.push_str("</div>\n");
+            }
         }
         _ => {
             let _ = writeln!(
@@ -209,6 +225,34 @@ fn write_block_body(out: &mut String, tab: &Tab, block: &Block, index: usize, st
             );
         }
     }
+}
+
+/// Inline markup for a user message's attachments: raster images as
+/// thumbnails (the tool-media allowlist), other files as chips with their
+/// name and MIME type.
+fn user_media_html(media: &[ContentPart]) -> String {
+    let mut out = String::new();
+    if let Some(images) = tool_media_html(
+        &media
+            .iter()
+            .filter(|part| matches!(part, ContentPart::Image { .. }))
+            .cloned()
+            .collect::<Vec<_>>(),
+        "attachment",
+    ) {
+        out.push_str(&images);
+    }
+    for part in media {
+        if let ContentPart::File { mime_type, .. } = part {
+            let _ = writeln!(
+                out,
+                "<p class=\"attachment-chip\" data-mime=\"{}\">attached file ({})</p>",
+                escape(mime_type),
+                escape(mime_type)
+            );
+        }
+    }
+    out
 }
 
 /// Render a thought block's body: the "Thinking… Ns"/"Thought Ns" label with
@@ -1695,6 +1739,53 @@ mod tests {
         assert_eq!(
             escape(r#"<script>&"x" '</script>"#),
             "&lt;script&gt;&amp;&quot;x&quot; &#39;&lt;/script&gt;"
+        );
+    }
+
+    #[test]
+    fn user_media_renders_thumbnails_and_file_chips() {
+        let (ws, id) = tab_with_blocks(vec![Block::UserMedia {
+            text: "describe this".into(),
+            media: vec![
+                ContentPart::Image {
+                    data: "aGk=".into(),
+                    mime_type: "image/png".into(),
+                },
+                ContentPart::File {
+                    data: "aGk=".into(),
+                    mime_type: "application/pdf".into(),
+                },
+            ],
+        }]);
+        let html = transcript_html(ws.tab(id).unwrap());
+
+        assert!(html.contains("describe this"), "{html}");
+        assert!(
+            html.contains("data:image/png;base64,aGk="),
+            "inline image must render as a thumbnail: {html}"
+        );
+        assert!(
+            html.contains("attachment-chip"),
+            "non-media attachments must render as chips: {html}"
+        );
+        // Attachments sit above the message text, inside one column group.
+        let group_at = html.find("<div class=\"user-media-group\">").unwrap();
+        let media_at = html.find("data:image/png;base64,aGk=").unwrap();
+        let text_at = html.find("describe this").unwrap();
+        assert!(
+            group_at < media_at && media_at < text_at,
+            "attachments must render above the message inside the group: {html}"
+        );
+        // The message-menu trigger rides inside the bubble (after the text),
+        // so it anchors to the message rather than the image above it.
+        let trigger_at = html.find("message-menu-trigger").unwrap();
+        assert!(
+            text_at < trigger_at,
+            "the message-menu trigger must anchor to the bubble, not the attachment: {html}"
+        );
+        assert!(
+            !html.contains("aGk=\"") || html.contains("base64,"),
+            "base64 must never render as text: {html}"
         );
     }
 

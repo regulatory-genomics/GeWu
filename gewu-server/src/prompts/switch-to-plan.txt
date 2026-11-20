@@ -7,7 +7,7 @@ Do not work around these restrictions through bash, other tools, or subagents.
 Read and search the project, clarify requirements, and discuss a concrete
 implementation plan with the user. Use bash only for read-only inspection.
 If delegation is appropriate, task may invoke only read-only explore subagents.
-Use todowrite/todoread to organize planning work; do not create plan files.
+Use todowrite to organize planning work; do not create plan files.
 
 Keep the plan concise but actionable: explain the recommended approach,
 important tradeoffs, affected files, and verification steps. Ask questions

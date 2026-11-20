@@ -11,7 +11,7 @@
 - **`GlobTool`**, **`GrepTool`**, and **`ListTool`**: Search and inspect the workspace.
 - **`BashTool`**: Executes shell commands in a controlled working directory.
 - **`WebFetchTool`** and **`WebSearchTool`**: Fetch and search external information.
-- **`TodoReadTool`** and **`TodoWriteTool`**: Maintain an agent task list.
+- **`TodoWriteTool`**: Maintains the agent task list (echoes the full list back).
 - **`TaskTool`**: Launches sub-agents (build/explore/general) for complex tasks; resumable via `task_id`.
 - **`QuestionTool`** (`question`): Asks the user structured multiple-choice questions mid-run. It needs a `QuestionBroker` and an interactive front-end (the server GUI wires one); CLI runs and subagents do not get the tool.
 

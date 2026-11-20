@@ -17,8 +17,7 @@
 //! | [`GrepTool`] | `grep` | Search file contents |
 //! | [`WebFetchTool`] | `webfetch` | Fetch web pages |
 //! | [`WebSearchTool`] | `websearch` | Search the web |
-//! | [`TodoReadTool`] | `todoread` | Read the task list |
-//! | [`TodoWriteTool`] | `todowrite` | Write the task list |
+//! | [`TodoWriteTool`] | `todowrite` | Write and echo back the task list |
 //! | [`TaskTool`] | `task` | Launch sub-agents for complex tasks |
 //! | [`WorkflowStartTool`] | `workflow_start` | Start a background workflow run from a JSON spec |
 //! | [`WorkflowStatusTool`] | `workflow_status` | Snapshot a workflow run without waiting |
@@ -84,6 +83,6 @@ pub use search::WebSearchTool;
 pub use shell_env::{ShellEnvironment, ShellError, ShellLimits, ShellMount, ShellOutcome};
 pub use skill::{SkillInfo, SkillTool};
 pub use task::{AgentFactory, AgentOverrides, TaskTool};
-pub use todo::{TodoItem, TodoReadTool, TodoWriteTool};
+pub use todo::{TodoItem, TodoWriteTool};
 pub use web_fetch::{WebFetchPolicy, WebFetchTool};
 pub use workflow::{WorkflowCancelTool, WorkflowManager, WorkflowStartTool, WorkflowStatusTool};

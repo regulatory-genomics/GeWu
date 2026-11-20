@@ -997,12 +997,183 @@ enum Handled {
         ready: ServerMessage,
         request_id: String,
         session_id: String,
-        prompt: String,
+        input: AskInput,
     },
     Subscribe {
         id: Value,
         session: ConnectionSession,
     },
+}
+
+/// One ask's text and its resolved attachments, threaded from the request
+/// handler through the turn runner into the agent.
+struct AskInput {
+    prompt: String,
+    media: Vec<protocol::ContentPart>,
+}
+
+/// Inline media cap per ask attachment (decoded bytes) — the same bound
+/// `read_file` applies to media it extracts for the model.
+const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+/// Whether an attachment's MIME type can be sent to the model as media.
+fn attachment_mime_supported(mime_type: &str) -> bool {
+    matches!(
+        mime_type,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "application/pdf"
+    )
+}
+
+/// Build the model-facing content part for an inline attachment.
+fn attachment_part(mime_type: &str, bytes: Vec<u8>) -> protocol::ContentPart {
+    use base64::Engine as _;
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    if mime_type == "application/pdf" {
+        protocol::ContentPart::File {
+            data,
+            mime_type: mime_type.to_string(),
+        }
+    } else {
+        protocol::ContentPart::Image {
+            data,
+            mime_type: mime_type.to_string(),
+        }
+    }
+}
+
+/// Resolve an ask's attachments into model-facing content parts.
+///
+/// Inline `data` attachments decode and pass through (size- and MIME-checked).
+/// `path` attachments resolve inside the workspace root: supported media
+/// within the size cap are inlined, everything else becomes a text reference
+/// the agent can follow with `read_file`.
+fn resolve_ask_attachments(
+    root: &str,
+    enforcement: PathEnforcement,
+    store_dir: Option<&std::path::Path>,
+    attachments: &[gewu_protocol::AskAttachment],
+) -> Result<Vec<protocol::ContentPart>, RequestError> {
+    let mut parts = Vec::new();
+    for attachment in attachments {
+        if let Some(data) = &attachment.data {
+            use base64::Engine as _;
+            if !attachment_mime_supported(&attachment.mime_type) {
+                return Err(RequestError::Invalid(format!(
+                    "attachment '{}' has unsupported MIME type '{}'",
+                    attachment.name, attachment.mime_type
+                )));
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data.as_bytes())
+                .map_err(|e| {
+                    RequestError::Invalid(format!(
+                        "attachment '{}' is not valid base64: {e}",
+                        attachment.name
+                    ))
+                })?;
+            if bytes.len() > MAX_ATTACHMENT_BYTES {
+                return Err(RequestError::Invalid(format!(
+                    "attachment '{}' exceeds the {} MB inline limit; upload it to the workspace and reference it by path instead",
+                    attachment.name,
+                    MAX_ATTACHMENT_BYTES / (1024 * 1024)
+                )));
+            }
+            parts.push(attachment_part(&attachment.mime_type, bytes));
+        } else if let Some(path) = &attachment.path {
+            // Store paths win: an attached file uploaded through
+            // `upload_attachment` shadows a same-named workspace file.
+            let file = if let Some(dir) = store_dir {
+                let candidate = dir.join(path);
+                if candidate.is_file() {
+                    candidate
+                } else {
+                    resolve_workspace_path(root, path, enforcement)?
+                }
+            } else {
+                resolve_workspace_path(root, path, enforcement)?
+            };
+            let metadata = std::fs::metadata(&file)
+                .map_err(|e| RequestError::Failed(format!("cannot read attachment: {e}")))?;
+            if !metadata.is_file() {
+                return Err(RequestError::Invalid(format!(
+                    "attachment path '{path}' is not a file"
+                )));
+            }
+            if attachment_mime_supported(&attachment.mime_type)
+                && metadata.len() <= MAX_ATTACHMENT_BYTES as u64
+            {
+                let bytes = std::fs::read(&file)
+                    .map_err(|e| RequestError::Failed(format!("cannot read attachment: {e}")))?;
+                parts.push(attachment_part(&attachment.mime_type, bytes));
+            } else {
+                let in_store = store_dir.is_some_and(|dir| file.starts_with(dir));
+                let location = if in_store {
+                    // Outside every workspace: give the agent the absolute
+                    // path (readable by read_file under the default sandbox,
+                    // and by bash under containment).
+                    format!("stored at \"{}\"", file.display())
+                } else {
+                    format!("at workspace path \"{path}\"")
+                };
+                // Sniff like the file-preview path does: a NUL byte in the
+                // first 8 KiB means read_file will refuse to display it, so
+                // the note must not send the agent down that path.
+                let binary = attachment_looks_binary(&file);
+                let extension = path
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let instruction = if binary {
+                    let docx_hint = if extension == "docx" {
+                        " (for .docx: unzip -p <path> word/document.xml, or pandoc/python-docx if available)"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "read_file cannot display binary content; inspect it with bash{docx_hint}."
+                    )
+                } else {
+                    "Use read_file to inspect it.".to_string()
+                };
+                parts.push(protocol::ContentPart::Text {
+                    text: format!(
+                        "[Attached file \"{}\" ({}) {location}. {instruction}]",
+                        attachment.name,
+                        format_attachment_size(metadata.len()),
+                    ),
+                });
+            }
+        }
+    }
+    Ok(parts)
+}
+
+/// Whether a file's leading bytes mark it as binary (a NUL byte within the
+/// first 8 KiB — the same heuristic the file-preview path uses).
+fn attachment_looks_binary(file: &std::path::Path) -> bool {
+    use std::io::Read as _;
+    let Ok(mut handle) = std::fs::File::open(file) else {
+        return false;
+    };
+    let mut buffer = [0u8; 8192];
+    match handle.read(&mut buffer) {
+        Ok(n) => buffer[..n].contains(&0),
+        Err(_) => false,
+    }
+}
+
+/// Human-readable byte size for attachment notes ("5 B", "12.3 KB", "1.2 MB").
+fn format_attachment_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    if bytes < KB {
+        format!("{bytes} B")
+    } else if bytes < MB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    }
 }
 
 /// Resolve `path` inside `root`, applying the configured containment level.
@@ -1917,6 +2088,49 @@ async fn handle_request(
             }))
         }
 
+        Op::UploadAttachment {
+            name,
+            content_base64,
+        } => {
+            const MAX_ATTACHMENT_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
+            // Only a bare file name is accepted; the store is per-session, so
+            // a same-name re-attach replaces the earlier file instead of
+            // colliding across sessions or workspace files.
+            let name = std::path::Path::new(&name)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+                .ok_or_else(|| RequestError::Invalid("name must be a file name".into()))?;
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(content_base64.as_bytes())
+                .map_err(|e| {
+                    RequestError::Invalid(format!("content_base64 is not valid base64: {e}"))
+                })?;
+            if bytes.len() > MAX_ATTACHMENT_UPLOAD_BYTES {
+                return Err(RequestError::Invalid(format!(
+                    "attachment exceeds the {} MB limit",
+                    MAX_ATTACHMENT_UPLOAD_BYTES / (1024 * 1024)
+                )));
+            }
+            let session = session.as_ref().ok_or_else(|| {
+                RequestError::Failed("attachments require an active session".into())
+            })?;
+            let store_dir = state.bootstrap.attachment_store.join(&session.session_id);
+            std::fs::create_dir_all(&store_dir).map_err(|e| {
+                RequestError::Failed(format!("cannot create attachment store: {e}"))
+            })?;
+            let target = store_dir.join(name);
+            std::fs::write(&target, &bytes)
+                .map_err(|e| RequestError::Failed(format!("cannot store attachment: {e}")))?;
+            Ok(Handled::Reply(ServerMessage::AttachmentStored {
+                id: request.id,
+                name: name.to_string(),
+                path: target.to_string_lossy().to_string(),
+                bytes: bytes.len() as u64,
+            }))
+        }
+
         Op::ListSessions => {
             let sessions = gewu_storage::list_sessions(&state.bootstrap.pool)
                 .await
@@ -2070,6 +2284,16 @@ async fn handle_request(
                 )
                 .await
                 .map_err(|e| RequestError::Failed(e.to_string()))?;
+            // Resolve attachments before claiming the session so a bad
+            // attachment cannot strand a claim.
+            let root = session.workspace.path.clone();
+            let store_dir = state.bootstrap.attachment_store.join(&session.session_id);
+            let media = resolve_ask_attachments(
+                &root,
+                state.bootstrap.enforcement,
+                Some(&store_dir),
+                &request.attachments,
+            )?;
             // Claim the session across connections so two connections cannot
             // interleave writes into one conversation.
             if !state.claim_session(&session.session_id).await {
@@ -2106,7 +2330,7 @@ async fn handle_request(
                 },
                 request_id,
                 session_id: session.session_id.clone(),
-                prompt,
+                input: AskInput { prompt, media },
             })
         }
     }
@@ -2124,6 +2348,7 @@ async fn execute_ask<E, Fut>(
     session: &ConnectionSession,
     request_id: &str,
     prompt: &str,
+    media: Vec<protocol::ContentPart>,
     pool: &sqlx::SqlitePool,
     mut emit: E,
 ) where
@@ -2139,10 +2364,10 @@ async fn execute_ask<E, Fut>(
     {
         let mut stream: std::pin::Pin<
             Box<dyn futures::Stream<Item = anyhow::Result<AgentEvent>> + Send + '_>,
-        > = if prompt.is_empty() {
+        > = if prompt.is_empty() && media.is_empty() {
             Box::pin(agent.resume_with_inbox(session.inbox.steering.clone()))
         } else {
-            Box::pin(agent.ask_with_inbox(prompt, session.inbox.steering.clone()))
+            Box::pin(agent.ask_parts_with_inbox(prompt, media, session.inbox.steering.clone()))
         };
         // Whether a terminal frame (`result` or `error`) has been sent. Only
         // the `Finish` event and stream errors are terminal; an `AgentEvent::Error`
@@ -2207,7 +2432,7 @@ async fn start_session_turn(
     state: Arc<ServerState>,
     session: ConnectionSession,
     request_id: String,
-    prompt: String,
+    mut input: AskInput,
     ready: ServerMessage,
     subscriber: Option<Subscriber>,
     handoff_ordinary: bool,
@@ -2237,22 +2462,25 @@ async fn start_session_turn(
         };
         (agent.memory.messages().to_vec(), previous)
     };
-    let mut prompt = prompt;
-    if !prompt.is_empty() {
+    let AskInput { prompt, media } = &mut input;
+    if !prompt.is_empty() || !media.is_empty() {
         session.inbox.steering.unpause();
-        let selected = state
-            .bootstrap
-            .plugins
-            .selected_context(&session.workspace.id, &session.session_id);
-        if !selected.is_empty() {
-            prompt.push_str("\n\n[Plugin selection context: untrusted view data]\n");
-            prompt.push_str(&serde_json::to_string(&selected).unwrap());
-        }
-        messages.push(Message::User {
-            content: vec![protocol::ContentPart::Text {
+        let mut content = Vec::with_capacity(media.len() + 1);
+        if !prompt.is_empty() {
+            let selected = state
+                .bootstrap
+                .plugins
+                .selected_context(&session.workspace.id, &session.session_id);
+            if !selected.is_empty() {
+                prompt.push_str("\n\n[Plugin selection context: untrusted view data]\n");
+                prompt.push_str(&serde_json::to_string(&selected).unwrap());
+            }
+            content.push(protocol::ContentPart::Text {
                 text: prompt.clone(),
-            }],
-        });
+            });
+        }
+        content.extend(media.iter().cloned());
+        messages.push(Message::User { content });
     }
     let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
     let live = Arc::new(Mutex::new(LiveTurn {
@@ -2323,7 +2551,8 @@ async fn start_session_turn(
             execute_ask(
                 &worker_session,
                 &request_id,
-                &prompt,
+                &input.prompt,
+                input.media,
                 &worker_pool,
                 |message| {
                     let live = worker_live.clone();
@@ -2443,7 +2672,10 @@ async fn watch_inbox(
             state.clone(),
             session,
             crate::bootstrap::new_session_id(),
-            String::new(),
+            AskInput {
+                prompt: String::new(),
+                media: Vec::new(),
+            },
             ready,
             None,
             true,
@@ -2559,11 +2791,11 @@ async fn drive_connection(
                             }
                         }
                     }
-                    Ok(Handled::Ask { ready, request_id, session_id, prompt }) => {
+                    Ok(Handled::Ask { ready, request_id, session_id, input }) => {
                         let session = session
                             .clone()
                             .expect("session created by handle_request");
-                        start_session_turn(state.clone(), session, request_id, prompt, ready,
+                        start_session_turn(state.clone(), session, request_id, input, ready,
                             Some(Subscriber { out: out.clone(), failed: failed.clone(), persistent: false }), false).await;
                         running = Some(RunningAsk { session_id });
                     }
@@ -3194,7 +3426,7 @@ mod tests {
             let session = session.clone();
             let prompt = prompt.to_string();
             async move {
-                execute_ask(&session, "req-test", &prompt, &pool, |msg| {
+                execute_ask(&session, "req-test", &prompt, Vec::new(), &pool, |msg| {
                     let tx = tx.clone();
                     async move { tx.send(msg.to_line()).await.map_err(anyhow::Error::from) }
                 })
@@ -3957,6 +4189,7 @@ mod tests {
                 ]),
                 model_selector: "test-model".to_string(),
                 agents: Arc::new(BTreeMap::new()),
+                attachment_store: std::env::temp_dir().join("gewu-test-attachments"),
             },
             token: token.map(str::to_string),
             busy_sessions: Mutex::new(HashSet::new()),
@@ -4564,6 +4797,528 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_attachment_stores_outside_the_workspace_and_ask_uses_it() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let mut state = server_state_with(TestLlm::plain());
+        {
+            let bootstrap = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            bootstrap.working_directory = root.path().to_string_lossy().to_string();
+            bootstrap.workspace_roots =
+                Arc::new(BTreeMap::from([("cwd".into(), root.path().to_path_buf())]));
+            bootstrap.attachment_store = store.path().to_path_buf();
+        }
+        let mut session = None;
+        let mut running = None;
+
+        // A session must exist before attachments can be stored (the GUI
+        // creates one when the tab is used).
+        let payload = b"\x89PNG data";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+        let stored = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::upload_attachment(1, "shot.png", &encoded),
+        )
+        .await;
+        assert!(
+            matches!(stored, Err(RequestError::Failed(_))),
+            "upload without a session must fail"
+        );
+
+        handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::ask(2, "hi"),
+        )
+        .await
+        .unwrap();
+        let session_id = session.as_ref().unwrap().session_id.clone();
+        // The setup ask claimed the session; release it so later requests in
+        // this test can claim again (the connection loop does this in
+        // production once the turn ends).
+        state.release_session(&session_id).await;
+
+        let handled = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::upload_attachment(3, "shot.png", &encoded),
+        )
+        .await
+        .unwrap();
+        let stored_path = match handled {
+            Handled::Reply(ServerMessage::AttachmentStored {
+                name, path, bytes, ..
+            }) => {
+                assert_eq!(name, "shot.png");
+                assert_eq!(bytes, payload.len() as u64);
+                path
+            }
+            _ => panic!("expected attachment_stored"),
+        };
+        // Stored under the session's store directory, not the workspace.
+        let stored_path = std::path::PathBuf::from(stored_path);
+        assert_eq!(
+            stored_path,
+            store
+                .path()
+                .join(&session_id)
+                .join("shot.png")
+                .canonicalize()
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(&stored_path).unwrap(), payload);
+        assert!(
+            !root.path().join("shot.png").exists(),
+            "the workspace must stay clean"
+        );
+
+        // The ask resolves the store name first and inlines the media.
+        let handled = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::ask_with_attachments(
+                4,
+                "look",
+                vec![gewu_protocol::AskAttachment {
+                    name: "shot.png".into(),
+                    mime_type: "image/png".into(),
+                    data: None,
+                    path: Some("shot.png".into()),
+                }],
+            ),
+        )
+        .await
+        .unwrap();
+        let media = match handled {
+            Handled::Ask {
+                input: AskInput { media, .. },
+                ..
+            } => media,
+            _ => panic!("expected ask"),
+        };
+        assert_eq!(
+            media,
+            vec![protocol::ContentPart::Image {
+                data: encoded,
+                mime_type: "image/png".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn store_attachments_shadow_same_named_workspace_files() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        // The workspace file must NOT be the one referenced.
+        std::fs::write(root.path().join("notes.txt"), "workspace copy").unwrap();
+        let mut state = server_state_with(TestLlm::plain());
+        {
+            let bootstrap = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            bootstrap.working_directory = root.path().to_string_lossy().to_string();
+            bootstrap.workspace_roots =
+                Arc::new(BTreeMap::from([("cwd".into(), root.path().to_path_buf())]));
+            bootstrap.attachment_store = store.path().to_path_buf();
+        }
+        let mut session = None;
+        let mut running = None;
+        handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::ask(1, "hi"),
+        )
+        .await
+        .unwrap();
+        let session_id = session.as_ref().unwrap().session_id.clone();
+        state.release_session(&session_id).await;
+        let store_dir = store.path().join(&session_id);
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("notes.txt"), "stored copy").unwrap();
+
+        let handled = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::ask_with_attachments(
+                2,
+                "look",
+                vec![gewu_protocol::AskAttachment {
+                    name: "notes.txt".into(),
+                    mime_type: "text/plain".into(),
+                    data: None,
+                    path: Some("notes.txt".into()),
+                }],
+            ),
+        )
+        .await
+        .unwrap();
+        let media = match handled {
+            Handled::Ask {
+                input: AskInput { media, .. },
+                ..
+            } => media,
+            _ => panic!("expected ask"),
+        };
+        // The reference carries the absolute store path, not the workspace.
+        match &media[0] {
+            protocol::ContentPart::Text { text } => {
+                assert!(text.contains("stored at \""), "{text}");
+                assert!(
+                    text.contains(&store_dir.join("notes.txt").to_string_lossy().to_string()),
+                    "reference must name the stored file: {text}"
+                );
+                assert!(!text.contains("workspace path"), "{text}");
+            }
+            other => panic!("expected a text reference, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_attachments_get_bash_guidance_not_read_file() {
+        let store = tempfile::tempdir().unwrap();
+        let mut state = server_state_with(TestLlm::plain());
+        {
+            let bootstrap = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            bootstrap.attachment_store = store.path().to_path_buf();
+        }
+        let mut session = None;
+        let mut running = None;
+        handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::ask(1, "hi"),
+        )
+        .await
+        .unwrap();
+        let session_id = session.as_ref().unwrap().session_id.clone();
+        state.release_session(&session_id).await;
+
+        // A real .docx is a zip container: its first bytes carry NULs, so
+        // read_file would refuse to display it.
+        let mut docx = vec![0x50, 0x4b, 0x03, 0x04];
+        docx.extend(std::iter::repeat_n(0u8, 64));
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&docx);
+        let handled = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::upload_attachment(2, "论文.docx", &encoded),
+        )
+        .await
+        .unwrap();
+        let stored_path = match handled {
+            Handled::Reply(ServerMessage::AttachmentStored { path, .. }) => path,
+            _ => panic!("expected attachment_stored"),
+        };
+
+        let handled = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::ask_with_attachments(
+                3,
+                "look",
+                vec![gewu_protocol::AskAttachment {
+                    name: "论文.docx".into(),
+                    mime_type:
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                            .into(),
+                    data: None,
+                    path: Some("论文.docx".into()),
+                }],
+            ),
+        )
+        .await
+        .unwrap();
+        let media = match handled {
+            Handled::Ask {
+                input: AskInput { media, .. },
+                ..
+            } => media,
+            _ => panic!("expected ask"),
+        };
+        let reference = match &media[0] {
+            protocol::ContentPart::Text { text } => text.clone(),
+            other => panic!("expected a text reference, got {other:?}"),
+        };
+        assert!(reference.contains("binary"), "{reference}");
+        assert!(reference.contains("inspect it with bash"), "{reference}");
+        assert!(
+            reference.contains("word/document.xml"),
+            "the .docx extraction hint must be present: {reference}"
+        );
+        assert!(
+            !reference.contains("Use read_file"),
+            "read_file must not be offered for binary files: {reference}"
+        );
+        assert!(reference.contains(&stored_path), "{reference}");
+    }
+
+    #[tokio::test]
+    async fn prune_attachment_store_removes_stale_session_dirs() {
+        let store = tempfile::tempdir().unwrap();
+        let old_dir = store.path().join("old-session");
+        let fresh_dir = store.path().join("fresh-session");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&fresh_dir).unwrap();
+        std::fs::write(old_dir.join("a.txt"), "x").unwrap();
+        std::fs::write(fresh_dir.join("b.txt"), "x").unwrap();
+        // Backdate the file inside the old directory past the TTL (rewrites
+        // do not bump a directory's mtime, so the newest file decides).
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600);
+        let handle = std::fs::File::options()
+            .write(true)
+            .open(old_dir.join("a.txt"))
+            .unwrap();
+        handle
+            .set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        drop(handle);
+
+        crate::bootstrap::prune_attachment_store(store.path());
+
+        assert!(!old_dir.exists(), "stale session dir must be pruned");
+        assert!(fresh_dir.exists(), "fresh session dir must survive");
+    }
+
+    #[tokio::test]
+    async fn inline_image_attachment_reaches_the_agent_memory() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut state = server_state_with(TestLlm::plain());
+        {
+            let bootstrap = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            bootstrap.pool = pool;
+        }
+        let mut session = None;
+        let mut running = None;
+        let handled = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::ask_with_attachments(
+                1,
+                "describe this",
+                vec![gewu_protocol::AskAttachment {
+                    name: "shot.png".into(),
+                    mime_type: "image/png".into(),
+                    data: Some("aGk=".into()),
+                    path: None,
+                }],
+            ),
+        )
+        .await
+        .unwrap();
+        let (request_id, media) = match handled {
+            Handled::Ask {
+                request_id,
+                input: AskInput { media, .. },
+                ..
+            } => (request_id, media),
+            _ => panic!("expected ask"),
+        };
+        assert_eq!(
+            media,
+            vec![protocol::ContentPart::Image {
+                data: "aGk=".into(),
+                mime_type: "image/png".into(),
+            }]
+        );
+
+        // Running the turn stores the prompt and the attachment in memory.
+        let session = session.clone().unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        execute_ask(
+            &session,
+            &request_id,
+            "describe this",
+            media,
+            &pool,
+            |_| async { Ok(()) },
+        )
+        .await;
+        let messages = session.agent.lock().await.memory.messages().to_vec();
+        let user = messages
+            .iter()
+            .find_map(|message| match message {
+                gewu_core::Message::User { content } => Some(content),
+                _ => None,
+            })
+            .expect("user message stored");
+        assert_eq!(user.len(), 2);
+        assert!(
+            matches!(&user[0], protocol::ContentPart::Text { text } if text == "describe this")
+        );
+        assert!(matches!(&user[1], protocol::ContentPart::Image { .. }));
+    }
+
+    #[tokio::test]
+    async fn path_attachments_inline_media_and_reference_other_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("shot.png"), [0x89, 0x50, 0x4e, 0x47]).unwrap();
+        std::fs::write(root.path().join("notes.txt"), "hello").unwrap();
+        let mut state = server_state_with(TestLlm::plain());
+        {
+            let bootstrap = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            bootstrap.working_directory = root.path().to_string_lossy().to_string();
+            bootstrap.workspace_roots =
+                Arc::new(BTreeMap::from([("cwd".into(), root.path().to_path_buf())]));
+        }
+        let mut session = None;
+        let mut running = None;
+        let handled = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::ask_with_attachments(
+                1,
+                "look",
+                vec![
+                    gewu_protocol::AskAttachment {
+                        name: "shot.png".into(),
+                        mime_type: "image/png".into(),
+                        data: None,
+                        path: Some("shot.png".into()),
+                    },
+                    gewu_protocol::AskAttachment {
+                        name: "notes.txt".into(),
+                        mime_type: "text/plain".into(),
+                        data: None,
+                        path: Some("notes.txt".into()),
+                    },
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+        let media = match handled {
+            Handled::Ask {
+                input: AskInput { media, .. },
+                ..
+            } => media,
+            _ => panic!("expected ask"),
+        };
+        assert_eq!(
+            media,
+            vec![
+                protocol::ContentPart::Image {
+                    data: base64::engine::general_purpose::STANDARD
+                        .encode([0x89, 0x50, 0x4e, 0x47]),
+                    mime_type: "image/png".into(),
+                },
+                protocol::ContentPart::Text { text: "[Attached file \"notes.txt\" (5 B) at workspace path \"notes.txt\". Use read_file to inspect it.]".into() },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn path_attachments_cannot_escape_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.png");
+        std::fs::write(&secret, [0x89, 0x50, 0x4e, 0x47]).unwrap();
+        let mut state = server_state_with(TestLlm::plain());
+        {
+            let bootstrap = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            bootstrap.working_directory = root.path().to_string_lossy().to_string();
+            bootstrap.workspace_roots =
+                Arc::new(BTreeMap::from([("cwd".into(), root.path().to_path_buf())]));
+            bootstrap.enforcement = PathEnforcement::Contain;
+        }
+        let relative = secret
+            .strip_prefix(root.path())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| format!("../{}", secret.file_name().unwrap().to_string_lossy()));
+        let mut session = None;
+        let mut running = None;
+        let result = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::ask_with_attachments(
+                1,
+                "look",
+                vec![gewu_protocol::AskAttachment {
+                    name: "secret.png".into(),
+                    mime_type: "image/png".into(),
+                    data: None,
+                    path: Some(relative),
+                }],
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(RequestError::Failed(_)) | Err(RequestError::Invalid(_))
+            ),
+            "an outside-workspace attachment must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_attachments_reject_unsupported_mime_and_oversize() {
+        let state = server_state_with(TestLlm::plain());
+        let mut session = None;
+        let mut running = None;
+
+        let bad_mime = handle_request(
+            &state.clone(),
+            &mut session,
+            &mut running,
+            ClientRequest::ask_with_attachments(
+                1,
+                "look",
+                vec![gewu_protocol::AskAttachment {
+                    name: "notes.txt".into(),
+                    mime_type: "text/plain".into(),
+                    data: Some("aGk=".into()),
+                    path: None,
+                }],
+            ),
+        )
+        .await;
+        assert!(
+            matches!(bad_mime, Err(RequestError::Invalid(_))),
+            "unsupported inline MIME must be rejected"
+        );
+
+        let oversized = vec![0u8; MAX_ATTACHMENT_BYTES + 1];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&oversized);
+        let too_big = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::ask_with_attachments(
+                2,
+                "look",
+                vec![gewu_protocol::AskAttachment {
+                    name: "big.png".into(),
+                    mime_type: "image/png".into(),
+                    data: Some(encoded),
+                    path: None,
+                }],
+            ),
+        )
+        .await;
+        assert!(
+            matches!(too_big, Err(RequestError::Invalid(_))),
+            "oversized inline attachment must be rejected"
+        );
+    }
+
+    #[tokio::test]
     async fn write_file_writes_within_working_root() {
         let root = tempfile::tempdir().unwrap();
         let mut session = None;
@@ -4962,6 +5717,7 @@ mod tests {
                 )]),
                 model_selector: "test-model".to_string(),
                 agents: Arc::new(BTreeMap::new()),
+                attachment_store: std::env::temp_dir().join("gewu-test-attachments"),
             },
             token: None,
             busy_sessions: Mutex::new(HashSet::new()),
@@ -5615,7 +6371,7 @@ mod tests {
         let handle = tokio::spawn({
             let session = session.clone();
             async move {
-                execute_ask(&session, "req-test", "go", &pool, |msg| {
+                execute_ask(&session, "req-test", "go", Vec::new(), &pool, |msg| {
                     let tx = tx.clone();
                     async move { tx.send(msg.to_line()).await.map_err(anyhow::Error::from) }
                 })

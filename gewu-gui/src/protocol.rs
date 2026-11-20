@@ -78,10 +78,14 @@ pub enum ClientMsg {
     Auth {
         token: String,
     },
-    /// Send a prompt to a tab.
+    /// Send a prompt to a tab, with optional file attachments.
     Ask {
         tab: u64,
         prompt: String,
+        /// Files attached to the prompt (inline base64 or workspace paths).
+        /// Absent on every client predating the field.
+        #[serde(default)]
+        attachments: Vec<gewu_protocol::AskAttachment>,
     },
     /// Answer the pending `question` form on a tab.
     AnswerQuestion {
@@ -165,6 +169,11 @@ pub enum ClientMsg {
     /// Upload files into the working-directory root. Names are sanitized
     /// server-side; contents are base64-encoded.
     UploadFiles {
+        files: Vec<UploadedFile>,
+    },
+    /// Store files in the session's attachment store (outside every
+    /// workspace) for reference by a later ask's attachments.
+    AttachFiles {
         files: Vec<UploadedFile>,
     },
     /// Close the file preview.
@@ -283,12 +292,42 @@ mod tests {
             serde_json::from_str::<ClientMsg>(r#"{"op":"ask","tab":3,"prompt":"hi"}"#).unwrap(),
             ClientMsg::Ask {
                 tab: 3,
-                prompt: "hi".to_string()
+                prompt: "hi".to_string(),
+                attachments: Vec::new(),
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(
+                r#"{"op":"ask","tab":3,"prompt":"hi","attachments":[
+                    {"name":"shot.png","mime_type":"image/png","data":"aGk="}]}"#
+            )
+            .unwrap(),
+            ClientMsg::Ask {
+                tab: 3,
+                prompt: "hi".to_string(),
+                attachments: vec![gewu_protocol::AskAttachment {
+                    name: "shot.png".into(),
+                    mime_type: "image/png".into(),
+                    data: Some("aGk=".into()),
+                    path: None,
+                }],
             }
         );
         assert_eq!(
             serde_json::from_str::<ClientMsg>(r#"{"op":"toggle_tool","tab":1,"block":7}"#).unwrap(),
             ClientMsg::ToggleTool { tab: 1, block: 7 }
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(
+                r#"{"op":"attach_files","files":[{"name":"notes.csv","content_base64":"aGk="}]}"#
+            )
+            .unwrap(),
+            ClientMsg::AttachFiles {
+                files: vec![UploadedFile {
+                    name: "notes.csv".to_string(),
+                    content_base64: "aGk=".to_string(),
+                }],
+            }
         );
         assert_eq!(
             serde_json::from_str::<ClientMsg>(

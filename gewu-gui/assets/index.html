@@ -39,6 +39,7 @@
       <footer class="footer">
         <div id="status" class="status" aria-live="polite"></div>
         <form id="composer" class="composer">
+          <div id="attachments" class="attachments hidden" aria-label="Attachments"></div>
           <span class="prompt-glyph" aria-hidden="true">›</span>
           <textarea
             id="prompt"
@@ -49,6 +50,7 @@
             autocapitalize="sentences"
             spellcheck="true"
             aria-label="Message"></textarea>
+          <button id="attach" class="icon-button" type="button" title="Attach files" aria-label="Attach files">+</button>
           <button id="interrupt" class="icon-button stop hidden" type="button" title="Interrupt (Esc)" aria-label="Interrupt">■</button>
           <button id="send" class="send" type="submit">Send <kbd>⏎</kbd></button>
         </form>
@@ -65,6 +67,7 @@
   <div id="toasts" class="toasts" aria-live="assertive"></div>
 
   <input id="file-upload" type="file" multiple hidden>
+  <input id="attachment-upload" type="file" multiple hidden>
 
 
   <div id="workflow-zoom" class="wf-zoom-overlay hidden" role="dialog" aria-modal="true" aria-label="Workflow graph"></div>

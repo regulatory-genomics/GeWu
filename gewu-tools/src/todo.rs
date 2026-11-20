@@ -23,28 +23,14 @@ pub struct TodoWriteArgs {
     pub todos: Vec<TodoItem>,
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Default)]
-pub struct TodoReadArgs {
-    #[serde(default)]
-    pub _placeholder: Option<String>,
-}
-
 /// Writes the session's todo list through [`ToolContext::session_state`],
 /// so the list persists per session and the tool itself stays stateless.
+/// Echoes the full updated list back (the opencode v2 shape), so no
+/// separate read tool is needed.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TodoWriteTool;
 
-/// Reads the session's todo list from [`ToolContext::session_state`].
-#[derive(Debug, Default, Clone, Copy)]
-pub struct TodoReadTool;
-
 impl TodoWriteTool {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl TodoReadTool {
     pub fn new() -> Self {
         Self
     }
@@ -93,40 +79,7 @@ impl Tool for TodoWriteTool {
 
         Ok(ToolResult::new(
             "todowrite",
-            format!("{} todos", non_completed_count(&input.todos)),
-        ))
-    }
-}
-
-#[async_trait]
-impl Tool for TodoReadTool {
-    fn name(&self) -> &str {
-        "todoread"
-    }
-
-    fn description(&self) -> &str {
-        "Use this tool to read your todo list"
-    }
-
-    fn schema(&self) -> RootSchema {
-        schemars::schema_for!(TodoReadArgs)
-    }
-
-    async fn execute(
-        &self,
-        _args: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
-        let todos: Vec<TodoItem> = ctx
-            .session_state
-            .read(&ctx.session_id, TODOS_KEY)
-            .await
-            .map_err(into_tool_error)?
-            .unwrap_or_default();
-
-        Ok(ToolResult::new(
-            "todoread",
-            render_todo_summary(&todos).map_err(into_tool_error)?,
+            render_todo_summary(&input.todos).map_err(into_tool_error)?,
         ))
     }
 }
@@ -157,10 +110,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_todo_write_and_read() {
+    async fn test_todo_write_echoes_full_list_and_persists() {
         let state = SessionState::in_memory();
         let write_tool = TodoWriteTool;
-        let read_tool = TodoReadTool;
 
         let input = serde_json::json!({
             "todos": [
@@ -172,21 +124,22 @@ mod tests {
 
         let ctx = ToolContext::new("test", "msg").with_session_state(state.clone());
         let result = write_tool.execute(input, &ctx).await.unwrap();
-        assert_eq!(result.output, "2 todos");
+        assert!(result.output.starts_with("2 todos"), "{}", result.output);
+        assert!(
+            result.output.contains("Write code"),
+            "the echo must contain the updated list: {}",
+            result.output
+        );
 
-        let read_ctx = ToolContext::new("test", "msg").with_session_state(state.clone());
-        let read_result = read_tool
-            .execute(serde_json::json!({}), &read_ctx)
-            .await
-            .unwrap();
-        assert!(read_result.output.contains("2 todos"));
+        let stored: Vec<TodoItem> = state.read("test", TODOS_KEY).await.unwrap().unwrap();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored[0].content, "Write code");
     }
 
     #[tokio::test]
     async fn test_todo_lists_are_isolated_per_session() {
         let state = SessionState::in_memory();
         let write_tool = TodoWriteTool;
-        let read_tool = TodoReadTool;
 
         let ctx = ToolContext::new("session-a", "msg").with_session_state(state.clone());
         let input = serde_json::json!({
@@ -197,10 +150,15 @@ mod tests {
         write_tool.execute(input, &ctx).await.unwrap();
 
         let other_ctx = ToolContext::new("session-b", "msg").with_session_state(state.clone());
-        let read_result = read_tool
-            .execute(serde_json::json!({}), &other_ctx)
+        let result = write_tool
+            .execute(serde_json::json!({"todos": []}), &other_ctx)
             .await
             .unwrap();
-        assert!(read_result.output.contains("0 todos"));
+        assert_eq!(result.output, "0 todos\n\n[]");
+
+        // Session B's empty write must not have touched session A's list.
+        let restored: Vec<TodoItem> = state.read("session-a", TODOS_KEY).await.unwrap().unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].content, "Only for A");
     }
 }

@@ -133,6 +133,9 @@ pub struct Bootstrap {
     /// User-defined agents from the config file, spawnable via the `task`
     /// tool.
     pub agents: Arc<BTreeMap<String, crate::config::AgentEntry>>,
+    /// Server-owned directory where ask attachments are stored, one
+    /// subdirectory per session, outside every workspace.
+    pub attachment_store: std::path::PathBuf,
 }
 
 /// Initialize tracing from the `--log-level` flag.
@@ -570,6 +573,15 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
         .await
         .context("Failed to connect to SQLite database")?;
 
+    // Ask attachments live next to the database, in per-session
+    // subdirectories. Prune sessions untouched for a week so the store does
+    // not grow without bound.
+    let attachment_store = std::path::Path::new(&db_path)
+        .parent()
+        .map(|dir| dir.join("attachments"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".gewu/attachments"));
+    prune_attachment_store(&attachment_store);
+
     let mcp_tools =
         crate::mcp_loader::load_mcp_tools(loaded_config.config.mcp_servers.clone()).await?;
     let log_writer = open_request_log(file_config)?;
@@ -600,7 +612,91 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
         models,
         model_selector,
         agents: Arc::new(file_config.agents.clone()),
+        attachment_store,
     })
+}
+
+/// Attachment-store sessions untouched for longer than this are pruned at
+/// startup. History keeps the attachment notes; only the stored bytes age
+/// out (inline media lives inside the stored messages and survives).
+const ATTACHMENT_STORE_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// Best-effort removal of stale per-session attachment directories. Failures
+/// are logged and ignored: pruning must never block startup.
+pub(crate) fn prune_attachment_store(store: &std::path::Path) {
+    prune_attachment_store_before(store, std::time::SystemTime::now());
+}
+
+/// Prune session directories whose newest content (the directory itself or
+/// anything inside it) is older than the TTL, measured against `now`.
+pub(crate) fn prune_attachment_store_before(store: &std::path::Path, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(store) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            // Stray files directly under the store root: prune by their own
+            // mtime.
+            prune_entry_if_stale(&entry.path(), &metadata, now);
+            continue;
+        }
+        // A session is stale when no file inside it was touched within the
+        // TTL. (The directory's own mtime only tracks entry create/delete —
+        // rewriting an attachment's content would not refresh it.) An empty
+        // session directory carries nothing and is dropped.
+        let newest = newest_modified(&entry.path(), None);
+        let stale = newest
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > ATTACHMENT_STORE_TTL);
+        if stale && let Err(e) = std::fs::remove_dir_all(entry.path()) {
+            tracing::debug!("could not prune {}: {e}", entry.path().display());
+        }
+    }
+}
+
+/// The newest modification time within `dir` (recursive), including `dir`
+/// itself; `None` when nothing could be stat'd.
+fn newest_modified(
+    dir: &std::path::Path,
+    seen: Option<std::time::SystemTime>,
+) -> Option<std::time::SystemTime> {
+    let mut newest = seen;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return newest;
+    };
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let modified = metadata.modified().ok();
+        if modified.is_some_and(|m| newest.is_none_or(|current| m > current)) {
+            newest = modified;
+        }
+        if metadata.is_dir()
+            && let Some(nested) = newest_modified(&entry.path(), newest)
+        {
+            newest = Some(nested);
+        }
+    }
+    newest
+}
+
+fn prune_entry_if_stale(
+    path: &std::path::Path,
+    metadata: &std::fs::Metadata,
+    now: std::time::SystemTime,
+) {
+    let stale = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age > ATTACHMENT_STORE_TTL);
+    if stale && let Err(e) = std::fs::remove_file(path) {
+        tracing::debug!("could not prune {}: {e}", path.display());
+    }
 }
 
 /// Default session ID generation shared by subcommands.

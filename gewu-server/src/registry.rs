@@ -11,8 +11,8 @@ use gewu_tools::workflow::{
 };
 use gewu_tools::{
     ApplyPatchTool, BashTool, EditFileTool, GlobTool, GrepTool, ImageLimits, QuestionTool,
-    ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoReadTool, TodoWriteTool, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoWriteTool, WebFetchTool, WebSearchTool,
+    WriteFileTool,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -31,7 +31,6 @@ const RESERVED_ADDITIONAL_TOOL_NAMES: &[&str] = &[
     "skill",
     "question",
     "todowrite",
-    "todoread",
     "workflow_start",
     "workflow_status",
     "workflow_cancel",
@@ -563,7 +562,6 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 Box::new(WebFetchTool::default()),
                 Box::new(WebSearchTool),
                 Box::new(TodoWriteTool),
-                Box::new(TodoReadTool),
             ]
         }
         "explore" => {
@@ -1892,12 +1890,18 @@ mod tests {
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].content, "first");
 
-        // The stateless todoread tool sees the restored list through the
-        // session state on its tool context.
+        // The stateless todowrite tool sees the restored list through the
+        // session state on its tool context; the echo proves it round-trips.
         let ctx =
             ToolContext::new(&session_id, "m").with_session_state(reader.session_state().clone());
         let result = reader
-            .execute("todoread", serde_json::json!({}), &ctx)
+            .execute(
+                "todowrite",
+                serde_json::json!({"todos": [
+                    {"id": "1", "content": "first", "status": "completed", "priority": null}
+                ]}),
+                &ctx,
+            )
             .await
             .unwrap();
         assert!(result.output.contains("first"), "{}", result.output);

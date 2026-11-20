@@ -69,6 +69,10 @@ import {panelHost} from './panels.mjs';
     inlinePreview: null,
     previewPath: null,
     sidebarTab: "files",
+    // Files attached to the next ask: {name, mime_type, data?|path?} with
+    // base64 `data` for inline media or a workspace-relative `path` for
+    // uploaded references.
+    attachments: [],
   };
 
   function loadToken() {
@@ -1014,13 +1018,22 @@ import {panelHost} from './panels.mjs';
 
   function submitPrompt() {
     const text = el.prompt.value.trim();
-    if (!text) return;
+    if (!text && !state.attachments.length) return;
     if (!state.ready) {
       showAlert("Still loading the session; try again in a moment");
       return;
     }
-    if (!send({ op: "ask", tab: state.active, prompt: text })) return;
+    const message = { op: "ask", tab: state.active, prompt: text };
+    if (state.attachments.length) {
+      message.attachments = state.attachments.map((attachment) => ({
+        name: attachment.name,
+        mime_type: attachment.mime_type,
+        ...(attachment.data !== undefined ? { data: attachment.data } : { path: attachment.path }),
+      }));
+    }
+    if (!send(message)) return;
     el.prompt.value = "";
+    clearAttachments();
     autosize();
     el.prompt.focus();
   }
@@ -1137,18 +1150,7 @@ import {panelHost} from './panels.mjs';
     const qtab = event.target.closest("[data-qtab]");
     if (qtab) {
       const form = qtab.closest(".question-form");
-      if (form) {
-        for (const button of form.querySelectorAll("[data-qtab]")) {
-          const active = button === qtab;
-          button.classList.toggle("active", active);
-          button.setAttribute("aria-selected", String(active));
-        }
-        for (const panel of form.querySelectorAll("[data-qpanel]")) {
-          const active = panel.dataset.qpanel === qtab.dataset.qtab;
-          panel.classList.toggle("active", active);
-          panel.hidden = !active;
-        }
-      }
+      if (form) activateQuestionTab(form, qtab.dataset.qtab);
       return;
     }
     const dismiss = event.target.closest("[data-question-dismiss]");
@@ -1204,6 +1206,36 @@ import {panelHost} from './panels.mjs';
     });
   }
 
+  // Applies the same tab/panel switch as a manual question-tab click.
+  function activateQuestionTab(form, number) {
+    for (const button of form.querySelectorAll("[data-qtab]")) {
+      const active = button.dataset.qtab === number;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-selected", String(active));
+    }
+    for (const panel of form.querySelectorAll("[data-qpanel]")) {
+      const active = panel.dataset.qpanel === number;
+      panel.classList.toggle("active", active);
+      panel.hidden = !active;
+    }
+  }
+
+  function panelAnswered(panel) {
+    if (panel.querySelector("input[type=radio]:checked, input[type=checkbox]:checked")) return true;
+    const custom = panel.querySelector("[data-custom]");
+    return !!custom && custom.value.trim() !== "";
+  }
+
+  // First panel after `current` (a question number) still missing an
+  // answer, or null when every later panel is answered.
+  function nextUnansweredPanel(form, current) {
+    for (const panel of form.querySelectorAll("[data-qpanel]")) {
+      if (Number(panel.dataset.qpanel) <= current) continue;
+      if (!panelAnswered(panel)) return panel.dataset.qpanel;
+    }
+    return null;
+  }
+
   el.transcript.addEventListener("submit", (event) => {
     const form = event.target.closest(".question-form");
     if (!form) return;
@@ -1239,6 +1271,13 @@ import {panelHost} from './panels.mjs';
     const panel = radio.closest("[data-qpanel]");
     const custom = panel && panel.querySelector("[data-custom]");
     if (custom) custom.value = "";
+    // A radio pick completes a single-select question, so move on to the
+    // next tab that still needs an answer (multi-select checkboxes do not
+    // advance: the user may want to tick several).
+    const form = radio.closest(".question-form");
+    if (!form || !panel) return;
+    const next = nextUnansweredPanel(form, Number(panel.dataset.qpanel));
+    if (next != null) activateQuestionTab(form, next);
   });
 
   function closeMessageMenus(restoreFocus = false) {
@@ -1574,6 +1613,133 @@ import {panelHost} from './panels.mjs';
   el.fileUpload.addEventListener("change", () => {
     if (el.fileUpload.files.length) uploadFiles(el.fileUpload.files);
     el.fileUpload.value = "";
+  });
+
+  // -- ask attachments -----------------------------------------------------
+
+  // Inline base64 ceiling for a single attachment; the server enforces the
+  // same 20 MB bound and anything larger (or non-media) is stored in the
+  // session's attachment store and referenced by name instead.
+  const MAX_INLINE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+  const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+  const ATTACHMENT_MEDIA_TYPES = (mime) =>
+    mime === "application/pdf" || mime.startsWith("image/");
+
+  function renderAttachments() {
+    el.attachments.classList.toggle("hidden", !state.attachments.length);
+    el.attachments.replaceChildren(
+      ...state.attachments.map((attachment, index) => {
+        const chip = document.createElement("span");
+        chip.className = "attachment";
+        chip.title = attachment.name;
+        // The name shrinks inside its own span (min-width: 0) so a long
+        // file name ellipsizes instead of pushing the remove button out of
+        // the chip's clipped box.
+        const name = document.createElement("span");
+        name.className = "attachment-name";
+        name.textContent =
+          attachment.name +
+          (attachment.data !== undefined ? "" : " (stored)");
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "attachment-remove";
+        remove.setAttribute("aria-label", `Remove ${attachment.name}`);
+        remove.textContent = "×";
+        remove.addEventListener("click", () => {
+          state.attachments.splice(index, 1);
+          renderAttachments();
+          el.prompt.focus();
+        });
+        chip.append(name, remove);
+        return chip;
+      }),
+    );
+  }
+
+  function clearAttachments() {
+    state.attachments = [];
+    renderAttachments();
+  }
+
+  async function addAttachmentFiles(fileList) {
+    for (const file of [...fileList]) {
+      const mime = file.type || "application/octet-stream";
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        showAlert(
+          `Can't attach ${file.name} — over the ${MAX_ATTACHMENT_BYTES / (1024 * 1024)} MB attachment limit`,
+          "warning",
+        );
+        continue;
+      }
+      if (file.size <= MAX_INLINE_ATTACHMENT_BYTES && ATTACHMENT_MEDIA_TYPES(mime)) {
+        // Small images and PDFs ride inline so the model sees them directly.
+        state.attachments.push({
+          name: file.name || "pasted-image.png",
+          mime_type: mime,
+          data: bytesToBase64(await file.arrayBuffer()),
+        });
+      } else {
+        // Large or non-media files are stored in the session's attachment
+        // store (outside every workspace) and referenced by name; the agent
+        // inspects them via the path the server resolves. The attach op is
+        // processed before the ask on the same connection, so the file
+        // exists when the server resolves the attachment.
+        send({
+          op: "attach_files",
+          files: [{ name: file.name, content_base64: bytesToBase64(await file.arrayBuffer()) }],
+        });
+        state.attachments.push({
+          name: file.name,
+          mime_type: mime,
+          path: file.name,
+        });
+      }
+    }
+    renderAttachments();
+  }
+
+  el.attachments = document.getElementById("attachments");
+  el.attach = document.getElementById("attach");
+  el.attachmentUpload = document.getElementById("attachment-upload");
+  el.attach.addEventListener("click", () => el.attachmentUpload.click());
+  el.attachmentUpload.addEventListener("change", () => {
+    if (el.attachmentUpload.files.length) addAttachmentFiles(el.attachmentUpload.files);
+    el.attachmentUpload.value = "";
+  });
+
+  // Pasted screenshots (and copied files) become attachments.
+  el.prompt.addEventListener("paste", (event) => {
+    if (!event.clipboardData?.files?.length) return;
+    event.preventDefault();
+    addAttachmentFiles(event.clipboardData.files);
+  });
+
+  // Dropping files onto the composer attaches them, with a visible cue
+  // while the drag hovers; the app-level drop handler (tree upload) must
+  // not also run.
+  const composerDropCue = () => el.composer.classList.add("drag-over");
+  const composerDropCueOff = () => el.composer.classList.remove("drag-over");
+  for (const type of ["dragenter", "dragover"]) {
+    el.composer.addEventListener(type, (event) => {
+      if (!event.dataTransfer?.types?.includes("Files")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      composerDropCue();
+    });
+  }
+  el.composer.addEventListener("dragleave", (event) => {
+    if (!event.dataTransfer?.types?.includes("Files")) return;
+    if (el.composer.contains(event.relatedTarget)) return;
+    composerDropCueOff();
+  });
+  el.composer.addEventListener("drop", (event) => {
+    composerDropCueOff();
+    if (!event.dataTransfer?.types?.includes("Files")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.dataTransfer.files.length) {
+      addAttachmentFiles(event.dataTransfer.files);
+    }
   });
 
   const fileTreeHost = document.getElementById("app");

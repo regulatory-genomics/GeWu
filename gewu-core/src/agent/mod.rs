@@ -41,21 +41,19 @@ mod compaction;
 mod reminder;
 pub use reminder::Reminder;
 mod execution;
-mod experiences;
 mod media;
 mod policy;
 mod steering;
 mod tools;
 
 pub use compaction::CompactionError;
-pub use experiences::SearchExperiencesTool;
 pub use media::extract_media_parts;
 pub use policy::ToolPolicy;
 pub use steering::{BackgroundJob, BackgroundNotification, IdleAction, InboxMessage, Steering};
 pub use tools::execute_tool_with_panic_recovery;
 
 use crate::middleware::TruncationService;
-use crate::traits::{Experiences, LlmProvider, Memory, RequestLog, Tool, ToolRegistry};
+use crate::traits::{LlmProvider, Memory, RequestLog, Tool, ToolRegistry};
 use crate::types::{
     AgentEvent, ContentPart, Message, PathEnforcement, ProgressSink, ProviderEvent, SessionState,
     TokenUsage, ToolCall, ToolContext, ToolResult,
@@ -105,9 +103,6 @@ pub struct Agent {
     session_id: String,
     /// File-path confinement level passed to tools on every [`ToolContext`].
     enforcement: PathEnforcement,
-    /// Optional experiences store for recording and retrieving past experiences.
-    #[allow(dead_code)]
-    experiences: Option<Arc<dyn Experiences>>,
     /// Optional request log; when set, every LLM request is recorded by the
     /// provider's `stream_response` (see [`crate::traits::RequestLog`]).
     log: Option<RequestLog>,
@@ -174,8 +169,6 @@ pub struct AgentBuilder {
     memory: Option<Box<dyn Memory>>,
     /// Context limit in tokens (defaults to 128,000).
     context_limit: usize,
-    /// Experiences store (optional).
-    experiences: Option<Arc<dyn Experiences>>,
     /// Request log for recording LLM requests (optional).
     log: Option<RequestLog>,
     /// File-path confinement level passed to tools (defaults to none).
@@ -224,7 +217,6 @@ impl Default for AgentBuilder {
             max_turns: None,
             memory: None,
             context_limit: 256_000,
-            experiences: None,
             log: None,
             enforcement: PathEnforcement::default(),
             session_state: None,
@@ -347,7 +339,19 @@ impl Agent {
         user_message: &'a str,
         inbox: Steering,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
-        self.run_inner(Some(user_message), RunOptions::default(), inbox)
+        self.ask_parts_with_inbox(user_message, Vec::new(), inbox)
+    }
+
+    /// Run an agent turn with a prompt plus attached media parts (inline
+    /// images or PDFs). The parts join the prompt text in one user message;
+    /// `media` may be non-empty while `user_message` is empty.
+    pub fn ask_parts_with_inbox<'a>(
+        &'a mut self,
+        user_message: &'a str,
+        media: Vec<ContentPart>,
+        inbox: Steering,
+    ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
+        self.run_inner(Some(user_message), media, RunOptions::default(), inbox)
     }
 
     pub fn resume(&mut self) -> impl Stream<Item = Result<AgentEvent>> + '_ {
@@ -358,7 +362,7 @@ impl Agent {
         &mut self,
         inbox: Steering,
     ) -> impl Stream<Item = Result<AgentEvent>> + '_ {
-        self.run_inner(None, RunOptions::default(), inbox)
+        self.run_inner(None, Vec::new(), RunOptions::default(), inbox)
     }
 
     /// Runs one turn with explicit budgets and cancellation.
@@ -371,12 +375,13 @@ impl Agent {
         user_message: &'a str,
         options: RunOptions,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
-        self.run_inner(Some(user_message), options, Steering::new())
+        self.run_inner(Some(user_message), Vec::new(), options, Steering::new())
     }
 
     fn run_inner<'a>(
         &'a mut self,
         user_message: Option<&'a str>,
+        media: Vec<ContentPart>,
         options: RunOptions,
         inbox: Steering,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
@@ -397,17 +402,20 @@ impl Agent {
                 yield event;
             }
 
-            if let Some(user_message) = user_message {
+            if user_message.is_some() || !media.is_empty() {
                 self.reminder.on_user_turn();
                 // A due mode reminder becomes part of the message before it is
                 // stored, so it is durable and every request in this turn — and
                 // later turns — still carries it instead of only the first
                 // provider call.
-                let mut message = Message::User {
-                    content: vec![ContentPart::Text {
-                        text: user_message.to_string(),
-                    }],
-                };
+                let mut content = Vec::with_capacity(media.len() + 1);
+                if let Some(text) = user_message.filter(|text| !text.is_empty()) {
+                    content.push(ContentPart::Text {
+                        text: text.to_string(),
+                    });
+                }
+                content.extend(media);
+                let mut message = Message::User { content };
                 self.reminder.apply_to(&mut message);
                 self.memory.add_message(message).await;
             }
@@ -969,7 +977,6 @@ impl Agent {
             context_limit: self.context_limit,
             truncation: self.truncation.clone(),
             enforcement: self.enforcement,
-            experiences: self.experiences.clone(),
             log: self.log.clone(),
             session_state: self.session_state.clone(),
             working_directory: self.working_directory.clone(),
@@ -993,7 +1000,6 @@ pub struct AgentTemplate {
     context_limit: usize,
     truncation: TruncationService,
     enforcement: PathEnforcement,
-    experiences: Option<Arc<dyn Experiences>>,
     log: Option<RequestLog>,
     session_state: SessionState,
     working_directory: Option<PathBuf>,
@@ -1071,7 +1077,6 @@ impl AgentTemplate {
             truncation: self.truncation,
             session_id: session_id.into(),
             enforcement: self.enforcement,
-            experiences: self.experiences,
             log: self.log,
             session_state: self.session_state,
             provider_usage: TokenUsage::default(),
@@ -1173,17 +1178,6 @@ impl AgentBuilder {
         self
     }
 
-    /// Sets the experiences store for experience search.
-    ///
-    /// When set, a [`search_experiences`](SearchExperiencesTool) tool is automatically
-    /// added to the agent, allowing the LLM to recall relevant past experiences.
-    ///
-    /// If not set, the search_experiences tool will not be available.
-    pub fn with_experiences(mut self, experiences: Arc<dyn Experiences>) -> Self {
-        self.experiences = Some(experiences);
-        self
-    }
-
     /// Sets the request log used to record every LLM request.
     ///
     /// When set, each request sent to the LLM provider is recorded as one JSONL
@@ -1232,11 +1226,7 @@ impl AgentBuilder {
     pub fn build(self) -> Result<Agent> {
         let llm = self.llm.context("LLM provider is required")?;
 
-        let mut tools = (*self.tools).clone();
-        if let Some(ref experiences) = self.experiences {
-            tools.push(Arc::new(SearchExperiencesTool::new(experiences.clone())));
-        }
-        let tools = Arc::new(tools);
+        let tools = Arc::new((*self.tools).clone());
 
         let agent = Agent {
             llm,
@@ -1249,7 +1239,6 @@ impl AgentBuilder {
             session_id: self
                 .session_id
                 .unwrap_or_else(|| Uuid::new_v4().to_string()),
-            experiences: self.experiences,
             log: self.log,
             enforcement: self.enforcement,
             provider_usage: TokenUsage::default(),
@@ -1531,6 +1520,94 @@ mod tests {
             )),
             "the backend stored an undecorated user message: {user:?}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attachments_join_the_user_message() -> Result<()> {
+        let added = Arc::new(Mutex::new(Vec::new()));
+        let memory = RecordingMemory {
+            messages: Vec::new(),
+            added: added.clone(),
+        };
+        let mut agent = Agent::builder()
+            .llm(Arc::new(MockProvider::single_content("ok")))
+            .memory(Box::new(memory))
+            .build()?;
+        let media = vec![
+            ContentPart::Image {
+                data: "aGk=".into(),
+                mime_type: "image/png".into(),
+            },
+            ContentPart::File {
+                data: "aGk=".into(),
+                mime_type: "application/pdf".into(),
+            },
+        ];
+        for event in agent
+            .ask_parts_with_inbox("describe this", media.clone(), Steering::new())
+            .collect::<Vec<_>>()
+            .await
+        {
+            event?;
+        }
+        let added = added.lock().unwrap();
+        let user = added
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => Some(content),
+                _ => None,
+            })
+            .expect("the user message must be stored");
+        assert_eq!(
+            user,
+            &vec![
+                ContentPart::Text {
+                    text: "describe this".into()
+                },
+                media[0].clone(),
+                media[1].clone(),
+            ],
+            "the prompt text must precede the media parts: {user:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attachments_without_prompt_still_start_a_turn() -> Result<()> {
+        let added = Arc::new(Mutex::new(Vec::new()));
+        let memory = RecordingMemory {
+            messages: Vec::new(),
+            added: added.clone(),
+        };
+        let mut agent = Agent::builder()
+            .llm(Arc::new(MockProvider::single_content("ok")))
+            .memory(Box::new(memory))
+            .build()?;
+        for event in agent
+            .ask_parts_with_inbox(
+                "",
+                vec![ContentPart::Image {
+                    data: "aGk=".into(),
+                    mime_type: "image/png".into(),
+                }],
+                Steering::new(),
+            )
+            .collect::<Vec<_>>()
+            .await
+        {
+            event?;
+        }
+        let added = added.lock().unwrap();
+        let user = added
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => Some(content),
+                _ => None,
+            })
+            .expect("the user message must be stored");
+        assert_eq!(user.len(), 1, "no empty text part is stored: {user:?}");
+        assert!(matches!(&user[0], ContentPart::Image { .. }));
         Ok(())
     }
 

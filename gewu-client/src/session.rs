@@ -55,6 +55,13 @@ impl QuestionState {
 pub enum Block {
     /// A message sent by the user.
     User(String),
+    /// A user message that carries attached media (inline images or PDFs).
+    /// `text` holds the message's text parts (possibly empty); `media` the
+    /// attachments, in ask order.
+    UserMedia {
+        text: String,
+        media: Vec<ContentPart>,
+    },
     /// Assistant content accumulated from `content_delta` events (or loaded
     /// from conversation history).
     Assistant(String),
@@ -98,6 +105,7 @@ impl Block {
     pub fn label(&self) -> &'static str {
         match self {
             Block::User(_) => "you",
+            Block::UserMedia { .. } => "you",
             Block::Assistant(_) => "gewu",
             Block::Thought { .. } => "thought",
             Block::Tool { .. } => "tool",
@@ -111,6 +119,7 @@ impl Block {
     pub fn text(&self) -> &str {
         match self {
             Block::User(text)
+            | Block::UserMedia { text, .. }
             | Block::Assistant(text)
             | Block::Error(text)
             | Block::Info(text)
@@ -351,9 +360,26 @@ impl SessionModel {
                 summary: summary.clone(),
             }),
             Message::User { content } => {
+                let media: Vec<ContentPart> = content
+                    .iter()
+                    .filter(|part| {
+                        matches!(
+                            part,
+                            ContentPart::Image { .. }
+                                | ContentPart::Audio { .. }
+                                | ContentPart::Video { .. }
+                                | ContentPart::File { .. }
+                        )
+                    })
+                    .cloned()
+                    .collect();
                 let text = parts_text(content);
-                if !text.is_empty() {
-                    self.blocks.push(Block::User(text));
+                if media.is_empty() {
+                    if !text.is_empty() {
+                        self.blocks.push(Block::User(text));
+                    }
+                } else {
+                    self.blocks.push(Block::UserMedia { text, media });
                 }
             }
             Message::Assistant {
@@ -596,7 +622,21 @@ impl SessionModel {
 
     /// Record a user prompt and enter the busy phase.
     pub fn submit(&mut self, prompt: String) {
-        self.blocks.push(Block::User(prompt));
+        self.submit_with_media(prompt, Vec::new());
+    }
+
+    /// Record a submitted ask locally, including its attachments, so the
+    /// initiating connection renders the same block the observer snapshot
+    /// will carry.
+    pub fn submit_with_media(&mut self, prompt: String, media: Vec<ContentPart>) {
+        if media.is_empty() {
+            self.blocks.push(Block::User(prompt));
+        } else {
+            self.blocks.push(Block::UserMedia {
+                text: prompt,
+                media,
+            });
+        }
         self.phase = Phase::Busy;
     }
 
@@ -813,6 +853,51 @@ mod tests {
             ],
         });
         assert_eq!(m.blocks, vec![Block::User("Update README.md".into())]);
+    }
+
+    /// A stored user message with attached media replays as a media block so
+    /// resumed sessions still show what was attached.
+    #[test]
+    fn media_in_history_replays_as_a_user_media_block() {
+        let mut m = model();
+        let media = vec![ContentPart::Image {
+            data: "aGk=".into(),
+            mime_type: "image/png".into(),
+        }];
+        m.apply_message(&Message::User {
+            content: vec![
+                ContentPart::Text {
+                    text: "describe this".into(),
+                },
+                media[0].clone(),
+            ],
+        });
+        assert_eq!(
+            m.blocks,
+            vec![Block::UserMedia {
+                text: "describe this".into(),
+                media,
+            }]
+        );
+
+        // A media-only message (empty prompt) keeps its attachments.
+        let mut m = model();
+        m.apply_message(&Message::User {
+            content: vec![ContentPart::File {
+                data: "aGk=".into(),
+                mime_type: "application/pdf".into(),
+            }],
+        });
+        assert_eq!(
+            m.blocks,
+            vec![Block::UserMedia {
+                text: String::new(),
+                media: vec![ContentPart::File {
+                    data: "aGk=".into(),
+                    mime_type: "application/pdf".into(),
+                }],
+            }]
+        );
     }
 
     #[test]

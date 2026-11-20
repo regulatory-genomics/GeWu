@@ -42,10 +42,7 @@
 //! }
 //! ```
 
-use crate::types::{
-    ExperienceQuery, Message, ProviderEvent, RecalledExperience, TokenUsage, ToolContext,
-    ToolResult,
-};
+use crate::types::{Message, ProviderEvent, TokenUsage, ToolContext, ToolResult};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::StreamExt;
@@ -481,29 +478,6 @@ impl Memory for Vec<Message> {
     async fn replace(&mut self, messages: Vec<Message>) {
         *self = messages;
     }
-}
-
-/// Abstraction for storing and retrieving experiences.
-///
-/// The `Experiences` trait provides a simple interface for recording
-/// and retrieving past experiences to inform future problem-solving.
-///
-/// When used with an [`Agent`] via
-/// [`AgentBuilder::with_experiences`](crate::agent::AgentBuilder::with_experiences),
-/// a `search_experiences` tool is automatically registered, allowing the LLM
-/// to recall relevant past experiences during problem-solving.
-///
-/// [`Agent`]: crate::agent::Agent
-#[async_trait]
-pub trait Experiences: Send + Sync {
-    /// Stores a new experience and returns its unique ID.
-    async fn store(&self, content: &str) -> Result<String, Box<dyn Error + Send + Sync>>;
-
-    /// Recalls experiences similar to the query, sorted by similarity (highest first).
-    async fn recall(
-        &self,
-        query: &ExperienceQuery,
-    ) -> Result<Vec<RecalledExperience>, Box<dyn Error + Send + Sync>>;
 }
 
 /// Persists small per-session JSON values keyed by tool-chosen keys.

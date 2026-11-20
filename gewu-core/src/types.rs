@@ -21,7 +21,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 
 /// Represents a function call within a tool call.
 ///
@@ -859,36 +858,6 @@ fn truncate_line(text: &str, max_chars: usize) -> String {
         out.push('…');
     }
     out.replace('\n', " ")
-}
-
-/// Represents a stored experience.
-///
-/// An experience records a problem-solving episode that can be
-/// retrieved later to inform future similar tasks.
-#[derive(Debug, Clone)]
-pub struct Experience {
-    pub id: String,
-    pub content: String,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Query parameters for experience recall.
-///
-/// Used to search for experiences similar to a given query text.
-#[derive(Debug, Clone)]
-pub struct ExperienceQuery {
-    pub query_text: String,
-    pub limit: usize,
-}
-
-/// A recalled experience with its similarity score.
-///
-/// Returned by [`Experiences::recall`](super::traits::Experiences::recall) to provide the matching
-/// experience along with a similarity score indicating relevance.
-#[derive(Debug, Clone)]
-pub struct RecalledExperience {
-    pub experience: Experience,
-    pub similarity_score: f32,
 }
 
 #[cfg(test)]
