@@ -1,0 +1,10 @@
+{
+  "apiVersion": "gewu.plugin/v1",
+  "id": "gewu-marketplace",
+  "version": "0.1.0",
+  "title": "GeWu Marketplace",
+  "scope": "workspace",
+  "backend": {"connector": "gewu-stdio", "config": {"entry": "bin/marketplace"}},
+  "settingsSchema": {"type": "object", "additionalProperties": false},
+  "views": [{"id": "marketplace", "title": "Marketplace", "kind": "webview", "placement": "main", "resourceTypes": ["gewu.marketplace"], "entry": "web/index.html", "stateSchema": {"type": "object", "additionalProperties": false}}]
+}
