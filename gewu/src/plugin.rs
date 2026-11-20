@@ -13,7 +13,7 @@ use gewu_server::plugins::{
     state::{GenerationState, StateStore},
     stdio::Limits,
 };
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, path::{Path, PathBuf}};
 
 #[derive(clap::Subcommand)]
 pub enum Action {
@@ -278,7 +278,24 @@ pub async fn run(action: Action) -> Result<()> {
             println!("Disabled {id} (installation default; restart a running GeWu to apply)");
         }
         Action::Uninstall { id } => {
-            state.uninstall(&id)?;
+            // A config `package` install has no generation state; its version
+            // directory is the only copy, so remove that instead of failing.
+            if state
+                .load()
+                .map(|saved| saved.plugins.contains_key(&id))
+                .unwrap_or(false)
+            {
+                state.uninstall(&id)?;
+            } else {
+                let package = select(&id, None)?;
+                std::fs::remove_dir_all(&package.root)?;
+                let _ = std::fs::remove_dir(root.join(&id));
+            }
+            let home = dirs::home_dir().context("cannot determine home directory")?;
+            clear_enable_override(&home.join(".gewu/plugin-state.json"), &id)?;
+            if prune_config_entry(&home.join(".gewu/config.json"), &id)? {
+                println!("Removed {id} from config");
+            }
             println!("Uninstalled {id}");
         }
         Action::Doctor { id } => {
@@ -682,4 +699,53 @@ async fn load_index(client: &MarketplaceClient, refresh: bool) -> Result<gewu_pr
     } else {
         client.load_cached().map_err(|error| anyhow::anyhow!(error.to_string()))
     }
+}
+
+/// Drop a host-owned enable override so a later reinstall of the same id does
+/// not silently inherit the old "disabled" choice.
+fn clear_enable_override(path: &Path, id: &str) -> Result<()> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let Ok(mut overrides) = serde_json::from_str::<BTreeMap<String, bool>>(&text) else {
+        return Ok(());
+    };
+    if overrides.remove(id).is_none() {
+        return Ok(());
+    }
+    write_atomic(path, &serde_json::to_vec_pretty(&overrides)?)
+}
+
+/// Drop the plugin's own entry from the default config. The file is backed up
+/// first. A JsonC file is left untouched: rewriting it would discard comments,
+/// so the caller keeps its entry rather than losing documentation.
+fn prune_config_entry(path: &Path, id: &str) -> Result<bool> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(false);
+    };
+    let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(false);
+    };
+    let Some(plugins) = config.get_mut("plugins").and_then(|value| value.as_object_mut()) else {
+        return Ok(false);
+    };
+    if plugins.remove(id).is_none() {
+        return Ok(false);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    let backup = path.with_extension(format!("json.bak-uninstall-{stamp}"));
+    std::fs::copy(path, &backup)?;
+    write_atomic(path, &serde_json::to_vec_pretty(&config)?)?;
+    println!("Backed up {} to {}", path.display(), backup.display());
+    Ok(true)
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temporary = path.with_extension("tmp-write");
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(&temporary, path)?;
+    Ok(())
 }

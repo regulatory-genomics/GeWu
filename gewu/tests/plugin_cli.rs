@@ -83,3 +83,51 @@ fn lifecycle_keeps_previous_generation_and_workspace_data() {
     assert!(run(&["uninstall", "demo"]).status.success());
     assert!(!home.join(".gewu/plugins/demo").exists());
 }
+
+#[test]
+fn uninstall_cleans_legacy_install_config_entry_and_override() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("workspace");
+    // Legacy layout: a version directory with no state.json entry, the shape a
+    // config `package` path produces.
+    let legacy = home.join(".gewu/plugins/demo/1.0.0");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(legacy.join("adapter"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(legacy.join("adapter"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        legacy.join("plugin.json"),
+        r#"{"apiVersion":"gewu.plugin/v1","id":"demo","title":"Demo","version":"1.0.0","scope":"workspace","backend":{"connector":"gewu-stdio","config":{"entry":"adapter"}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        home.join(".gewu/config.json"),
+        r#"{"plugins":{"demo":{"package":"/tmp/demo","enabled":true},"other":{"package":"/tmp/other","enabled":true}}}"#,
+    )
+    .unwrap();
+    fs::write(home.join(".gewu/plugin-state.json"), r#"{"demo":false}"#).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_gewu"))
+        .args(["--no-update-check", "plugin", "uninstall", "demo"])
+        .env("HOME", &home)
+        .current_dir(&workspace)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!legacy.exists(), "the legacy version directory must be removed");
+
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(home.join(".gewu/config.json")).unwrap()).unwrap();
+    assert!(config["plugins"].get("demo").is_none(), "config entry must be dropped: {config}");
+    assert!(config["plugins"].get("other").is_some(), "unrelated entries stay: {config}");
+
+    let overrides: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(home.join(".gewu/plugin-state.json")).unwrap())
+            .unwrap();
+    assert!(overrides.get("demo").is_none(), "stale override must be dropped: {overrides}");
+}
