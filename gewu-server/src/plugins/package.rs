@@ -43,6 +43,7 @@ pub struct Package {
     pub root: PathBuf,
     pub manifest: Manifest,
     executable: PathBuf,
+    pub(crate) skills: Vec<gewu_tools::SkillInfo>,
 }
 
 #[derive(Clone, Debug)]
@@ -141,10 +142,22 @@ impl Package {
         if let Some(schema) = &manifest.settings_schema {
             validator(&Value::Object(schema.clone()))?;
         }
+        let skills = if let Ok(dir) = contained(&root, Path::new("skills")) {
+            gewu_tools::skill::discover(&[dir])
+                .into_iter()
+                .map(|mut skill| {
+                    skill.name = format!("{}:{}", manifest.id, skill.name);
+                    skill
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             root,
             manifest,
             executable,
+            skills,
         })
     }
 

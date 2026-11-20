@@ -2,6 +2,7 @@ pub mod bootstrap;
 pub mod cli;
 pub mod config;
 pub mod mcp_loader;
+pub use gewu_server::plugins;
 mod memory_view;
 pub mod registry;
 pub mod server;

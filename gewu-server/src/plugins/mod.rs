@@ -12,6 +12,7 @@ pub mod resources;
 pub mod runtime;
 pub mod state;
 pub mod stdio;
+pub mod tools;
 
 use anyhow::{Context, Result, bail, ensure};
 use gewu_protocol::plugin::*;
