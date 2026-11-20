@@ -178,3 +178,20 @@ Ports are ephemeral unless you pass `--ws-port/--tcp-port/--http-port`.
 
 An invalid installed package is shown as a blocked entry with its error instead
 of disappearing from the panel.
+
+## Application context and Agent calls
+
+GeWu keeps the current application context in the host: workspace, session,
+plugin instance, bound resource, focused view and generation. A typed plugin
+tool such as `tachyon.render` uses that context automatically. The generic
+`plugin_call` gateway uses the same resolver, so an asynchronous call also
+follows the focused ready view when the caller does not provide `viewId`.
+
+The host returns a bounded `appContext` receipt with instance and view
+observability. Published view selections use the same structured envelope when
+they are included in the next Agent prompt; package paths, runtime details,
+service headers and view assets are never injected into the model context.
+
+Use `plugin_describe` and `plugin_call` for discovery, debugging and generic
+fallbacks. Stable typed tools are the normal Agent surface because they avoid
+making the Agent manage instance and view identifiers for every domain action.

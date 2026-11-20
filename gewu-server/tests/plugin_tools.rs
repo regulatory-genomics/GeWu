@@ -62,11 +62,176 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
         .iter()
         .find(|tool| tool.name().starts_with("plg_demo_echo_"))
         .unwrap();
-    assert!(!selected.iter().any(|tool| tool.name().contains("workflow_echo")));
+    let view_echo = selected
+        .iter()
+        .find(|tool| tool.name().starts_with("plg_demo_view_echo_"))
+        .unwrap();
+    assert!(
+        !selected
+            .iter()
+            .any(|tool| tool.name().contains("workflow_echo"))
+    );
     let ctx = ToolContext::new("conversation", "message").with_working_directory(root);
     let out = echo.execute(json!({"value":7}), &ctx).await.unwrap();
     assert_eq!(out.metadata["gewu.plugin"]["data"]["value"], 7);
     assert!(echo.execute(json!({"value":"bad"}), &ctx).await.is_err());
+
+    let attached = host
+        .action(
+            "workspace",
+            root,
+            "conversation",
+            HostAction::Attach {
+                instance_id: now.activation.instance_id.clone(),
+                view_type: "demo-view".into(),
+                resource: None,
+            },
+        )
+        .await
+        .unwrap();
+    let view_id = attached["viewId"].as_str().unwrap().to_owned();
+    host.action(
+        "workspace",
+        root,
+        "conversation",
+        HostAction::ViewReady {
+            view_id: view_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    host.action(
+        "workspace",
+        root,
+        "conversation",
+        HostAction::FocusInstance {
+            instance_id: now.activation.instance_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    host.action(
+        "workspace",
+        root,
+        "conversation",
+        HostAction::PublishContext {
+            view_id: view_id.clone(),
+            summary: "slide 3 selected".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let selected_context =
+        serde_json::to_value(host.selected_context("workspace", "conversation")).unwrap();
+    assert_eq!(
+        selected_context[0]["instanceId"],
+        now.activation.instance_id
+    );
+    let listing = host
+        .action("workspace", root, "conversation", HostAction::List)
+        .await
+        .unwrap();
+    assert_eq!(
+        listing["appContext"][0]["instanceId"],
+        now.activation.instance_id
+    );
+    assert_eq!(listing["appContext"][0]["viewId"], view_id);
+    let gateway_listing = selected
+        .iter()
+        .find(|tool| tool.name() == "plugin_list")
+        .unwrap()
+        .execute(json!({}), &ctx)
+        .await
+        .unwrap();
+    let gateway_listing = serde_json::from_str::<Value>(&gateway_listing.output).unwrap();
+    assert_eq!(
+        gateway_listing["appContext"][0]["instanceId"],
+        now.activation.instance_id
+    );
+    let view_call = view_echo.execute(json!({"value":11}), &ctx).await.unwrap();
+    assert_eq!(view_call.metadata["gewu.plugin"]["data"]["value"], 11);
+    assert_eq!(
+        view_call.metadata["gewu.plugin"]["context"]["viewId"],
+        view_id
+    );
+
+    let async_view_call = selected
+        .iter()
+        .find(|tool| tool.name() == "plugin_call")
+        .unwrap()
+        .execute(
+            json!({
+                "instanceId": now.activation.instance_id,
+                "tool": "view_echo",
+                "args": {"value": 12},
+                "async": true
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let async_view_id = serde_json::from_str::<Value>(&async_view_call.output).unwrap()["callId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let async_view_status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let reply = selected
+                .iter()
+                .find(|tool| tool.name() == "plugin_call_status")
+                .unwrap()
+                .execute(json!({"callId": async_view_id}), &ctx)
+                .await
+                .unwrap();
+            let value = serde_json::from_str::<Value>(&reply.output).unwrap();
+            if value["result"] != Value::Null {
+                break value;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(async_view_status["result"]["data"]["value"], 12);
+    assert_eq!(async_view_status["context"]["viewId"], view_id);
+
+    let second_view = host
+        .action(
+            "workspace",
+            root,
+            "conversation",
+            HostAction::Attach {
+                instance_id: now.activation.instance_id.clone(),
+                view_type: "demo-view".into(),
+                resource: None,
+            },
+        )
+        .await
+        .unwrap();
+    let second_view_id = second_view["viewId"].as_str().unwrap().to_owned();
+    host.action(
+        "workspace",
+        root,
+        "conversation",
+        HostAction::ViewReady {
+            view_id: second_view_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    host.action(
+        "workspace",
+        root,
+        "conversation",
+        HostAction::Detach { view_id },
+    )
+    .await
+    .unwrap();
+    let after_detach = host
+        .action("workspace", root, "conversation", HostAction::List)
+        .await
+        .unwrap();
+    assert_eq!(after_detach["appContext"][0]["viewId"], second_view_id);
 
     host.action(
         "workspace",
@@ -75,7 +240,11 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
         HostAction::SetSession {
             plugin_id: "demo".into(),
             enabled: Some(true),
-            profiles: vec!["workspace-basic".into(), "analysis-read".into(), "workflow-authoring".into()],
+            profiles: vec![
+                "workspace-basic".into(),
+                "analysis-read".into(),
+                "workflow-authoring".into(),
+            ],
         },
     )
     .await
@@ -83,7 +252,11 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
     let profiled = host
         .tools("workspace", root.to_owned(), "conversation", &[])
         .await;
-    assert!(profiled.iter().any(|tool| tool.name().contains("workflow_echo")));
+    assert!(
+        profiled
+            .iter()
+            .any(|tool| tool.name().contains("workflow_echo"))
+    );
 
     let instance_id = now.activation.instance_id.clone();
     let joined = host
@@ -122,7 +295,10 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
     })
     .await
     .unwrap();
-    assert_eq!(actual, out.metadata["gewu.plugin"]);
+    assert_eq!(
+        actual["data"]["value"],
+        out.metadata["gewu.plugin"]["data"]["value"]
+    );
     assert!(
         host.action(
             "workspace",
@@ -169,7 +345,10 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
     .await
     .unwrap();
     assert_eq!(status["data"]["value"], 3);
-    let calls = gateway("plugin_calls").execute(json!({}), &ctx).await.unwrap();
+    let calls = gateway("plugin_calls")
+        .execute(json!({}), &ctx)
+        .await
+        .unwrap();
     assert!(calls.output.contains(&async_id));
 
     let result: anyhow::Result<ToolOutput> = now
@@ -255,25 +434,43 @@ async fn resource_instances_are_shared_but_visible_only_to_attached_sessions() {
     };
 
     let first = host
-        .open_for_session("demo", "workspace", root, Some(resource()), Some("session-a"))
+        .open_for_session(
+            "demo",
+            "workspace",
+            root,
+            Some(resource()),
+            Some("session-a"),
+        )
         .await
         .unwrap();
     assert_eq!(
-        host.active_for_session("workspace", root, Some("session-a")).await.len(),
+        host.active_for_session("workspace", root, Some("session-a"))
+            .await
+            .len(),
         1
     );
     assert!(
-        host.active_for_session("workspace", root, Some("session-b")).await.is_empty(),
+        host.active_for_session("workspace", root, Some("session-b"))
+            .await
+            .is_empty(),
         "another session must not see this instance or its preview"
     );
 
     let second = host
-        .open_for_session("demo", "workspace", root, Some(resource()), Some("session-b"))
+        .open_for_session(
+            "demo",
+            "workspace",
+            root,
+            Some(resource()),
+            Some("session-b"),
+        )
         .await
         .unwrap();
     assert_eq!(first.activation.instance_id, second.activation.instance_id);
     assert_eq!(
-        host.active_for_session("workspace", root, Some("session-b")).await.len(),
+        host.active_for_session("workspace", root, Some("session-b"))
+            .await
+            .len(),
         1
     );
     host.close_for_session(
@@ -285,9 +482,94 @@ async fn resource_instances_are_shared_but_visible_only_to_attached_sessions() {
     .await
     .unwrap();
     assert_eq!(
-        host.active_for_session("workspace", root, Some("session-a")).await.len(),
+        host.active_for_session("workspace", root, Some("session-a"))
+            .await
+            .len(),
         1,
         "closing one session must not stop the shared resource instance"
     );
+
+    let attached = host
+        .action(
+            "workspace",
+            root,
+            "session-a",
+            HostAction::Attach {
+                instance_id: first.activation.instance_id.clone(),
+                view_type: "demo-view".into(),
+                resource: Some(ResourceRef {
+                    uri: "workspace:///doc".into(),
+                    resource_type: "demo.view".into(),
+                    mime_type: None,
+                    revision: Some("current".into()),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    let view_id = attached["viewId"].as_str().unwrap().to_owned();
+    host.action(
+        "workspace",
+        root,
+        "session-a",
+        HostAction::ViewReady {
+            view_id: view_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    host.action(
+        "workspace",
+        root,
+        "session-a",
+        HostAction::FocusInstance {
+            instance_id: first.activation.instance_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let started = host
+        .action(
+            "workspace",
+            root,
+            "session-a",
+            HostAction::Call {
+                instance_id: first.activation.instance_id.clone(),
+                tool: "view_echo".into(),
+                args: json!({"value":13}).as_object().unwrap().clone(),
+                view_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let call_id = started["callId"].as_str().unwrap().to_owned();
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = host
+                .action(
+                    "workspace",
+                    root,
+                    "session-a",
+                    HostAction::CallStatus {
+                        call_id: call_id.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            if status["result"] != Value::Null {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["result"]["error"]["code"], "CALL_FAILED");
+    let changes = host
+        .action("workspace", root, "session-a", HostAction::Changes)
+        .await
+        .unwrap();
+    assert_eq!(changes, json!([]));
     host.close_all().await.unwrap();
 }

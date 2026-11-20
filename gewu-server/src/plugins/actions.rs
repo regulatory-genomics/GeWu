@@ -1,4 +1,9 @@
-use super::{Instance, PluginHost, package, workspace_path};
+use super::{
+    Instance, PluginHost,
+    context::{AppContext, MAX_APP_CONTEXT_BYTES},
+    invocation,
+    package, workspace_path,
+};
 use anyhow::{Context, Result, bail, ensure};
 use gewu_protocol::plugin::*;
 use serde_json::{Value, json};
@@ -26,6 +31,7 @@ struct Record {
     owner: String,
     workspace: String,
     instance: Arc<Instance>,
+    context: AppContext,
     tool: String,
     status: &'static str,
     progress: Option<String>,
@@ -56,7 +62,7 @@ impl Record {
             })
             .take(8)
             .collect();
-        json!({"id":id,"instanceId":self.instance.activation.instance_id,"tool":self.tool,"status":self.status,"progress":self.progress,"resources":resources})
+        json!({"id":id,"instanceId":self.instance.activation.instance_id,"tool":self.tool,"status":self.status,"progress":self.progress,"context":self.context,"resources":resources})
     }
 }
 
@@ -125,27 +131,93 @@ impl PluginHost {
         }
     }
 
-    pub(super) fn selected_view(
+    pub(super) fn resolve_context(
         &self,
-        instance: &Arc<Instance>,
+        workspace: &str,
         owner: &str,
-        context: &mut CallContext,
-    ) {
+        instance: &Arc<Instance>,
+        requested_view: Option<&str>,
+    ) -> Result<AppContext> {
+        let mut context = AppContext::for_instance(instance, owner);
         let state = self.calls.lock().unwrap();
         let key = (instance.activation.workspace_id.clone(), owner.into());
-        if let Some((id, view)) = state
-            .focus
-            .get(&key)
-            .and_then(|id| state.views.get_key_value(id))
-            && view.ready
-            && view.active.load(Ordering::Acquire)
-            && Arc::ptr_eq(&view.instance, instance)
-        {
-            context.view_id = Some(id.clone());
-            context.view_epoch = Some(instance.activation.generation);
-            context.resource = view.resource.clone();
+        let focused = state.focus.get(&key).map(String::as_str);
+        let selected = requested_view.or(focused);
+        if let Some(view_id) = selected {
+            let view = state.views.get(view_id).filter(|view| {
+                view.owner == owner
+                    && view.instance.activation.workspace_id == workspace
+                    && view.ready
+                    && view.active.load(Ordering::Acquire)
+                    && !view.instance.adapter.is_closed()
+                    && Arc::ptr_eq(&view.instance, instance)
+            });
+            if let Some(view) = view {
+                context = AppContext::for_view(
+                    instance,
+                    owner,
+                    view_id,
+                    view.resource.clone(),
+                    view.selection.clone(),
+                );
+            } else if requested_view.is_some() {
+                bail!("VIEW_NOT_READY: view is stale or belongs to another instance");
+            }
         }
+        Ok(context)
     }
+
+    pub(super) fn app_contexts(&self, workspace: &str, owner: &str) -> Vec<AppContext> {
+        let state = self.calls.lock().unwrap();
+        let key = (workspace.into(), owner.into());
+        let focused = state.focus.get(&key).cloned();
+        let mut contexts = Vec::new();
+        if let Some(view_id) = focused.as_deref()
+            && let Some(view) = state.views.get(view_id).filter(|view| {
+                view.owner == owner
+                    && view.instance.activation.workspace_id == workspace
+                    && view.ready
+                    && view.active.load(Ordering::Acquire)
+                    && !view.instance.adapter.is_closed()
+            })
+        {
+            contexts.push(AppContext::for_view(
+                &view.instance,
+                owner,
+                view_id,
+                view.resource.clone(),
+                view.selection.clone(),
+            ));
+        }
+        let mut selected: Vec<_> = state
+            .views
+            .iter()
+            .filter(|(id, view)| {
+                Some(id.as_str()) != focused.as_deref()
+                    && view.owner == owner
+                    && view.instance.activation.workspace_id == workspace
+                    && view.ready
+                    && view.active.load(Ordering::Acquire)
+                    && !view.instance.adapter.is_closed()
+                    && view.selection.is_some()
+            })
+            .collect();
+        selected.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (view_id, view) in selected {
+            if contexts.len() >= 4 {
+                break;
+            }
+            contexts.push(AppContext::for_view(
+                &view.instance,
+                owner,
+                view_id,
+                view.resource.clone(),
+                view.selection.clone(),
+            ));
+        }
+        contexts
+    }
+
     async fn find(
         &self,
         workspace: &str,
@@ -177,29 +249,41 @@ impl PluginHost {
     }
 
     fn remove_views_for(&self, owner: &str, instance_id: &str, all: bool) {
-        self.calls.lock().unwrap().views.retain(|_, view| {
-            view.instance.activation.instance_id != instance_id
-                || (!all && view.owner != owner)
+        let mut state = self.calls.lock().unwrap();
+        state.views.retain(|_, view| {
+            view.instance.activation.instance_id != instance_id || (!all && view.owner != owner)
         });
+        repair_focus(&mut state);
     }
 
-    pub fn selected_context(&self, workspace: &str, session: &str) -> Vec<String> {
-        let mut items: Vec<_> = self
-            .calls
-            .lock()
-            .unwrap()
-            .views
-            .iter()
-            .filter(|(_, v)| {
-                v.owner == session
-                    && v.instance.activation.workspace_id == workspace
-                    && v.ready
-                    && !v.instance.adapter.is_closed()
-            })
-            .filter_map(|(id, v)| v.selection.as_ref().map(|s| (id.clone(), s.clone())))
-            .collect();
-        items.sort_by(|a, b| a.0.cmp(&b.0));
-        items.into_iter().take(4).map(|(_, text)| text).collect()
+    pub fn selected_context(&self, workspace: &str, session: &str) -> Vec<Value> {
+        let mut budget = MAX_APP_CONTEXT_BYTES.saturating_sub(2);
+        let mut output = Vec::new();
+        for mut context in self
+            .app_contexts(workspace, session)
+            .into_iter()
+            .filter(|context| context.selection.is_some())
+        {
+            let mut value = match serde_json::to_value(&context) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let mut size = serde_json::to_vec(&value).map_or(usize::MAX, |bytes| bytes.len());
+            if size + 1 > budget {
+                context.selection = context.selection.map(|text| clip(&text, budget.min(512)));
+                value = match serde_json::to_value(&context) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                size = serde_json::to_vec(&value).map_or(usize::MAX, |bytes| bytes.len());
+            }
+            if size + 1 > budget {
+                break;
+            }
+            budget -= size + 1;
+            output.push(value);
+        }
+        output
     }
 
     pub async fn action(
@@ -230,11 +314,9 @@ impl PluginHost {
                 let mut profiles = profiles;
                 profiles.sort();
                 profiles.dedup();
-                let state = super::SessionPluginState {
-                    enabled,
-                    profiles,
-                };
-                self.persist_session_state(owner, &plugin_id, &state).await?;
+                let state = super::SessionPluginState { enabled, profiles };
+                self.persist_session_state(owner, &plugin_id, &state)
+                    .await?;
                 if state.enabled == Some(false) {
                     let ids: Vec<_> = self
                         .active_for_session(workspace, root, Some(owner))
@@ -285,6 +367,7 @@ impl PluginHost {
                 });
                 Ok(json!({
                     "workspaceRoot": root.to_string_lossy(),
+                    "appContext": self.app_contexts(workspace, owner),
                     "plugins":plugins,
                     "instances":self.active_for_session(workspace, root, Some(owner)).await.iter().map(|i| {
                         let mut info = i.public_info();
@@ -317,17 +400,9 @@ impl PluginHost {
                     .find(workspace, root, &instance_id, Some(owner))
                     .await?;
                 let id = Uuid::new_v4().to_string();
-                let mut context = instance.context(id.clone(), Some(owner.into()));
-                if let Some(view_id) = view_id {
-                    let view = self.view(workspace, owner, &view_id)?;
-                    ensure!(
-                        view.ready && Arc::ptr_eq(&view.instance, &instance),
-                        "view is not bound to this instance"
-                    );
-                    context.resource = view.resource;
-                    context.view_id = Some(view_id);
-                    context.view_epoch = Some(instance.activation.generation);
-                }
+                let app_context =
+                    self.resolve_context(workspace, owner, &instance, view_id.as_deref())?;
+                let context = app_context.call_context(id.clone(), None);
                 let state = self.calls.clone();
                 {
                     let mut state = state.lock().unwrap();
@@ -341,6 +416,7 @@ impl PluginHost {
                             owner: owner.into(),
                             workspace: workspace.into(),
                             instance: instance.clone(),
+                            context: app_context.clone(),
                             tool: tool.clone(),
                             status: "running",
                             progress: None,
@@ -352,7 +428,16 @@ impl PluginHost {
                 let store = self.store.clone();
                 tokio::spawn(async move {
                     let (progress, mut events) = mpsc::channel(8);
-                    let work = instance.invoke(&tool, args, context, Some(progress), false, false);
+                    let work = invocation::invoke_adapter(
+                        &app_context,
+                        &instance,
+                        &tool,
+                        args,
+                        context,
+                        Some(progress),
+                        false,
+                        false,
+                    );
                     tokio::pin!(work);
                     let result = loop {
                         tokio::select! {
@@ -563,7 +648,7 @@ impl PluginHost {
                 {
                     let mut state = self.calls.lock().unwrap();
                     state.views.remove(&view_id);
-                    state.focus.retain(|_, id| id != &view_id);
+                    repair_focus(&mut state);
                 }
                 if view.ready {
                     native_view(&view, &view_id, "view.detach").await?;
@@ -588,12 +673,13 @@ impl PluginHost {
                 let found = state
                     .views
                     .iter()
-                    .find(|(_, v)| {
+                    .filter(|(_, v)| {
                         v.owner == owner
                             && v.instance.activation.instance_id == instance_id
                             && v.ready
                             && v.active.load(Ordering::Acquire)
                     })
+                    .min_by(|(a, _), (b, _)| a.cmp(b))
                     .map(|(id, _)| id.clone());
                 let Some(view_id) = found else {
                     bail!("instance '{instance_id}' has no open view in this session");
@@ -720,24 +806,43 @@ impl PluginHost {
                     "releases": releases,
                 }))
             }
-            HostAction::MarketplaceInstall { plugin_id, version, channel } => {
-                let root = self.installation_root.clone().context("host has no installation root")?;
+            HostAction::MarketplaceInstall {
+                plugin_id,
+                version,
+                channel,
+            } => {
+                let root = self
+                    .installation_root
+                    .clone()
+                    .context("host has no installation root")?;
                 let (client, index) = self.marketplace_index(true).await?;
                 let target = super::runtime::current_target()
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                 let release = index
-                    .select_release_version(&plugin_id, version.as_deref(), &channel, &super::marketplace::now_rfc3339())
+                    .select_release_version(
+                        &plugin_id,
+                        version.as_deref(),
+                        &channel,
+                        &super::marketplace::now_rfc3339(),
+                    )
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?
                     .clone();
                 let store = super::artifacts::ArtifactStore::new(root.join("store"));
-                let package = client.download_artifact(&release.package, &store).await
+                let package = client
+                    .download_artifact(&release.package, &store)
+                    .await
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                let selections = super::lifecycle::RuntimeSelection::auto_candidates(&release, &target, None).await?;
+                let selections =
+                    super::lifecycle::RuntimeSelection::auto_candidates(&release, &target, None)
+                        .await?;
                 let manager = super::lifecycle::InstallManager::new(&root);
                 let mut failures = Vec::new();
                 for selection in selections {
                     let runtime_archive = match &selection {
-                        super::lifecycle::RuntimeSelection::Bundled(runtime_ref) => match client.download_artifact(&runtime_ref.artifact, &store).await {
+                        super::lifecycle::RuntimeSelection::Bundled(runtime_ref) => match client
+                            .download_artifact(&runtime_ref.artifact, &store)
+                            .await
+                        {
                             Ok(path) => Some(path),
                             Err(error) => {
                                 failures.push(error.to_string());
@@ -747,26 +852,45 @@ impl PluginHost {
                         _ => None,
                     };
                     match manager
-                        .install_release(&release, &package, runtime_archive.as_deref(), selection, &root, std::time::Duration::from_secs(60))
+                        .install_release(
+                            &release,
+                            &package,
+                            runtime_archive.as_deref(),
+                            selection,
+                            &root,
+                            std::time::Duration::from_secs(60),
+                        )
                         .await
                     {
                         Ok(runtime) => {
                             self.refresh_installation(&plugin_id)?;
-                            return Ok(json!({"installed": plugin_id, "version": release.version, "runtime": runtime.runtime}));
+                            return Ok(
+                                json!({"installed": plugin_id, "version": release.version, "runtime": runtime.runtime}),
+                            );
                         }
                         Err(error) => failures.push(error.to_string()),
                     }
                 }
-                bail!("all runtime providers failed for {}: {}", release.release_id, failures.join("; "))
+                bail!(
+                    "all runtime providers failed for {}: {}",
+                    release.release_id,
+                    failures.join("; ")
+                )
             }
             HostAction::MarketplaceRollback { plugin_id } => {
-                let root = self.installation_root.clone().context("host has no installation root")?;
+                let root = self
+                    .installation_root
+                    .clone()
+                    .context("host has no installation root")?;
                 let release = super::state::StateStore::new(&root).rollback(&plugin_id)?;
                 self.refresh_installation(&plugin_id)?;
                 Ok(json!({"rolledBack": plugin_id, "release": release}))
             }
             HostAction::MarketplaceDoctor => {
-                let root = self.installation_root.clone().context("host has no installation root")?;
+                let root = self
+                    .installation_root
+                    .clone()
+                    .context("host has no installation root")?;
                 let state = super::state::StateStore::new(&root).load()?;
                 Ok(json!(state.plugins))
             }
@@ -776,12 +900,20 @@ impl PluginHost {
     async fn marketplace_index(
         &self,
         refresh: bool,
-    ) -> Result<(super::marketplace::MarketplaceClient, gewu_protocol::MarketplaceIndex)> {
+    ) -> Result<(
+        super::marketplace::MarketplaceClient,
+        gewu_protocol::MarketplaceIndex,
+    )> {
         use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-        let root = self.installation_root.clone().context("host has no installation root")?;
+        let root = self
+            .installation_root
+            .clone()
+            .context("host has no installation root")?;
         let key_text = std::env::var("GEWU_MARKETPLACE_PUBLIC_KEY")
             .unwrap_or_else(|_| super::marketplace::OFFICIAL_PUBLIC_KEY_B64.trim().into());
-        let public_key = BASE64.decode(key_text).context("official marketplace public key is not base64")?;
+        let public_key = BASE64
+            .decode(key_text)
+            .context("official marketplace public key is not base64")?;
         let base = std::env::var("GEWU_MARKETPLACE_BASE_URL")
             .unwrap_or_else(|_| super::marketplace::OFFICIAL_INDEX_BASE.into());
         let client = super::marketplace::MarketplaceClient::new(
@@ -815,6 +947,47 @@ impl Calls {
             .push_back((workspace.into(), owner.into(), change));
         while self.changes.len() > 128 {
             self.changes.pop_front();
+        }
+    }
+}
+
+fn repair_focus(state: &mut Calls) {
+    let keys: Vec<_> = state.focus.keys().cloned().collect();
+    for (workspace, owner) in keys {
+        let key = (workspace.clone(), owner.clone());
+        let current_is_live = state
+            .focus
+            .get(&key)
+            .and_then(|id| state.views.get(id))
+            .is_some_and(|view| {
+                view.owner == owner
+                    && view.instance.activation.workspace_id == workspace
+                    && view.ready
+                    && view.active.load(Ordering::Acquire)
+                    && !view.instance.adapter.is_closed()
+            });
+        if current_is_live {
+            continue;
+        }
+        let next = state
+            .views
+            .iter()
+            .filter(|(_, view)| {
+                view.owner == owner
+                    && view.instance.activation.workspace_id == workspace
+                    && view.ready
+                    && view.active.load(Ordering::Acquire)
+                    && !view.instance.adapter.is_closed()
+            })
+            .min_by(|(a, _), (b, _)| a.cmp(b))
+            .map(|(id, _)| id.clone());
+        match next {
+            Some(id) => {
+                state.focus.insert(key, id);
+            }
+            None => {
+                state.focus.remove(&key);
+            }
         }
     }
 }
