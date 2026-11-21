@@ -12,6 +12,8 @@
 
 pub mod cli;
 mod download;
+mod plugin_apps;
+mod plugins;
 mod protocol;
 mod server;
 mod session;
@@ -141,6 +143,10 @@ pub async fn run_with_updates(
         .context("failed to build the download HTTP client")?;
 
     let state = AppState {
+        apps: Arc::new(plugin_apps::AppGateway::configure(
+            cli.public_origin.as_deref(),
+            cli.plugin_app_origin_template.as_deref(),
+        )?),
         endpoint,
         version,
         updates: update_rx,

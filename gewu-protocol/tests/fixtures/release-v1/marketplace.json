@@ -1,0 +1,11 @@
+{
+  "index": {
+    "schemaVersion": "gewu.marketplace/v1",
+    "repository": "official",
+    "generatedAt": "2026-11-19T00:00:00Z",
+    "expiresAt": "2026-12-19T00:00:00Z",
+    "keyId": "official-v1",
+    "releases": []
+  },
+  "signature": {"algorithm": "ed25519", "keyId": "official-v1", "value": "fixture-signature"}
+}

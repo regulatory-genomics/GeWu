@@ -34,6 +34,7 @@ struct Conn {
     observer: Option<Client>,
     observing: bool,
     task: Option<JoinHandle<()>>,
+    plugin_views: Vec<String>,
     /// When the streaming Markdown body was last pushed, throttling
     /// re-renders to [`STREAM_INTERVAL`]. `None` means the next delta is due.
     last_stream_render: Option<Instant>,
@@ -228,13 +229,19 @@ pub struct GuiSession {
     /// Workflow run currently shown in the zoom panel, if any.
     zoom: Option<ZoomTarget>,
     downloads: Arc<DownloadTickets>,
+    apps: Arc<crate::plugin_apps::AppGateway>,
+    app_owner: crate::plugin_apps::AppOwner,
     tab_tx: Option<mpsc::UnboundedSender<TabEvent>>,
+    /// Replies produced by background plugin requests. They are written from
+    /// the connection loop so the WebSocket sink has one owner.
+    out_tx: Option<mpsc::UnboundedSender<ServerMsg>>,
 }
 
 enum Incoming {
     Socket(Option<Result<Message, axum::Error>>),
     Tab(Option<TabEvent>),
     Update(bool),
+    Out(Option<ServerMsg>),
 }
 
 impl GuiSession {
@@ -245,6 +252,7 @@ impl GuiSession {
         version: &str,
         updates: watch::Receiver<Option<gewu_update::Update>>,
         downloads: Arc<DownloadTickets>,
+        apps: Arc<crate::plugin_apps::AppGateway>,
     ) -> Result<Self> {
         let admin = endpoint
             .connect_with_token(server_token)
@@ -332,6 +340,8 @@ impl GuiSession {
 
         let update = updates.borrow().clone();
         Ok(Self {
+            app_owner: apps.owner(),
+            apps,
             endpoint: endpoint.clone(),
             server_token: server_token.map(str::to_string),
             version: version.to_string(),
@@ -351,6 +361,7 @@ impl GuiSession {
             zoom: None,
             downloads,
             tab_tx: None,
+            out_tx: None,
         })
     }
 
@@ -361,6 +372,8 @@ impl GuiSession {
         // Keep a sender alive so `tab_rx.recv()` only yields real events.
         let _tab_keepalive = tab_tx.clone();
         self.tab_tx = Some(tab_tx.clone());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMsg>();
+        self.out_tx = Some(out_tx);
 
         match self.admin.ping().await {
             Ok(()) => self.note_active("connected"),
@@ -410,6 +423,7 @@ impl GuiSession {
             let incoming = tokio::select! {
                 message = receiver.next() => Incoming::Socket(message),
                 event = tab_rx.recv() => Incoming::Tab(event),
+                reply = out_rx.recv() => Incoming::Out(reply),
                 changed = self.updates.changed(), if updates_live => Incoming::Update(changed.is_ok()),
             };
 
@@ -444,6 +458,10 @@ impl GuiSession {
                         self.send_error(&mut sender, e.to_string()).await?;
                     }
                 }
+                Incoming::Out(Some(message)) => {
+                    send_msg(&mut sender, &message).await?;
+                }
+                Incoming::Out(None) => break,
                 Incoming::Update(true) => {
                     self.update = self.updates.borrow().clone();
                     send_msg(
@@ -933,6 +951,113 @@ impl GuiSession {
         tab_tx: &mpsc::UnboundedSender<TabEvent>,
     ) -> Result<()> {
         match msg {
+            ClientMsg::Plugin {
+                tab,
+                request,
+                plugin,
+            } => {
+                use gewu_protocol::plugin::HostAction;
+                if matches!(&plugin, HostAction::MarketplaceInstall { .. }) {
+                    self.ensure_session(tab).await?;
+                    let ws = self
+                        .workspace
+                        .tab(tab)
+                        .expect("known tab")
+                        .workspace
+                        .clone();
+                    let session_id = self
+                        .workspace
+                        .tab(tab)
+                        .and_then(|tab| tab.model.session_id.clone());
+                    let client = self.client(tab).expect("ensured");
+                    let out = self
+                        .out_tx
+                        .clone()
+                        .context("GUI connection has no reply channel")?;
+                    tokio::spawn(async move {
+                        let response = client.plugin(ws, plugin).await;
+                        let (result, error) = match response {
+                            Ok(result) => (Some(result), None),
+                            Err(error) => (None, Some(error.to_string())),
+                        };
+                        let _ = out.send(ServerMsg::Plugin {
+                            request,
+                            result,
+                            error,
+                            session_id,
+                        });
+                    });
+                    return Ok(());
+                }
+                let attaching = matches!(&plugin, HostAction::Attach { .. });
+                let detaching = if let HostAction::Detach { view_id } = &plugin {
+                    Some(view_id.clone())
+                } else {
+                    None
+                };
+                let response = async {
+                    self.ensure_session(tab).await?;
+                    let ws = self
+                        .workspace
+                        .tab(tab)
+                        .expect("known tab")
+                        .workspace
+                        .clone();
+                    let mut result = self
+                        .client(tab)
+                        .expect("ensured")
+                        .plugin(ws.clone(), plugin)
+                        .await
+                        .map_err(anyhow::Error::from)?;
+                    if attaching {
+                        if let Err(error) = self.apps.bind(&self.app_owner, &mut result) {
+                            if let Some(id) = result["viewId"].as_str() {
+                                let _ = self
+                                    .client(tab)
+                                    .expect("ensured")
+                                    .plugin(ws, HostAction::Detach { view_id: id.into() })
+                                    .await;
+                            }
+                            return Err(error);
+                        }
+                    }
+                    if let Some(id) = &detaching {
+                        self.apps.unbind(&self.app_owner, id);
+                    }
+                    Ok::<_, anyhow::Error>(result)
+                }
+                .await;
+                if let Ok(result) = &response
+                    && let Some(conn) = self.conns.get_mut(&tab)
+                {
+                    if attaching
+                        && let Some(id) = result.get("viewId").and_then(serde_json::Value::as_str)
+                    {
+                        conn.plugin_views.push(id.into());
+                    }
+                    if let Some(id) = detaching {
+                        conn.plugin_views.retain(|saved| saved != &id);
+                    }
+                }
+                let session_id = self
+                    .workspace
+                    .tab(tab)
+                    .and_then(|tab| tab.model.session_id.clone());
+                let (result, error) = match response {
+                    Ok(result) => (Some(result), None),
+                    Err(error) => (None, Some(error.to_string())),
+                };
+                send_msg(
+                    sender,
+                    &ServerMsg::Plugin {
+                        request,
+                        result,
+                        error,
+                        session_id,
+                    },
+                )
+                .await?;
+            }
             ClientMsg::RevertChat { tab, block, undo } => {
                 self.close_zoom_for_tab(tab, sender).await?;
                 let Some(tab_state) = self.workspace.tab(tab) else {
@@ -1073,6 +1198,9 @@ impl GuiSession {
                 }
                 if let Err(e) = self.ensure_session(tab).await {
                     return self.send_error(sender, e.to_string()).await;
+                }
+                if let Some(conn) = self.conns.get_mut(&tab) {
+                    detach_views(conn).await;
                 }
                 let client = self.client(tab).expect("ensured");
                 match client.switch_workspace(workspace.clone()).await {
@@ -1789,6 +1917,7 @@ impl GuiSession {
 
     async fn stop_tab(&mut self, tab_id: u64) {
         if let Some(mut conn) = self.conns.remove(&tab_id) {
+            detach_views(&mut conn).await;
             if let Some(task) = conn.task.take() {
                 if let Some(client) = &conn.client {
                     let _ = client.interrupt().await;
@@ -2262,6 +2391,7 @@ impl GuiSession {
 
     async fn shutdown(&mut self) {
         for (_, mut conn) in self.conns.drain() {
+            detach_views(&mut conn).await;
             if let Some(task) = conn.task.take() {
                 task.abort();
             }
@@ -2273,6 +2403,21 @@ impl GuiSession {
             }
         }
         self.admin.close().await;
+    }
+}
+
+async fn detach_views(conn: &mut Conn) {
+    if let Some(client) = &conn.client {
+        for view_id in conn.plugin_views.drain(..) {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.plugin(
+                    "cwd".into(),
+                    gewu_protocol::plugin::HostAction::Detach { view_id },
+                ),
+            )
+            .await;
+        }
     }
 }
 

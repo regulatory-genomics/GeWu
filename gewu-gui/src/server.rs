@@ -71,6 +71,7 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Shared state for every request.
 #[derive(Clone)]
 pub struct AppState {
+    pub(crate) apps: Arc<crate::plugin_apps::AppGateway>,
     /// Upstream server every browser session connects to.
     pub endpoint: Endpoint,
     /// Version shown in the session sidebar.
@@ -102,6 +103,7 @@ async fn serve_router(listener: TcpListener, app: Router) -> anyhow::Result<()> 
 
 /// Build the router. Exposed for tests.
 pub fn router(state: AppState) -> Router {
+    let middleware_state = state.clone();
     Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
@@ -110,8 +112,43 @@ pub fn router(state: AppState) -> Router {
         .route("/api/config", get(config))
         .route("/download/{ticket}", get(download).head(download_head))
         .route("/preview/{ticket}", get(preview))
+        .route(
+            "/plugin-data/{ticket}/{*path}",
+            axum::routing::any(crate::plugins::proxy),
+        )
+        .route(
+            "/panels.mjs",
+            get(|| js_module(include_str!("../assets/panels.mjs"))),
+        )
+        .route(
+            "/plugin-bridge.mjs",
+            get(|| js_module(include_str!("../assets/plugin-bridge.mjs"))),
+        )
+        .route(
+            "/editor.mjs",
+            get(|| js_module(include_str!("../assets/editor.mjs"))),
+        )
         .route("/ws", get(ws_handler))
+        .route(
+            "/plugin-app-bridge.mjs",
+            get(|| js_module(include_str!("../assets/plugin-app-bridge.mjs"))),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            middleware_state,
+            crate::plugin_apps::dispatch,
+        ))
         .with_state(state)
+}
+
+async fn js_module(source: &'static str) -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        source,
+    )
 }
 
 #[derive(Serialize)]
@@ -120,16 +157,22 @@ struct ConfigResponse {
     auth_required: bool,
 }
 
-async fn index() -> impl IntoResponse {
+async fn index(State(state): State<AppState>) -> impl IntoResponse {
+    let csp = state
+        .apps
+        .frame_source()
+        .map(|source| format!("{CSP}; frame-src 'self' {source}"))
+        .unwrap_or_else(|| CSP.into());
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::CONTENT_SECURITY_POLICY, CSP),
+            (header::CONTENT_SECURITY_POLICY, csp.as_str()),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             (header::REFERRER_POLICY, "no-referrer"),
         ],
         Html(INDEX_HTML),
     )
+        .into_response()
 }
 
 async fn app_js() -> impl IntoResponse {
@@ -322,6 +365,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         &state.version,
         state.updates.clone(),
         state.downloads.clone(),
+        state.apps.clone(),
     )
     .await
     {
@@ -419,6 +463,7 @@ mod tests {
 
     fn test_state(token: Option<&str>) -> AppState {
         AppState {
+            apps: Arc::new(crate::plugin_apps::AppGateway::default()),
             endpoint: Endpoint::Tcp {
                 host: "127.0.0.1".to_string(),
                 port: 8421,

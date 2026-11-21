@@ -1,0 +1,30 @@
+{
+  "schemaVersion": "gewu.runtime-plan/v1",
+  "policies": ["external", "managed", "bundled"],
+  "providers": [
+    {
+      "kind": "external",
+      "id": "paper-python",
+      "target": {"os": "linux", "arch": "x86_64", "libc": "glibc"},
+      "executable": {"env": "PAPER_PYTHON", "commands": ["python3"]},
+      "probe": {"args": ["-c", "import paper"], "timeoutSeconds": 60}
+    },
+    {
+      "kind": "managed",
+      "id": "paper-managed",
+      "target": {"os": "linux", "arch": "x86_64", "libc": "glibc"},
+      "manager": "micromamba",
+      "packages": ["python=3.11"],
+      "pip": ["paper"],
+      "probe": {"args": ["-c", "import paper"], "timeoutSeconds": 120}
+    },
+    {
+      "kind": "bundled",
+      "id": "paper-runtime",
+      "version": "0.2.0",
+      "target": {"os": "linux", "arch": "x86_64", "libc": "glibc"},
+      "artifact": {"url": "https://plugin.regulogen.cn/releases/download/paper-0.2.0/paper-0.2.0.runtime.zip", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "bytes": 200},
+      "manifest": {"url": "https://plugin.regulogen.cn/releases/download/paper-0.2.0/paper-0.2.0.runtime.zip.json", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "bytes": 300}
+    }
+  ]
+}

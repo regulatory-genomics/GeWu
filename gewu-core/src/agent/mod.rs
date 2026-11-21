@@ -214,6 +214,11 @@ impl Agent {
         self.llm = llm;
     }
 
+    /// Swap the catalog at a turn boundary without resetting its prompt or reminder.
+    pub fn replace_tools(&mut self, tools: Arc<Vec<Arc<dyn Tool>>>) -> Arc<Vec<Arc<dyn Tool>>> {
+        std::mem::replace(&mut self.tools, tools)
+    }
+
     /// Changes the filesystem root used by subsequent tool calls.
     /// The caller must ensure the agent is idle.
     pub fn set_working_directory(&mut self, working_directory: impl Into<PathBuf>) {

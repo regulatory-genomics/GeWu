@@ -6,7 +6,7 @@
 use crate::types::{ToolContext, ToolResult};
 use anyhow::Result;
 use std::error::Error;
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 
 use super::extract_panic_message;
 
@@ -29,8 +29,8 @@ use super::extract_panic_message;
 /// # Design Notes
 ///
 /// We spawn the tool as a separate task. Tokio automatically catches panics in
-/// spawned tasks and stores them in the JoinHandle. When we await the handle,
-/// we get a `JoinError` if the task panicked.
+/// spawned tasks. The owning task set returns a `JoinError` on panic and aborts
+/// the child if the caller is cancelled.
 ///
 /// This avoids the nested `block_on` anti-pattern where blocking inside
 /// `spawn_blocking` can cause deadlocks when the blocking thread pool is exhausted.
@@ -42,12 +42,13 @@ pub async fn execute_tool_with_panic_recovery(
     let tool_name = tool.name().to_string();
 
     // Spawn the async tool execution as a separate task.
-    // Tokio will catch any panics and store them in the JoinHandle.
-    let handle: JoinHandle<Result<ToolResult, Box<dyn Error + Send + Sync>>> =
-        tokio::spawn(async move { tool.execute(args, &ctx).await });
+    // Tokio catches any panics at the task boundary.
+    // Keep the panic boundary owned: dropping this future must cancel the tool.
+    let mut task = JoinSet::new();
+    task.spawn(async move { tool.execute(args, &ctx).await });
 
-    // Await the result. Tokio's JoinHandle catches panics automatically.
-    match handle.await {
+    // The set contains exactly the one tool spawned above.
+    match task.join_next().await.expect("one tool task") {
         // Task completed successfully with a result
         Ok(Ok(res)) => Ok(res),
         // Tool returned an error (not a panic)
