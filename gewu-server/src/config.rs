@@ -37,11 +37,13 @@ use gewu_tools::{DEFAULT_MAX_BASE64_BYTES, DEFAULT_MAX_DIMENSION, ImageLimits};
 pub const BUILTIN_AGENT_NAMES: &[&str] = &["build", "plan", "explore", "general"];
 
 /// A user-defined agent from the config file: a base profile plus optional
-/// overrides. Spawnable through the `task` tool (and later workflows);
-/// never selectable as the primary agent.
+/// overrides. Spawnable through the `task` tool; primary use is explicit opt-in.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentEntry {
+    /// Allow this profile to be selected as a primary session agent.
+    #[serde(default)]
+    pub primary: bool,
     /// Built-in profile providing the tool set.
     pub base: String,
     /// Shown to the model in the task tool's agent list.
@@ -140,6 +142,10 @@ pub struct Config {
     pub sandbox: PathEnforcement,
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
+    #[serde(default)]
+    pub plugins: BTreeMap<String, crate::plugins::package::PluginEntry>,
+    #[serde(rename = "pluginHost", default)]
+    pub plugin_host: crate::plugins::stdio::Limits,
     /// User-defined agents keyed by name; spawnable via the `task` tool.
     #[serde(default)]
     pub agents: BTreeMap<String, AgentEntry>,
@@ -275,7 +281,7 @@ impl Config {
             }
             if let Some(tools) = &agent.tools {
                 anyhow::ensure!(
-                    !tools.is_empty(),
+                    agent.primary || !tools.is_empty(),
                     "agent '{name}': tools cannot be an empty list (omit it to keep the base profile's tools)"
                 );
                 for tool in tools {

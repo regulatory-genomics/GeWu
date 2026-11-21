@@ -506,6 +506,7 @@ mod tests {
         assert_eq!(info.session_id.as_deref(), Some("s1"));
 
         let _ = tab.model.apply_event(&AgentEvent::ToolStart {
+            call_id: String::new(),
             tool: "question".into(),
             input: "{}".into(),
         });

@@ -110,8 +110,35 @@ pub fn router(state: AppState) -> Router {
         .route("/api/config", get(config))
         .route("/download/{ticket}", get(download).head(download_head))
         .route("/preview/{ticket}", get(preview))
+        .route(
+            "/plugin-data/{ticket}/{*path}",
+            axum::routing::any(crate::plugins::proxy),
+        )
+        .route(
+            "/panels.mjs",
+            get(|| js_module(include_str!("../assets/panels.mjs"))),
+        )
+        .route(
+            "/plugin-bridge.mjs",
+            get(|| js_module(include_str!("../assets/plugin-bridge.mjs"))),
+        )
+        .route(
+            "/editor.mjs",
+            get(|| js_module(include_str!("../assets/editor.mjs"))),
+        )
         .route("/ws", get(ws_handler))
         .with_state(state)
+}
+
+async fn js_module(source: &'static str) -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        source,
+    )
 }
 
 #[derive(Serialize)]
@@ -280,14 +307,21 @@ async fn preview(State(state): State<AppState>, Path(ticket): Path<String>) -> R
     }
 
     // The upstream serves every file as an attachment with an opaque type;
-    // override both so the browser renders the page instead of downloading it.
+    // override both so the browser renders the file instead of downloading it.
+    // Only allowlisted types reach here (see `is_previewable_path`).
+    let content_type = crate::session::preview_content_type(&path)
+        .unwrap_or("application/octet-stream");
     let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(header::CONTENT_SECURITY_POLICY, PREVIEW_CSP)
+        .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "no-store")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(header::REFERRER_POLICY, "no-referrer");
+    // HTML is untrusted page content, so it gets the sandbox policy; media is
+    // rendered by an img/video/audio element and must not be sandboxed here.
+    if content_type.starts_with("text/html") {
+        builder = builder.header(header::CONTENT_SECURITY_POLICY, PREVIEW_CSP);
+    }
     if let Some(length) = upstream.headers().get(header::CONTENT_LENGTH) {
         builder = builder.header(header::CONTENT_LENGTH, length);
     }

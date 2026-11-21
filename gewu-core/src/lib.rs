@@ -52,7 +52,7 @@ pub mod question;
 pub mod traits;
 pub mod types;
 
-pub use agent::{Agent, AgentTemplate, Steering};
+pub use agent::{Agent, AgentTemplate, CancelHandle, RunOptions, Steering};
 pub use compaction::{estimate_tokens, is_overflow};
 pub use middleware::TruncationService;
 pub use question::{Question, QuestionBroker, QuestionOption};

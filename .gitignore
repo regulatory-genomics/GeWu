@@ -5,3 +5,8 @@ target/
 .vscode/
 .opencode/
 gewu-cli/target/
+gewu-core/truncation/
+
+# Local plans and evidence are not committed.
+plans/
+.worktrees/

@@ -116,6 +116,40 @@ pub struct Agent {
     session_state: SessionState,
     /// Session-selected filesystem root, when supplied by the host.
     working_directory: Option<PathBuf>,
+    /// Shared with every tool context of the active run.
+    run_abort: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Per-run budgets. `Default` keeps the historical behaviour.
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    /// Overrides the agent's `max_turns` for this run.
+    pub max_turns: Option<usize>,
+    /// Hard cap on tool executions in one run.
+    pub max_tool_calls: Option<usize>,
+    /// Wall-clock budget for the whole run.
+    pub deadline: Option<std::time::Duration>,
+}
+
+/// A handle that can cancel a run while its stream is being consumed.
+///
+/// `Agent::run_with` borrows the agent mutably, so the owner needs this handle
+/// rather than `&Agent` to stop a run from another task.
+///
+/// Semantics: the handle cancels the run that is currently streaming. A cancel
+/// with no active run has no effect — the next run clears the flag when it
+/// starts, so a stale Stop cannot poison a later request.
+#[derive(Clone)]
+pub struct CancelHandle(Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelHandle {
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Builder for constructing `Agent` instances.
@@ -214,6 +248,11 @@ impl Agent {
         self.llm = llm;
     }
 
+    /// Swap the catalog at a turn boundary without resetting its prompt or reminder.
+    pub fn replace_tools(&mut self, tools: Arc<Vec<Arc<dyn Tool>>>) -> Arc<Vec<Arc<dyn Tool>>> {
+        std::mem::replace(&mut self.tools, tools)
+    }
+
     /// Changes the filesystem root used by subsequent tool calls.
     /// The caller must ensure the agent is idle.
     pub fn set_working_directory(&mut self, working_directory: impl Into<PathBuf>) {
@@ -243,6 +282,11 @@ impl Agent {
     /// Creates a new `AgentBuilder` for constructing `Agent` instances.
     pub fn builder() -> AgentBuilder {
         AgentBuilder::default()
+    }
+
+    /// Handle that stops the current or next run.
+    pub fn cancel_handle(&self) -> CancelHandle {
+        CancelHandle(self.run_abort.clone())
     }
 
     /// Resets the agent to its initial state.
@@ -307,7 +351,7 @@ impl Agent {
         media: Vec<ContentPart>,
         inbox: Steering,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
-        self.run_parts(Some(user_message), media, inbox)
+        self.run_inner(Some(user_message), media, RunOptions::default(), inbox)
     }
 
     pub fn resume(&mut self) -> impl Stream<Item = Result<AgentEvent>> + '_ {
@@ -318,24 +362,36 @@ impl Agent {
         &mut self,
         inbox: Steering,
     ) -> impl Stream<Item = Result<AgentEvent>> + '_ {
-        self.run(None, inbox)
+        self.run_inner(None, Vec::new(), RunOptions::default(), inbox)
     }
 
-    fn run<'a>(
+    /// Runs one turn with explicit budgets and cancellation.
+    ///
+    /// The stream ends after exactly one terminal event: [`AgentEvent::Finish`]
+    /// (success), [`AgentEvent::Cancelled`] (owner stopped it), or
+    /// [`AgentEvent::Error`] (turn budget exhausted or the run failed).
+    pub fn run_with<'a>(
         &'a mut self,
-        user_message: Option<&'a str>,
-        inbox: Steering,
+        user_message: &'a str,
+        options: RunOptions,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
-        self.run_parts(user_message, Vec::new(), inbox)
+        self.run_inner(Some(user_message), Vec::new(), options, Steering::new())
     }
 
-    fn run_parts<'a>(
+    fn run_inner<'a>(
         &'a mut self,
         user_message: Option<&'a str>,
         media: Vec<ContentPart>,
+        options: RunOptions,
         inbox: Steering,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
         async_stream::try_stream! {
+            self.run_abort.store(false, std::sync::atomic::Ordering::SeqCst);
+            let abort = self.run_abort.clone();
+            let run_id = Uuid::new_v4().to_string();
+            let max_turns = options.max_turns.or(self.max_turns);
+            let max_tool_calls = options.max_tool_calls;
+            let deadline = options.deadline.map(|limit| std::time::Instant::now() + limit);
             if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
                 self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
             }
@@ -365,6 +421,7 @@ impl Agent {
             }
 
             let mut turn = 0;
+            let mut tool_calls_made = 0usize;
             let mut doom_loop = DoomLoopDetector::new(3);
 
             // Provider retry backoff is reported through this channel and
@@ -377,6 +434,15 @@ impl Agent {
             })));
 
             loop {
+                if abort.load(std::sync::atomic::Ordering::SeqCst) {
+                    yield AgentEvent::Cancelled { reason: "cancelled by owner".to_string() };
+                    break;
+                }
+                if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+                    yield AgentEvent::Error { error: "Run deadline exceeded.".to_string() };
+                    break;
+                }
+
                 // Inject messages steered mid-run before the context
                 // estimate so they count toward compaction. This point is
                 // the only safe spot: all tool results of the previous
@@ -404,11 +470,12 @@ impl Agent {
                     yield self.usage_event();
                 }
 
-                if let Some(max) = self.max_turns
-                    && turn >= max {
-                        yield AgentEvent::Error { error: "Max turns reached without final answer.".to_string() };
-                        break;
-                    }
+                if let Some(max) = max_turns
+                    && turn >= max
+                {
+                    yield AgentEvent::Error { error: "Max turns reached without final answer.".to_string() };
+                    break;
+                }
                 turn += 1;
 
                 let mut aggregator = LlmResponseAggregator::new();
@@ -461,6 +528,9 @@ impl Agent {
                 // by the next ask), so it never signals closure here.
                 let mut stream_open = true;
                 while stream_open {
+                    if abort.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
                     let event_result = tokio::select! {
                         event_result = stream.next(), if stream_open => match event_result {
                             Some(event_result) => event_result,
@@ -498,6 +568,14 @@ impl Agent {
                     if let Some(agent_event) = aggregator.process_event(event) {
                         yield agent_event;
                     }
+                }
+
+                if abort.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Do not record a partial assistant turn: the provider may
+                    // still be mid-stream, and a truncated tool call would leave
+                    // history that cannot be answered.
+                    yield AgentEvent::Cancelled { reason: "cancelled while streaming".to_string() };
+                    break;
                 }
 
                 let aggregated = aggregator.take_parts();
@@ -563,9 +641,20 @@ impl Agent {
                 // still receive a `ToolFinish`, or the UI shows a tool card
                 // that never completes.
                 let mut announced: Vec<ToolCall> = Vec::new();
+                // Cancellation or a run budget can stop announcement midway.
+                // Every advertised call still receives an answer so persisted
+                // history stays protocol-valid.
+                let mut stop_reason: Option<AgentEvent> = None;
                 for (index, call) in tool_calls.iter().enumerate() {
                     let tool_name = call.function.name.clone();
                     let args = call.function.arguments.clone();
+
+                    if abort.load(std::sync::atomic::Ordering::SeqCst) {
+                        stop_reason = Some(AgentEvent::Cancelled {
+                            reason: "cancelled before executing tools".to_string(),
+                        });
+                        break;
+                    }
 
                     let plan = plan_tool_call(call, &mut doom_loop);
                     if let ToolCallPlan::Stop(ref error) = plan {
@@ -577,6 +666,7 @@ impl Agent {
                             .to_string();
                         for announced_call in announced.drain(..) {
                             yield AgentEvent::ToolFinish {
+                                call_id: announced_call.id.clone(),
                                 tool: announced_call.function.name.clone(),
                                 title: announced_call.function.name.clone(),
                                 output: not_executed.clone(),
@@ -602,9 +692,65 @@ impl Agent {
                         continue;
                     }
 
-                    yield AgentEvent::ToolStart { tool: tool_name.clone(), input: args.clone() };
+                    if let Some(max) = max_tool_calls
+                        && tool_calls_made >= max
+                    {
+                        stop_reason = Some(AgentEvent::Error {
+                            error: format!("Tool call budget of {max} exhausted."),
+                        });
+                        break;
+                    }
+                    tool_calls_made += 1;
+
+                    yield AgentEvent::ToolStart {
+                        call_id: call.id.clone(),
+                        tool: tool_name.clone(),
+                        input: args.clone(),
+                    };
                     announced.push(call.clone());
                     pending.push((index, call.clone(), Uuid::new_v4().to_string()));
+                }
+
+                if let Some(event) = stop_reason.as_ref() {
+                    if matches!(event, AgentEvent::Cancelled { .. }) {
+                        let not_executed =
+                            "Error: not executed because the run was cancelled.".to_string();
+                        for announced_call in announced.drain(..) {
+                            yield AgentEvent::ToolFinish {
+                                call_id: announced_call.id.clone(),
+                                tool: announced_call.function.name.clone(),
+                                title: announced_call.function.name.clone(),
+                                output: not_executed.clone(),
+                                metadata: Default::default(),
+                            };
+                        }
+                        for call in &tool_calls {
+                            self.memory.add_message(Message::Tool {
+                                tool_call_id: call.id.clone(),
+                                tool_name: Some(call.function.name.clone()),
+                                content: not_executed.clone(),
+                                media: Vec::new(),
+                            })
+                            .await;
+                        }
+                        yield event.clone();
+                        return;
+                    }
+                    // Budget exhaustion still executes the calls announced
+                    // before the cap; every later call gets an answer too.
+                    let pending_indices: std::collections::HashSet<usize> =
+                        pending.iter().map(|(index, _, _)| *index).collect();
+                    let not_executed =
+                        "Error: not executed because the tool-call budget was exhausted."
+                            .to_string();
+                    for (index, call) in tool_calls.iter().enumerate() {
+                        if results[index].is_none() && !pending_indices.contains(&index) {
+                            results[index] = Some(Ok(ToolResult::new(
+                                call.function.name.clone(),
+                                not_executed.clone(),
+                            )));
+                        }
+                    }
                 }
 
                 // Execute every pending call in parallel, bounded by a
@@ -635,13 +781,22 @@ impl Agent {
                     let inbox = inbox.clone();
                     let working_directory = self.working_directory.clone();
                     let progress_tx = progress_tx.clone();
+                    let run_id = run_id.clone();
+                    let abort = abort.clone();
                     executing += 1;
                     join_set.spawn(async move {
                         let _permit = semaphore.acquire_owned().await.ok();
                         let tool_name = call.function.name.clone();
-                        let mut ctx = ToolContext::new(&session_id, &message_id)
-                            .with_enforcement(enforcement)
-                            .with_session_state(session_state);
+                        let call_id = call.id.clone();
+                        let mut ctx = ToolContext::with_call(
+                            &session_id,
+                            &run_id,
+                            &message_id,
+                            &call_id,
+                            abort,
+                        )
+                        .with_enforcement(enforcement)
+                        .with_session_state(session_state);
                         ctx.inbox = Some(inbox);
                         ctx.progress = Some(ProgressSink::new(&tool_name, progress_tx));
                         if let Some(working_directory) = working_directory {
@@ -666,7 +821,12 @@ impl Agent {
                 // interleaving live progress events from the running tools.
                 // Progress queued after the last tool completes is dropped:
                 // it is transient UI state, superseded by the ToolFinish.
+                let mut cancelled_mid_tools = false;
                 while executing > 0 {
+                    if abort.load(std::sync::atomic::Ordering::SeqCst) {
+                        cancelled_mid_tools = true;
+                        break;
+                    }
                     tokio::select! {
                         joined = join_set.join_next() => {
                             if let Some(Ok((index, result))) = joined {
@@ -678,6 +838,16 @@ impl Agent {
                             if let Some(event) = progress {
                                 yield event;
                             }
+                        }
+                    }
+                }
+                if cancelled_mid_tools {
+                    for (index, call) in tool_calls.iter().enumerate() {
+                        if results[index].is_none() {
+                            results[index] = Some(Ok(ToolResult::new(
+                                call.function.name.clone(),
+                                "Error: run cancelled by owner.".to_string(),
+                            )));
                         }
                     }
                 }
@@ -698,6 +868,18 @@ impl Agent {
                     if let Some(error) = normalized.error { yield error; }
                     yield normalized.finish;
                     self.memory.add_message(normalized.message).await;
+                }
+
+                if cancelled_mid_tools {
+                    yield AgentEvent::Cancelled {
+                        reason: "cancelled while executing tools".to_string(),
+                    };
+                    return;
+                }
+
+                if let Some(event) = stop_reason {
+                    yield event;
+                    return;
                 }
 
                 // Report usage AFTER the tool results are in history: the
@@ -900,6 +1082,7 @@ impl AgentTemplate {
             provider_usage: TokenUsage::default(),
             reminder,
             working_directory: self.working_directory,
+            run_abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -1063,6 +1246,7 @@ impl AgentBuilder {
             tool_policy: self.tool_policy,
             session_state: self.session_state.unwrap_or_else(SessionState::in_memory),
             working_directory: self.working_directory,
+            run_abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         Ok(agent)
     }

@@ -52,6 +52,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod plugin;
+pub mod release;
+
+pub use release::{
+    Artifact, ExecutableHint, GeWuCompatibility, MarketplaceIndex, MarketplaceSignature, ProbeSpec,
+    Provenance, Release, ReleaseSelectionError, Revocation, RuntimeManifest, RuntimePlan,
+    RuntimeProvider, RuntimeRef, SignedMarketplaceIndex, Target,
+};
+
 pub use gewu_core::question::{Question, QuestionOption};
 pub use gewu_core::types::{
     AgentEvent, ContentPart, FunctionCall, Message, TokenUsage, ToolCall, summarize_tool_input,
@@ -60,6 +69,7 @@ pub use gewu_core::types::{
 /// Operations a client can request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
+    Plugin(plugin::HostAction),
     RevertChat {
         turn: Option<usize>,
         undo: bool,
@@ -234,6 +244,7 @@ impl Serialize for ClientRequest {
             + matches!(
                 self.op,
                 Op::Ask { .. }
+                    | Op::Plugin(_)
                     | Op::Auth { .. }
                     | Op::Steer { .. }
                     | Op::ListFiles { .. }
@@ -252,6 +263,10 @@ impl Serialize for ClientRequest {
         let mut map = serializer.serialize_map(Some(2 + extra))?;
         map.serialize_entry("id", &self.id)?;
         match &self.op {
+            Op::Plugin(action) => {
+                map.serialize_entry("op", "plugin")?;
+                map.serialize_entry("plugin", action)?;
+            }
             Op::RevertChat { turn, undo } => {
                 map.serialize_entry("op", "revert_chat")?;
                 map.serialize_entry("turn", turn)?;
@@ -848,6 +863,10 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
                 })?
                 .to_string(),
         },
+        "plugin" => Op::Plugin(
+            serde_json::from_value(value.get("plugin").cloned().unwrap_or_default())
+                .map_err(|_| RequestError::Invalid("invalid plugin action".into()))?,
+        ),
         "list_tools" => Op::ListTools,
         "list_files" | "read_file" => {
             let path = obj
@@ -1084,6 +1103,10 @@ pub struct WorkflowRunState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    Plugin {
+        id: Value,
+        result: Value,
+    },
     /// Consistent reconnect boundary: history before the turn and every
     /// streamed frame through `seq`. Subsequent frames are newer than it.
     SessionSnapshot {
@@ -1392,6 +1415,7 @@ impl ServerMessage {
             ServerMessage::Ready { .. } => "ready",
             ServerMessage::Event { .. } => "event",
             ServerMessage::WorkflowProgress { .. } => "workflow_progress",
+            ServerMessage::Plugin { .. } => "plugin",
             ServerMessage::Result { .. } => "result",
             ServerMessage::Interrupted { .. } => "interrupted",
             ServerMessage::Steered { .. } => "steered",
@@ -1428,6 +1452,7 @@ impl ServerMessage {
             ServerMessage::WorkspaceAdded { id, .. } => Some(id),
             ServerMessage::Ready { id, .. }
             | ServerMessage::Pong { id }
+            | ServerMessage::Plugin { id, .. }
             | ServerMessage::Info { id, .. }
             | ServerMessage::Usage { id, .. }
             | ServerMessage::Auth { id, .. }
@@ -2156,6 +2181,7 @@ mod tests {
     #[test]
     fn event_messages_round_trip_through_deserialize() {
         let agent_event = AgentEvent::ToolStart {
+            call_id: "call-1".to_string(),
             tool: "bash".to_string(),
             input: r#"{"command":"ls"}"#.to_string(),
         };
@@ -2171,6 +2197,7 @@ mod tests {
     #[test]
     fn serializes_tool_events() {
         let agent_event = AgentEvent::ToolStart {
+            call_id: "call-1".to_string(),
             tool: "bash".to_string(),
             input: r#"{"command":"ls"}"#.to_string(),
         };

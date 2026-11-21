@@ -221,9 +221,20 @@ pub enum AgentEvent {
     /// A delta of text content from the model.
     ContentDelta { delta: String },
     /// The agent has started executing a tool.
-    ToolStart { tool: String, input: String },
+    ///
+    /// `call_id` is the provider's tool-call id. It is the correlation key for
+    /// [`AgentEvent::ToolFinish`]: the same tool may run several times in one
+    /// run, so the name alone cannot identify a call.
+    ToolStart {
+        #[serde(default)]
+        call_id: String,
+        tool: String,
+        input: String,
+    },
     /// A tool has finished executing.
     ToolFinish {
+        #[serde(default)]
+        call_id: String,
         tool: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         title: String,
@@ -302,6 +313,10 @@ pub enum AgentEvent {
         #[serde(default)]
         summary: String,
     },
+    /// The run stopped because it was cancelled by its owner.
+    ///
+    /// Effects already applied stay applied; nothing further is dispatched.
+    Cancelled { reason: String },
     /// An error occurred during agent execution.
     Error { error: String },
 }
@@ -633,7 +648,13 @@ impl ProgressSink {
 #[derive(Clone, Debug)]
 pub struct ToolContext {
     pub session_id: String,
+    /// Identifier of the run this call belongs to.
+    pub run_id: String,
     pub message_id: String,
+    /// Provider tool-call id; correlates a tool with its `ToolFinish` event.
+    pub call_id: String,
+    /// Shared with the agent loop: cancelling the run sets this flag, so a tool
+    /// that polls it stops work instead of finishing into a dead run.
     pub abort: Arc<std::sync::atomic::AtomicBool>,
     pub metadata: std::collections::HashMap<String, serde_json::Value>,
     /// File-path confinement level for this execution.
@@ -650,10 +671,14 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    /// Compatibility constructor for callers that only have a session and message.
     pub fn new(session_id: impl Into<String>, message_id: impl Into<String>) -> Self {
+        let session_id = session_id.into();
         Self {
-            session_id: session_id.into(),
+            run_id: session_id.clone(),
+            session_id,
             message_id: message_id.into(),
+            call_id: String::new(),
             abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metadata: Default::default(),
             enforcement: PathEnforcement::default(),
@@ -724,6 +749,29 @@ impl ToolContext {
     /// Returns the selected workspace root, or the tool's legacy fallback.
     pub fn active_working_directory<'a>(&'a self, fallback: &'a Path) -> &'a Path {
         self.working_directory.as_deref().unwrap_or(fallback)
+    }
+
+    /// Full constructor used by the agent loop.
+    pub fn with_call(
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        message_id: impl Into<String>,
+        call_id: impl Into<String>,
+        abort: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            run_id: run_id.into(),
+            message_id: message_id.into(),
+            call_id: call_id.into(),
+            abort,
+            metadata: Default::default(),
+            enforcement: PathEnforcement::default(),
+            session_state: SessionState::in_memory(),
+            inbox: None,
+            progress: None,
+            working_directory: None,
+        }
     }
 
     pub fn is_aborted(&self) -> bool {

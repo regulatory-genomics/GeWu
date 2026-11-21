@@ -1,0 +1,4 @@
+{"id":"r1","op":"call","params":{"tool":"render","args":{},"context":{"instanceId":"i1","generation":1,"workspaceId":"w1","callId":"c1"}}}
+{"id":"r2","op":"cancel","params":{"callId":"c1"}}
+{"type":"result","id":"r2","result":{"state":"requested"}}
+{"type":"result","id":"r1","result":{"ok":false,"error":{"code":"CANCELLED","message":"Render stopped","retryable":false},"resources":[]}}

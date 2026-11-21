@@ -7,6 +7,7 @@ members = ["gewu",
     "gewu-graph",
     "gewu-lab",
     "gewu-update",
+    "gewu-runtime",
 ]
 exclude = ["opencode"]
 resolver = "2"

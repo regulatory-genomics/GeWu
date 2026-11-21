@@ -4,6 +4,8 @@
 // applies snapshots/deltas, and forwards user actions. Model-authored text is
 // inserted with textContent, never innerHTML.
 
+import {panelHost} from './panels.mjs';
+
 (() => {
   "use strict";
 
@@ -35,9 +37,10 @@
     sessionsExpand: document.getElementById("sessions-expand"),
     filesExpand: document.getElementById("files-expand"),
     drawerBackdrop: document.getElementById("drawer-backdrop"),
-    filePreview: document.getElementById("file-preview"),
     fileMenu: document.getElementById("file-menu"),
     workflowZoom: document.getElementById("workflow-zoom"),
+    pluginHost: document.getElementById("plugin-host"),
+    sidebarResizer: document.getElementById("sidebar-resizer"),
   };
 
   const state = {
@@ -63,6 +66,9 @@
     workflowZoom: { runId: null, scale: 1, x: 0, y: 0 },
     fileMenu: { path: null, entry: null },
     previewWindow: null,
+    inlinePreview: null,
+    previewPath: null,
+    sidebarTab: "files",
     // Files attached to the next ask: {name, mime_type, data?|path?} with
     // base64 `data` for inline media or a workspace-relative `path` for
     // uploaded references.
@@ -135,8 +141,70 @@
     }
   }
 
-  function setSessionsOpen(open, remember) {
-    el.app.classList.toggle("sessions-collapsed", !open);
+  const PANEL_WIDTH_KEY = "gewu-gui-panel-width";
+  const PANEL_MIN = 240;
+  const PANEL_APP_MIN = 720;
+
+  // The dock can never eat the composer: the transcript keeps its own room,
+  // and hiding the sessions sidebar gives the dock what it frees.
+  const TRANSCRIPT_MIN = 320;
+
+  function panelWidthMax() {
+    const sessions = parseFloat(getComputedStyle(el.app).getPropertyValue("--session-sidebar-width")) || 0;
+    return Math.max(PANEL_MIN, Math.round(window.innerWidth - sessions - TRANSCRIPT_MIN));
+  }
+
+  function setPanelWidth(px, remember) {
+    const width = Math.min(Math.max(PANEL_MIN, Math.round(px)), panelWidthMax());
+    el.app.style.setProperty("--panel-width", `${width}px`);
+    if (!remember) return;
+    try {
+      localStorage.setItem(PANEL_WIDTH_KEY, String(width));
+    } catch {
+      // The width still applies to this page.
+    }
+  }
+
+  function loadPanelWidth() {
+    const saved = Number(localStorage.getItem(PANEL_WIDTH_KEY));
+    return Number.isFinite(saved) && saved >= PANEL_MIN ? saved : 420;
+  }
+
+  function installSidebarResizer() {
+    setPanelWidth(loadPanelWidth(), false);
+    const handle = el.sidebarResizer;
+    if (!handle) return;
+    let startX = 0;
+    let startWidth = 0;
+    const move = (event) => {
+      setPanelWidth(startWidth + (startX - event.clientX), false);
+    };
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      handle.classList.remove("dragging");
+      el.app.classList.remove("resizing");
+      setPanelWidth(parseFloat(getComputedStyle(el.app).getPropertyValue("--panel-width")) || 420, true);
+    };
+    handle.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      startX = event.clientX;
+      startWidth = el.sidebar.getBoundingClientRect().width;
+      handle.classList.add("dragging");
+      el.app.classList.add("resizing");
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", stop, {once: true});
+    });
+    handle.addEventListener("keydown", (event) => {
+      const current = el.sidebar.getBoundingClientRect().width;
+      if (event.key === "ArrowLeft") setPanelWidth(current + 24, true);
+      else if (event.key === "ArrowRight") setPanelWidth(current - 24, true);
+      else return;
+      event.preventDefault();
+    });
+  }
+
+  function setSessionsOpen(open, remember) {    el.app.classList.toggle("sessions-collapsed", !open);
     el.sessionsExpand.setAttribute("aria-expanded", String(open));
     if (!remember) return;
     try {
@@ -179,15 +247,15 @@
   }
 
   function setSessionSidebarHtml(html) {
-    // The sidebar is server-rendered and swaps the whole subtree; carry the
-    // session list's scroll position across so switching tabs (which resends
-    // the active highlight) does not jump the reader back to the top.
-    const scroller = el.sessionSidebar.querySelector(".session-workspace-groups");
-    const scrollTop = scroller ? scroller.scrollTop : 0;
-    el.sessionSidebar.innerHTML = html || "";
+    const next = html || "";
+    // Replacing the markup rebuilds the scroll container, so keep the user's
+    // place in a long session list instead of snapping back to the top.
+    const groups = el.sessionSidebar.querySelector(".session-workspace-groups");
+    const scrollTop = groups ? groups.scrollTop : 0;
+    if (el.sessionSidebar.innerHTML !== next) el.sessionSidebar.innerHTML = next;
     applyWorkspaceCollapseState();
-    const replaced = el.sessionSidebar.querySelector(".session-workspace-groups");
-    if (replaced) replaced.scrollTop = scrollTop;
+    const rebuilt = el.sessionSidebar.querySelector(".session-workspace-groups");
+    if (rebuilt) rebuilt.scrollTop = scrollTop;
   }
 
   function toggleWorkspaceGroup(id) {
@@ -276,6 +344,8 @@
       if (state.ws !== ws) return;
       state.connected = true;
       state.ready = false;
+      for (const entry of pluginPending.values()) entry.reject(Error('Disconnected'));
+      pluginPending.clear();
       state.attempt = 0;
       state.follow.clear();
       state.loadingEarlier = false;
@@ -366,6 +436,74 @@
     return true;
   }
 
+  const pluginPending = new Map();
+  let pluginRequest = 0;
+  let pluginTabs = [];
+  let panelSyncTimer;
+  // Bundled runtimes can be hundreds of MB and managed environments may solve
+  // packages for several minutes; the host request remains transactional while
+  // it installs, so the GUI must not discard the response after 65 seconds.
+  const MARKETPLACE_INSTALL_TIMEOUT_MS = 30 * 60 * 1000;
+  const panels = panelHost(document.getElementById('plugin-host'), (tab, plugin) => {
+    return new Promise((resolve,reject) => {
+      if (!Number.isSafeInteger(tab) || !state.ready) {reject(Error('No connected workspace'));return;}
+      const request=++pluginRequest;
+      const timeout = plugin.action === 'marketplace_install' ? MARKETPLACE_INSTALL_TIMEOUT_MS : 65000;
+      const timer=setTimeout(()=>{pluginPending.delete(request);reject(Error(timeout === MARKETPLACE_INSTALL_TIMEOUT_MS ? 'Marketplace install timed out; the host may still be finishing the transaction' : 'Plugin request timed out'));},timeout);
+      pluginPending.set(request,{tab,resolve:value=>{clearTimeout(timer);resolve(value);},reject:error=>{clearTimeout(timer);reject(error);}});
+      if (!send({op:'plugin',tab,request,plugin})) {
+        pluginPending.get(request).reject(Error('Disconnected'));
+        pluginPending.delete(request);
+      }
+    });
+  }, {
+    onShow: () => {
+      setSidebarOpen(true, false);
+      setSidebarTab("preview");
+      // An application needs room: at the default Files width its canvas is
+      // unusable. On a narrow window the session list steps aside, since the
+      // application is what the reader just opened. A width the user chose on
+      // purpose is left alone.
+      if (panelWidthMax() < PANEL_APP_MIN) setSessionsOpen(false, false);
+      const dock = parseFloat(getComputedStyle(el.app).getPropertyValue("--panel-width")) || 0;
+      if (dock <= 440) setPanelWidth(Math.min(900, panelWidthMax()), true);
+    },
+    onHide: () => setSidebarTab("files"),
+  });
+
+  // Replacing or moving an iframe's ancestors reloads it and loses its port.
+  // Keep Preview mounted; snapshots only replace the server-rendered panes.
+  function updateSidebar(html) {
+    if (!el.sidebar.querySelector('#sidebar-preview')) {
+      el.sidebar.innerHTML = html;
+      return;
+    }
+    const next = document.createElement('template');
+    next.innerHTML = html;
+    for (const selector of ['.sidebar-head', '#sidebar-files', '#sidebar-tools']) {
+      const current = el.sidebar.querySelector(selector);
+      const fresh = next.content.querySelector(selector);
+      if (current && fresh) current.replaceWith(fresh);
+    }
+  }
+
+  function mountPanels() {
+    const slot = el.sidebar.querySelector('#sidebar-preview');
+    const host = el.pluginHost;
+    if (!slot || !host) return;
+    if (host.parentNode !== slot) slot.append(host);
+    host.hidden = false;
+    setSidebarTab(state.sidebarTab || 'files');
+  }
+
+  function syncPanels(message) {
+    pluginTabs = message.tabs;
+    panels.switchTab(pluginTabs.find(tab=>tab.id===message.active));
+    mountPanels();
+    clearTimeout(panelSyncTimer);
+    panelSyncTimer = setTimeout(() => panels.sync(), 120);
+  }
+
   // -- server messages ----------------------------------------------------
 
   function handle(message) {
@@ -377,9 +515,10 @@
         state.loadingEarlier = false;
         setTranscript(message.transcript, true);
         setStatus(message.status);
-        el.sidebar.innerHTML = message.sidebar || "";
+        updateSidebar(message.sidebar || "");
         setSessionSidebarHtml(message.session_sidebar);
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
+        syncPanels(message);
         break;
       case "tabs": {
         if (state.active !== message.active) {
@@ -395,6 +534,20 @@
           if (!alive.has(id)) state.follow.delete(id);
         }
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
+        syncPanels(message);
+        break;
+      }
+      case 'plugin': {
+        const entry=pluginPending.get(message.request);
+        if (!entry) break;
+        pluginPending.delete(message.request);
+        const tab=pluginTabs.find(tab=>tab.id===entry.tab);
+        if (tab && !tab.session_id && message.session_id) {
+          const bound={...tab,session_id:message.session_id};
+          pluginTabs=pluginTabs.map(item=>item.id===bound.id ? bound : item);
+          if (state.active===entry.tab) panels.switchTab(bound);
+        }
+        if (message.error) entry.reject(Error(message.error)); else entry.resolve(message.result);
         break;
       }
       case "session_sidebar":
@@ -427,6 +580,7 @@
         break;
       case "error":
         state.loadingEarlier = false;
+        state.inlinePreview = null;
         closePendingPreview();
         if (isUnauthorized(message.message)) {
           handleUnauthorized();
@@ -463,8 +617,7 @@
         break;
       }
       case "file_preview":
-        el.filePreview.innerHTML = message.html;
-        el.filePreview.classList.remove("hidden");
+        panels.showFile('text', state.previewPath, {html: message.html});
         break;
       case "download_ready": {
         if (typeof message.url !== "string" || !message.url.startsWith("/download/")) break;
@@ -473,6 +626,12 @@
       }
       case "preview_ready": {
         if (typeof message.url !== "string" || !message.url.startsWith("/preview/")) break;
+        const inline = state.inlinePreview;
+        state.inlinePreview = null;
+        if (inline) {
+          panels.showFile(inline.kind, inline.path, {url: message.url});
+          break;
+        }
         const pending = state.previewWindow;
         state.previewWindow = null;
         if (pending && !pending.closed) {
@@ -489,10 +648,6 @@
         opened.opener = null;
         break;
       }
-      case "close_preview":
-        el.filePreview.classList.add("hidden");
-        el.filePreview.textContent = "";
-        break;
       case "workflow_zoom": {
         const keep =
           !el.workflowZoom.classList.contains("hidden") &&
@@ -908,8 +1063,6 @@
     if (event.key === "Escape" && event.target.closest(".question-form")) return;
     if (event.key === "Escape" && !el.workflowZoom.classList.contains("hidden")) {
       send({ op: "close_workflow_zoom" });
-    } else if (event.key === "Escape" && !el.filePreview.classList.contains("hidden")) {
-      send({ op: "close_preview" });
     } else if (event.key === "Escape" && state.busy && el.login.classList.contains("hidden")) {
       send({ op: "interrupt", tab: state.active });
     } else if (
@@ -955,6 +1108,8 @@
   });
 
   el.transcript.addEventListener("click", (event) => {
+    const pluginResult=event.target.closest('[data-plugin-result]');
+    if (pluginResult) { panels.agentResult(pluginResult.dataset.pluginResult); return; }
     const loadEarlier = event.target.closest("[data-load-earlier]");
     if (loadEarlier) {
       if (state.loadingEarlier) return;
@@ -1163,6 +1318,34 @@
     return entry.classList.contains("tree-file") && /\.html?$/i.test(entry.dataset.path || "");
   }
 
+  /// File types the preview route serves, grouped by the element that renders
+  /// them. Anything else falls back to the text reader.
+  const MEDIA_KINDS = {
+    png: "image", jpg: "image", jpeg: "image", gif: "image", webp: "image",
+    avif: "image", svg: "image",
+    pdf: "pdf",
+    mp4: "video", webm: "video", mov: "video",
+    mp3: "audio", wav: "audio", m4a: "audio", ogg: "audio", oga: "audio",
+  };
+
+  function previewKind(path) {
+    if (!path || !path.includes(".")) return null;
+    if (/\.html?$/i.test(path)) return "html";
+    return MEDIA_KINDS[path.split(".").pop().toLowerCase()] ?? null;
+  }
+
+  /// Open a tree file: media in the dock overlay, everything else as text.
+  function openFileEntry(path) {
+    const kind = previewKind(path);
+    if (!kind || kind === "html") {
+      state.previewPath = path;
+      send({ op: "read_file", path });
+      return;
+    }
+    state.inlinePreview = { kind, path };
+    send({ op: "preview_file", path });
+  }
+
   // The preview window is opened inside the click gesture because popup
   // blockers reject opens that follow an async round trip. Navigate it once
   // the ticket URL arrives; close it if the request fails or the socket drops.
@@ -1246,7 +1429,7 @@
     const dir = event.target.closest("[data-path].tree-dir");
     if (dir) { send({ op: "toggle_dir", path: dir.dataset.path }); return; }
     const file = event.target.closest("[data-path].tree-file");
-    if (file) { send({ op: "read_file", path: file.dataset.path }); return; }
+    if (file) { openFileEntry(file.dataset.path); return; }
     if (event.target.closest("[data-tree-upload]")) {
       el.fileUpload.click();
       return;
@@ -1271,6 +1454,12 @@
   });
 
   el.fileMenu.addEventListener("click", (event) => {
+    if (event.target.closest('[data-file-edit]')) {
+      const path = state.fileMenu.path;
+      closeFileMenu();
+      if (path) panels.editPath(path);
+      return;
+    }
     if (event.target.closest("[data-file-preview]")) {
       const path = state.fileMenu.path;
       closeFileMenu();
@@ -1574,23 +1763,23 @@
   });
 
   function setSidebarTab(name) {
+    state.sidebarTab = name;
     const tabs = el.sidebar.querySelectorAll("[data-sidebar-tab]");
-    const panels = el.sidebar.querySelectorAll(".sidebar-panel");
+    const panes = el.sidebar.querySelectorAll(".sidebar-panel");
     for (const tab of tabs) {
       const active = tab.dataset.sidebarTab === name;
       tab.classList.toggle("active", active);
       tab.setAttribute("aria-selected", String(active));
     }
-    for (const panel of panels) {
-      const active = panel.id === `sidebar-${name}`;
-      panel.classList.toggle("active", active);
-      panel.hidden = !active;
+    for (const pane of panes) {
+      const active = pane.id === `sidebar-${name}`;
+      pane.classList.toggle("active", active);
+      pane.hidden = !active;
     }
+    el.app.classList.toggle("preview-open", name === "preview");
+    el.pluginHost.hidden = name !== "preview";
+    panels.setVisible(name === "preview");
   }
-
-  el.filePreview.addEventListener("click", (event) => {
-    if (event.target.closest("[data-preview-close]")) send({ op: "close_preview" });
-  });
 
   el.workflowZoom.addEventListener("click", (event) => {
     if (event.target.closest("[data-zoom-close]")) {
@@ -1854,9 +2043,9 @@
 
   setSessionsOpen(loadSessionsOpen(), false);
   setSidebarOpen(loadSidebarOpen(), false);
+  installSidebarResizer();
   requestAnimationFrame(() => {
     requestAnimationFrame(() => el.app.classList.remove("preload"));
   });
   boot();
 })();
-

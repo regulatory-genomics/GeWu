@@ -1,0 +1,4 @@
+{"id":"r1","op":"call","params":{"tool":"render","args":{"scene":"Intro"},"context":{"instanceId":"i1","generation":1,"workspaceId":"w1","callId":"c1","viewId":"v1","viewEpoch":1}}}
+{"type":"result","id":"r1","result":{"ok":true,"data":{"scene":"Intro"},"resources":[{"uri":"workspace:///intro.png","type":"demo.image","mimeType":"image/png","revision":"rev1"}],"changes":[{"uri":"workspace:///intro.png","afterRevision":"rev1"}]}}
+{"id":"r2","op":"call","params":{"tool":"render","args":{},"context":{"instanceId":"i1","generation":1,"workspaceId":"w1","callId":"c2"}}}
+{"type":"error","id":"r2","error":{"code":"INVALID_REQUEST","message":"Invalid call context","retryable":false}}

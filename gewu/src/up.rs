@@ -82,8 +82,26 @@ pub async fn run(args: UpArgs) -> Result<()> {
         .await
         .with_context(|| format!("the gewu server did not become ready at {server_url}"))?;
 
+    // Ports default to ephemeral, so publish every endpoint a client needs
+    // instead of making callers probe loopback ports. A wildcard bind is not
+    // dialable, so clients get loopback instead.
+    let client_host = published_host(&args.host);
+    let client_gui_host = published_host(&args.gui_host);
+    let ws_url = format!("ws://{client_host}:{ws_port}");
+    let tcp_url = format!("{client_host}:{tcp_port}");
+    let http_url = format!("http://{client_host}:{http_port}");
+    let gui_url = format!("http://{client_gui_host}:{}", args.gui_port);
+    let _record = write_endpoint_record(
+        &ws_url,
+        &tcp_url,
+        &http_url,
+        if args.no_gui { None } else { Some(&gui_url) },
+    );
+
     if args.no_gui {
-        println!("gewu server → {server_url}");
+        println!("gewu server → {ws_url}");
+        println!("  tcp:  {tcp_url}");
+        println!("  http: {http_url}");
         println!("press Ctrl+C to stop");
         // `serve` shuts down cleanly on Ctrl+C by itself.
         return server_task.await.context("gewu server task panicked")?;
@@ -93,16 +111,17 @@ pub async fn run(args: UpArgs) -> Result<()> {
         host: args.gui_host.clone(),
         port: args.gui_port,
         server: server_url.clone(),
-        server_http: format!("http://{}:{}", args.host, http_port),
+        server_http: http_url.clone(),
         token: args.gui_token.clone(),
         server_token: token.clone(),
         allow_anonymous: args.allow_anonymous,
         open: !args.no_open,
         log_level: args.common.log_level.clone(),
     };
-    let gui_url = format!("http://{}:{}", args.gui_host, args.gui_port);
     println!("gewu agent is running");
-    println!("  agent server: {server_url}");
+    println!("  agent server: {ws_url}");
+    println!("  agent tcp:    {tcp_url}");
+    println!("  agent http:   {http_url}");
     println!("  web GUI:      {gui_url}");
 
     let gui_task = tokio::spawn(gewu_gui::run_with_updates(
@@ -140,6 +159,68 @@ pub async fn run(args: UpArgs) -> Result<()> {
 /// Whether a bind host is reachable only from this machine.
 fn is_loopback(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+}
+
+/// A wildcard bind address is not dialable; publish loopback instead.
+fn published_host(host: &str) -> &str {
+    match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "[::1]",
+        other => other,
+    }
+}
+
+/// `~/.gewu/server.json`, readable only by its owner, so a client can find the
+/// agent endpoints this process actually bound. Removed on shutdown.
+struct EndpointRecord {
+    path: std::path::PathBuf,
+}
+
+impl Drop for EndpointRecord {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn write_endpoint_record(
+    websocket: &str,
+    tcp: &str,
+    http: &str,
+    gui: Option<&str>,
+) -> Option<EndpointRecord> {
+    let root = dirs::home_dir()?.join(".gewu");
+    let path = root.join("server.json");
+    let body = serde_json::json!({
+        "pid": std::process::id(),
+        "websocket": websocket,
+        "tcp": tcp,
+        "http": http,
+        "gui": gui,
+    });
+    let write = || -> std::io::Result<()> {
+        std::fs::create_dir_all(&root)?;
+        let temp = path.with_extension("json.tmp");
+        {
+            use std::io::Write;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temp)?;
+            file.write_all(serde_json::to_string_pretty(&body)?.as_bytes())?;
+        }
+        std::fs::rename(&temp, &path)?;
+        Ok(())
+    };
+    if let Err(error) = write() {
+        // Discovery is a convenience: a read-only home must not stop startup.
+        info!("could not write {}: {error}", path.display());
+        return None;
+    }
+    Some(EndpointRecord { path })
 }
 
 /// Resolve the server's listener ports.
@@ -249,9 +330,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn wildcard_binds_are_published_as_loopback() {
+        assert_eq!(published_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(published_host("::"), "[::1]");
+        assert_eq!(published_host("127.0.0.1"), "127.0.0.1");
+        assert_eq!(published_host("10.0.0.5"), "10.0.0.5");
+    }
+
     #[tokio::test]
-    async fn picks_three_distinct_ephemeral_ports() {
-        let (ws, tcp, http) = resolve_ports(&args("127.0.0.1", 0, 0)).await.unwrap();
+    async fn picks_three_distinct_ephemeral_ports() {        let (ws, tcp, http) = resolve_ports(&args("127.0.0.1", 0, 0)).await.unwrap();
         assert_ne!(ws, 0);
         assert_ne!(tcp, 0);
         assert_ne!(http, 0);

@@ -109,6 +109,18 @@ pub fn list_agent_names() -> Vec<String> {
         .collect()
 }
 
+/// Primary eligibility shared by session creation, listing and profile switches.
+pub fn primary_agent_names(agents: &BTreeMap<String, AgentEntry>) -> Vec<String> {
+    let mut names = list_agent_names();
+    names.extend(
+        agents
+            .iter()
+            .filter(|(_, a)| a.primary)
+            .map(|(name, _)| name.clone()),
+    );
+    names
+}
+
 /// The execution policy for a profile or config-defined agent.
 ///
 /// Config-defined agents inherit the mode policy of the profile they are
@@ -547,7 +559,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 Box::new(GrepTool {
                     working_directory: working_directory.clone(),
                 }),
-                Box::new(WebFetchTool),
+                Box::new(WebFetchTool::default()),
                 Box::new(WebSearchTool),
                 Box::new(TodoWriteTool),
             ]
@@ -568,7 +580,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 Box::new(GrepTool {
                     working_directory: working_directory.clone(),
                 }),
-                Box::new(WebFetchTool),
+                Box::new(WebFetchTool::default()),
                 Box::new(WebSearchTool),
             ]
         }
@@ -1012,6 +1024,7 @@ mod tests {
             description: "test agent".to_string(),
             instructions: instructions.map(str::to_string),
             tools: tools.map(|list| list.iter().map(|t| t.to_string()).collect()),
+            primary: false,
         }
     }
 

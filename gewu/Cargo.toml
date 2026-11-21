@@ -1,6 +1,6 @@
 [package]
 name = "gewu"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 
 [dependencies]
@@ -9,7 +9,15 @@ gewu-gui = { path = "../gewu-gui" }
 gewu-server = { path = "../gewu-server" }
 gewu-update = { path = "../gewu-update" }
 anyhow = "1.0"
+dirs = "6.0"
+serde_json = "1.0"
+base64 = "0.22"
+url = "2"
+gewu-protocol = { path = "../gewu-protocol" }
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.10"

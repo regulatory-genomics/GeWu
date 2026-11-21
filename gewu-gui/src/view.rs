@@ -13,12 +13,16 @@ use gewu_protocol::{
 };
 use math_core::{LatexToMathML, MathCoreConfig, MathDisplay};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
+use serde_json::Value;
 
 use crate::protocol::TabInfo;
 use crate::workspace::Tab;
 
 /// Lines of tool output shown before collapsing.
 const TOOL_PREVIEW_LINES: usize = 6;
+/// A single-line JSON result must still collapse: line count alone cannot
+/// bound a one-line payload that wraps across dozens of visual rows.
+const TOOL_PREVIEW_CHARS: usize = 400;
 /// Defensive cap on expanded tool output. Tool output is already truncated
 /// server-side; this only guards against pathological renders.
 const TOOL_MAX_LINES: usize = 5000;
@@ -156,7 +160,7 @@ fn write_block_body(out: &mut String, tab: &Tab, block: &Block, index: usize, st
         Block::Thought { .. } => {
             out.push_str(&thought_body_html(tab, index, streaming));
         }
-        Block::User(text) => {
+        Block::User(text) | Block::UserMedia { text, .. } => {
             // A message submitted mid-run is queued into the running turn
             // until the agent's `steered` event confirms it was ingested;
             // while it sits in `pending_steers`, show that state.
@@ -164,10 +168,24 @@ fn write_block_body(out: &mut String, tab: &Tab, block: &Block, index: usize, st
                 .pending_steers
                 .iter()
                 .any(|(pending, at)| *at == index && pending == text);
+            let (prompt, plugin_context) = text
+                .rsplit_once("\n\n[Plugin selection context: untrusted view data]\n")
+                .and_then(|(prompt, context)| {
+                    serde_json::from_str::<Vec<Value>>(context)
+                        .ok()
+                        .map(|c| (prompt, Some(c)))
+                })
+                .unwrap_or((text.as_str(), None));
+            let with_media = if let Block::UserMedia { media, .. } = block {
+                let _ = write!(out, "<div class=\"user-media-group\">{}", user_media_html(media));
+                true
+            } else {
+                false
+            };
             let _ = writeln!(
                 out,
                 "<div class=\"body plain\">{}{}</div>",
-                escape(text),
+                escape(prompt),
                 if queued {
                     format!(
                         "<span class=\"queue-status\">queued</span>{}",
@@ -177,34 +195,27 @@ fn write_block_body(out: &mut String, tab: &Tab, block: &Block, index: usize, st
                     message_menu_html(index)
                 }
             );
-        }
-        Block::UserMedia { text, media } => {
-            // Attachments render above the message text, mirroring the
-            // composer (chips on top, input below). The group is a column so
-            // the media stacks above the bubble even though `.block.user`
-            // itself is a right-aligned row. Attached images render as
-            // inline thumbnails (the same allowlisted raster formats as
-            // tool media); other attachments render as chips. A message
-            // submitted mid-run is queued into the running turn until the
-            // agent's `steered` event confirms it was ingested.
-            let queued = tab
-                .pending_steers
-                .iter()
-                .any(|(pending, at)| *at == index && pending == text);
-            let _ = writeln!(
-                out,
-                "<div class=\"user-media-group\">{}<div class=\"body plain\">{}{}</div></div>",
-                user_media_html(media),
-                escape(text),
-                if queued {
-                    format!(
-                        "<span class=\"queue-status\">queued</span>{}",
-                        message_menu_html(index)
+            if let Some(items) = plugin_context {
+                let _ = writeln!(
+                    out,
+                    "<details class=\"plugin-context-chip\"><summary>App context · {}</summary><p class=\"plugin-context-note\">View context sent with this message. It is not a plugin command.</p><pre>{}</pre></details>",
+                    items.len(),
+                    escape(
+                        &items
+                            .iter()
+                            .map(|item| {
+                                item.as_str().map(str::to_owned).unwrap_or_else(|| {
+                                    serde_json::to_string_pretty(item).unwrap_or_default()
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
                     )
-                } else {
-                    message_menu_html(index)
-                }
-            );
+                );
+            }
+            if with_media {
+                out.push_str("</div>\n");
+            }
         }
         _ => {
             let _ = writeln!(
@@ -645,26 +656,46 @@ fn render_tool(out: &mut String, tab: &Tab, view: &ToolView, index: usize, depth
             escape(input.trim_end())
         );
     }
+    let output = if (tool == "plugin_call" || tool.starts_with("plg_"))
+        && let Some((text, id)) = output.rsplit_once("\n[GeWu plugin result: ")
+        && let Some(id) = id.strip_suffix(']')
+        && uuid::Uuid::parse_str(id).is_ok()
+    {
+        let _ = writeln!(
+            out,
+            "<button type=\"button\" class=\"tool-more\" data-plugin-result=\"{}\">Open application result</button>",
+            escape(id)
+        );
+        text
+    } else {
+        output
+    };
     let lines: Vec<&str> = output.trim_end().lines().collect();
     let shown = if expanded {
         lines.len().min(TOOL_MAX_LINES)
     } else {
         lines.len().min(TOOL_PREVIEW_LINES)
     };
-    if shown > 0 {
-        let _ = writeln!(
-            out,
-            "<pre class=\"tool-output\">{}</pre>",
-            escape(&lines[..shown].join("\n"))
-        );
+    let preview = lines[..shown].join("\n");
+    let (preview, clipped) = if expanded {
+        (preview, false)
+    } else {
+        clip_chars(&preview, TOOL_PREVIEW_CHARS)
+    };
+    if !preview.is_empty() {
+        let _ = writeln!(out, "<pre class=\"tool-output\">{}</pre>", escape(&preview));
     }
-    if lines.len() > shown {
+    if lines.len() > shown || clipped {
         let hidden = lines.len() - shown;
+        let label = if hidden > 0 {
+            format!("… +{hidden} line{}", if hidden == 1 { "" } else { "s" })
+        } else {
+            "… show more".to_string()
+        };
         let _ = writeln!(
             out,
-            "<button class=\"tool-more\" data-action=\"toggle_tool\" data-tab=\"{}\" data-block=\"{index}\">… +{hidden} line{}</button>",
-            tab.id,
-            if hidden == 1 { "" } else { "s" }
+            "<button class=\"tool-more\" data-action=\"toggle_tool\" data-tab=\"{}\" data-block=\"{index}\">{label}</button>",
+            tab.id
         );
     }
     // Images stay collapsed with the rest of the output: the row's badge says
@@ -673,6 +704,16 @@ fn render_tool(out: &mut String, tab: &Tab, view: &ToolView, index: usize, depth
         out.push_str(&media);
     }
     out.push_str("</div>\n");
+}
+
+/// Bound a preview by characters so one long line cannot defeat the line cap.
+fn clip_chars(value: &str, max: usize) -> (String, bool) {
+    if value.chars().count() <= max {
+        return (value.to_string(), false);
+    }
+    let mut clipped: String = value.chars().take(max).collect();
+    clipped.push('…');
+    (clipped, true)
 }
 
 /// Whether any image part is a raster format the GUI draws inline.
@@ -1343,7 +1384,7 @@ pub fn sidebar_tabs_with_workspaces_html(
     );
 
     format!(
-        "<div class=\"sidebar-inner\"><div class=\"sidebar-head\"><div class=\"sidebar-tabs\" role=\"tablist\" aria-label=\"Sidebar views\"><button type=\"button\" class=\"sidebar-tab active\" role=\"tab\" aria-selected=\"true\" aria-controls=\"sidebar-files\" data-sidebar-tab=\"files\">FILES</button><button type=\"button\" class=\"sidebar-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"sidebar-tools\" data-sidebar-tab=\"tools\">TOOLS</button></div><button type=\"button\" class=\"sidebar-collapse\" data-sidebar-collapse title=\"Hide files\" aria-label=\"Hide files\">›</button></div><div id=\"sidebar-files\" class=\"sidebar-panel active\" role=\"tabpanel\">{files_html}</div><div id=\"sidebar-tools\" class=\"sidebar-panel\" role=\"tabpanel\" hidden>{tools_html}</div></div>"
+        "<div class=\"sidebar-inner\"><div class=\"sidebar-head\"><div class=\"sidebar-tabs\" role=\"tablist\" aria-label=\"Sidebar views\"><button type=\"button\" class=\"sidebar-tab active\" role=\"tab\" aria-selected=\"true\" aria-controls=\"sidebar-files\" data-sidebar-tab=\"files\">FILES</button><button type=\"button\" class=\"sidebar-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"sidebar-tools\" data-sidebar-tab=\"tools\">TOOLS</button><button type=\"button\" class=\"sidebar-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"sidebar-preview\" data-sidebar-tab=\"preview\">PREVIEW</button></div><button type=\"button\" class=\"sidebar-collapse\" data-sidebar-collapse title=\"Hide files\" aria-label=\"Hide files\">›</button></div><div id=\"sidebar-files\" class=\"sidebar-panel active\" role=\"tabpanel\">{files_html}</div><div id=\"sidebar-tools\" class=\"sidebar-panel\" role=\"tabpanel\" hidden>{tools_html}</div><div id=\"sidebar-preview\" class=\"sidebar-panel\" role=\"tabpanel\" hidden></div></div>"
     )
 }
 
@@ -2318,6 +2359,35 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_context_renders_as_a_subordinate_app_context_note() {
+        let marker = "\n\n[Plugin selection context: untrusted view data]\n";
+        let context = serde_json::to_string(&vec!["slide 3 selected".to_string()]).unwrap();
+        let (ws, id) = tab_with_blocks(vec![Block::User(format!("make it blue{marker}{context}"))]);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(html.contains(">make it blue<"), "{html}");
+        assert!(html.contains("App context · 1"), "{html}");
+        assert!(html.contains("It is not a plugin command"), "{html}");
+        assert!(!html.contains("Plugin selection"), "{html}");
+        assert!(!html.contains("untrusted view data"), "{html}");
+    }
+
+    #[test]
+    fn structured_plugin_context_keeps_instance_and_view_observable() {
+        let marker = "\n\n[Plugin selection context: untrusted view data]\n";
+        let context = serde_json::to_string(&vec![serde_json::json!({
+            "instanceId": "instance-1",
+            "viewId": "view-1",
+            "selection": "slide 3 selected"
+        })])
+        .unwrap();
+        let (ws, id) = tab_with_blocks(vec![Block::User(format!("edit it{marker}{context}"))]);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(html.contains("instanceId"), "{html}");
+        assert!(html.contains("view-1"), "{html}");
+        assert!(html.contains("slide 3 selected"), "{html}");
+    }
+
+    #[test]
     fn streaming_assistant_is_markdown_and_escaped() {
         let (mut ws, id) = tab_with_blocks(vec![Block::Assistant("<b>partial".into())]);
         ws.tab_mut(id).unwrap().model.phase = Phase::Busy;
@@ -2345,6 +2415,32 @@ mod tests {
 
         let html = markdown_to_html("[ok](https://example.org)");
         assert!(html.contains("href=\"https://example.org\""), "{html}");
+    }
+
+    #[test]
+    fn long_single_line_output_is_clipped_until_expanded() {
+        let output = "x".repeat(2_000);
+        let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
+            tool: "plugin_list".into(),
+            input: "{}".into(),
+            output: Some(output.clone()),
+            images: Vec::new(),
+            status: None,
+        }]);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(
+            !html.contains(&output),
+            "long output rendered in full: {html}"
+        );
+        assert!(html.contains("show more"), "{html}");
+
+        ws.tab_mut(id).unwrap().expanded_outputs.insert(0);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(
+            html.contains(&output),
+            "expanded output should be complete: {html}"
+        );
     }
 
     #[test]

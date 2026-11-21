@@ -13,6 +13,7 @@
 //! command: `gewu` starts the agent server on a free loopback port, waits
 //! for it to accept connections, then serves the web GUI pointed at it.
 
+mod plugin;
 mod up;
 
 use anyhow::Result;
@@ -85,6 +86,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Install and validate local application plugins
+    Plugin {
+        #[command(subcommand)]
+        action: plugin::Action,
+    },
     /// Run only the agent server (same flags as `gewu-server serve`)
     Serve {
         #[command(flatten)]
@@ -113,6 +119,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let no_update_check = cli.no_update_check;
     match cli.command {
+        Some(Command::Plugin { action }) => plugin::run(action).await,
         Some(Command::Serve { args }) => gewu_server::cli::serve_command(args).await,
         Some(Command::Gui { args }) => {
             gewu_gui::run_with_updates(args, env!("CARGO_PKG_VERSION"), !no_update_check).await

@@ -249,7 +249,19 @@ pub(super) fn normalize_tool_result(
             None,
         ),
     };
+    // Malformed arguments are answered with a normal tool result so history
+    // stays protocol-valid, but the parse failure is still surfaced as an
+    // error event for the UI.
+    let error = error.or_else(|| {
+        result
+            .output
+            .starts_with("Error: invalid arguments")
+            .then(|| AgentEvent::Error {
+                error: result.output.clone(),
+            })
+    });
     let finish = AgentEvent::ToolFinish {
+        call_id: call.id.clone(),
         tool: tool_name.clone(),
         title: result.title,
         output: result.output.clone(),
@@ -463,7 +475,7 @@ mod tests {
             let normalized = normalize_tool_result(&call("tool", "{}"), Some(Ok(result)));
             assert!(normalized.error.is_none());
             assert!(
-                matches!(normalized.finish, AgentEvent::ToolFinish { tool, title, output: raw, metadata }
+                matches!(normalized.finish, AgentEvent::ToolFinish { tool, title, output: raw, metadata, .. }
                 if tool == "tool" && title == "image title" && raw == output && metadata["key"] == 1)
             );
             assert!(

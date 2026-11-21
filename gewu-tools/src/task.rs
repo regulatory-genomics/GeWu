@@ -256,7 +256,7 @@ impl Tool for TaskTool {
                     AgentEvent::ContentDelta { delta } => {
                         result.push_str(&delta);
                     }
-                    AgentEvent::ToolStart { tool, input: args } => {
+                    AgentEvent::ToolStart { tool, input: args, .. } => {
                         let status = format!(
                             "{} — {}: {}",
                             format_elapsed(started_at.elapsed()),

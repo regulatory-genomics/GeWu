@@ -36,7 +36,70 @@ fn default_format() -> String {
     "markdown".to_string()
 }
 
-pub struct WebFetchTool;
+/// Where `webfetch` is allowed to go.
+#[derive(Debug, Clone)]
+pub struct WebFetchPolicy {
+    /// Refuse destinations that resolve to a private address. On by default.
+    pub block_private_networks: bool,
+    /// Host suffixes that may be fetched. Empty means "no host allowlist".
+    pub allowed_hosts: Vec<String>,
+}
+
+impl Default for WebFetchPolicy {
+    fn default() -> Self {
+        Self {
+            block_private_networks: true,
+            allowed_hosts: Vec::new(),
+        }
+    }
+}
+
+impl WebFetchPolicy {
+    /// Normalize a comma-separated host list: trim, lowercase, drop a leading
+    /// `*.` and trailing dots, drop empty entries.
+    pub fn parse_hosts(raw: &str) -> Vec<String> {
+        raw.split(',')
+            .map(|host| {
+                host.trim()
+                    .trim_start_matches("*.")
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase()
+            })
+            .filter(|host| !host.is_empty())
+            .collect()
+    }
+
+    fn permits_host(&self, host: &str) -> bool {
+        self.allowed_hosts.is_empty()
+            || self
+                .allowed_hosts
+                .iter()
+                .any(|allowed| host == allowed || host.ends_with(&format!(".{allowed}")))
+    }
+}
+
+pub struct WebFetchTool {
+    policy: Arc<WebFetchPolicy>,
+}
+
+impl Default for WebFetchTool {
+    fn default() -> Self {
+        Self::new(WebFetchPolicy::default())
+    }
+}
+
+impl WebFetchTool {
+    pub fn new(policy: WebFetchPolicy) -> Self {
+        Self {
+            policy: Arc::new(policy),
+        }
+    }
+
+    /// Share one policy across the tools an agent (and its sub-agents) build.
+    pub fn with_shared_policy(policy: Arc<WebFetchPolicy>) -> Self {
+        Self { policy }
+    }
+}
 
 /// Returns true if the host resolves to a loopback address or is a
 /// loopback-style name. Loopback is intentionally allowed (local dev
@@ -74,7 +137,7 @@ fn is_blocked_host(host: &str) -> bool {
 
 /// Validates a URL is fetchable: http(s) only, host present, and the host is
 /// not an internal address.
-fn validate_url(url: &Url) -> Result<(), String> {
+fn validate_url(url: &Url, policy: &WebFetchPolicy) -> Result<(), String> {
     match url.scheme() {
         "http" | "https" => {}
         other => return Err(format!("unsupported URL scheme: {}", other)),
@@ -82,9 +145,12 @@ fn validate_url(url: &Url) -> Result<(), String> {
     let host = url
         .host_str()
         .ok_or_else(|| "URL has no host".to_string())?;
-    if is_blocked_host(host) {
+    if !policy.permits_host(host) {
+        return Err(format!("host '{}' is not in the webfetch allowlist", host));
+    }
+    if policy.block_private_networks && is_blocked_host(host) {
         return Err(format!(
-            "access to internal host '{}' is blocked (private/link-local network)",
+            "access to internal host '{}' is blocked (private address or link-local network)",
             host
         ));
     }
@@ -105,7 +171,7 @@ impl WebFetchTool {
         &self,
         url: &Url,
     ) -> Result<(String, Option<std::net::SocketAddr>), Box<dyn Error + Send + Sync>> {
-        validate_url(url).map_err(|e| into_tool_error(anyhow::anyhow!(e)))?;
+        validate_url(url, &self.policy).map_err(|e| into_tool_error(anyhow::anyhow!(e)))?;
         let host = url
             .host_str()
             .ok_or_else(|| anyhow::anyhow!("URL has no host"))?
@@ -127,9 +193,10 @@ impl WebFetchTool {
         if addrs.is_empty() {
             return Err(anyhow::anyhow!("{host} did not resolve").into());
         }
-        if let Some(private) = addrs
-            .iter()
-            .find(|addr| is_blocked_host(&addr.ip().to_string()))
+        if self.policy.block_private_networks
+            && let Some(private) = addrs
+                .iter()
+                .find(|addr| is_blocked_host(&addr.ip().to_string()))
         {
             return Err(anyhow::anyhow!(
                 "access to internal host '{host}' is blocked: it resolves to {}, a private address",
@@ -387,7 +454,7 @@ mod tests {
             .create_async()
             .await;
 
-        let tool = WebFetchTool;
+        let tool = WebFetchTool::default();
         let url = format!("{}/hello", server.url());
 
         let args = serde_json::json!({ "url": url });
@@ -426,11 +493,37 @@ mod tests {
     }
 
     #[test]
+    fn policy_normalizes_and_matches_hosts() {
+        let hosts = WebFetchPolicy::parse_hosts("*.Example.COM, foo.,, bar");
+        assert_eq!(hosts, vec!["example.com", "foo", "bar"]);
+        let policy = WebFetchPolicy {
+            block_private_networks: true,
+            allowed_hosts: hosts,
+        };
+        assert!(policy.permits_host("example.com"));
+        assert!(policy.permits_host("a.example.com"));
+        assert!(!policy.permits_host("badexample.com"));
+        assert!(WebFetchPolicy::default().permits_host("anything.test"));
+    }
+
+    #[test]
+    fn private_literals_follow_the_policy() {
+        let url = Url::parse("http://10.0.0.5/").unwrap();
+        assert!(validate_url(&url, &WebFetchPolicy::default()).is_err());
+        let permissive = WebFetchPolicy {
+            block_private_networks: false,
+            allowed_hosts: Vec::new(),
+        };
+        assert!(validate_url(&url, &permissive).is_ok());
+    }
+
+    #[test]
     fn non_http_schemes_are_rejected() {
+        let policy = WebFetchPolicy::default();
         let url = Url::parse("file:///etc/passwd").unwrap();
-        assert!(validate_url(&url).is_err());
+        assert!(validate_url(&url, &policy).is_err());
         let url = Url::parse("gopher://example.com").unwrap();
-        assert!(validate_url(&url).is_err());
+        assert!(validate_url(&url, &policy).is_err());
     }
 
     #[test]
@@ -519,7 +612,7 @@ mod tests {
             .create_async()
             .await;
 
-        let tool = WebFetchTool;
+        let tool = WebFetchTool::default();
         let url = format!("{}/page", server.url());
         let args = serde_json::json!({ "url": url });
         let ctx = ToolContext::new("test", "msg");
@@ -553,7 +646,7 @@ mod tests {
             .create_async()
             .await;
 
-        let tool = WebFetchTool;
+        let tool = WebFetchTool::default();
         let url = format!("{}/start", server.url());
         let args = serde_json::json!({ "url": url });
         let ctx = ToolContext::new("test", "msg");
@@ -577,7 +670,7 @@ mod tests {
             .create_async()
             .await;
 
-        let tool = WebFetchTool;
+        let tool = WebFetchTool::default();
         let url = format!("{}/loop", server.url());
         let args = serde_json::json!({ "url": url });
         let ctx = ToolContext::new("test", "msg");
@@ -599,7 +692,7 @@ mod tests {
             .create_async()
             .await;
 
-        let tool = WebFetchTool;
+        let tool = WebFetchTool::default();
         let url = format!("{}/to-private", server.url());
         let args = serde_json::json!({ "url": url });
         let ctx = ToolContext::new("test", "msg");
@@ -613,7 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn private_urls_fail_at_runtime() {
-        let tool = WebFetchTool;
+        let tool = WebFetchTool::default();
         let args = serde_json::json!({ "url": "http://169.254.169.254/latest/meta-data/" });
         let ctx = ToolContext::new("test", "msg");
         let err = tool

@@ -34,6 +34,7 @@ struct Conn {
     observer: Option<Client>,
     observing: bool,
     task: Option<JoinHandle<()>>,
+    plugin_views: Vec<String>,
     /// When the streaming Markdown body was last pushed, throttling
     /// re-renders to [`STREAM_INTERVAL`]. `None` means the next delta is due.
     last_stream_render: Option<Instant>,
@@ -933,6 +934,60 @@ impl GuiSession {
         tab_tx: &mpsc::UnboundedSender<TabEvent>,
     ) -> Result<()> {
         match msg {
+            ClientMsg::Plugin {
+                tab,
+                request,
+                plugin,
+            } => {
+                use gewu_protocol::plugin::HostAction;
+                let attaching = matches!(&plugin, HostAction::Attach { .. });
+                let detaching = if let HostAction::Detach { view_id } = &plugin {
+                    Some(view_id.clone())
+                } else {
+                    None
+                };
+                let response = async {
+                    self.ensure_session(tab).await?;
+                    let ws = self
+                        .workspace
+                        .tab(tab)
+                        .expect("known tab")
+                        .workspace
+                        .clone();
+                    self.client(tab).expect("ensured").plugin(ws, plugin).await
+                }
+                .await;
+                if let Ok(result) = &response
+                    && let Some(conn) = self.conns.get_mut(&tab)
+                {
+                    if attaching
+                        && let Some(id) = result.get("viewId").and_then(serde_json::Value::as_str)
+                    {
+                        conn.plugin_views.push(id.into());
+                    }
+                    if let Some(id) = detaching {
+                        conn.plugin_views.retain(|saved| saved != &id);
+                    }
+                }
+                let session_id = self
+                    .workspace
+                    .tab(tab)
+                    .and_then(|tab| tab.model.session_id.clone());
+                let (result, error) = match response {
+                    Ok(result) => (Some(result), None),
+                    Err(error) => (None, Some(error.to_string())),
+                };
+                send_msg(
+                    sender,
+                    &ServerMsg::Plugin {
+                        request,
+                        result,
+                        error,
+                        session_id,
+                    },
+                )
+                .await?;
+            }
             ClientMsg::RevertChat { tab, block, undo } => {
                 self.close_zoom_for_tab(tab, sender).await?;
                 let Some(tab_state) = self.workspace.tab(tab) else {
@@ -1073,6 +1128,9 @@ impl GuiSession {
                 }
                 if let Err(e) = self.ensure_session(tab).await {
                     return self.send_error(sender, e.to_string()).await;
+                }
+                if let Some(conn) = self.conns.get_mut(&tab) {
+                    detach_views(conn).await;
                 }
                 let client = self.client(tab).expect("ensured");
                 match client.switch_workspace(workspace.clone()).await {
@@ -1539,9 +1597,14 @@ impl GuiSession {
                 }
             }
             ClientMsg::PreviewFile { path } => {
-                if !is_html_path(&path) {
-                    self.send_error(sender, format!("'{path}' is not an HTML file"))
-                        .await?
+                if !is_previewable_path(&path) {
+                    self.send_error(
+                        sender,
+                        format!(
+                            "'{path}' has no preview; supported: images, PDF, audio, video and HTML"
+                        ),
+                    )
+                    .await?
                 } else {
                     let tab_id = self.workspace.active_id();
                     self.file_client().await?;
@@ -1789,6 +1852,7 @@ impl GuiSession {
 
     async fn stop_tab(&mut self, tab_id: u64) {
         if let Some(mut conn) = self.conns.remove(&tab_id) {
+            detach_views(&mut conn).await;
             if let Some(task) = conn.task.take() {
                 if let Some(client) = &conn.client {
                     let _ = client.interrupt().await;
@@ -2262,6 +2326,7 @@ impl GuiSession {
 
     async fn shutdown(&mut self) {
         for (_, mut conn) in self.conns.drain() {
+            detach_views(&mut conn).await;
             if let Some(task) = conn.task.take() {
                 task.abort();
             }
@@ -2273,6 +2338,21 @@ impl GuiSession {
             }
         }
         self.admin.close().await;
+    }
+}
+
+async fn detach_views(conn: &mut Conn) {
+    if let Some(client) = &conn.client {
+        for view_id in conn.plugin_views.drain(..) {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.plugin(
+                    "cwd".into(),
+                    gewu_protocol::plugin::HostAction::Detach { view_id },
+                ),
+            )
+            .await;
+        }
     }
 }
 
@@ -2376,10 +2456,38 @@ fn sanitize_upload_name(name: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-/// Whether a workspace path names an HTML file the preview route may serve.
-fn is_html_path(path: &str) -> bool {
+/// Whether a workspace path names a file the preview route may serve.
+///
+/// This is an allowlist: an unknown extension is not previewed, so the route
+/// never becomes a general-purpose file reader.
+fn is_previewable_path(path: &str) -> bool {
+    preview_content_type(path).is_some()
+}
+
+/// Content type the preview route serves for a path, or `None` when the file
+/// type is not previewable. HTML keeps its own type so the route can apply a
+/// sandbox policy.
+pub(crate) fn preview_content_type(path: &str) -> Option<&'static str> {
     let lower = path.to_ascii_lowercase();
-    lower.ends_with(".html") || lower.ends_with(".htm")
+    let extension = lower.rsplit_once('.')?.1;
+    Some(match extension {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "ogg" | "oga" => "audio/ogg",
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -2387,13 +2495,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_html_paths_are_previewable() {
-        assert!(is_html_path("docs/a.html"));
-        assert!(is_html_path("A.HTM"));
-        assert!(is_html_path("index.HTML"));
-        assert!(!is_html_path("src/main.rs"));
-        assert!(!is_html_path("docs/a.html.bak"));
-        assert!(!is_html_path("html"));
+    fn only_previewable_paths_are_accepted() {
+        assert!(is_previewable_path("docs/a.html"));
+        assert!(is_previewable_path("A.HTM"));
+        assert!(is_previewable_path("shot.PNG"));
+        assert!(is_previewable_path("deck.pdf"));
+        assert!(!is_previewable_path("src/main.rs"));
+        assert!(!is_previewable_path("docs/a.html.bak"));
+        assert!(!is_previewable_path("html"));
+        assert!(!is_previewable_path("archive.zip"));
+    }
+
+    #[test]
+    fn html_keeps_a_text_content_type_and_media_uses_its_own() {
+        assert_eq!(
+            preview_content_type("a.html"),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(preview_content_type("a.png"), Some("image/png"));
+        assert_eq!(preview_content_type("a.pdf"), Some("application/pdf"));
+        assert_eq!(preview_content_type("a.bin"), None);
     }
 
     #[test]

@@ -260,12 +260,25 @@ body {
   transition-timing-function: var(--ease);
 }
 
+/* The dock width the user dragged; collapsing zeroes it without forgetting it. */
+.app {
+  --panel-width: 420px;
+  --sidebar-width: var(--panel-width);
+}
+
 .app.sessions-collapsed {
   --session-sidebar-width: 0px;
 }
 
 .app.sidebar-collapsed {
   --sidebar-width: 0px;
+  --panel-width: 0px;
+}
+
+/* A dragged frame must track the pointer, not animate behind it. */
+.app.resizing,
+.app.resizing .workspace {
+  transition: none;
 }
 
 .session-sidebar-host {
@@ -2471,7 +2484,7 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  width: 240px;
+  width: var(--sidebar-width, 240px);
   max-width: 100%;
   min-height: 0;
   padding: 0;
@@ -2488,11 +2501,51 @@ body {
 .sidebar-inner {
   display: flex;
   flex-direction: column;
-  width: 240px;
+  width: 100%;
   height: 100%;
   overflow: hidden;
   padding: 16px 14px;
   transition: transform 0.2s var(--ease);
+}
+
+/* Drag handle on the right dock's left edge; sits over the transcript. */
+.sidebar-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: var(--sidebar-width, 240px);
+  width: 9px;
+  margin-right: -5px;
+  z-index: 8;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.sidebar-resizer::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 4px;
+  width: 2px;
+  height: 44px;
+  transform: translateY(-50%);
+  border-radius: 2px;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity 0.15s var(--ease);
+}
+
+.sidebar-resizer:hover::after,
+.sidebar-resizer:focus-visible::after,
+.sidebar-resizer.dragging::after {
+  opacity: 0.7;
+}
+
+.app.sidebar-collapsed .sidebar-resizer {
+  display: none;
 }
 
 .app.sidebar-collapsed .sidebar {
@@ -3093,11 +3146,13 @@ body {
 .file-context-menu button { display: block; width: 100%; padding: 7px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--text-dim); font: 12.5px var(--sans); text-align: left; cursor: pointer; }
 .file-context-menu button[hidden] { display: none; }
 .file-context-menu button:hover, .file-context-menu button:focus-visible { background: var(--bg-hover); color: var(--accent); outline: none; }
-.preview-overlay { position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column; margin-left: 8vw; padding: 0; background: var(--bg-panel); border-left: 1px solid var(--line); box-shadow: -12px 0 32px rgba(0,0,0,.45); }
-.preview-overlay.hidden { display: none; }
 .preview-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
 .preview-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font: 12px var(--mono); }
 .preview-content { flex: 1; overflow: auto; margin: 0; padding: 18px; color: var(--text); font: 12px/1.6 var(--mono); white-space: pre; }
+.preview-media { flex: 1 1 auto; min-height: 0; width: 100%; border: 0; object-fit: contain; background: #0d1420; }
+img.preview-media, video.preview-media { max-height: 100%; margin: auto; }
+audio.preview-media { flex: 0 0 auto; width: auto; align-self: center; margin: 18px; }
+iframe.preview-media { background: #101927; }
 .preview-truncated { margin: 0; padding: 8px 18px; color: var(--text-faint); border-top: 1px solid var(--line); font-size: 11px; }
 
 /* On narrow screens the sidebars overlay the transcript. */
@@ -3254,3 +3309,75 @@ body {
     transition-delay: 0s !important;
   }
 }
+.plugin-host {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  min-height: 0;
+  height: 100%;
+  color: var(--text);
+}
+.plugin-host[hidden] { display: none; }
+.plugin-host [hidden] { display: none; }
+.plugin-host button {
+  font: 11px var(--mono);
+  color: var(--text);
+  border: 1px solid var(--line);
+  margin: 2px 4px 2px 0;
+  padding: 3px 7px;
+  background: var(--bg-raised, #1e2b40);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.plugin-host button:hover { border-color: var(--accent); }
+.plugin-host button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+.plugin-host :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.plugin-host nav { display: flex; flex-wrap: wrap; flex: 0 0 auto; }
+.plugin-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.plugin-manager { overflow-y: auto; min-height: 0; flex: 1; }
+.plugin-manager h3 { margin: 12px 0 4px; font-size: 11px; letter-spacing: 0.08em; color: var(--text-faint); text-transform: uppercase; }
+.plugin-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.plugin-head { display: flex; align-items: baseline; gap: 6px; width: 100%; }
+.plugin-head strong { font-size: 12px; }
+.plugin-head > span { color: var(--text-faint); font: 11px var(--mono); }
+.plugin-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; width: 100%; }
+.plugin-advanced { width: 100%; padding-left: 2px; }
+.plugin-advanced > summary { cursor: pointer; color: var(--text-faint); font: 10px var(--mono); letter-spacing: .06em; text-transform: uppercase; padding: 2px 0; }
+.plugin-advanced .plugin-profiles { display: flex; flex-wrap: wrap; gap: 10px; padding: 4px 0 4px 10px; color: var(--text-faint); font: 11px var(--mono); }
+.plugin-advanced .plugin-profiles label { display: inline-flex; align-items: center; gap: 4px; }
+.plugin-context-chip { margin-top: 6px; }
+.plugin-context-chip > summary { cursor: pointer; color: var(--text-faint); font: 10px var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+.plugin-context-chip pre { margin: 4px 0 0; color: var(--text-faint); font-size: 11px; white-space: pre-wrap; }
+.plugin-context-note { margin: 4px 0 0; color: var(--text-faint); font-size: 10px; }
+.plugin-row > code { color: var(--text-faint); word-break: break-all; }
+.plugin-tools { width: 100%; padding: 6px 10px; border-left: 2px solid var(--line); }
+.plugin-tools summary { cursor: pointer; color: var(--text-faint); padding: 3px 0; }
+.plugin-tools details { margin: 4px 0 4px 10px; }
+.plugin-tools p { margin: 4px 0; }
+.plugin-tools code { overflow-wrap: anywhere; }
+.plugin-tools pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+.plugin-panel { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: auto; }
+.plugin-panel textarea { width: 100%; min-height: 15rem; background: #0d1420; color: inherit; font: 12px var(--mono); }
+.plugin-panel iframe { flex: 1 1 auto; width: 100%; min-height: 24rem; border: 0; background: #101927; }
+.plugin-panel pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.plugin-panel img, .plugin-panel video { max-width: 100%; }
+.plugin-panel a { color: var(--accent); }
+
+/* A running plugin's binding, extra views and Stop, kept under its own row. */
+.plugin-sub {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 6px;
+  margin: 0 0 6px 2px;
+  padding: 0 0 2px 9px;
+  border-left: 2px solid var(--line);
+  color: var(--text-faint);
+}
+
+.plugin-sub > code {
+  color: var(--text-faint);
+  word-break: break-all;
+}
+.plugin-workspace-maximized { position: fixed !important; inset: 8px !important; z-index: 1000; width: auto !important; height: auto !important; max-width: none !important; background: var(--bg, #15191e); }

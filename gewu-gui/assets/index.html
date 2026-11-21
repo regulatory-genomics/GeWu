@@ -34,6 +34,8 @@
 
       <main id="transcript" class="transcript" aria-live="polite"></main>
 
+      <div id="sidebar-resizer" class="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="Resize panels" tabindex="0"></div>
+
       <footer class="footer">
         <div id="status" class="status" aria-live="polite"></div>
         <form id="composer" class="composer">
@@ -60,16 +62,18 @@
 
   <div id="alerts" class="alerts" role="alert" aria-live="assertive" hidden></div>
 
+  <section id="plugin-host" class="plugin-host" aria-label="Application panels" hidden></section>
+
   <div id="toasts" class="toasts" aria-live="assertive"></div>
 
   <input id="file-upload" type="file" multiple hidden>
   <input id="attachment-upload" type="file" multiple hidden>
 
-  <div id="file-preview" class="preview-overlay hidden" role="dialog" aria-modal="true" aria-label="File preview"></div>
 
   <div id="workflow-zoom" class="wf-zoom-overlay hidden" role="dialog" aria-modal="true" aria-label="Workflow graph"></div>
 
   <div id="file-menu" class="file-context-menu" role="menu" aria-label="File actions" hidden>
+    <button type="button" role="menuitem" data-file-edit>Edit as text</button>
     <button type="button" role="menuitem" data-file-preview hidden>Preview</button>
     <button type="button" role="menuitem" data-file-download>Download…</button>
   </div>
@@ -85,6 +89,6 @@
     </form>
   </div>
 
-  <script src="/app.js"></script>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

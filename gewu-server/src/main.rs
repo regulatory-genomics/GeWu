@@ -2,6 +2,7 @@ pub mod bootstrap;
 pub mod cli;
 pub mod config;
 pub mod mcp_loader;
+pub use gewu_server::plugins;
 mod memory_view;
 pub mod registry;
 pub mod server;
@@ -80,7 +81,7 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str, inbox: &Steering)
                                 spinner_frame = 0;
                             }
                         }
-                        AgentEvent::ToolStart { tool, input } => {
+                        AgentEvent::ToolStart { tool, input, .. } => {
                             stop_spinner(&mut spinner_active, is_tty)?;
                             if tool == "bash"
                                 && let Some(command) = extract_bash_command(&input)
@@ -99,6 +100,10 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str, inbox: &Steering)
                         AgentEvent::Finish { response: _ } => {
                             stop_spinner(&mut spinner_active, is_tty)?;
                             println!();
+                        }
+                        AgentEvent::Cancelled { .. } => {
+                            stop_spinner(&mut spinner_active, is_tty)?;
+                            println!("\nCancelled.");
                         }
                         AgentEvent::Usage { .. } => {}
                         AgentEvent::Compacted { summary } => {
