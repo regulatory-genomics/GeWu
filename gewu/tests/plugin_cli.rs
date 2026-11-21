@@ -36,6 +36,11 @@ fn install_check_remove_are_static_and_preserve_workspace() {
             .success()
     );
     assert!(run(&["check", "demo"]).status.success());
+    assert!(
+        run(&["check", "demo", "--version", "1.0.0"])
+            .status
+            .success()
+    );
     assert!(String::from_utf8_lossy(&run(&["list"]).stdout).contains("demo\t1.0.0"));
     assert!(run(&["remove", "demo"]).status.success());
     assert!(!run(&["check", "demo"]).status.success());
@@ -44,6 +49,37 @@ fn install_check_remove_are_static_and_preserve_workspace() {
         fs::read_to_string(workspace.join("document.txt")).unwrap(),
         "keep"
     );
+}
+
+#[test]
+fn failed_install_has_a_local_report_but_dry_run_does_not_write_one() {
+    let home = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_gewu"))
+            .args(["--no-update-check", "plugin"])
+            .args(args)
+            .env("HOME", home.path())
+            .output()
+            .unwrap()
+    };
+    let attempts = home.path().join(".gewu/install-attempts");
+    assert!(
+        !run(&["marketplace-install", "demo", "--offline", "--dry-run"])
+            .status
+            .success()
+    );
+    assert!(!attempts.exists());
+    let result = run(&["marketplace-install", "demo", "--offline"]);
+    assert!(!result.status.success());
+    let entry = fs::read_dir(attempts).unwrap().next().unwrap().unwrap();
+    let id = entry.file_name().into_string().unwrap();
+    assert!(String::from_utf8_lossy(&result.stderr).contains(&id));
+    let result = run(&["install-report", &id, "--json"]);
+    assert!(result.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["attemptId"], id);
+    assert_eq!(report["outcome"], "failed");
+    assert_eq!(report["stage"], "catalog");
 }
 
 #[test]

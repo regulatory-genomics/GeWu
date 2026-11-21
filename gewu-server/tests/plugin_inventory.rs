@@ -68,6 +68,7 @@ async fn installed_but_unconfigured_packages_are_listed_and_refuse_enabling() {
     )]);
     let host = PluginHost::from_config(&entries, Some(&config), Limits::default()).unwrap();
     assert_eq!(host.catalog()[0]["enabled"], true);
+    assert_eq!(host.catalog()[0]["settingsValid"], true);
     assert_eq!(host.catalog()[0]["package"], json!(installed));
     assert_eq!(host.catalog()[0]["sources"]["adapter"], json!(fixture()));
     assert_eq!(

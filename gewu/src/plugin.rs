@@ -4,7 +4,7 @@ use gewu_protocol::RuntimeProvider;
 use gewu_protocol::plugin::{Object, ResourceRef};
 use gewu_server::plugins::{
     PluginHost,
-    artifacts::ArtifactStore,
+    diagnostics::{self, Attempt},
     lifecycle::{InstallManager, RuntimeSelection},
     marketplace::{MarketplaceClient, MarketplaceRepository, now_rfc3339},
     package::{self, PluginEntry},
@@ -60,6 +60,12 @@ pub enum Action {
     Uninstall { id: String },
     /// Report installation and package state.
     Doctor { id: Option<String> },
+    /// Read a local Marketplace installation report.
+    InstallReport {
+        attempt_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Search the configured signed marketplace cache.
     Search {
         query: String,
@@ -170,11 +176,9 @@ pub async fn run(action: Action) -> Result<()> {
         if let Ok(saved) = state.load() {
             if let Some(plugin) = saved.plugins.get(id) {
                 for generation in plugin.generations.values() {
-                    if version.is_none_or(|v| generation.release_id == v) {
-                        let path = state.root().join(&generation.package_path);
-                        if let Ok(package) = package::Package::read(&path) {
-                            installed.push(package);
-                        }
+                    let path = state.root().join(&generation.package_path);
+                    if let Ok(package) = package::Package::read(&path) {
+                        installed.push(package);
                     }
                 }
             }
@@ -494,6 +498,14 @@ pub async fn run(action: Action) -> Result<()> {
             )
             .await?;
         }
+        Action::InstallReport { attempt_id, json } => {
+            let document = diagnostics::read(state.root(), &attempt_id, None)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&document["report"])?);
+            } else {
+                print!("{}", document["markdown"].as_str().unwrap_or_default());
+            }
+        }
         Action::Check {
             id,
             version,
@@ -566,18 +578,27 @@ async fn marketplace_install(
         matches!(policy, "auto" | "external" | "managed" | "bundled"),
         "unknown runtime policy {policy}; expected auto, external, managed, or bundled"
     );
+    let workspace = std::env::current_dir()?;
+    let mut report = (!dry_run).then(|| Attempt::start(state.root(), None,
+        serde_json::json!({"plugin":id,"version":version,"channel":channel,"policy":policy,"gewuVersion":env!("CARGO_PKG_VERSION")}), None, &workspace)).transpose()?;
+    let result = async {
     let client = official_client(state)?;
     let index = load_index(&client, refresh).await?;
-    let target = runtime::current_target().map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    if let Some(report) = report.as_mut() { report.stage("release_selection"); }
+    let target = runtime::current_target()?;
     let release = index
         .select_release_version(id, version, channel, &now_rfc3339())
         .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        .clone();
+        ;
+    if let Some(report) = report.as_mut() {
+        report.release(release, &target);
+        report.stage("runtime_selection");
+    }
     let selections = if policy == "auto" {
-        RuntimeSelection::auto_candidates(&release, &target, executable).await?
+        RuntimeSelection::auto_candidates_reported(release, &target, executable, report.as_mut()).await?
     } else {
         vec![RuntimeSelection::select(
-            &release, policy, &target, executable,
+            release, policy, &target, executable,
         )?]
     };
     if dry_run {
@@ -596,58 +617,17 @@ async fn marketplace_install(
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
-    let store = ArtifactStore::new(state.root().join("store"));
-    let package_archive = client
-        .download_artifact(&release.package, &store)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let workspace = std::env::current_dir()?;
     let manager = InstallManager::new(state.root());
-    let mut failures = Vec::new();
-    for selection in selections {
-        let runtime_archive = match &selection {
-            RuntimeSelection::Bundled(runtime) => {
-                match client.download_artifact(&runtime.artifact, &store).await {
-                    Ok(path) => Some(path),
-                    Err(error) => {
-                        failures.push(error.to_string());
-                        continue;
-                    }
-                }
-            }
-            _ => None,
-        };
-        match manager
-            .install_release(
-                &release,
-                &package_archive,
-                runtime_archive.as_deref(),
-                selection,
-                &workspace,
-                Limits::default().startup,
-            )
-            .await
-        {
-            Ok(generation) => {
-                let runtime = generation
-                    .runtime
-                    .as_ref()
-                    .map(|runtime| format!(" via {} ({})", runtime.provider, runtime.kind))
-                    .unwrap_or_default();
-                println!(
-                    "Installed {} {}{}",
-                    release.plugin, release.version, runtime
-                );
-                return Ok(());
-            }
-            Err(error) => failures.push(error.to_string()),
-        }
+    let generation = client.install_candidates(&manager, release, selections, &workspace, Limits::default().startup,
+        report.as_mut().expect("writing install has a report context")).await?;
+    let runtime = generation.runtime.as_ref().map(|runtime| format!(" via {} ({})", runtime.provider, runtime.kind)).unwrap_or_default();
+    println!("Installed {} {}{}", release.plugin, release.version, runtime);
+    Ok(())
+    }.await;
+    match report.as_mut() {
+        Some(report) => report.finish(result),
+        None => result,
     }
-    bail!(
-        "all runtime providers failed for {}: {}",
-        release.release_id,
-        failures.join("; ")
-    )
 }
 
 async fn runtime_discover(

@@ -117,6 +117,11 @@ pub enum HostAction {
         /// `auto`, preserving the original Marketplace action contract.
         #[serde(default = "default_runtime_policy")]
         runtime: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_id: Option<String>,
+    },
+    MarketplaceInstallReport {
+        attempt_id: String,
     },
     MarketplaceRollback {
         plugin_id: String,

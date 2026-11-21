@@ -3,6 +3,7 @@ pub mod artifacts;
 pub mod builtin;
 mod changes;
 mod context;
+pub mod diagnostics;
 mod invocation;
 pub mod lifecycle;
 pub mod marketplace;
@@ -54,6 +55,7 @@ pub struct PluginHost {
     /// user's `~/.gewu`.
     persist: bool,
     installation_root: Option<PathBuf>,
+    configured_packages: BTreeMap<String, bool>,
     runtimes: RwLock<BTreeMap<String, runtime::RuntimeBundle>>,
     protected: std::collections::BTreeSet<String>,
 }
@@ -163,6 +165,10 @@ impl PluginHost {
             state_file,
             persist: config_path.is_some(),
             installation_root: installation_root.clone(),
+            configured_packages: entries
+                .iter()
+                .map(|(id, entry)| (id.clone(), !entry.package.as_os_str().is_empty()))
+                .collect(),
             runtimes: Default::default(),
             protected: Default::default(),
             ..Self::default()
@@ -267,6 +273,9 @@ impl PluginHost {
     /// Re-read one host-owned marketplace generation into the live registry.
     /// Config entries are never replaced: an explicit local package still wins.
     pub(crate) fn refresh_installation(&self, id: &str) -> Result<()> {
+        if self.configured_packages.get(id) == Some(&true) || self.protected.contains(id) {
+            return Ok(());
+        }
         let root = self
             .installation_root
             .as_ref()
@@ -287,14 +296,24 @@ impl PluginHost {
         let package_root = root.join(&generation.package_path);
         let package = package::Package::read(&package_root)
             .with_context(|| format!("active installed generation for '{id}' is invalid"))?;
-        let entry = PluginEntry {
-            package: package_root,
-            enabled: plugin_state.enabled,
-            settings: Default::default(),
-            workspace_settings: Default::default(),
-            service_origins: Default::default(),
-            sources: Default::default(),
-        };
+        let mut entries = self.entries.write().unwrap();
+        let mut entry = entries
+            .get(id)
+            .map(|(entry, _)| entry.clone())
+            .unwrap_or_else(|| PluginEntry {
+                package: Default::default(),
+                enabled: plugin_state.enabled,
+                settings: Default::default(),
+                workspace_settings: Default::default(),
+                service_origins: Default::default(),
+                sources: Default::default(),
+            });
+        entry.package = package_root;
+        if !entries.contains_key(id) && self.persist {
+            if let Some(enabled) = self.enabled_overrides().get(id) {
+                entry.enabled = *enabled;
+            }
+        }
         {
             let mut runtimes = self.runtimes.write().unwrap();
             match generation.runtime_path.as_deref() {
@@ -310,10 +329,8 @@ impl PluginHost {
                 }
             }
         }
-        self.entries
-            .write()
-            .unwrap()
-            .insert(id.into(), (entry, plugin_state.enabled.then_some(package)));
+        let enabled = entry.enabled;
+        entries.insert(id.into(), (entry, enabled.then_some(package)));
         Ok(())
     }
 
@@ -398,6 +415,10 @@ impl PluginHost {
     }
 
     pub fn catalog(&self) -> Vec<Value> {
+        self.catalog_for(None)
+    }
+
+    fn catalog_for(&self, workspace: Option<&str>) -> Vec<Value> {
         let entries = self.entries.read().unwrap();
         let mut out: Vec<Value> = entries
             .iter()
@@ -408,9 +429,12 @@ impl PluginHost {
                 let meta = package
                     .clone()
                     .or_else(|| Package::read(&entry.package).ok());
+                let settings = workspace.and_then(|id| entry.workspace_settings.get(id)).unwrap_or(&entry.settings);
+                let settings_error = meta.as_ref().and_then(|package| package.validate_settings(settings).err()).map(|error| error.to_string());
                 json!({
                     "id":id, "enabled":package.is_some(), "configured":true,
                     "available":meta.is_some(),
+                    "settingsValid":meta.is_some() && settings_error.is_none(), "settingsError":settings_error,
                     "builtin":self.protected.contains(id),
                     "title":meta.as_ref().map(|p| &p.manifest.title),
                     "version":meta.as_ref().map(|p| &p.manifest.version),

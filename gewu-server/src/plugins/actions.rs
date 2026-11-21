@@ -295,7 +295,7 @@ impl PluginHost {
                 anyhow::bail!("agent results require persistent session storage")
             }
             HostAction::List => {
-                let mut plugins = self.catalog();
+                let mut plugins = self.catalog_for(Some(workspace));
                 for plugin in &mut plugins {
                     if let Some(id) = plugin["id"].as_str() {
                         let state = self.session_state(owner, id).await?;
@@ -779,77 +779,46 @@ impl PluginHost {
                 version,
                 channel,
                 runtime,
+                attempt_id,
             } => {
                 let root = self
                     .installation_root
-                    .clone()
+                    .as_deref()
                     .context("host has no installation root")?;
-                let (client, index) = self.marketplace_index(true).await?;
-                let target = super::runtime::current_target()
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                let release = index
-                    .select_release_version(
-                        &plugin_id,
-                        version.as_deref(),
-                        &channel,
-                        &super::marketplace::now_rfc3339(),
-                    )
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?
-                    .clone();
-                let store = super::artifacts::ArtifactStore::new(root.join("store"));
-                let package = client
-                    .download_artifact(&release.package, &store)
-                    .await
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                let selections = if runtime == "auto" {
-                    super::lifecycle::RuntimeSelection::auto_candidates(&release, &target, None)
-                        .await?
-                } else {
-                    vec![super::lifecycle::RuntimeSelection::select(
-                        &release, &runtime, &target, None,
-                    )?]
-                };
-                let manager = super::lifecycle::InstallManager::new(&root);
-                let mut failures = Vec::new();
-                for selection in selections {
-                    let runtime_archive = match &selection {
-                        super::lifecycle::RuntimeSelection::Bundled(runtime_ref) => match client
-                            .download_artifact(&runtime_ref.artifact, &store)
-                            .await
-                        {
-                            Ok(path) => Some(path),
-                            Err(error) => {
-                                failures.push(error.to_string());
-                                continue;
-                            }
-                        },
-                        _ => None,
+                let mut report = super::diagnostics::Attempt::start(
+                    root,
+                    attempt_id.as_deref(),
+                    json!({"plugin":plugin_id,"version":version,"channel":channel,"policy":runtime}),
+                    Some((workspace, owner)),
+                    root,
+                )?;
+                let result = async {
+                    use super::lifecycle::{InstallManager, RuntimeSelection};
+                    let (client, index) = self.marketplace_index(true).await?;
+                    report.stage("release_selection");
+                    let target = super::runtime::current_target()?;
+                    let release = index.select_release_version(&plugin_id, version.as_deref(), &channel, &super::marketplace::now_rfc3339())?;
+                    report.release(release, &target);
+                    report.stage("runtime_selection");
+                    let selections = if runtime == "auto" {
+                        RuntimeSelection::auto_candidates_reported(release, &target, None, Some(&mut report)).await?
+                    } else {
+                        vec![RuntimeSelection::select(release, &runtime, &target, None)?]
                     };
-                    match manager
-                        .install_release(
-                            &release,
-                            &package,
-                            runtime_archive.as_deref(),
-                            selection,
-                            &root,
-                            std::time::Duration::from_secs(60),
-                        )
-                        .await
-                    {
-                        Ok(runtime) => {
-                            self.refresh_installation(&plugin_id)?;
-                            return Ok(
-                                json!({"installed": plugin_id, "version": release.version, "runtime": runtime.runtime}),
-                            );
-                        }
-                        Err(error) => failures.push(error.to_string()),
-                    }
-                }
-                bail!(
-                    "all runtime providers failed for {}: {}",
-                    release.release_id,
-                    failures.join("; ")
-                )
+                    let manager = InstallManager::new(root);
+                    let installed = client.install_candidates(&manager, release, selections, root, self.limits.startup, &mut report).await?;
+                    report.stage("registry_refresh");
+                    self.refresh_installation(&plugin_id).context("artifacts installed but could not refresh the live registry")?;
+                    Ok(json!({"installed":plugin_id,"version":release.version,"runtime":installed.runtime,"attemptId":report.id()}))
+                }.await;
+                report.finish(result)
+            }
+            HostAction::MarketplaceInstallReport { attempt_id } => {
+                let root = self
+                    .installation_root
+                    .as_deref()
+                    .context("host has no installation root")?;
+                super::diagnostics::read(root, &attempt_id, Some((workspace, owner)))
             }
             HostAction::MarketplaceRollback { plugin_id } => {
                 let root = self
@@ -920,7 +889,7 @@ impl PluginHost {
                         "detail": if available { format!("{manager} detected") } else { format!("{manager} is not installed") },
                     })
                 }
-                gewu_protocol::release::RuntimeProvider::Bundled { .. } => {
+                gewu_protocol::release::RuntimeProvider::Bundled { artifact, .. } => {
                     let available = release.runtimes.iter().any(|runtime| {
                         runtime.id == provider.id() && runtime.target == *target
                     });
@@ -928,7 +897,7 @@ impl PluginHost {
                         "id": provider.id(),
                         "kind": provider.kind(),
                         "available": available,
-                        "detail": if available { "download on install" } else { "no matching artifact" },
+                        "detail": if available { format!("downloads {} MB", artifact.bytes.div_ceil(1_000_000)) } else { "no matching artifact".into() },
                     })
                 }
             })
@@ -1001,7 +970,7 @@ impl PluginHost {
                 Ok(index) => Ok(index),
                 // A previously verified snapshot is still usable offline; the
                 // expiry and artifact digests are checked on every use.
-                Err(_) => client.load_cached(),
+                Err(refresh_error) => client.load_cached().map_err(|_| refresh_error),
             }
         } else {
             client.load_cached()

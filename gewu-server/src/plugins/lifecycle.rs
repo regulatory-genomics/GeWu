@@ -13,6 +13,7 @@ use std::{
 
 use super::{
     artifacts::{ArtifactStore, sha256_file},
+    diagnostics::Attempt,
     package::Package,
     providers,
     runtime::{RuntimeBundle, select_runtime},
@@ -37,6 +38,15 @@ impl<'a> RuntimeSelection<'a> {
         target: &Target,
         executable: Option<&Path>,
     ) -> Result<Vec<Self>> {
+        Self::auto_candidates_reported(release, target, executable, None).await
+    }
+
+    pub async fn auto_candidates_reported(
+        release: &'a Release,
+        target: &Target,
+        executable: Option<&Path>,
+        mut report: Option<&mut Attempt>,
+    ) -> Result<Vec<Self>> {
         let mut candidates = Vec::new();
         if let Some(plan) = &release.runtime_plan {
             for kind in &plan.policies {
@@ -47,18 +57,39 @@ impl<'a> RuntimeSelection<'a> {
                 {
                     match provider {
                         RuntimeProvider::External { probe, .. } => {
-                            if let Ok(path) = providers::resolve_external(provider, executable)
-                                && providers::probe_executable(&path, probe).await.is_ok()
-                            {
-                                candidates.push(Self::External {
+                            if let Some(report) = report.as_mut() {
+                                report.provider("external", provider.id(), None);
+                            }
+                            let result = match providers::resolve_external(provider, executable) {
+                                Ok(path) => providers::probe_external_reported(
+                                    &path,
+                                    probe,
+                                    report.as_deref_mut(),
+                                )
+                                .await
+                                .map(|()| path),
+                                Err(error) => Err(error),
+                            };
+                            match result {
+                                Ok(path) => candidates.push(Self::External {
                                     provider,
                                     executable: Some(path),
-                                });
+                                }),
+                                Err(error) => {
+                                    if let Some(report) = report.as_mut() {
+                                        report.provider_result(&Err(error.into()));
+                                    }
+                                }
                             }
                         }
                         RuntimeProvider::Managed { manager, .. } => {
                             if providers::managed_available(manager) {
                                 candidates.push(Self::Managed { provider });
+                            } else if let Some(report) = report.as_mut() {
+                                report.provider("managed", provider.id(), None);
+                                report.provider_result(&Err(anyhow::anyhow!(
+                                    "{manager} was not found on the GeWu host"
+                                )));
                             }
                         }
                         RuntimeProvider::Bundled { id, .. } => {
@@ -76,8 +107,18 @@ impl<'a> RuntimeSelection<'a> {
         }
         if candidates.is_empty() {
             candidates.push(Self::Bundled(
-                select_runtime(&release.runtimes, target)
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+                select_runtime(&release.runtimes, target).with_context(|| {
+                    format!(
+                        "no usable runtime for {} on {}{}",
+                        release.plugin,
+                        super::runtime::target_label(target),
+                        report
+                            .as_deref()
+                            .and_then(Attempt::selection_error)
+                            .map(|reason| format!(": {reason}"))
+                            .unwrap_or_default()
+                    )
+                })?,
             ));
         }
         Ok(candidates)
@@ -230,6 +271,32 @@ impl InstallManager {
         workspace_root: &Path,
         probe_deadline: Duration,
     ) -> Result<GenerationState> {
+        self.install_reported(
+            release,
+            package_archive,
+            runtime_archive,
+            selection,
+            workspace_root,
+            probe_deadline,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn install_reported(
+        &self,
+        release: &Release,
+        package_archive: &Path,
+        runtime_archive: Option<&Path>,
+        selection: RuntimeSelection<'_>,
+        workspace_root: &Path,
+        probe_deadline: Duration,
+        mut report: Option<&mut Attempt>,
+    ) -> Result<GenerationState> {
+        if let Some(report) = report.as_mut() {
+            report.stage("artifact_verify");
+        }
         let host_target =
             super::runtime::current_target().map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let package_blob = self.artifacts.put_file(
@@ -271,6 +338,9 @@ impl InstallManager {
                 provider,
                 executable: override_path,
             } => {
+                if let Some(report) = report.as_mut() {
+                    report.stage("runtime_acquisition");
+                }
                 ensure!(
                     provider.target() == &host_target,
                     "runtime provider target does not match host"
@@ -281,7 +351,7 @@ impl InstallManager {
                     RuntimeProvider::External { probe, .. } => probe,
                     _ => unreachable!("selection is external"),
                 };
-                providers::probe_executable(&resolved, probe)
+                providers::probe_external_reported(&resolved, probe, report.as_deref_mut())
                     .await
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                 executable = Some(resolved);
@@ -294,6 +364,9 @@ impl InstallManager {
                 }
             }
             RuntimeSelection::Managed { provider } => {
+                if let Some(report) = report.as_mut() {
+                    report.stage("runtime_acquisition");
+                }
                 ensure!(
                     provider.target() == &host_target,
                     "runtime provider target does not match host"
@@ -302,9 +375,14 @@ impl InstallManager {
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                 let target_prefix = self.state.root().join("runtimes").join(key);
                 if !providers::managed_complete(&target_prefix) {
-                    providers::install_managed(provider, &target_prefix, 3600)
-                        .await
-                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    providers::install_managed_reported(
+                        provider,
+                        &target_prefix,
+                        3600,
+                        report.as_deref_mut(),
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                 }
                 prefix = Some(target_prefix);
                 RuntimeIdentity {
@@ -332,87 +410,89 @@ impl InstallManager {
             installed_at: release.provenance.created_at.clone(),
             runtime: Some(identity),
         };
-        let generation_root =
-            self.state
-                .stage_generation(&release.plugin, &generation, |stage| {
-                    let package_root = stage.join("package");
-                    let runtime_root = stage.join("runtime");
-                    self.artifacts.extract_zip(&package_blob, &package_root)?;
-                    let package = Package::read(&package_root)?;
+        if let Some(report) = report.as_mut() {
+            report.stage("extract");
+        }
+        let (generation_root, stage) = self
+            .state
+            .prepare_generation(&release.plugin, &generation)?;
+        let stage = {
+            let stage = stage.path();
+            let package_root = stage.join("package");
+            let runtime_root = stage.join("runtime");
+            self.artifacts.extract_zip(&package_blob, &package_root)?;
+            let package = Package::read(&package_root)?;
+            ensure!(
+                package.manifest.id == release.plugin
+                    && package.manifest.version == release.version,
+                "package manifest does not match the release"
+            );
+            match &selection {
+                RuntimeSelection::Bundled(runtime) => {
+                    let blob = runtime_blob
+                        .as_ref()
+                        .context("bundled runtime blob is missing")?;
+                    self.artifacts.extract_zip(blob, &runtime_root)?;
+                    let loaded = RuntimeBundle::load(&runtime_root, &release.plugin, &host_target)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    let manifest_bytes = std::fs::read(runtime_root.join("runtime.json"))?;
                     ensure!(
-                        package.manifest.id == release.plugin
-                            && package.manifest.version == release.version,
-                        "package manifest does not match the release"
+                        sha256_bytes(&manifest_bytes) == runtime.manifest.sha256,
+                        "runtime manifest digest does not match the release"
                     );
-                    match &selection {
-                        RuntimeSelection::Bundled(runtime) => {
-                            let blob = runtime_blob
-                                .as_ref()
-                                .context("bundled runtime blob is missing")?;
-                            self.artifacts.extract_zip(blob, &runtime_root)?;
-                            let loaded =
-                                RuntimeBundle::load(&runtime_root, &release.plugin, &host_target)
-                                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                            let manifest_bytes = std::fs::read(runtime_root.join("runtime.json"))?;
-                            ensure!(
-                                sha256_bytes(&manifest_bytes) == runtime.manifest.sha256,
-                                "runtime manifest digest does not match the release"
-                            );
-                            ensure!(
-                                loaded.manifest.version == runtime.version,
-                                "runtime version does not match the release"
-                            );
-                        }
-                        RuntimeSelection::External { provider, .. } => {
-                            let resolved = executable
-                                .as_ref()
-                                .context("external runtime was not resolved")?;
-                            providers::synthesize_external(
-                                &runtime_root,
-                                &release.plugin,
-                                &release.version,
-                                &host_target,
-                                provider,
-                                resolved,
-                            )
-                            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                        }
-                        RuntimeSelection::Managed { provider } => {
-                            let prefix = prefix
-                                .as_ref()
-                                .context("managed runtime prefix is missing")?;
-                            providers::synthesize_managed(
-                                &runtime_root,
-                                &release.plugin,
-                                &release.version,
-                                &host_target,
-                                provider,
-                                prefix,
-                            )
-                            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                        }
-                    }
-                    Ok(())
-                })?;
-        // Persist the resolved runtime before probing so a failed probe can be
-        // diagnosed from state without activating the generation.
-        let bundle = RuntimeBundle::load(
-            generation_root.join("runtime"),
-            &release.plugin,
-            &host_target,
-        )
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        if let Err(error) = bundle
-            .probe(
-                &generation_root.join("package"),
+                    ensure!(
+                        loaded.manifest.version == runtime.version,
+                        "runtime version does not match the release"
+                    );
+                }
+                RuntimeSelection::External { provider, .. } => {
+                    let resolved = executable
+                        .as_ref()
+                        .context("external runtime was not resolved")?;
+                    providers::synthesize_external(
+                        &runtime_root,
+                        &release.plugin,
+                        &release.version,
+                        &host_target,
+                        provider,
+                        resolved,
+                    )
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                }
+                RuntimeSelection::Managed { provider } => {
+                    let prefix = prefix
+                        .as_ref()
+                        .context("managed runtime prefix is missing")?;
+                    providers::synthesize_managed(
+                        &runtime_root,
+                        &release.plugin,
+                        &release.version,
+                        &host_target,
+                        provider,
+                        prefix,
+                    )
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                }
+            }
+            stage
+        };
+        let bundle = RuntimeBundle::load(stage.join("runtime"), &release.plugin, &host_target)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if let Some(report) = report.as_mut() {
+            report.stage("runtime_probe");
+        }
+        bundle
+            .probe_reported(
+                &stage.join("package"),
                 workspace_root,
                 probe_deadline,
+                report.as_deref_mut(),
             )
-            .await
-        {
-            let _ = std::fs::remove_dir_all(&generation_root);
-            return Err(anyhow::anyhow!(error.to_string()));
+            .await?;
+        if let Some(report) = report.as_mut() {
+            report.stage("commit");
         }
+        std::fs::rename(stage, &generation_root)?;
         self.state
             .commit_active(&release.plugin, generation.clone(), &release.channel)?;
         Ok(generation)

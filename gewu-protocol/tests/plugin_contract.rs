@@ -1,4 +1,13 @@
 use gewu_protocol::plugin::*;
+
+#[test]
+fn marketplace_install_attempt_is_optional_and_reports_are_readable() {
+    let install =
+        serde_json::json!({"action":"marketplace_install","pluginId":"demo","channel":"stable"});
+    assert!(serde_json::from_value::<HostAction>(install).is_ok());
+    let report = serde_json::json!({"action":"marketplace_install_report","attemptId":"774872c7-4a4c-4702-a70b-c39bf3e0249a"});
+    assert!(serde_json::from_value::<HostAction>(report).is_ok());
+}
 use serde_json::{Value, json};
 
 #[test]

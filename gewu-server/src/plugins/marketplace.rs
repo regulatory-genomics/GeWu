@@ -15,7 +15,12 @@ use std::{
 };
 use time::format_description::well_known::Rfc3339;
 
-use super::artifacts::ArtifactStore;
+use super::{
+    artifacts::ArtifactStore,
+    diagnostics::Attempt,
+    lifecycle::{InstallManager, RuntimeSelection},
+    state::GenerationState,
+};
 
 const DEFAULT_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Large artifacts are fetched in bounded ranges so a proxy or tunnel cannot
@@ -73,6 +78,73 @@ pub struct MarketplaceClient {
 }
 
 impl MarketplaceClient {
+    /// GUI and CLI use the same verified download and fallback transaction.
+    pub async fn install_candidates(
+        &self,
+        manager: &InstallManager,
+        release: &Release,
+        selections: Vec<RuntimeSelection<'_>>,
+        workspace: &Path,
+        deadline: Duration,
+        report: &mut Attempt,
+    ) -> Result<GenerationState> {
+        report.stage("package_download");
+        let package = self
+            .download_artifact(&release.package, &manager.artifacts)
+            .await?;
+        let mut failures = Vec::new();
+        for selection in selections {
+            let (kind, id, sha) = match &selection {
+                RuntimeSelection::Bundled(r) => {
+                    ("bundled", r.id.as_str(), Some(r.artifact.sha256.as_str()))
+                }
+                RuntimeSelection::External { provider, .. } => ("external", provider.id(), None),
+                RuntimeSelection::Managed { provider } => ("managed", provider.id(), None),
+            };
+            report.provider(kind, id, sha);
+            let result = async {
+                let runtime_archive = if let RuntimeSelection::Bundled(runtime) = &selection {
+                    report.stage("runtime_download");
+                    Some(
+                        self.download_artifact(&runtime.artifact, &manager.artifacts)
+                            .await?,
+                    )
+                } else {
+                    None
+                };
+                manager
+                    .install_reported(
+                        release,
+                        &package,
+                        runtime_archive.as_deref(),
+                        selection,
+                        workspace,
+                        deadline,
+                        Some(report),
+                    )
+                    .await
+            }
+            .await;
+            report.provider_result(&result);
+            match result {
+                Ok(installed) => return Ok(installed),
+                Err(error) => {
+                    // If publication of state has started, don't try another provider
+                    // against a generation that may already be committed.
+                    if report.is_committing() {
+                        return Err(error);
+                    }
+                    failures.push(format!("{kind}/{id}: {error:#}"));
+                }
+            }
+        }
+        anyhow::bail!(
+            "all runtime providers failed for {}: {}",
+            release.release_id,
+            failures.join("; ")
+        )
+    }
+
     pub fn new(repository: MarketplaceRepository, cache_dir: impl Into<PathBuf>) -> Self {
         Self {
             repository,

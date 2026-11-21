@@ -6,10 +6,9 @@ use std::{
     collections::BTreeMap,
     fmt,
     path::{Component, Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
-use tokio::{process::Command, time::timeout};
+use tokio::process::Command;
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -202,6 +201,17 @@ impl RuntimeBundle {
         workspace_root: &Path,
         deadline: Duration,
     ) -> std::result::Result<(), RuntimeError> {
+        self.probe_reported(plugin_root, workspace_root, deadline, None)
+            .await
+    }
+
+    pub(crate) async fn probe_reported(
+        &self,
+        plugin_root: &Path,
+        workspace_root: &Path,
+        deadline: Duration,
+        report: Option<&mut super::diagnostics::Attempt>,
+    ) -> std::result::Result<(), RuntimeError> {
         let environment = RuntimeEnvironment {
             plugin_root: plugin_root.to_path_buf(),
             runtime_root: self.root.clone(),
@@ -209,12 +219,7 @@ impl RuntimeBundle {
             target: target_label(&self.manifest.target),
         };
         let mut command = Command::new(&self.probe);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_clear()
-            .current_dir(workspace_root);
+        command.env_clear().current_dir(workspace_root);
         for key in ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"] {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
@@ -223,16 +228,9 @@ impl RuntimeBundle {
         for (key, value) in environment.variables() {
             command.env(key, value);
         }
-        let output = timeout(deadline, command.output())
+        super::diagnostics::run(command, deadline, "runtime probe", report)
             .await
-            .map_err(|_| RuntimeError::ProbeFailed("probe timed out".into()))?
-            .map_err(|e| RuntimeError::ProbeFailed(e.to_string()))?;
-        if !output.status.success() {
-            return Err(RuntimeError::ProbeFailed(
-                String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            ));
-        }
-        Ok(())
+            .map_err(|error| RuntimeError::ProbeFailed(error.to_string()))
     }
 
     pub fn environment(&self, plugin_root: &Path, workspace_root: &Path) -> RuntimeEnvironment {

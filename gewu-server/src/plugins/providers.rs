@@ -5,6 +5,7 @@
 //! and a probe. Managed and external runtimes therefore reuse the existing
 //! `RuntimeBundle` validation, probe, and activation path.
 
+use super::diagnostics::{self, Attempt};
 use gewu_protocol::release::{ProbeSpec, RuntimeProvider, Target};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -12,10 +13,9 @@ use std::{
     fmt,
     io::ErrorKind,
     path::{Path, PathBuf},
-    process::Stdio,
     time::{Duration, Instant},
 };
-use tokio::{process::Command, time::timeout};
+use tokio::process::Command;
 
 #[derive(Debug)]
 pub enum ProviderError {
@@ -140,58 +140,56 @@ pub fn resolve_external(
     let RuntimeProvider::External { executable, .. } = provider else {
         return Err(ProviderError::Invalid("provider is not external".into()));
     };
-    if let Some(path) = override_path {
-        return is_executable(path)
-            .then(|| path.to_path_buf())
-            .ok_or_else(|| {
-                ProviderError::Unavailable(format!("{} is not executable", path.display()))
-            });
-    }
-    if let Some(name) = executable.env.as_deref()
+    let path = if let Some(path) = override_path {
+        path.to_path_buf()
+    } else if let Some(name) = executable.env.as_deref()
         && let Some(value) = std::env::var_os(name)
         && !value.is_empty()
     {
         let path = PathBuf::from(value);
-        if is_executable(&path) {
-            return Ok(path);
+        if !is_executable(&path) {
+            return Err(ProviderError::Unavailable(format!(
+                "${name} does not point at an executable"
+            )));
         }
+        path
+    } else {
+        executable
+            .commands
+            .iter()
+            .find_map(|command| find_command(command))
+            .ok_or_else(|| {
+                ProviderError::Unavailable(format!("none of {:?} is on PATH", executable.commands))
+            })?
+    };
+    if !is_executable(&path) {
         return Err(ProviderError::Unavailable(format!(
-            "${name} does not point at an executable"
+            "{} is not executable",
+            path.display()
         )));
     }
-    executable
-        .commands
-        .iter()
-        .find_map(|command| find_command(command))
-        .ok_or_else(|| {
-            ProviderError::Unavailable(format!("none of {:?} is on PATH", executable.commands))
-        })
+    std::path::absolute(path).map_err(|error| ProviderError::Invalid(error.to_string()))
 }
 
 /// Run the provider's probe against an interpreter before synthesizing a root.
 pub async fn probe_executable(executable: &Path, probe: &ProbeSpec) -> Result<(), ProviderError> {
+    probe_external_reported(executable, probe, None).await
+}
+
+pub(crate) async fn probe_external_reported(
+    executable: &Path,
+    probe: &ProbeSpec,
+    report: Option<&mut Attempt>,
+) -> Result<(), ProviderError> {
     let deadline = Duration::from_secs(probe.timeout_seconds.unwrap_or(120));
     let mut command = Command::new(executable);
-    command
-        .args(&probe.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear();
+    command.args(&probe.args).env_clear();
     for key in ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"] {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
         }
     }
-    let output = timeout(deadline, command.output())
-        .await
-        .map_err(|_| ProviderError::ProbeFailed("probe timed out".into()))?
-        .map_err(|error| ProviderError::ProbeFailed(error.to_string()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ProviderError::ProbeFailed(trim_message(&stderr)));
-    }
-    Ok(())
+    run_install(command, deadline, "external runtime probe", report).await
 }
 
 /// Materialize an external provider as a packed runtime root. The generated
@@ -210,8 +208,14 @@ pub fn synthesize_external(
     else {
         return Err(ProviderError::Invalid("provider is not external".into()));
     };
-    let binary = executable
-        .canonicalize()
+    if !is_executable(executable) {
+        return Err(ProviderError::Unavailable(format!(
+            "{} is not executable",
+            executable.display()
+        )));
+    }
+    // Dereferencing a venv's Python symlink selects base Python and loses its packages.
+    let binary = std::path::absolute(executable)
         .map_err(|error| ProviderError::Invalid(format!("cannot resolve executable: {error}")))?;
     write_runtime_root(
         root,
@@ -282,6 +286,15 @@ pub async fn install_managed(
     prefix: &Path,
     timeout_seconds: u64,
 ) -> Result<(), ProviderError> {
+    install_managed_reported(provider, prefix, timeout_seconds, None).await
+}
+
+pub(crate) async fn install_managed_reported(
+    provider: &RuntimeProvider,
+    prefix: &Path,
+    timeout_seconds: u64,
+    report: Option<&mut Attempt>,
+) -> Result<(), ProviderError> {
     let RuntimeProvider::Managed { manager, .. } = provider else {
         return Err(ProviderError::Invalid("provider is not managed".into()));
     };
@@ -295,7 +308,7 @@ pub async fn install_managed(
         .filter(|path| is_executable(path))
         .or_else(|| find_command("micromamba"))
         .ok_or_else(|| ProviderError::Unavailable("micromamba is not installed".into()))?;
-    install_managed_with_binary(provider, prefix, timeout_seconds, &binary).await
+    install_managed_with_binary(provider, prefix, timeout_seconds, &binary, report).await
 }
 
 async fn install_managed_with_binary(
@@ -303,6 +316,7 @@ async fn install_managed_with_binary(
     prefix: &Path,
     timeout_seconds: u64,
     binary: &Path,
+    mut report: Option<&mut Attempt>,
 ) -> Result<(), ProviderError> {
     let RuntimeProvider::Managed {
         manager,
@@ -349,7 +363,7 @@ async fn install_managed_with_binary(
         create.arg("--channel").arg(channel);
     }
     create.args(packages);
-    run_install(create, deadline, "micromamba create").await?;
+    run_install(create, deadline, "micromamba create", report.as_deref_mut()).await?;
     if !pip.is_empty() {
         let mut install = Command::new(binary);
         install
@@ -375,9 +389,9 @@ async fn install_managed_with_binary(
             install.arg("--extra-index-url").arg(extra);
         }
         install.args(pip);
-        run_install(install, deadline, "pip install").await?;
+        run_install(install, deadline, "pip install", report.as_deref_mut()).await?;
     }
-    probe_managed(&work, probe, deadline).await?;
+    probe_managed(&work, probe, deadline, report).await?;
     std::fs::write(work.join(".gewu-complete"), b"gewu managed runtime\n")
         .map_err(|error| ProviderError::Invalid(error.to_string()))?;
     std::fs::rename(&work, prefix).map_err(|error| {
@@ -390,6 +404,7 @@ async fn probe_managed(
     prefix: &Path,
     probe: &ProbeSpec,
     deadline: Duration,
+    report: Option<&mut Attempt>,
 ) -> Result<(), ProviderError> {
     let python = prefix.join("bin/python3");
     if !is_executable(&python) {
@@ -398,12 +413,7 @@ async fn probe_managed(
         ));
     }
     let mut command = Command::new(&python);
-    command
-        .args(&probe.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear();
+    command.args(&probe.args).env_clear();
     for key in ["HOME", "LANG", "LC_ALL", "TMPDIR"] {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
@@ -419,16 +429,7 @@ async fn probe_managed(
     if library.is_dir() {
         command.env("LD_LIBRARY_PATH", library);
     }
-    let output = timeout(deadline, command.output())
-        .await
-        .map_err(|_| ProviderError::ProbeFailed("managed runtime probe timed out".into()))?
-        .map_err(|error| ProviderError::ProbeFailed(error.to_string()))?;
-    if !output.status.success() {
-        return Err(ProviderError::ProbeFailed(trim_message(
-            &String::from_utf8_lossy(&output.stderr),
-        )));
-    }
-    Ok(())
+    run_install(command, deadline, "managed runtime probe", report).await
 }
 
 struct ManagedLock {
@@ -464,25 +465,14 @@ impl Drop for ManagedLock {
 }
 
 async fn run_install(
-    mut command: Command,
+    command: Command,
     deadline: Duration,
     what: &str,
+    report: Option<&mut Attempt>,
 ) -> Result<(), ProviderError> {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = timeout(deadline, command.output())
+    diagnostics::run(command, deadline, what, report)
         .await
-        .map_err(|_| ProviderError::ProbeFailed(format!("{what} timed out")))?
-        .map_err(|error| ProviderError::Unavailable(error.to_string()))?;
-    if !output.status.success() {
-        return Err(ProviderError::ProbeFailed(format!(
-            "{what} failed: {}",
-            trim_message(&String::from_utf8_lossy(&output.stderr))
-        )));
-    }
-    Ok(())
+        .map_err(|error| ProviderError::ProbeFailed(error.to_string()))
 }
 
 fn write_runtime_root(
@@ -574,17 +564,6 @@ fn quote_shell(value: &str) -> Result<String, ProviderError> {
     Ok(format!("'{}'", value.replace('\'', r"'\''")))
 }
 
-fn trim_message(value: &str) -> String {
-    let message = value.trim();
-    let mut chars = message.chars();
-    let clipped: String = chars.by_ref().take(400).collect();
-    if chars.next().is_some() {
-        format!("{clipped}…")
-    } else {
-        clipped
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,6 +630,84 @@ mod tests {
             resolve_external(&provider, None),
             Err(ProviderError::Unavailable(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_venv_keeps_its_packages_after_synthesis_and_cwd_change() {
+        let cwd = std::env::current_dir().unwrap();
+        let temp = tempfile::tempdir_in(&cwd).unwrap();
+        let venv = temp.path().join("venv with ' spaces");
+        let python = find_command("python3").unwrap();
+        let created = Command::new(&python)
+            .args(["-m", "venv", "--without-pip", "--symlinks"])
+            .arg(&venv)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let executable = venv.join("bin/python");
+        let installed = Command::new(&executable)
+            .args(["-c", "import pathlib,sysconfig; pathlib.Path(sysconfig.get_path('purelib'), 'gewu_venv_marker.py').write_text('value = 42')"])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let probe = ProbeSpec {
+            args: vec![
+                "-c".into(),
+                "import gewu_venv_marker; assert gewu_venv_marker.value == 42".into(),
+            ],
+            timeout_seconds: Some(10),
+        };
+        let provider = RuntimeProvider::External {
+            id: "venv-python".into(),
+            target: target(),
+            executable: ExecutableHint {
+                env: None,
+                commands: vec![],
+            },
+            probe: probe.clone(),
+            binaries: [("python".into(), "{executable}".into())].into(),
+        };
+        for (name, path) in [
+            ("absolute", executable.as_path()),
+            ("relative", executable.strip_prefix(&cwd).unwrap()),
+        ] {
+            let resolved = resolve_external(&provider, Some(path)).unwrap();
+            assert!(resolved.is_absolute());
+            probe_executable(&resolved, &probe).await.unwrap();
+            let root = temp.path().join(name);
+            synthesize_external(&root, "demo", "1.0.0", &target(), &provider, &resolved).unwrap();
+            let bundle =
+                crate::plugins::runtime::RuntimeBundle::load(&root, "demo", &target()).unwrap();
+            bundle
+                .probe(&root, temp.path(), Duration::from_secs(10))
+                .await
+                .unwrap();
+            for binary in ["launch", "python", "python3"] {
+                let output = Command::new(root.join("bin").join(binary))
+                    .args(&probe.args)
+                    .current_dir(temp.path())
+                    .env_clear()
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{name}/{binary}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
     }
 
     #[test]
@@ -725,7 +782,7 @@ mod tests {
             binaries: Default::default(),
         };
         let prefix = temp.path().join("runtime");
-        install_managed_with_binary(&provider, &prefix, 5, &manager)
+        install_managed_with_binary(&provider, &prefix, 5, &manager, None)
             .await
             .expect("micromamba must be allowed to create the prefix");
         assert!(prefix.join(".gewu-complete").is_file());
@@ -757,7 +814,7 @@ mod tests {
         };
         let prefix = temp.path().join("runtime");
         assert!(
-            install_managed_with_binary(&provider, &prefix, 2, &manager)
+            install_managed_with_binary(&provider, &prefix, 2, &manager, None)
                 .await
                 .is_err()
         );

@@ -163,10 +163,23 @@ impl Package {
 
     pub fn validate_settings(&self, settings: &Object) -> Result<()> {
         if let Some(schema) = &self.manifest.settings_schema {
-            validate(
-                &validator(&Value::Object(schema.clone()))?,
-                &Value::Object(settings.clone()),
-            )?;
+            let validator = validator(&Value::Object(schema.clone()))?;
+            let value = Value::Object(settings.clone());
+            if let Err(error) = validator.validate(&value) {
+                let path = error.instance_path().to_string();
+                let path = if path.is_empty() { "/" } else { &path };
+                // The generic validator message can include the user's settings values.
+                if let jsonschema::error::ValidationErrorKind::Required { property } = error.kind()
+                {
+                    anyhow::bail!(
+                        "invalid settings at {path}: missing required property {property}"
+                    );
+                }
+                anyhow::bail!(
+                    "invalid settings at {path}: check the plugin's settings schema ({})",
+                    error.schema_path()
+                );
+            }
         }
         Ok(())
     }

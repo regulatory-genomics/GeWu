@@ -2763,6 +2763,36 @@ async fn drive_connection(
                     continue;
                 }
 
+                // Marketplace installs can run for minutes while downloading
+                // or probing a runtime. Run them off the connection loop so a
+                // single install cannot block new sessions, prompts or other
+                // clients behind the global lifecycle lock.
+                if matches!(
+                    &request.op,
+                    Op::Plugin(gewu_protocol::plugin::HostAction::MarketplaceInstall { .. })
+                ) {
+                    let state = state.clone();
+                    let out = out.clone();
+                    let request_id = request.id.clone();
+                    let mut session = session.clone();
+                    tokio::spawn(async move {
+                        let mut running = None;
+                        let handled =
+                            handle_request(&state, &mut session, &mut running, request).await;
+                        let message = match handled {
+                            Ok(Handled::Reply(message)) => message,
+                            Ok(_) => return,
+                            Err(RequestError::Invalid(message))
+                            | Err(RequestError::Failed(message)) => ServerMessage::Error {
+                                id: Some(request_id),
+                                error: message,
+                            },
+                        };
+                        let _ = out.send(message.to_line()).await;
+                    });
+                    continue;
+                }
+
                 // An interrupt request aborts + awaits the running ask inside
                 // handle_request, so the agent lock is released before any
                 // further request is handled.

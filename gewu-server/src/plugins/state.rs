@@ -124,6 +124,17 @@ impl StateStore {
         generation: &GenerationState,
         stage: impl FnOnce(&Path) -> Result<()>,
     ) -> Result<PathBuf> {
+        let (destination, temporary) = self.prepare_generation(plugin, generation)?;
+        stage(temporary.path())?;
+        fs::rename(temporary.path(), &destination)?;
+        Ok(destination)
+    }
+
+    pub(crate) fn prepare_generation(
+        &self,
+        plugin: &str,
+        generation: &GenerationState,
+    ) -> Result<(PathBuf, tempfile::TempDir)> {
         let destination = self.generation_root(plugin, &generation.release_id)?;
         if destination.exists() {
             bail!(
@@ -136,9 +147,7 @@ impl StateStore {
         let temporary = tempfile::Builder::new()
             .prefix(".generation-")
             .tempdir_in(parent)?;
-        stage(temporary.path())?;
-        fs::rename(temporary.path(), &destination)?;
-        Ok(destination)
+        Ok((destination, temporary))
     }
 
     pub fn commit_active(
