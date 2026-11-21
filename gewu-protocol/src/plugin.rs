@@ -66,6 +66,9 @@ pub enum HostAction {
     ViewReady {
         view_id: String,
     },
+    RenewView {
+        view_id: String,
+    },
     FocusView {
         view_id: Option<String>,
     },
@@ -199,8 +202,18 @@ pub enum Placement {
     deny_unknown_fields
 )]
 pub enum ViewKind {
-    Webview { entry: String, state_schema: Object },
-    Builtin { renderer: Renderer },
+    Webview {
+        entry: String,
+        state_schema: Object,
+    },
+    Webapp {
+        service_id: String,
+        entry_path: String,
+        state_schema: Object,
+    },
+    Builtin {
+        renderer: Renderer,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -424,6 +437,7 @@ pub struct ServiceEndpoint {
 #[serde(rename_all = "snake_case")]
 pub enum HttpProtocol {
     Http,
+    Websocket,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

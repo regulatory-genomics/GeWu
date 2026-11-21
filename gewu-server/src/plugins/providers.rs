@@ -184,6 +184,7 @@ pub(crate) async fn probe_external_reported(
     let deadline = Duration::from_secs(probe.timeout_seconds.unwrap_or(120));
     let mut command = Command::new(executable);
     command.args(&probe.args).env_clear();
+    command.env("GEWU_PLUGIN_HOST_FEATURES", "plugin-websocket");
     for key in ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"] {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);

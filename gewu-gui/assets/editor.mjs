@@ -30,7 +30,7 @@ export async function editor(container, request, resource) {
   container.append(input, save, status);
 }
 
-export function preview(container, url, resource) {
+export function preview(container, url, resource, resolveUrl) {
   const mime = resource.mimeType ?? '';
   let element;
   if (mime.startsWith('image/')) {
@@ -42,6 +42,25 @@ export function preview(container, url, resource) {
     if (mime === 'text/html' || /\.html?$/i.test(resource.uri)) element.setAttribute('sandbox','');
   }
   if (element) {
+    if (resolveUrl && (mime.startsWith('video/') || mime.startsWith('audio/'))) {
+      let resolving = false, refreshed = false;
+      element.addEventListener('loadedmetadata', () => {refreshed = false;});
+      element.addEventListener('error', async () => {
+        if (resolving || refreshed || !element.isConnected) return;
+        resolving = true; refreshed = true;
+        const time = element.currentTime, playing = !element.paused;
+        try {
+          const next = await resolveUrl();
+          if (!element.isConnected) return;
+          element.addEventListener('loadedmetadata', () => {
+            if (Number.isFinite(time)) element.currentTime = Math.min(time, element.duration || time);
+            if (playing) element.play().catch(() => {});
+          }, {once:true});
+          element.src = next;
+        } catch (error) { container.append(node('p', `Could not refresh media: ${error.message}`)); }
+        finally {resolving = false;}
+      });
+    }
     element.src = url;
     element.referrerPolicy = 'no-referrer';
     container.append(element);
@@ -49,6 +68,14 @@ export function preview(container, url, resource) {
   const download = node('a','Download');
   download.href = url;
   download.download = decodeURIComponent(resource.uri.split('/').at(-1));
+  if (resolveUrl) download.addEventListener('click', async event => {
+    event.preventDefault();
+    try {
+      const next = await resolveUrl(), link = node('a');
+      link.href = next; link.download = download.download;
+      document.body.append(link); link.click(); link.remove();
+    } catch (error) {container.append(node('p', `Could not download: ${error.message}`));}
+  });
   container.append(download);
 }
 

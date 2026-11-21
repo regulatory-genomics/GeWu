@@ -1,4 +1,5 @@
 import {bindFrame} from './plugin-bridge.mjs';
+import {bindAppFrame} from './plugin-app-bridge.mjs';
 import {button, changes, editor, node, preview} from './editor.mjs';
 
 export const dismissedKey = (scope) => `gewu.dismissed.v1:${JSON.stringify([scope.workspace, scope.session_id ?? scope.id])}`;
@@ -217,7 +218,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
       disposed = true;
       return release();
     };
-    if (view.kind === 'webview') panel.reload = async () => {
+    if (view.kind === 'webview' || view.kind === 'webapp') panel.reload = async () => {
       panel.reload = null;
       render();
       await panel.dispose();
@@ -235,11 +236,13 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
       const detach = () => request({action: 'detach', viewId}).catch(() => {});
       if (disposed) { detach(); return; }
       release = detach;
-      if (view.kind === 'webview') {
+      if (view.kind === 'webview' || view.kind === 'webapp') {
         const frame = node('iframe');
         frame.title = view.title;
         panel.content.append(frame);
-        const local = bindFrame(frame, binding.url, async () => {
+        const bind = view.kind === 'webapp' ? bindAppFrame : bindFrame;
+        const renewal = view.kind === 'webapp' ? setInterval(() => request({action:'renew_view',viewId}).catch(error=>fail(panel.content,error)),60000) : null;
+        const local = bind(frame, view.kind === 'webapp' ? binding : binding.url, async () => {
           const context = await request({action: 'view_ready', viewId});
           if (!disposed) {
             panel.viewId = viewId;
@@ -251,17 +254,37 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
           callTool: ({tool, args}) => request({action: 'call', instanceId: instance.id, viewId, tool, args}),
           resolveResource: ({resource}) => request({action: 'resource', instanceId: instance.id, viewId, resource}),
           openResource: ({resource}) => { openResultResource(instance, resource); return {opened: true}; },
+          downloadResource: async ({resource}) => {
+            const {url}=await request({action:'resource',instanceId:instance.id,viewId,resource});
+            const link=document.createElement('a');link.href=url;link.download=resource.uri.split('/').at(-1)||'artifact';document.body.append(link);link.click();link.remove();return {downloaded:true};
+          },
           publishContext: ({summary}) => request({action: 'publish_context', viewId, summary}),
           saveState: async ({state: next}) => { const saved = await request({action: 'save_state', viewId, state: next}); write(stateKey(scope, instance, view), saved); return saved; },
           requestService: ({serviceId, path, method}) => request({action: 'service', viewId, serviceId, path, method}),
           getCall: ({callId}) => request({action: 'call_status', callId}),
           cancelCall: ({callId}) => request({action: 'cancel', callId}),
+          maximize: () => {const maximized=root.classList.toggle('plugin-workspace-maximized');return {maximized};},
+          pickFiles: ({accept,multiple}) => new Promise((resolve,reject)=>{
+            if(typeof accept!=='string'||accept.length>80||!/^[.a-zA-Z0-9,]+$/.test(accept)){reject(Error('Invalid file type filter'));return;}
+            const input=document.createElement('input');input.type='file';input.accept=accept;input.multiple=!!multiple;input.hidden=true;root.append(input);
+            input.oncancel=()=>{input.remove();resolve({files:[]});};
+            input.onchange=async()=>{
+              try{
+                const chosen=[...input.files];if(chosen.length>8||chosen.some(f=>f.size>32*1024*1024))throw Error('Choose at most 8 files, each no larger than 32 MiB');
+                const files=await Promise.all(chosen.map(file=>new Promise((done,fail)=>{const reader=new FileReader();reader.onerror=()=>fail(Error('Could not read file'));reader.onload=()=>done({name:file.name,base64:reader.result.split(',')[1]});reader.readAsDataURL(file);})));resolve({files});
+              }catch(error){reject(error);}finally{input.remove();}
+            };
+            input.click();
+          }),
         }, (error) => fail(panel.content, error));
-        release = () => { local(); return detach(); };
+        release = () => { clearInterval(renewal); local(); return detach(); };
       } else if (view.renderer === 'diff') await changes(panel.content, request);
       else if (!resource) throw Error('Select a content resource before opening this view.');
       else if (view.renderer === 'text') await editor(panel.content, request, resource);
-      else preview(panel.content, (await request({action: 'resource', instanceId: instance.id, resource})).url, resource);
+      else {
+        const resolveUrl = async () => (await request({action:'resource',instanceId:instance.id,resource})).url;
+        preview(panel.content,await resolveUrl(),resource,resolveUrl);
+      }
     } catch (error) { if (!disposed) fail(panel.content, error); }
   }
 
@@ -274,7 +297,8 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
     active = id;
     render();
     onShow?.();
-    request({action: 'resource', instanceId: instance.id, resource}).then(({url}) => preview(panel.content, url, resource)).catch((error) => fail(panel.content, error));
+    const resolveUrl = async () => (await request({action:'resource',instanceId:instance.id,resource})).url;
+    resolveUrl().then(url => preview(panel.content,url,resource,resolveUrl)).catch((error) => fail(panel.content,error));
   }
 
   async function agentResult(resultId) {
@@ -591,8 +615,8 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
   }
 
   function primaryView(instance) {
-    return instance.views?.find((v) => v.kind === 'webview' && v.placement === 'main')
-      ?? instance.views?.find((v) => v.kind === 'webview');
+    return instance.views?.find((v) => ['webview','webapp'].includes(v.kind) && v.placement === 'main')
+      ?? instance.views?.find((v) => ['webview','webapp'].includes(v.kind));
   }
 
   /// Reconcile open tabs with the live instances. This only attaches and
@@ -784,10 +808,10 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
     for (const item of instance.views ?? []) {
       if (primary && item.id === primary.id) continue;
       row.append(button(item.title, () => {
-        const resource = item.kind !== 'webview' && item.renderer !== 'diff'
+        const resource = item.kind === 'builtin' && item.renderer !== 'diff'
           ? promptResource(`Workspace content path for ${item.title}`, item.resourceTypes?.[0])
           : undefined;
-        if (item.kind === 'webview' || item.renderer === 'diff' || resource) {
+        if (item.kind === 'webview' || item.kind === 'webapp' || item.renderer === 'diff' || resource) {
           openView(instance, item, resource).catch((error) => fail(view, error));
         }
       }));

@@ -1,4 +1,5 @@
 mod actions;
+mod app_sessions;
 pub mod artifacts;
 pub mod builtin;
 mod changes;
@@ -39,6 +40,7 @@ pub struct PluginHost {
     next_generation: AtomicU64,
     limits: Limits,
     resources: Arc<resources::Resources>,
+    apps: Arc<app_sessions::Apps>,
     calls: Arc<Mutex<actions::Calls>>,
     editor: changes::Editor,
     store: Option<gewu_core::types::SessionState>,
@@ -131,7 +133,7 @@ impl PluginHost {
         self
     }
     pub fn data_router(&self) -> axum::Router {
-        self.resources.router()
+        self.resources.router().merge(self.apps.router())
     }
 
     pub fn from_config(

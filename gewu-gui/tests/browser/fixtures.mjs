@@ -1,5 +1,5 @@
 import {once} from 'node:events';
-import {createServer as createHttp} from 'node:http';
+import {createServer as createHttp, request as httpRequest} from 'node:http';
 import {createServer as createTcp} from 'node:net';
 import {spawn} from 'node:child_process';
 import {cp, mkdtemp, readFile, mkdir, rm, writeFile} from 'node:fs/promises';
@@ -14,7 +14,7 @@ async function port() {
   const {port}=server.address(); server.close(); await once(server,'close'); return port;
 }
 
-export async function startFixture({packagePath, settings = {}, useDemo = !packagePath, disabled = false, marketplace} = {}) {
+export async function startFixture({packagePath, settings = {}, useDemo = !packagePath, disabled = false, marketplace, appOrigins = false, respond} = {}) {
   const temp=await mkdtemp(join(process.env.GEWU_TEST_TMP ?? process.env.TMPDIR ?? '/tmp','gewu-addon-'));
   const root=join(temp,'workspace');
   const other=join(temp,'other');
@@ -29,26 +29,40 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
     const chunks=[];
     for await (const chunk of req) chunks.push(chunk);
     const body=Buffer.concat(chunks).toString();
+    const pathname=new URL(req.url,'http://fixture').pathname;
+    if(appOrigins && pathname==='/native/app') {
+      res.writeHead(200,{'content-type':'text/html','content-security-policy':`frame-ancestors ${req.headers['x-gewu-parent-origin']}`}).end('<!doctype html><body>Connecting…<script type="module" src="/native/app.mjs"></script>');return;
+    }
+    if(appOrigins && pathname==='/native/app.mjs') {
+      res.writeHead(200,{'content-type':'text/javascript'}).end(`const b=JSON.parse(sessionStorage.getItem('gewu.app.binding'));window.addEventListener('message',e=>{if(e.source===parent&&e.origin===b.parentOrigin&&e.data?.type==='gewu.view.bound'&&e.ports.length===1)document.body.textContent='Native application connected';});parent.postMessage({type:'gewu.view.ready',viewId:b.viewId,nonce:b.nonce},b.parentOrigin);`);return;
+    }
+    if(appOrigins && pathname==='/native/range') {res.writeHead(206,{'content-type':'video/mp4','content-range':'bytes 1-3/6','accept-ranges':'bytes'}).end('bcd');return;}
+    if(appOrigins && pathname==='/native/conditional') {
+      const unchanged=req.headers['x-demo-key']==='native-secret'&&req.headers['if-none-match']==='"current"';
+      res.writeHead(unchanged?304:412,{'etag':'"current"'}).end();return;
+    }
     if (req.url === '/native/events') {
       if (req.headers['x-demo-key'] !== 'native-secret') {res.writeHead(401).end();return;}
       nativeStream=res;
       res.writeHead(200,{'content-type':'text/event-stream'}).write('data: first\n\n');
       return;
     }
-    if (req.url === '/native/echo') {
+    if (pathname === '/native/echo') {
       if (req.headers['x-demo-key'] !== 'native-secret') {res.writeHead(401).end();return;}
       if (req.headers.authorization || req.headers.cookie) {res.writeHead(400).end();return;}
-      res.writeHead(200,{'content-type':'text/plain','set-cookie':'private=1'}).end(`Native service: ${JSON.parse(body).value}`);
+      res.writeHead(200,{'content-type':'text/plain','set-cookie':'private=1','etag':'"next"'}).end(`Native service: ${JSON.parse(body).value}`);
       return;
     }
     if (req.url !== '/v1/chat/completions') {res.writeHead(404).end();return;}
     const turn=JSON.parse(body);
     requests.push(turn);
+    if(respond) {await respond(turn,res);return;}
     const plugin=turn.tools?.find(t=>t.function.name.startsWith('plg_demo_echo_'));
     const openTool=turn.tools?.find(t=>t.function.name==='plugin_open');
-    const lastUser=turn.messages.reduce((index,message,current) => message.role === 'user' ? current : index, -1);
+    const humanUser=message=>message.role==='user'&&!(Array.isArray(message.content)&&/^Tool(?: '[^']*')? returned additional media:/.test(message.content[0]?.text??''));
+    const lastUser=turn.messages.reduce((index,message,current) => humanUser(message) ? current : index, -1);
     const afterTool=lastUser >= 0 && turn.messages.slice(lastUser + 1).some(m=>m.role==='tool');
-    const userMessages=turn.messages.filter(m=>m.role==='user');
+    const userMessages=turn.messages.filter(humanUser);
     const askedMessage=userMessages.at(-1);
     const asked=typeof askedMessage?.content==='string'
       ? askedMessage.content
@@ -57,7 +71,7 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
     res.writeHead(200,{'content-type':'text/event-stream'});
     // Any plugin conformance spec can say `call <tool> <json>`; the agent, not
     // the browser, is the surface that names plugin tools.
-    const askedCall = /^call\s+(\S+)\s+(\{[\s\S]*\})$/.exec(asked.trim());
+    const askedCall = /^call\s+(\S+)\s+(\{[^\n]*\})$/m.exec(asked.trim());
     if (askedCall && !afterTool) {
       const name = turn.tools?.find(t => t.function.name === askedCall[1]
         || t.function.name.endsWith(`.${askedCall[1]}`)
@@ -110,7 +124,7 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
   const serve=()=>start(['serve','--llm-config',config,'--db-path',join(temp,'test.db'),'--ws-port',`${socket}`,'--tcp-port',`${tcp}`,'--http-port',`${http}`]);
   let server=serve();
   let guiChild;
-  const url=`http://127.0.0.1:${gui}`;
+  const url=`http://${appOrigins ? 'gui.gewu.localhost' : '127.0.0.1'}:${gui}`;
   const stop=async()=>{
     for (const child of [guiChild,server]) {
       if (!child?.pid || child.exitCode!==null || child.signalCode!==null) continue;
@@ -129,9 +143,12 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
   for (let i=0;i<150;i++) {
     try {
       await fetch(`http://127.0.0.1:${http}/ready`,{signal:AbortSignal.timeout(150)});
-      guiChild ??= start(['gui','--port',`${gui}`,'--server',`ws://127.0.0.1:${socket}`,'--server-http',`http://127.0.0.1:${http}`]);
-      const response=await fetch(`${url}/api/config`,{signal:AbortSignal.timeout(150)});
-      if (response.ok) return;
+       guiChild ??= start(['gui','--port',`${gui}`,'--server',`ws://127.0.0.1:${socket}`,'--server-http',`http://127.0.0.1:${http}`,...(appOrigins?['--public-origin',url,'--plugin-app-origin-template',`http://{view}.apps.gewu.localhost:${gui}`]:[])]);
+       const status=await new Promise((resolve,reject)=>{
+         const req=httpRequest({hostname:'127.0.0.1',port:gui,path:'/api/config',headers:appOrigins?{Host:`gui.gewu.localhost:${gui}`}:{},timeout:150},res=>{res.resume();resolve(res.statusCode);});
+         req.on('error',reject);req.on('timeout',()=>req.destroy(Error('GUI probe timed out')));req.end();
+       });
+       if (status===200) return;
     } catch {}
     if (server.exitCode!==null || (guiChild && guiChild.exitCode!==null)) break;
     await new Promise(resolve=>setTimeout(resolve,50));

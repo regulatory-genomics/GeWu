@@ -228,6 +228,7 @@ impl RuntimeBundle {
         for (key, value) in environment.variables() {
             command.env(key, value);
         }
+        command.env("GEWU_PLUGIN_HOST_FEATURES", "plugin-websocket");
         super::diagnostics::run(command, deadline, "runtime probe", report)
             .await
             .map_err(|error| RuntimeError::ProbeFailed(error.to_string()))

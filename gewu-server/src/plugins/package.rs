@@ -138,6 +138,9 @@ impl Package {
                 );
                 validator(&Value::Object(state_schema.clone()))?;
             }
+            if let ViewKind::Webapp { state_schema, .. } = &view.kind {
+                validator(&Value::Object(state_schema.clone()))?;
+            }
         }
         if let Some(schema) = &manifest.settings_schema {
             validator(&Value::Object(schema.clone()))?;

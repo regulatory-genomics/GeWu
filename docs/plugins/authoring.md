@@ -2,6 +2,40 @@
 
 Ship a `plugin.json`, an executable declared by `backend.config.entry`, optional static assets under `web/`, and the app's normal dependencies. Use the [v1 protocol](protocol-v1.md); Rust can use `gewu_protocol::plugin` and Python can vendor `sdk/python/gewu_plugin.py` into the staged package. That helper has no third-party runtime dependencies. Launch native programs with explicit argv. The host starts the adapter in the workspace with a minimal environment (`PATH`, `HOME`, locale and temp settings); resolve credentials before activation and pass app-specific settings explicitly. Do not return credentials in public results, descriptions, progress, or saved state.
 
+## Browser-native application views
+
+`webview` runs a plugin's own static page in an opaque-origin frame. A whole web
+application that needs its own origin — its own API, `Range` media, SSE or a
+service worker — declares `kind: "webapp"` instead:
+
+```json
+{"id":"studio","title":"Studio","kind":"webapp","placement":"main",
+ "serviceId":"studio","entryPath":"/","resourceTypes":["example.project"],
+ "stateSchema":{"type":"object"}}
+```
+
+- `serviceId` must be an HTTP `serviceEndpoints` entry from `activate`;
+  `entryPath` is an origin-relative path and may not carry a query, fragment,
+  backslash or `..` segment.
+- On attach the host returns `app.relayPath`, `app.relayKey` and `app.entryPath`
+  in the host-only attach result. The GUI turns that into a browser URL on the
+  configured application origin; the relay key and the service's private headers
+  never reach the model or the page.
+- The operator configures the origins:
+  `gewu gui --public-origin https://gewu.example.com --plugin-app-origin-template 'https://{view}.apps.gewu.example.com'`.
+  Remote deployments require HTTPS and same-site origins; `{view}` must be the
+  whole first hostname label. Local development can use
+  `http://gui.gewu.localhost:8430` and `http://{view}.apps.gewu.localhost:8430`.
+- The page boots from `/_gewu/bootstrap`, exchanges the one-time fragment
+  credential for a host-only `HttpOnly` cookie, then hides in the view's own
+  origin. The bridge handshake (`gewu.view.ready` → `gewu.view.bound`) checks the
+  exact origin, view id and a per-attach nonce; state, selection and `callTool`
+  work as in a webview.
+- Only the current project's routes are reachable through the relay: static
+  assets, the project API, previews/media, history, registry and events. Desktop
+  launch, share/publish, other projects and the GUI's own socket/config are not.
+
+
 ## Browser bridge
 
 Load the application in GeWu's opaque-origin frame. After the view JS is ready, call `parent.postMessage({type:'gewu.view.ready'}, '*')`. Listen for `type:'gewu.view.bound'` from `parent` with precisely one transferred `MessagePort`; it includes `context` (`workspaceId`, `instanceId`, `viewId`, `viewEpoch`, `bindingResource`, `resource`, `binding`, `state`). `binding` is private adapter data returned by `view.attach`, provided only to the bound view. `view.detach` is optional. Both tools must have `exposeToAgent:false` and accept `{}`; the metadata is in CallContext.

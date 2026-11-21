@@ -102,3 +102,142 @@ async fn tickets_stream_ranges_and_expire_when_instance_closes() {
     assert_eq!(client.get(&url).send().await.unwrap().status(), 404);
     server.abort();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn websocket_ticket_is_one_use_and_live_stream_is_revoked_on_detach() {
+    use axum::{
+        Router, extract::ws::WebSocketUpgrade, http::HeaderMap, response::IntoResponse,
+        routing::get,
+    };
+    use futures::{SinkExt, StreamExt};
+    use gewu_protocol::plugin::{HostAction, HttpMethod};
+    use gewu_server::plugins::{PluginHost, package::PluginEntry, stdio::Limits};
+    use serde_json::json;
+    use std::{collections::BTreeMap, path::Path, time::Duration};
+    let native = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", native.local_addr().unwrap());
+    let echo = Router::new().route(
+        "/native/screen",
+        get(|headers: HeaderMap, ws: WebSocketUpgrade| async move {
+            assert_eq!(headers["x-demo-key"], "native-secret");
+            ws.on_upgrade(|mut stream| async move {
+                while let Some(Ok(msg)) = stream.recv().await {
+                    if stream.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .into_response()
+        }),
+    );
+    let native_task = tokio::spawn(axum::serve(native, echo).into_future());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("workspace");
+    let package = tmp.path().join("package");
+    std::fs::create_dir_all(package.join("web")).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plugin-adapter");
+    for f in ["plugin.json", "adapter.py", "web/index.html"] {
+        std::fs::copy(fixture.join(f), package.join(f)).unwrap();
+    }
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../sdk/python/gewu_plugin.py"),
+        package.join("gewu_plugin.py"),
+    )
+    .unwrap();
+    let host = PluginHost::from_config(
+        &BTreeMap::from([(
+            "demo".into(),
+            PluginEntry {
+                package,
+                enabled: true,
+                settings: json!({"service":origin,"serviceProtocol":"websocket"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                workspace_settings: Default::default(),
+                service_origins: vec![],
+                sources: Default::default(),
+            },
+        )]),
+        None,
+        Limits::default(),
+    )
+    .unwrap();
+    let instance = host.open("demo", "w", &root, None).await.unwrap();
+    let attached = host
+        .action(
+            "w",
+            &root,
+            "s",
+            HostAction::Attach {
+                instance_id: instance.activation.instance_id.clone(),
+                view_type: "demo-view".into(),
+                resource: None,
+            },
+        )
+        .await
+        .unwrap();
+    let view = attached["viewId"].as_str().unwrap().to_owned();
+    host.action(
+        "w",
+        &root,
+        "s",
+        HostAction::ViewReady {
+            view_id: view.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let ticket = host
+        .action(
+            "w",
+            &root,
+            "s",
+            HostAction::Service {
+                view_id: view.clone(),
+                service_id: "native".into(),
+                path: "/native/screen".into(),
+                method: HttpMethod::Get,
+            },
+        )
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "ws://{}{}",
+        listener.local_addr().unwrap(),
+        ticket["url"].as_str().unwrap()
+    );
+    let server = tokio::spawn(axum::serve(listener, host.data_router()).into_future());
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Declared WebSocket service must upgrade");
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        vec![0, 1, 255, 4].into(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        ws.next().await.unwrap().unwrap().into_data().as_ref(),
+        &[0, 1, 255, 4]
+    );
+    assert!(
+        tokio_tungstenite::connect_async(&url).await.is_err(),
+        "Consumed ticket must not reconnect"
+    );
+    host.action("w", &root, "s", HostAction::Detach { view_id: view })
+        .await
+        .unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("Detach must revoke an existing stream");
+    assert!(match ended {
+        Some(Ok(m)) => m.is_close(),
+        _ => true,
+    });
+    host.close_all().await.unwrap();
+    server.abort();
+    native_task.abort();
+}

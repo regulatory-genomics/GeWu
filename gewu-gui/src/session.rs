@@ -229,6 +229,8 @@ pub struct GuiSession {
     /// Workflow run currently shown in the zoom panel, if any.
     zoom: Option<ZoomTarget>,
     downloads: Arc<DownloadTickets>,
+    apps: Arc<crate::plugin_apps::AppGateway>,
+    app_owner: crate::plugin_apps::AppOwner,
     tab_tx: Option<mpsc::UnboundedSender<TabEvent>>,
     /// Replies produced by background plugin requests. They are written from
     /// the connection loop so the WebSocket sink has one owner.
@@ -250,6 +252,7 @@ impl GuiSession {
         version: &str,
         updates: watch::Receiver<Option<gewu_update::Update>>,
         downloads: Arc<DownloadTickets>,
+        apps: Arc<crate::plugin_apps::AppGateway>,
     ) -> Result<Self> {
         let admin = endpoint
             .connect_with_token(server_token)
@@ -337,6 +340,8 @@ impl GuiSession {
 
         let update = updates.borrow().clone();
         Ok(Self {
+            app_owner: apps.owner(),
+            apps,
             endpoint: endpoint.clone(),
             server_token: server_token.map(str::to_string),
             version: version.to_string(),
@@ -998,7 +1003,28 @@ impl GuiSession {
                         .expect("known tab")
                         .workspace
                         .clone();
-                    self.client(tab).expect("ensured").plugin(ws, plugin).await
+                    let mut result = self
+                        .client(tab)
+                        .expect("ensured")
+                        .plugin(ws.clone(), plugin)
+                        .await
+                        .map_err(anyhow::Error::from)?;
+                    if attaching {
+                        if let Err(error) = self.apps.bind(&self.app_owner, &mut result) {
+                            if let Some(id) = result["viewId"].as_str() {
+                                let _ = self
+                                    .client(tab)
+                                    .expect("ensured")
+                                    .plugin(ws, HostAction::Detach { view_id: id.into() })
+                                    .await;
+                            }
+                            return Err(error);
+                        }
+                    }
+                    if let Some(id) = &detaching {
+                        self.apps.unbind(&self.app_owner, id);
+                    }
+                    Ok::<_, anyhow::Error>(result)
                 }
                 .await;
                 if let Ok(result) = &response

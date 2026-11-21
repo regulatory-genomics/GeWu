@@ -568,6 +568,19 @@ impl PluginHost {
                     }
                     _ => None,
                 };
+                let app = if let ViewKind::Webapp {
+                    service_id,
+                    entry_path,
+                    ..
+                } = &declared.kind
+                {
+                    Some(
+                        self.apps
+                            .create(&instance, &active, &id, service_id, entry_path)?,
+                    )
+                } else {
+                    None
+                };
                 let mut state = self.calls.lock().unwrap();
                 state.views.retain(|_, v| !v.instance.adapter.is_closed());
                 ensure!(state.views.len() < 1024, "too many open views");
@@ -583,7 +596,17 @@ impl PluginHost {
                         selection: None,
                     },
                 );
-                Ok(json!({"viewId":id,"viewEpoch":instance.activation.generation,"url":url}))
+                let mut result =
+                    json!({"viewId":id,"viewEpoch":instance.activation.generation,"url":url});
+                if let Some(app) = app {
+                    result["app"] = app;
+                }
+                Ok(result)
+            }
+            HostAction::RenewView { view_id } => {
+                self.view(workspace, owner, &view_id)?;
+                self.apps.renew(&view_id)?;
+                Ok(json!({"renewed":true}))
             }
             HostAction::ViewReady { view_id } => {
                 let view = self.view(workspace, owner, &view_id)?;
@@ -656,8 +679,10 @@ impl PluginHost {
                     .iter()
                     .find(|v| v.id == view.view_type)
                     .unwrap();
-                let ViewKind::Webview { state_schema, .. } = &declared.kind else {
-                    anyhow::bail!("view has no state schema");
+                let state_schema = match &declared.kind {
+                    ViewKind::Webview { state_schema, .. }
+                    | ViewKind::Webapp { state_schema, .. } => state_schema,
+                    _ => anyhow::bail!("view has no state schema"),
                 };
                 let value = Value::Object(state);
                 ensure!(

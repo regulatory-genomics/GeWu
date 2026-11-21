@@ -8,23 +8,28 @@ use anyhow::{Context, Result, ensure};
 use axum::{
     Router,
     body::Body,
-    extract::{Path as AxPath, State},
+    extract::{
+        Path as AxPath, State,
+        ws::{Message, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection},
+    },
     http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::any,
 };
-use gewu_protocol::plugin::{HttpMethod, ResourceRef, Source};
+use futures::{SinkExt, StreamExt};
+use gewu_protocol::plugin::{HttpMethod, HttpProtocol, ResourceRef, Source};
 use reqwest::Url;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_tungstenite::tungstenite::{Message as NativeMessage, client::IntoClientRequest};
 use uuid::Uuid;
 
 const TTL: Duration = Duration::from_secs(120);
@@ -34,6 +39,7 @@ const DOCUMENT_CSP: &str = "sandbox; default-src 'none'; style-src 'self' 'unsaf
 #[derive(Default)]
 pub(crate) struct Resources {
     tickets: Mutex<HashMap<Uuid, Ticket>>,
+    active_streams: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -42,6 +48,18 @@ struct Ticket {
     expires: Instant,
     instance: Weak<Instance>,
     view: Option<Weak<AtomicBool>>,
+}
+
+impl Ticket {
+    fn active(&self) -> bool {
+        self.instance
+            .upgrade()
+            .is_some_and(|i| !i.adapter.is_closed())
+            && self.view.as_ref().is_none_or(|v| {
+                v.upgrade()
+                    .is_some_and(|active| active.load(Ordering::Acquire))
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -56,6 +74,10 @@ enum Data {
     Service {
         url: Url,
         method: Method,
+        headers: HeaderMap,
+    },
+    Websocket {
+        url: Url,
         headers: HeaderMap,
     },
 }
@@ -204,16 +226,21 @@ impl Resources {
             );
             headers.insert(name, value.parse()?);
         }
-        self.mint(
-            instance,
-            view,
-            Data::Service {
+        let target = match endpoint.protocol {
+            HttpProtocol::Http => Data::Service {
                 url,
                 method,
                 headers,
             },
-            "resource",
-        )
+            HttpProtocol::Websocket => {
+                ensure!(
+                    view.is_some() && method == Method::GET,
+                    "WebSocket services require an attached view and GET"
+                );
+                Data::Websocket { url, headers }
+            }
+        };
+        self.mint(instance, view, target, "resource")
     }
 
     pub async fn resolve(
@@ -282,6 +309,7 @@ fn content_type(path: &Path) -> String {
 async fn fetch(
     State(state): State<Arc<Resources>>,
     AxPath((id, path)): AxPath<(String, String)>,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
     method: Method,
     headers: HeaderMap,
     body: Body,
@@ -290,16 +318,54 @@ async fn fetch(
         return StatusCode::NOT_FOUND.into_response();
     };
     let ticket = state.tickets.lock().unwrap().get(&id).cloned();
-    let Some(ticket) = ticket.filter(|t| {
-        t.expires > Instant::now()
-            && t.instance.upgrade().is_some_and(|i| !i.adapter.is_closed())
-            && t.view.as_ref().is_none_or(|v| {
-                v.upgrade()
-                    .is_some_and(|active| active.load(Ordering::Acquire))
-            })
-    }) else {
+    let Some(ticket) = ticket.filter(|t| t.expires > Instant::now() && t.active()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if let Data::Websocket {
+        url,
+        headers: private,
+    } = &ticket.target
+    {
+        if path != "resource" || method != Method::GET {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let Ok(upgrade) = upgrade else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        if state.active_streams.fetch_add(1, Ordering::AcqRel) >= 32 {
+            state.active_streams.fetch_sub(1, Ordering::AcqRel);
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+        let slot = StreamSlot(state.clone());
+        if state.tickets.lock().unwrap().remove(&id).is_none() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let mut url = url.clone();
+        let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
+        if url.set_scheme(scheme).is_err() {
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+        let Ok(mut request) = url.as_str().into_client_request() else {
+            return StatusCode::BAD_GATEWAY.into_response();
+        };
+        request.headers_mut().extend(private.clone());
+        let upstream = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_tungstenite::connect_async(request),
+        )
+        .await;
+        let Ok(Ok((upstream, _))) = upstream else {
+            return StatusCode::BAD_GATEWAY.into_response();
+        };
+        return upgrade
+            .max_message_size(8 * 1024 * 1024)
+            .max_frame_size(8 * 1024 * 1024)
+            .on_upgrade(move |browser| async move {
+                let _slot = slot;
+                relay(browser, upstream, ticket).await;
+            })
+            .into_response();
+    }
     let assets = matches!(ticket.target, Data::Assets(_));
     let result = if method == Method::OPTIONS {
         StatusCode::NO_CONTENT.into_response()
@@ -351,6 +417,40 @@ async fn fetch(
         }
     };
     with_headers(result, assets)
+}
+
+struct StreamSlot(Arc<Resources>);
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        self.0.active_streams.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+async fn relay(
+    mut browser: WebSocket,
+    mut upstream: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    ticket: Ticket,
+) {
+    let mut revoke = tokio::time::interval(Duration::from_millis(100));
+    loop {
+        tokio::select! {
+            _=revoke.tick()=>{if !ticket.active(){break;}},
+            value=browser.recv()=>{
+                let Some(Ok(value))=value else {break;};
+                let value=match value {Message::Text(v)=>NativeMessage::Text(v.to_string().into()),Message::Binary(v)=>NativeMessage::Binary(v),Message::Ping(v)=>NativeMessage::Ping(v),Message::Pong(v)=>NativeMessage::Pong(v),Message::Close(_)=>break};
+                if !matches!(tokio::time::timeout(Duration::from_secs(5),upstream.send(value)).await,Ok(Ok(()))){break;}
+            },
+            value=upstream.next()=>{
+                let Some(Ok(value))=value else {break;};
+                let value=match value {NativeMessage::Text(v)=>Message::Text(v.to_string().into()),NativeMessage::Binary(v)=>Message::Binary(v),NativeMessage::Ping(v)=>Message::Ping(v),NativeMessage::Pong(v)=>Message::Pong(v),NativeMessage::Close(_)=>break,NativeMessage::Frame(_)=>continue};
+                if !matches!(tokio::time::timeout(Duration::from_secs(5),browser.send(value)).await,Ok(Ok(()))){break;}
+            }
+        }
+    }
+    let _ = browser.close().await;
+    let _ = upstream.close(None).await;
 }
 
 fn with_headers(mut response: Response, assets: bool) -> Response {

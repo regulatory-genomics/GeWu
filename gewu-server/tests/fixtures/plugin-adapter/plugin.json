@@ -5,7 +5,7 @@
   "title": "Demo adapter",
   "scope": "workspace",
   "backend": {"connector": "gewu-stdio", "config": {"entry": "adapter.py"}},
-  "settingsSchema": {"type":"object", "properties":{"service":{"type":"string"}}, "additionalProperties":false},
+  "settingsSchema": {"type":"object", "properties":{"service":{"type":"string"},"serviceProtocol":{"enum":["http","websocket"]}}, "additionalProperties":false},
   "views":[
     {"id":"demo-view","title":"Demo View","kind":"webview","placement":"main","entry":"web/index.html","resourceTypes":["demo.view"],"stateSchema":{"type":"object","properties":{"saved":{"type":"boolean"}},"additionalProperties":false}},
     {"id":"source","title":"Source","kind":"builtin","placement":"sidebar","renderer":"text","resourceTypes":["demo.source"]}

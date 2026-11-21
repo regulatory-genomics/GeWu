@@ -280,8 +280,23 @@ impl Tool for PluginTool {
                 let live = || host.active_for_session(workspace, root, Some(session));
                 let data = match kind {
                     Gateway::List => {
-                        host.action(workspace, root, session, HostAction::List)
-                            .await?
+                        let mut catalog = host
+                            .action(workspace, root, session, HostAction::List)
+                            .await?;
+                        if let Some(instances) = catalog["instances"].as_array_mut() {
+                            for instance in instances {
+                                if let Some(tools) = instance["tools"].as_array_mut() {
+                                    *tools = tools
+                                        .iter()
+                                        .filter(|tool| tool["exposeToAgent"] == true)
+                                        .filter_map(|tool| {
+                                            tool["name"].as_str().map(|name| json!(name))
+                                        })
+                                        .collect();
+                                }
+                            }
+                        }
+                        catalog
                     }
                     Gateway::Open => {
                         let resource = args
