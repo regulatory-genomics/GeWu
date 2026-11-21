@@ -4,6 +4,12 @@
 
 GeWu ships the official Ed25519 public key and the public catalog:
 
+For the quickest setup, choose **Install** in Marketplace or use the exact
+release's **Copy install instructions** action. The default instructions run
+the signed Marketplace installer with `--runtime auto`, then require a plugin
+check and one real operation. Source-building instructions are under
+**Advanced → Install from source**.
+
 ```sh
 gewu plugin search manimble
 gewu plugin info manimble --version 0.2.0
@@ -48,6 +54,24 @@ materialized as the same `runtime.json` + launcher + probe layout a packed
 runtime uses, so verification and rollback are unchanged. The resolved provider,
 executable or prefix, target, and probe result are recorded in
 `plugins/state.json`.
+
+External discovery is bounded to the explicit `--executable`, the provider's
+declared environment hint, and its declared command names on PATH/user bin
+directories. It does not scan all virtual environments. An activated venv is
+usable through PATH; for a different environment, supply its interpreter:
+
+```sh
+gewu plugin marketplace-install gewu-browser --version 0.1.2 --channel stable \
+  --runtime auto --executable /absolute/path/to/venv/bin/python
+```
+
+The wrapper keeps the selected interpreter path, including venv symlinks,
+instead of replacing it with the base Python executable. Keep that environment
+in place while using the plugin. Auto falls back to the next declared provider
+if the external environment fails its probe; explicit `--runtime external`
+reports the failure instead. The Browser plan recipe uses external then bundled
+and checks actual headless page rendering and PNG capture without network
+access. Older signed release plans retain their own declared order.
 
 Managed installations never modify your system Python or conda base. GeWu
 creates a prefix under its own installation root. Set `GEWU_MICROMAMBA` to
@@ -104,6 +128,32 @@ gewu plugin check tachyon --probe --workspace /path/to/workspace --settings sett
 
 `install` copies the package into a host-owned generation and records it in
 `~/.gewu/plugins/state.json`. It does not execute the application.
+
+For source installation, follow the pinned application's guide to stage the
+adapter and bind its runtime **before** this command. `plugin install` does not
+discover or download dependencies, and the host starts adapters with a minimal
+environment. Use a compatible existing runtime first; build an isolated one
+only for missing dependencies. Do not compile the runtime's applications from
+source unless that is explicitly needed.
+
+For Browser, its source tree supplies both the SDK helper and a local staging
+command (run from the pinned checkout's `browser/` directory):
+
+```sh
+python3 scripts/stage.py --out /absolute/path/to/new-staged-package \
+  --python /absolute/path/to/venv/bin/python
+gewu plugin install /absolute/path/to/new-staged-package
+gewu plugin check gewu-browser --version 0.1.2 --probe \
+  --workspace /absolute/path/to/workspace --session installation-check
+```
+
+Pass `--browsers /absolute/path/to/cache` to staging when using a non-default
+Playwright cache. This binds host-local paths in the launcher, not in a
+redistributable release. The source handoff must stop with a specific blocker
+if a different plugin's pinned guide provides no supported runtime-binding path.
+After CLI installation restart a running GeWu, open the plugin and verify one
+real page/document/render/export operation. `check --probe` alone verifies the
+adapter lifecycle, not the final application output.
 
 ## From downloaded release archives
 

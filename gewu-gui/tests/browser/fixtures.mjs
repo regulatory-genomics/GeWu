@@ -14,7 +14,7 @@ async function port() {
   const {port}=server.address(); server.close(); await once(server,'close'); return port;
 }
 
-export async function startFixture({packagePath, settings = {}, useDemo = !packagePath, disabled = false} = {}) {
+export async function startFixture({packagePath, settings = {}, useDemo = !packagePath, disabled = false, marketplace} = {}) {
   const temp=await mkdtemp(join(process.env.GEWU_TEST_TMP ?? process.env.TMPDIR ?? '/tmp','gewu-addon-'));
   const root=join(temp,'workspace');
   const other=join(temp,'other');
@@ -72,6 +72,9 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
     } else if (openTool && asked.includes('open the demo') && !afterTool) {
       send({role:'assistant',tool_calls:[{index:0,id:'open-1',type:'function',function:{name:openTool.function.name,arguments:'{"pluginId":"demo"}'}}]});
       send({},'tool_calls');
+    } else if (asked.includes('concurrency probe')) {
+      send({role:'assistant',content:'session responsive while installing'});
+      send({},'stop');
     } else if (plugin && !afterTool) {
       send({role:'assistant',tool_calls:[{index:0,id:'echo-1',type:'function',function:{name:plugin.function.name,arguments:'{"evidence":"adapter evidence"}'}}]});
       send({},'tool_calls');
@@ -87,44 +90,62 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
   const config=join(temp,'config.json');
   await writeFile(config,JSON.stringify({
     model:'local/fixture',endpoints:{local:{base_url:`${origin}/v1`,api_key:'test-only',models:{fixture:{provider:'openai-compatible'}}}},
-    workspaces:{other},plugins:{[manifest.id]:{package:pkg,enabled:!disabled,settings:useDemo ? {service:origin} : settings}},
+    workspaces:{other},plugins:marketplace ? {} : {[manifest.id]:{package:pkg,enabled:!disabled,settings:useDemo ? {service:origin} : settings}},
   }));
   const [socket,tcp,http,gui]=await Promise.all([port(),port(),port(),port()]);
   let output='';
   // A private HOME keeps ~/.gewu/plugins out of the workspace's inventory.
   const env={...process.env,HOME:temp,GEWU_GUI_TOKEN:'',GEWU_SERVE_TOKEN:'',NO_PROXY:'127.0.0.1,localhost',no_proxy:'127.0.0.1,localhost'};
   for (const key of ['OPENAI_MODEL','GEWU_PROVIDER','OPENAI_API_KEY','OPENAI_BASE_URL','OPENAI_ENDPOINT']) delete env[key];
+  if (marketplace) {
+    Object.assign(env, await marketplace({temp, pkg}));
+    delete env.GEWU_MARKETPLACE_ASSET_ORIGIN;
+  }
   const start=(args)=>{
     const child=spawn(binary,['--no-update-check',...args],{cwd:root,env,stdio:['ignore','pipe','pipe']});
     child.on('error',err=>{output+=err.message;});
     for (const channel of [child.stdout,child.stderr]) channel.on('data',data=>{output=(output+data).slice(-24000);});
     return child;
   };
-  const server=start(['serve','--llm-config',config,'--db-path',join(temp,'test.db'),'--ws-port',`${socket}`,'--tcp-port',`${tcp}`,'--http-port',`${http}`]);
+  const serve=()=>start(['serve','--llm-config',config,'--db-path',join(temp,'test.db'),'--ws-port',`${socket}`,'--tcp-port',`${tcp}`,'--http-port',`${http}`]);
+  let server=serve();
   let guiChild;
   const url=`http://127.0.0.1:${gui}`;
-  const close=async()=>{
+  const stop=async()=>{
     for (const child of [guiChild,server]) {
       if (!child?.pid || child.exitCode!==null || child.signalCode!==null) continue;
       const exit=once(child,'exit'); child.kill('SIGINT');
       const kill=setTimeout(()=>child.kill('SIGKILL'),6500);
       await exit; clearTimeout(kill);
     }
+  };
+  const close=async()=>{
+    await stop();
     provider.closeAllConnections();
     await new Promise(resolve=>provider.close(resolve));
     await rm(temp,{recursive:true,force:true});
   };
+  const ready=async()=>{
   for (let i=0;i<150;i++) {
     try {
       await fetch(`http://127.0.0.1:${http}/ready`,{signal:AbortSignal.timeout(150)});
       guiChild ??= start(['gui','--port',`${gui}`,'--server',`ws://127.0.0.1:${socket}`,'--server-http',`http://127.0.0.1:${http}`]);
       const response=await fetch(`${url}/api/config`,{signal:AbortSignal.timeout(150)});
-      if (response.ok) return {url,close,root,other,packagePath:pkg,requests,log:()=>output,manifest, finishNativeStream:()=>nativeStream.end('data: done\n\n')};
+      if (response.ok) return;
     } catch {}
     if (server.exitCode!==null || (guiChild && guiChild.exitCode!==null)) break;
     await new Promise(resolve=>setTimeout(resolve,50));
   }
-  await close(); throw Error(`GeWu fixture could not start:\n${output}`);
+  throw Error(`GeWu fixture could not start:\n${output}`);
+  };
+  try { await ready(); } catch (error) { await close(); throw error; }
+  const restart=async()=>{
+    await stop();
+    guiChild=undefined;
+    server=serve();
+    await ready();
+  };
+  return {url,close,restart,root,other,home:temp,start,packagePath:pkg,requests,log:()=>output,manifest, finishNativeStream:()=>nativeStream.end('data: done\n\n')};
 }
 
 /// The files sidebar starts closed and remembers being opened, so a reload

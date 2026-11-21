@@ -230,12 +230,16 @@ pub struct GuiSession {
     zoom: Option<ZoomTarget>,
     downloads: Arc<DownloadTickets>,
     tab_tx: Option<mpsc::UnboundedSender<TabEvent>>,
+    /// Replies produced by background plugin requests. They are written from
+    /// the connection loop so the WebSocket sink has one owner.
+    out_tx: Option<mpsc::UnboundedSender<ServerMsg>>,
 }
 
 enum Incoming {
     Socket(Option<Result<Message, axum::Error>>),
     Tab(Option<TabEvent>),
     Update(bool),
+    Out(Option<ServerMsg>),
 }
 
 impl GuiSession {
@@ -352,6 +356,7 @@ impl GuiSession {
             zoom: None,
             downloads,
             tab_tx: None,
+            out_tx: None,
         })
     }
 
@@ -362,6 +367,8 @@ impl GuiSession {
         // Keep a sender alive so `tab_rx.recv()` only yields real events.
         let _tab_keepalive = tab_tx.clone();
         self.tab_tx = Some(tab_tx.clone());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMsg>();
+        self.out_tx = Some(out_tx);
 
         match self.admin.ping().await {
             Ok(()) => self.note_active("connected"),
@@ -411,6 +418,7 @@ impl GuiSession {
             let incoming = tokio::select! {
                 message = receiver.next() => Incoming::Socket(message),
                 event = tab_rx.recv() => Incoming::Tab(event),
+                reply = out_rx.recv() => Incoming::Out(reply),
                 changed = self.updates.changed(), if updates_live => Incoming::Update(changed.is_ok()),
             };
 
@@ -445,6 +453,10 @@ impl GuiSession {
                         self.send_error(&mut sender, e.to_string()).await?;
                     }
                 }
+                Incoming::Out(Some(message)) => {
+                    send_msg(&mut sender, &message).await?;
+                }
+                Incoming::Out(None) => break,
                 Incoming::Update(true) => {
                     self.update = self.updates.borrow().clone();
                     send_msg(
@@ -940,6 +952,38 @@ impl GuiSession {
                 plugin,
             } => {
                 use gewu_protocol::plugin::HostAction;
+                if matches!(&plugin, HostAction::MarketplaceInstall { .. }) {
+                    self.ensure_session(tab).await?;
+                    let ws = self
+                        .workspace
+                        .tab(tab)
+                        .expect("known tab")
+                        .workspace
+                        .clone();
+                    let session_id = self
+                        .workspace
+                        .tab(tab)
+                        .and_then(|tab| tab.model.session_id.clone());
+                    let client = self.client(tab).expect("ensured");
+                    let out = self
+                        .out_tx
+                        .clone()
+                        .context("GUI connection has no reply channel")?;
+                    tokio::spawn(async move {
+                        let response = client.plugin(ws, plugin).await;
+                        let (result, error) = match response {
+                            Ok(result) => (Some(result), None),
+                            Err(error) => (None, Some(error.to_string())),
+                        };
+                        let _ = out.send(ServerMsg::Plugin {
+                            request,
+                            result,
+                            error,
+                            session_id,
+                        });
+                    });
+                    return Ok(());
+                }
                 let attaching = matches!(&plugin, HostAction::Attach { .. });
                 let detaching = if let HostAction::Detach { view_id } = &plugin {
                     Some(view_id.clone())
