@@ -417,6 +417,7 @@ pub struct ServiceEndpoint {
 #[serde(rename_all = "snake_case")]
 pub enum HttpProtocol {
     Http,
+    Websocket,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

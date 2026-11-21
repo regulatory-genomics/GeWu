@@ -8,7 +8,7 @@ def activate(params):
         {"name": name, "description": name.capitalize() + " in the fixture", "group": "workflow" if name == "workflow_echo" else "workspace", "inputSchema": {"type": "object", "properties": {"value": {"type": "integer"}}},
          "outputSchema": {"type": "object", "properties": {"value": {"type": "integer"}}}, "exposeToAgent": True, "effect": "read", "target": "view" if name == "view_echo" else "backend"}
         for name in ("echo", "wait", "make_file", "bad_output", "workflow_echo", "view_echo")
-    ], "serviceEndpoints": [{"id":"native","baseUrl":service,"protocol":"http", "headers":{"x-demo-key":"native-secret"},"routes":[{"pathPrefix":"/native","methods":["GET","POST"]}]}] if service else []}
+    ], "serviceEndpoints": [{"id":"native","baseUrl":service,"protocol":params['settings'].get('serviceProtocol','http'), "headers":{"x-demo-key":"native-secret"},"routes":[{"pathPrefix":"/native","methods":["GET","POST"]}]}] if service else []}
 
 
 def call(tool, args, context, control):

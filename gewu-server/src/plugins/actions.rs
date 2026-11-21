@@ -1030,7 +1030,7 @@ impl PluginHost {
                 Ok(index) => Ok(index),
                 // A previously verified snapshot is still usable offline; the
                 // expiry and artifact digests are checked on every use.
-                Err(_) => client.load_cached(),
+                Err(refresh_error) => client.load_cached().map_err(|_| refresh_error),
             }
         } else {
             client.load_cached()
