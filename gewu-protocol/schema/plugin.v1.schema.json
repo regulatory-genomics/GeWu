@@ -51,7 +51,7 @@
     "ToolDefinition": {"type":"object","additionalProperties":false,"required":["name","description","inputSchema","outputSchema","exposeToAgent","effect","target"],"properties":{
       "name":{"$ref":"#/$defs/ToolName"},"description":{"$ref":"#/$defs/String"},"group":{"type":"string","pattern":"^[a-z][a-z0-9-]{0,63}$"},"inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"exposeToAgent":{"type":"boolean"},"effect":{"enum":["read","write"]},"target":{"enum":["backend","view"]}}},
     "ServiceEndpoint": {"type":"object","additionalProperties":false,"required":["id","baseUrl","protocol"],"properties":{
-      "id":{"$ref":"#/$defs/Id"},"baseUrl":{"type":"string","pattern":"^https?://[^/?#@\\s]+/?$"},"protocol":{"const":"http"},"headers":{"type":"object","additionalProperties":{"type":"string"}},
+      "id":{"$ref":"#/$defs/Id"},"baseUrl":{"type":"string","pattern":"^https?://[^/?#@\\s]+/?$"},"protocol":{"enum":["http","websocket"]},"headers":{"type":"object","additionalProperties":{"type":"string"}},
       "routes":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["pathPrefix","methods"],"properties":{
         "pathPrefix":{"type":"string","pattern":"^/(?!/)[^?#]*$"},"methods":{"type":"array","minItems":1,"uniqueItems":true,"items":{"enum":["GET","HEAD","POST","PUT","DELETE","PATCH"]}}}}}}},
     "Activated": {"type":"object","additionalProperties":false,"required":["tools","serviceEndpoints"],"properties":{

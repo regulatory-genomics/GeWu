@@ -113,6 +113,7 @@ impl RuntimeBundle {
             }
         }
         for (key, value) in environment.variables() { command.env(key, value); }
+        command.env("GEWU_PLUGIN_HOST_FEATURES", "plugin-websocket");
         let output = timeout(deadline, command.output()).await.map_err(|_| RuntimeError::ProbeFailed("probe timed out".into()))?
             .map_err(|e| RuntimeError::ProbeFailed(e.to_string()))?;
         if !output.status.success() {

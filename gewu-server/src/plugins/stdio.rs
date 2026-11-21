@@ -80,6 +80,7 @@ impl Adapter {
         limits: Limits,
     ) -> Result<(Self, Activated)> {
         command
+            .env("GEWU_PLUGIN_HOST_FEATURES", "plugin-websocket")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

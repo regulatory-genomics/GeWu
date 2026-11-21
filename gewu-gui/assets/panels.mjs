@@ -140,11 +140,29 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
           callTool: ({tool, args}) => request({action: 'call', instanceId: instance.id, viewId, tool, args}),
           resolveResource: ({resource}) => request({action: 'resource', instanceId: instance.id, viewId, resource}),
           openResource: ({resource}) => { openResultResource(instance, resource); return {opened: true}; },
+          downloadResource: async ({resource}) => {
+            const {url}=await request({action:'resource',instanceId:instance.id,viewId,resource});
+            const result=await fetch(url);if(!result.ok)throw Error('Artifact download failed');
+            const object=URL.createObjectURL(await result.blob()),link=document.createElement('a');link.href=object;link.download=resource.uri.split('/').at(-1)||'artifact';document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(object),30000);return {downloaded:true};
+          },
           publishContext: ({summary}) => request({action: 'publish_context', viewId, summary}),
           saveState: async ({state: next}) => { const saved = await request({action: 'save_state', viewId, state: next}); write(stateKey(scope, instance, view), saved); return saved; },
           requestService: ({serviceId, path, method}) => request({action: 'service', viewId, serviceId, path, method}),
           getCall: ({callId}) => request({action: 'call_status', callId}),
           cancelCall: ({callId}) => request({action: 'cancel', callId}),
+          maximize: () => {const maximized=root.classList.toggle('plugin-workspace-maximized');return {maximized};},
+          pickFiles: ({accept,multiple}) => new Promise((resolve,reject)=>{
+            if(typeof accept!=='string'||accept.length>80||!/^[.a-zA-Z0-9,]+$/.test(accept)){reject(Error('Invalid file type filter'));return;}
+            const input=document.createElement('input');input.type='file';input.accept=accept;input.multiple=!!multiple;input.hidden=true;root.append(input);
+            input.oncancel=()=>{input.remove();resolve({files:[]});};
+            input.onchange=async()=>{
+              try{
+                const chosen=[...input.files];if(chosen.length>8||chosen.some(f=>f.size>32*1024*1024))throw Error('Choose at most 8 files, each no larger than 32 MiB');
+                const files=await Promise.all(chosen.map(file=>new Promise((done,fail)=>{const reader=new FileReader();reader.onerror=()=>fail(Error('Could not read file'));reader.onload=()=>done({name:file.name,base64:reader.result.split(',')[1]});reader.readAsDataURL(file);})));resolve({files});
+              }catch(error){reject(error);}finally{input.remove();}
+            };
+            input.click();
+          }),
         }, (error) => fail(panel.content, error));
         release = () => { local(); return detach(); };
       } else if (view.renderer === 'diff') await changes(panel.content, request);
