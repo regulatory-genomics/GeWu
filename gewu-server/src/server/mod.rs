@@ -6440,7 +6440,9 @@ mod tests {
 
     #[tokio::test]
     async fn list_tools_answers_from_snapshot_while_ask_runs() {
-        let state = server_state_with(TestLlm::tool_call());
+        // Slow first provider call keeps the ask observably in-flight while
+        // list_tools is handled.
+        let state = server_state_with(TestLlm::slow_tool_call());
         let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
 
         // The first ask creates the connection session (explore profile has
@@ -6453,13 +6455,21 @@ mod tests {
         assert_eq!(ready["type"], "ready");
 
         // Ask is now running; list_tools must still answer promptly from
-        // the session snapshot instead of blocking on the agent lock.
+        // the session snapshot instead of blocking on the agent lock. Event
+        // frames from the running ask may interleave before the reply.
         in_tx
             .send(r#"{"id": 2, "op": "list_tools"}"#.to_string())
             .await
             .unwrap();
-        let tools = recv_json(&mut out_rx).await;
-        assert_eq!(tools["type"], "tools");
+        let mut tools = None;
+        for _ in 0..10 {
+            let msg = recv_json(&mut out_rx).await;
+            if msg["type"] == "tools" {
+                tools = Some(msg);
+                break;
+            }
+        }
+        let tools = tools.expect("tools reply while ask running");
         assert_eq!(tools["id"], 2);
         assert!(
             tools["tools"]
