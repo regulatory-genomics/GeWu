@@ -1,6 +1,17 @@
 use super::*;
 use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
 
+fn acquire_after_fork<T>(mut operation: impl FnMut() -> anyhow::Result<T>) -> T {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match operation() {
+            Ok(value) => return value,
+            Err(error) if std::time::Instant::now() >= deadline => panic!("{error:#}"),
+            Err(_) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+}
+
 #[test]
 fn a_plugin_mutation_lock_blocks_a_concurrent_uninstall() {
     let temp = tempfile::tempdir().unwrap();
@@ -21,10 +32,11 @@ fn a_plugin_mutation_lock_blocks_a_concurrent_uninstall() {
         })
         .unwrap();
     store.commit_active("demo", generation, "stable").unwrap();
-    let held = store.lock_plugin_mutation("demo").unwrap();
+    // Parallel adapter tests can briefly inherit a lock fd between fork and exec.
+    let held = acquire_after_fork(|| store.lock_plugin_mutation("demo"));
     assert!(store.uninstall("demo").is_err());
     drop(held);
-    store.uninstall("demo").unwrap();
+    acquire_after_fork(|| store.uninstall("demo"));
 }
 
 #[tokio::test]
