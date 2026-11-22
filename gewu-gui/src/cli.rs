@@ -37,6 +37,14 @@ pub struct Cli {
     )]
     pub server_http: String,
 
+    /// Browser-facing GUI origin, paired with --plugin-app-origin-template.
+    #[arg(long, env = "GEWU_GUI_PUBLIC_ORIGIN")]
+    pub public_origin: Option<String>,
+
+    /// Isolated Studio origin, e.g. https://{view}.apps.example.com.
+    #[arg(long, env = "GEWU_PLUGIN_APP_ORIGIN_TEMPLATE")]
+    pub plugin_app_origin_template: Option<String>,
+
     /// Shared token required for browser connections (also GEWU_GUI_TOKEN)
     #[arg(long, env = "GEWU_GUI_TOKEN")]
     pub token: Option<String>,

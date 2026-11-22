@@ -98,6 +98,8 @@ pub async fn run(args: UpArgs) -> Result<()> {
         port: args.gui_port,
         server: server_url.clone(),
         server_http: format!("http://{}:{}", args.host, http_port),
+        public_origin: std::env::var("GEWU_GUI_PUBLIC_ORIGIN").ok(),
+        plugin_app_origin_template: std::env::var("GEWU_PLUGIN_APP_ORIGIN_TEMPLATE").ok(),
         token: args.gui_token.clone(),
         server_token: token.clone(),
         allow_anonymous: args.allow_anonymous,

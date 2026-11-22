@@ -12,6 +12,8 @@
 
 pub mod cli;
 mod download;
+mod plugin_apps;
+mod plugins;
 mod protocol;
 mod server;
 mod session;
@@ -121,7 +123,36 @@ pub async fn run_with_updates(
         }
     }
 
-    let url = browser_url(&cli.host, local.port());
+    let local_default = cli.public_origin.is_none()
+        && cli.plugin_app_origin_template.is_none()
+        && matches!(local.ip().to_string().as_str(), "127.0.0.1" | "::1");
+    let url = cli.public_origin.clone().unwrap_or_else(|| {
+        browser_url(
+            if local_default {
+                "gui.gewu.localhost"
+            } else {
+                &cli.host
+            },
+            local.port(),
+        )
+    });
+    // The app cookie is SameSite=Strict: the GUI and per-view origin must share gewu.localhost.
+    let template =
+        local_default.then(|| format!("http://{{view}}.apps.gewu.localhost:{}", local.port()));
+    let mut apps = plugin_apps::AppGateway::configure(
+        cli.public_origin
+            .as_deref()
+            .or(local_default.then_some(url.as_str())),
+        cli.plugin_app_origin_template
+            .as_deref()
+            .or(template.as_deref()),
+    )?;
+    if local_default {
+        apps = apps.with_local_aliases(vec![
+            local.to_string(),
+            format!("localhost:{}", local.port()),
+        ]);
+    }
     info!("gewu-gui listening on {url}");
     info!("upstream server: {}", endpoint.display());
     if token.is_some() {
@@ -141,6 +172,7 @@ pub async fn run_with_updates(
         .context("failed to build the download HTTP client")?;
 
     let state = AppState {
+        apps: Arc::new(apps),
         endpoint,
         version,
         updates: update_rx,
