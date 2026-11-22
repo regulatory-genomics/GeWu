@@ -61,9 +61,22 @@ pub fn validator(schema: &Value) -> Result<jsonschema::Validator> {
 }
 
 pub fn validate(validator: &jsonschema::Validator, value: &Value) -> Result<()> {
-    validator
-        .validate(value)
-        .map_err(|err| anyhow!("schema validation failed at {}", err.instance_path()))
+    validator.validate(value).map_err(|err| {
+        // Report the constraint, not the rejected value (settings may contain credentials).
+        let hint = match err.kind() {
+            jsonschema::error::ValidationErrorKind::Pattern { pattern } => {
+                format!("expected pattern {pattern}")
+            }
+            jsonschema::error::ValidationErrorKind::Required { property } => {
+                format!("missing required field {property}")
+            }
+            _ => format!("expected constraint {}", err.schema_path()),
+        };
+        anyhow!(
+            "schema validation failed at {}: {hint}",
+            err.instance_path()
+        )
+    })
 }
 
 pub fn wire_validator(definition: &str) -> Result<jsonschema::Validator> {

@@ -84,6 +84,23 @@ impl PluginHost {
         }
         let mut names: HashSet<_> = existing.iter().map(|t| t.name().to_owned()).collect();
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let protocol: Value = serde_json::from_str(SCHEMA).expect("embedded plugin schema");
+        let mut resource_schema = protocol["$defs"]["ResourceRef"].clone();
+        // Inline ResourceRef's scalar definitions so provider tool schemas need no external refs.
+        for property in resource_schema["properties"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            let reference = property["$ref"].as_str().unwrap();
+            *property = protocol.pointer(&reference[1..]).unwrap().clone();
+        }
+        resource_schema["properties"]["uri"]["description"] = json!(
+            "Existing path relative to workspaceRoot, using workspace:/// and percent-encoding spaces; e.g. workspace:///demo-scene.svg. Do not use file:// or an absolute filesystem path."
+        );
+        resource_schema["properties"]["type"]["description"] = json!(
+            "Use the matching resourceTypes entry from plugin_list views, e.g. inkscape.document."
+        );
         for (kind, name, description, properties, required) in [
             (
                 Gateway::List,
@@ -95,8 +112,8 @@ impl PluginHost {
             (
                 Gateway::Open,
                 "plugin_open",
-                "Open a configured application in this workspace and show it in the Preview panel. Resource-scoped plugins need a bindingResource.",
-                json!({"pluginId":{"type":"string"},"bindingResource":{"type":"object"}}),
+                "Open a configured application and show it in Preview. Call plugin_list to discover pluginId, scope and resourceTypes. Resource-scoped plugins require bindingResource, e.g. {\"uri\":\"workspace:///demo-scene.svg\",\"type\":\"inkscape.document\"}; create the file/directory first. Omit bindingResource for session/workspace-scoped plugins such as gewu-browser. Use the returned id with plugin_describe and plugin_call.",
+                json!({"pluginId":{"type":"string"},"bindingResource":resource_schema}),
                 json!(["pluginId"]),
             ),
             (
@@ -109,7 +126,7 @@ impl PluginHost {
             (
                 Gateway::Describe,
                 "plugin_describe",
-                "Read input/output schemas for an exposed tool in an active application instance.",
+                "Read input/output schemas for a tool listed by an already-open application. instanceId must be an actual id from plugin_open or plugin_list. This does not describe host tools such as plugin_open.",
                 json!({"instanceId":{"type":"string"},"tool":{"type":"string"}}),
                 json!(["instanceId", "tool"]),
             ),
@@ -335,7 +352,7 @@ impl Tool for PluginTool {
                             .into_iter()
                             .find(|i| i.activation.instance_id == id)
                             .ok_or_else(|| {
-                                anyhow::anyhow!("plugin instance is not ready in this workspace")
+                                anyhow::anyhow!("plugin instance is not ready in this workspace; call plugin_open or plugin_list and use an actual returned instance id, then choose a tool from that instance's tools list")
                             })?;
                         if matches!(kind, Gateway::Call) {
                             if args.get("async").and_then(Value::as_bool) == Some(true) {
