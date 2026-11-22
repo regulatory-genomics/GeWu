@@ -140,6 +140,10 @@ pub struct Config {
     pub sandbox: PathEnforcement,
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
+    #[serde(default)]
+    pub plugins: BTreeMap<String, crate::plugins::package::PluginEntry>,
+    #[serde(rename = "pluginHost", default)]
+    pub plugin_host: crate::plugins::stdio::Limits,
     /// User-defined agents keyed by name; spawnable via the `task` tool.
     #[serde(default)]
     pub agents: BTreeMap<String, AgentEntry>,

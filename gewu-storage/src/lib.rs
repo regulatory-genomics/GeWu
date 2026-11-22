@@ -536,28 +536,34 @@ async fn memory_table_exists(pool: &SqlitePool) -> Result<bool> {
 
 /// List persisted conversation sessions, newest first.
 ///
-/// Sessions are derived from the `memory_messages` table, so a session exists
-/// once it has at least one stored message. Subagent sessions recorded via
+/// Sessions start with a stored message or a persisted application binding.
+/// Subagent sessions recorded via
 /// [`record_subagent_session`] are excluded: they belong to their parent
 /// conversation, not the session list.
 pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<gewu_protocol::SessionSummary>> {
     session_agent(pool, "").await?;
     ensure_subagents(pool).await?;
+    ensure_session_state(pool).await?;
     if !memory_table_exists(pool).await? {
         return Ok(Vec::new());
     }
     let rows = sqlx::query(
         r#"
-        SELECT
-            memory_messages.session_id,
-            COALESCE((SELECT agent FROM session_agents WHERE session_agents.session_id = memory_messages.session_id), 'build') AS agent,
-            COUNT(*) AS message_count,
-            datetime(MAX(memory_messages.created_at), 'unixepoch', 'localtime') AS updated_at
-        FROM memory_messages
-        LEFT JOIN subagent_sessions ON subagent_sessions.session_id = memory_messages.session_id
+        WITH activity AS (
+            SELECT session_id, COUNT(*) AS message_count, MAX(created_at) AS time
+            FROM memory_messages GROUP BY session_id
+            UNION ALL
+            SELECT session_id, 0, CAST(value AS INTEGER) FROM session_state WHERE key = 'gewu.plugin.session'
+        )
+        SELECT activity.session_id,
+            COALESCE((SELECT agent FROM session_agents WHERE session_agents.session_id = activity.session_id), 'build') AS agent,
+            SUM(activity.message_count) AS message_count,
+            datetime(MAX(activity.time), 'unixepoch', 'localtime') AS updated_at
+        FROM activity
+        LEFT JOIN subagent_sessions ON subagent_sessions.session_id = activity.session_id
         WHERE subagent_sessions.session_id IS NULL
-        GROUP BY memory_messages.session_id
-        ORDER BY MAX(memory_messages.created_at) DESC, memory_messages.session_id ASC
+        GROUP BY activity.session_id
+        ORDER BY MAX(activity.time) DESC, activity.session_id ASC
         "#,
     )
     .fetch_all(pool)
@@ -900,6 +906,63 @@ mod tests {
     use super::*;
     use gewu_core::types::{ContentPart, Message};
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn plugin_session_restores_without_chat_and_deletes_cleanly() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        SqliteMemory::new(pool.clone(), "app-only".into()).await?;
+        let store = SqliteSessionStateStore::new(pool.clone());
+        store
+            .save("app-only", "gewu.plugin.session", "123".into())
+            .await?;
+        let sessions = list_sessions(&pool).await?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "app-only");
+        assert_eq!(sessions[0].message_count, 0);
+        assert_eq!(delete_session(&pool, "app-only").await?, 0);
+        assert!(list_sessions(&pool).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plugin_session_markers_do_not_double_count_chat_or_expose_subagents() -> Result<()> {
+        use gewu_core::traits::Memory;
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        let mut memory = SqliteMemory::new(pool.clone(), "chat".into()).await?;
+        memory
+            .add_message(Message::User {
+                content: vec![ContentPart::Text {
+                    text: "hello".into(),
+                }],
+            })
+            .await;
+        let store = SqliteSessionStateStore::new(pool.clone());
+        for session in ["chat", "child", "app-only"] {
+            store
+                .save(session, "gewu.plugin.session", "123".into())
+                .await?;
+        }
+        record_subagent_session(&pool, "child", "chat", "explore").await?;
+        let sessions = list_sessions(&pool).await?;
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|s| s.session_id == "chat")
+                .unwrap()
+                .message_count,
+            1
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|s| s.session_id == "app-only")
+                .unwrap()
+                .message_count,
+            0
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn session_model_round_trips() -> Result<()> {
