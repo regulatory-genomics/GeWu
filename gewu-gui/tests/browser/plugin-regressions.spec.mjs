@@ -13,6 +13,7 @@ for (const disabled of [false,true]) {
       await expect(prompt).toBeEnabled();
       // Upstream defers the cwd tree until this tab owns a session.
       await prompt.fill('Initialize the conversation');
+      await expect(page.getByRole('button',{name:/^Send/})).toBeEnabled();
       await prompt.press('Enter');
       await expect(page.getByText('No plugin tool selected.',{exact:true})).toBeVisible();
       const reveal=page.getByRole('button',{name:'Show files'});
