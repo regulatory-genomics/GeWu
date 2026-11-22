@@ -2,6 +2,7 @@ pub mod bootstrap;
 pub mod cli;
 pub mod config;
 pub mod mcp_loader;
+pub mod plugins;
 pub mod registry;
 pub mod server;
 pub mod tool_policy;
