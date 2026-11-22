@@ -25,6 +25,7 @@ pub(crate) struct AppGateway {
 struct Config {
     parent: String,
     template: String,
+    local_aliases: Vec<String>,
 }
 #[derive(Clone)]
 struct Session {
@@ -115,9 +116,16 @@ impl AppGateway {
             config: Some(Config {
                 parent: parent.origin().ascii_serialization(),
                 template: template.trim_end_matches('/').into(),
+                local_aliases: Vec::new(),
             }),
             sessions: Mutex::new(HashMap::new()),
         })
+    }
+    pub fn with_local_aliases(mut self, authorities: Vec<String>) -> Self {
+        if let Some(config) = &mut self.config {
+            config.local_aliases = authorities;
+        }
+        self
     }
     pub fn owner(self: &Arc<Self>) -> AppOwner {
         AppOwner {
@@ -213,6 +221,16 @@ pub(crate) async fn dispatch(
         .to_string();
     if host == reqwest::Url::parse(&config.parent).unwrap().authority() {
         return next.run(request).await;
+    }
+    if config.local_aliases.contains(&host)
+        && matches!(*request.method(), Method::GET | Method::HEAD)
+    {
+        let path = request
+            .uri()
+            .path_and_query()
+            .map_or("/", |path| path.as_str());
+        return axum::response::Redirect::temporary(&format!("{}{path}", config.parent))
+            .into_response();
     }
     // Unknown application hosts must never expose the main GUI's socket or config.
     let Some((view, s)) = state.apps.for_host(&host) else {

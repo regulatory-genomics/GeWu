@@ -14,6 +14,25 @@ fn generation(id: &str) -> GenerationState {
 }
 
 #[test]
+fn concurrent_commits_preserve_both_plugins() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = StateStore::new(temp.path());
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        for plugin in ["paper", "manimble"] {
+            let (store, barrier) = (&store, &barrier);
+            scope.spawn(move || {
+                barrier.wait();
+                store
+                    .commit_active(plugin, generation(&format!("{plugin}-1.0.0")), "stable")
+                    .unwrap();
+            });
+        }
+    });
+    assert_eq!(store.load().unwrap().plugins.len(), 2);
+}
+
+#[test]
 fn active_pointer_is_atomic_and_rollback_keeps_user_data_outside_plugin_root() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");

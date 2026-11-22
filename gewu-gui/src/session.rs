@@ -954,10 +954,11 @@ impl GuiSession {
             ClientMsg::Plugin {
                 tab,
                 request,
-                plugin,
+                mut plugin,
             } => {
                 use gewu_protocol::plugin::HostAction;
-                if matches!(&plugin, HostAction::MarketplaceInstall { .. }) {
+                if let HostAction::MarketplaceInstall { app_origin, .. } = &mut plugin {
+                    *app_origin = self.apps.frame_source().is_some();
                     self.ensure_session(tab).await?;
                     let ws = self
                         .workspace
@@ -1003,12 +1004,16 @@ impl GuiSession {
                         .expect("known tab")
                         .workspace
                         .clone();
+                    let marketplace = matches!(&plugin, HostAction::MarketplaceSearch { .. });
                     let mut result = self
                         .client(tab)
                         .expect("ensured")
                         .plugin(ws.clone(), plugin)
                         .await
                         .map_err(anyhow::Error::from)?;
+                    if marketplace {
+                        result["appOriginReady"] = self.apps.frame_source().is_some().into();
+                    }
                     if attaching {
                         if let Err(error) = self.apps.bind(&self.app_owner, &mut result) {
                             if let Some(id) = result["viewId"].as_str() {

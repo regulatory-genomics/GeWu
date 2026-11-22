@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import zipfile
+import shutil
 
 
 def sha256(path: Path) -> str:
@@ -18,7 +19,7 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def build(root: Path, output: Path) -> dict:
+def build(root: Path, output: Path, profile: str = "core") -> dict:
     root = root.resolve()
     output = output.resolve()
     manifest_path = root / "runtime.json"
@@ -41,18 +42,23 @@ def build(root: Path, output: Path) -> dict:
         for path in files:
             name = PurePosixPath(path.relative_to(root).as_posix())
             info = zipfile.ZipInfo(name.as_posix(), date_time=(1980, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
+            info.compress_type = (zipfile.ZIP_STORED
+                                  if (manifest.get("installation") or {}).get("archive") == name.as_posix()
+                                  else zipfile.ZIP_DEFLATED)
             info.create_system = 3
             info.external_attr = ((path.stat().st_mode & 0o777) | 0o100000) << 16
-            contents = path.read_bytes()
-            archive.writestr(info, contents)
-            entries.append({"path": name.as_posix(), "sha256": hashlib.sha256(contents).hexdigest(), "bytes": len(contents)})
+            with path.open("rb") as source, archive.open(info, "w", force_zip64=True) as destination:
+                shutil.copyfileobj(source, destination)
+            entries.append({"path": name.as_posix(), "sha256": sha256(path), "bytes": path.stat().st_size})
     metadata = {
         "schemaVersion": "gewu.runtime-artifact/v1",
         "plugin": manifest["plugin"],
         "version": manifest["version"],
         "id": manifest["id"],
         "target": manifest["target"],
+        "runtimeSchema": manifest["schemaVersion"],
+        "profile": profile,
+        "unpackedBytes": sum(entry["bytes"] for entry in entries),
         "files": entries,
         "runtime": {"path": archive_path.name, "sha256": sha256(archive_path), "bytes": archive_path.stat().st_size},
         "manifest": {"sha256": sha256(manifest_path), "bytes": manifest_path.stat().st_size},
@@ -65,9 +71,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--profile", choices=("core", "pdf", "tex"), default="core")
     args = parser.parse_args()
     try:
-        metadata = build(args.root, args.out)
+        metadata = build(args.root, args.out, args.profile)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
     print(json.dumps(metadata, sort_keys=True))

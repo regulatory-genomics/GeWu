@@ -122,6 +122,10 @@ pub enum HostAction {
         runtime: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attempt_id: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        app_origin: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
     },
     MarketplaceInstallReport {
         attempt_id: String,

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:gewu:marketplace:v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["index", "signature"],
+  "properties": {
+    "signature": {"$ref": "urn:gewu:marketplace:v2#/$defs/Signature"},
+    "index": {"type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "repository", "generatedAt", "expiresAt", "keyId", "releases"],
+      "properties": {
+        "schemaVersion": {"const": "gewu.marketplace/v3"},
+        "repository": {"type": "string", "minLength": 1},
+        "generatedAt": {"type": "string", "format": "date-time"},
+        "expiresAt": {"type": "string", "format": "date-time"},
+        "keyId": {"type": "string", "minLength": 1},
+        "releases": {"type": "array", "items": {"oneOf": [
+          {"$ref": "urn:gewu:marketplace:v2#/$defs/Release"},
+          {"$ref": "urn:gewu:release:v3"}
+        ]}}
+      }
+    }
+  }
+}

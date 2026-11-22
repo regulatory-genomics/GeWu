@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -16,12 +17,27 @@ import sys
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
+    parser.add_argument("--require-plugins", help="Require exactly these comma-separated IDs")
+    parser.add_argument("--validate-only", action="store_true", help="Check the set of plugin IDs without running tests")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     base = args.manifest.absolute().parent
-    entries = json.loads(args.manifest.read_text())
-    if sorted(item['id'] for item in entries) != ['manimble', 'paper', 'tachyon']:
-        parser.error('require one entry each for paper, tachyon and manimble')
+    try:
+        entries = json.loads(args.manifest.read_text())
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
+    if not isinstance(entries, list) or not entries or any(
+        not isinstance(item, dict) or not isinstance(item.get('id'), str)
+        or not re.fullmatch(r'[a-z][a-z0-9.-]{0,127}', item['id']) for item in entries
+    ):
+        parser.error('manifest must contain a nonempty array of entries with valid plugin IDs')
+    ids = {item['id'] for item in entries}
+    if len(ids) != len(entries):
+        parser.error('duplicate plugin IDs')
+    if args.require_plugins is not None and ids != set(args.require_plugins.split(',')):
+        parser.error(f'require exactly: {args.require_plugins}')
+    if args.validate_only:
+        return 0
     failed = False
     for item in entries:
         try:

@@ -61,7 +61,11 @@ pub async fn run(args: UpArgs) -> Result<()> {
 
     // Resolves config, provider, database, and MCP tools; also initializes
     // tracing from --log-level.
-    let boot = gewu_server::bootstrap::bootstrap(&args.common).await?;
+    let boot = gewu_server::bootstrap::bootstrap_with_host_version(
+        &args.common,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await?;
     info!(
         "Starting gewu (agent: {}, model: {}, provider: {})",
         args.common.agent, boot.model, boot.provider_name

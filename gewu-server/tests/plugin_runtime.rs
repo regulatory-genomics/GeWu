@@ -88,6 +88,11 @@ fn runtime_selector_requires_exact_target() {
             sha256: "b".repeat(64),
             bytes: 1,
         },
+        runtime_schema: None,
+        profile: None,
+        requirements: None,
+        unpacked_bytes: None,
+        installed_bytes_upper_bound: None,
     };
     assert_eq!(
         select_runtime(&[runtime], &target).unwrap().id,

@@ -82,19 +82,30 @@ fn artifact_origin_rewrite_changes_only_scheme_host_and_port() {
 struct RangeState {
     bytes: Arc<Vec<u8>>,
     first_request: Arc<AtomicUsize>,
+    fail_tail: Arc<std::sync::atomic::AtomicBool>,
 }
 
 async fn ranged_artifact(State(state): State<RangeState>, headers: HeaderMap) -> impl IntoResponse {
-    let range = headers
-        .get("range")
-        .and_then(|value| value.to_str().ok())
-        .unwrap();
+    let Some(range) = headers.get("range").and_then(|value| value.to_str().ok()) else {
+        return (
+            StatusCode::OK,
+            [("content-range", String::new())],
+            state.bytes.as_ref().clone(),
+        );
+    };
     let (start, end) = range
         .strip_prefix("bytes=")
         .unwrap()
         .split_once('-')
         .unwrap();
     let start: usize = start.parse().unwrap();
+    if start != 0 && state.fail_tail.load(Ordering::SeqCst) {
+        return (
+            StatusCode::FORBIDDEN,
+            [("content-range", String::new())],
+            vec![],
+        );
+    }
     let requested_end: usize = end.parse().unwrap();
     let end = requested_end.min(state.bytes.len() - 1);
     let mut body_end = end;
@@ -117,6 +128,7 @@ async fn large_artifacts_retry_short_ranges_and_verify_the_complete_digest() {
     let state = RangeState {
         bytes: Arc::new(bytes.clone()),
         first_request: Arc::new(AtomicUsize::new(0)),
+        fail_tail: Default::default(),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -147,5 +159,41 @@ async fn large_artifacts_retry_short_ranges_and_verify_the_complete_digest() {
     let path = client.download_artifact(&artifact, &store).await.unwrap();
     assert_eq!(std::fs::read(path).unwrap(), bytes);
     assert!(store.root().join("sha256").exists());
+    server.abort();
+    let cached = client.download_artifact(&artifact, &store).await.unwrap();
+    assert_eq!(std::fs::read(cached).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn a_new_client_resumes_after_the_last_complete_range() {
+    let bytes = vec![42; 32 * 1024 * 1024 + 1];
+    let state = RangeState {
+        bytes: Arc::new(bytes.clone()),
+        first_request: Arc::new(AtomicUsize::new(1)),
+        fail_tail: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let artifact = Artifact {
+        url: format!("http://{}/artifact", listener.local_addr().unwrap()),
+        sha256: sha256_bytes(&bytes),
+        bytes: bytes.len() as u64,
+    };
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/artifact", get(ranged_artifact))
+                .with_state(state.clone()),
+        )
+        .into_future(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::new(temp.path().join("store"));
+    let client = || MarketplaceClient::new(repository().0, temp.path());
+    assert!(client().download_artifact(&artifact, &store).await.is_err());
+    state.fail_tail.store(false, Ordering::SeqCst);
+    let path = client().download_artifact(&artifact, &store).await.unwrap();
+    assert_eq!(state.first_request.load(Ordering::SeqCst), 2);
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
     server.abort();
 }

@@ -49,6 +49,10 @@ pub fn is_loopback(host: &str) -> bool {
 
 /// Entry point for `gewu-server serve` (also `gewu serve`).
 pub async fn serve_command(cli: ServeArgs) -> Result<()> {
+    serve_with_host_version(cli, env!("CARGO_PKG_VERSION")).await
+}
+
+pub async fn serve_with_host_version(cli: ServeArgs, version: &str) -> Result<()> {
     // Guard remote exposure: an unauthenticated, non-loopback server would
     // hand shell access to anyone who can reach the ports.
     if !is_loopback(&cli.host) && cli.token.is_none() && !cli.allow_anonymous {
@@ -60,7 +64,7 @@ pub async fn serve_command(cli: ServeArgs) -> Result<()> {
         );
     }
 
-    let boot = bootstrap::bootstrap(&cli.common).await?;
+    let boot = bootstrap::bootstrap_with_host_version(&cli.common, version).await?;
     info!(
         "Starting gewu server (agent: {}, model: {}, provider: {})",
         cli.common.agent, boot.model, boot.provider_name

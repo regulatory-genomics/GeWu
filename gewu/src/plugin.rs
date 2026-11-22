@@ -104,6 +104,8 @@ pub enum Action {
         /// auto | external | managed | bundled
         #[arg(long, default_value = "auto")]
         runtime: String,
+        #[arg(long, default_value = "core", value_parser = ["core", "pdf", "tex"])]
+        profile: String,
         #[arg(long)]
         executable: Option<PathBuf>,
         #[arg(long)]
@@ -410,6 +412,7 @@ pub async fn run(action: Action) -> Result<()> {
             version,
             offline,
             runtime: policy,
+            profile,
             executable,
             dry_run,
         } => {
@@ -420,6 +423,7 @@ pub async fn run(action: Action) -> Result<()> {
                 version.as_deref(),
                 !offline,
                 &policy,
+                &profile,
                 executable.as_deref(),
                 dry_run,
             )
@@ -493,6 +497,7 @@ pub async fn run(action: Action) -> Result<()> {
                 version.as_deref(),
                 true,
                 "auto",
+                "core",
                 None,
                 false,
             )
@@ -571,6 +576,7 @@ async fn marketplace_install(
     version: Option<&str>,
     refresh: bool,
     policy: &str,
+    profile: &str,
     executable: Option<&std::path::Path>,
     dry_run: bool,
 ) -> Result<()> {
@@ -582,32 +588,50 @@ async fn marketplace_install(
     let mut report = (!dry_run).then(|| Attempt::start(state.root(), None,
         serde_json::json!({"plugin":id,"version":version,"channel":channel,"policy":policy,"gewuVersion":env!("CARGO_PKG_VERSION")}), None, &workspace)).transpose()?;
     let result = async {
-    let client = official_client(state)?;
-    let index = load_index(&client, refresh).await?;
+    let client = official_client(state)?.offline(!refresh);
+    let index = load_index(&client, refresh && !dry_run).await?;
     if let Some(report) = report.as_mut() { report.stage("release_selection"); }
     let target = runtime::current_target()?;
-    let release = index
-        .select_release_version(id, version, channel, &now_rfc3339())
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        ;
+    let release = gewu_server::plugins::marketplace::select_for_install(
+        &index, id, version, channel, &target, env!("CARGO_PKG_VERSION"), policy, true, profile)?;
     if let Some(report) = report.as_mut() {
         report.release(release, &target);
         report.stage("runtime_selection");
     }
-    let selections = if policy == "auto" {
+    let mut selections = if profile != "core" {
+        vec![RuntimeSelection::Bundled(runtime::select_runtime_profile(&release.runtimes, &target, profile)?)]
+    } else if policy == "auto" && !dry_run {
         RuntimeSelection::auto_candidates_reported(release, &target, executable, report.as_mut()).await?
     } else {
         vec![RuntimeSelection::select(
             release, policy, &target, executable,
         )?]
     };
+    if !refresh {
+        selections.retain(|s| !matches!(s, RuntimeSelection::Managed { .. }));
+        ensure!(!selections.is_empty(), "offline installation needs a bundled or external runtime");
+    }
     if dry_run {
         let selection = &selections[0];
+        let manager = InstallManager::new(state.root());
+        let missing_bytes = |artifact: &gewu_protocol::Artifact| {
+            manager.artifacts.blob_path(&artifact.sha256).ok()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .is_none_or(|meta| meta.len() != artifact.bytes)
+                .then_some(artifact.bytes).unwrap_or(0)
+        };
+        let (runtime_bytes, disk) = match selection {
+            RuntimeSelection::Bundled(r) => (missing_bytes(&r.artifact), r.installed_bytes_upper_bound),
+            _ => (0, None),
+        };
         let value = serde_json::json!({
             "release": release.release_id,
             "plugin": release.plugin,
             "version": release.version,
             "target": runtime::target_label(&target),
+            "profile": profile,
+            "missingDownloadBytes": missing_bytes(&release.package).saturating_add(runtime_bytes),
+            "runtimeInstalledBytesUpperBound": disk,
             "runtime": match &selection {
                 RuntimeSelection::Bundled(runtime) => serde_json::json!({"kind": "bundled", "provider": runtime.id}),
                 RuntimeSelection::External { provider, .. } => serde_json::json!({"kind": "external", "provider": provider.id()}),

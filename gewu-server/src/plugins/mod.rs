@@ -16,6 +16,9 @@ pub mod state;
 pub mod stdio;
 pub mod tools;
 
+#[cfg(all(test, unix))]
+mod lease_tests;
+
 use anyhow::{Context, Result, bail, ensure};
 use gewu_protocol::plugin::*;
 use package::{Package, PluginEntry, contained, relative, validate, validator};
@@ -57,6 +60,7 @@ pub struct PluginHost {
     /// user's `~/.gewu`.
     persist: bool,
     installation_root: Option<PathBuf>,
+    host_version: String,
     configured_packages: BTreeMap<String, bool>,
     runtimes: RwLock<BTreeMap<String, runtime::RuntimeBundle>>,
     protected: std::collections::BTreeSet<String>,
@@ -126,6 +130,11 @@ struct RegisteredTool {
 }
 
 impl PluginHost {
+    pub fn with_host_version(mut self, version: &str) -> Self {
+        self.host_version = version.to_owned();
+        self
+    }
+
     pub fn with_store(mut self, pool: sqlx::SqlitePool) -> Self {
         self.store = Some(gewu_core::types::SessionState::new(Arc::new(
             gewu_storage::SqliteSessionStateStore::new(pool),
@@ -167,6 +176,7 @@ impl PluginHost {
             state_file,
             persist: config_path.is_some(),
             installation_root: installation_root.clone(),
+            host_version: env!("CARGO_PKG_VERSION").into(),
             configured_packages: entries
                 .iter()
                 .map(|(id, entry)| (id.clone(), !entry.package.as_os_str().is_empty()))
@@ -550,13 +560,12 @@ impl PluginHost {
         binding_resource: Option<ResourceRef>,
         session: Option<&str>,
     ) -> Result<Arc<Instance>> {
-        let (entry, package) = self
-            .entries
-            .read()
-            .unwrap()
-            .get(id)
-            .cloned()
-            .context("unknown plugin")?;
+        let (entry, package, runtime_bundle) = {
+            let entries = self.entries.read().unwrap();
+            let (entry, package) = entries.get(id).cloned().context("unknown plugin")?;
+            let bundle = self.runtimes.read().unwrap().get(id).cloned();
+            (entry, package, bundle)
+        };
         // A workspace-wide disable must not itself close the door on a session
         // override, so load the manifest for metadata and only fall back to the
         // live package when the plugin is globally enabled.
@@ -699,17 +708,26 @@ impl PluginHost {
                 .clone(),
         };
         package.validate_settings(&activation.settings)?;
-        let runtime_bundle = self.runtimes.read().unwrap().get(id).cloned();
+        let lease = self
+            .installation_root
+            .as_ref()
+            .map(|root| state::StateStore::new(root).lease_package(id, &package.root))
+            .transpose()?
+            .flatten();
         let command = if let Some(runtime) = &runtime_bundle {
-            runtime
-                .probe(&package.root, &root, self.limits.startup)
-                .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            package.command_with_runtime(&root, &runtime.environment(&package.root, &root))
+            if runtime.manifest.installation.is_some() {
+                runtime.command(&runtime.launcher, &package.root, &root)
+            } else {
+                runtime
+                    .probe(&package.root, &root, self.limits.startup)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                package.command_with_runtime(&root, &runtime.environment(&package.root, &root))
+            }
         } else {
             package.command(&root)
         };
-        let result = Adapter::start(command, activation.clone(), self.limits.clone()).await;
+        let result = Adapter::start(command, activation.clone(), self.limits.clone(), lease).await;
         let (adapter, catalog) = match result {
             Ok(result) => result,
             Err(error) => {

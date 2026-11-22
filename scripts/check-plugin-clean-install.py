@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Check signed marketplace artifacts on Linux in a network namespace with no uplink.
+
+Input is the publisher's test mirror, plus one installed operation per plugin.
+The controller needs Python and bubblewrap; the GeWu process inherits no builder environment.
+"""
+import argparse
+import json
+from pathlib import Path
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--gewu", required=True, type=Path)
+    parser.add_argument("--mirror", required=True, type=Path)
+    parser.add_argument("--public-key", required=True, type=Path)
+    parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument("--plugin", action="append")
+    parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--linux-rootfs", type=Path, help="Test inside an extracted clean Linux userspace")
+    parser.add_argument("--isolated", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if not args.isolated and not args.linux_rootfs:
+        return subprocess.call(["bwrap", "--unshare-net", "--die-with-parent", "--bind", "/", "/",
+                                "--dev-bind", "/dev", "/dev", "--proc", "/proc",
+                                sys.executable, __file__, *sys.argv[1:], "--isolated"])
+    if args.linux_rootfs and args.isolated:
+        args.linux_rootfs = None
+    if not args.linux_rootfs and [name for _, name in socket.if_nameindex()] != ["lo"]:
+        parser.error("acceptance requires a network namespace with only loopback")
+    entries = json.loads(args.manifest.read_text())
+    if not isinstance(entries, list) or not entries or any(
+        not isinstance(e, dict) or not isinstance(e.get("id"), str)
+        or not re.fullmatch(r"[a-z][a-z0-9.-]{0,127}", e["id"]) for e in entries
+    ):
+        parser.error("expected a nonempty list of plugin entries")
+    ids = {e["id"] for e in entries}
+    if len(ids) != len(entries) or not set(args.plugin or ()) <= ids:
+        parser.error("duplicate or unknown plugin ID")
+    for entry in entries:
+        if args.plugin and entry["id"] not in args.plugin:
+            continue
+        artifact = entry["packageSha256"]
+        runtime = entry["runtimeSha256"]
+        if not all(re.fullmatch(r"[0-9a-f]{64}", s) for s in (artifact, runtime)):
+            parser.error("invalid artifact SHA-256")
+        out = args.out.resolve() / entry["id"]
+        home = out / "home 空格"
+        workspace = out / "workspace 空格"
+        home.mkdir(parents=True)
+        shutil.copytree(args.manifest.resolve().parent / entry["fixture"], workspace)
+        # Stage the two original downloads and signed catalog; the host performs all verification.
+        cache = home / ".gewu/marketplace/official"
+        cache.mkdir(parents=True)
+        for name in ("index.v1.json", "index.v1.json.sig"):
+            shutil.copyfile(args.mirror / name, cache / name)
+        store = home / ".gewu/store/sha256"
+        store.mkdir(parents=True)
+        for digest in (artifact, runtime):
+            files = list((args.mirror / "releases/blobs/sha256" / digest).glob("*.zip"))
+            if len(files) != 1:
+                parser.error(f"expected one ZIP for {digest}")
+            shutil.copyfile(files[0], store / digest)
+        path = out / "bin"
+        path.mkdir()
+        for name in ("python", "python3", "node", "uv", "pixi", "micromamba", "npm", "ghc"):
+            executable = path / name
+            executable.write_text("#!/bin/sh\necho unexpected host executable: \"$0\" >&2\nexit 99\n")
+            executable.chmod(0o755)
+        env = {"PATH": str(path) + ":/usr/bin:/bin", "HOME": str(home), "LANG": "C.UTF-8",
+               "GEWU_MARKETPLACE_PUBLIC_KEY": args.public_key.read_text().strip()}
+        gewu = str(args.gewu.resolve())
+        start = time.monotonic()
+        with (out / "acceptance.log").open("w") as log:
+            def run(*argv):
+                command = [gewu, "plugin", *argv]
+                if args.linux_rootfs:
+                    command = ["/usr/bin/bwrap", "--unshare-net", "--die-with-parent",
+                               "--ro-bind", str(args.linux_rootfs.resolve()), "/",
+                               "--dev", "/dev", "--proc", "/proc", "--bind", "/tmp", "/tmp",
+                               "--tmpfs", "/dev/shm",
+                               "--bind", str(out), str(out), "--ro-bind", gewu, "/usr/bin/gewu",
+                               "--chdir", str(workspace), "/usr/bin/gewu", "plugin", *argv]
+                subprocess.run(command, cwd=workspace, env=env,
+                               stdout=log, stderr=subprocess.STDOUT, check=True, timeout=1200)
+            run("marketplace-install", entry["id"], "--channel", entry.get("channel", "beta"),
+                "--version", entry["version"], "--offline")
+            check = ["check", entry["id"], "--probe", "--workspace", str(workspace), "--session", "acceptance"]
+            if "resource" in entry:
+                check += ["--resource", entry["resource"], "--resource-type", entry["resourceType"]]
+            run(*check)
+        (out / "result.json").write_text(json.dumps({"id": entry["id"], "version": entry["version"],
+            "seconds": round(time.monotonic() - start, 2), "network": "isolated", "packageSha256": artifact,
+            "runtimeSha256": runtime}, indent=2) + "\n")
+        print(f"PASS: {entry['id']} ({out})", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

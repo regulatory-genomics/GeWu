@@ -124,7 +124,8 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
   const serve=()=>start(['serve','--llm-config',config,'--db-path',join(temp,'test.db'),'--ws-port',`${socket}`,'--tcp-port',`${tcp}`,'--http-port',`${http}`]);
   let server=serve();
   let guiChild;
-  const url=`http://${appOrigins ? 'gui.gewu.localhost' : '127.0.0.1'}:${gui}`;
+  const explicitAppOrigins=appOrigins === true;
+  const url=`http://gui.gewu.localhost:${gui}`;
   const stop=async()=>{
     for (const child of [guiChild,server]) {
       if (!child?.pid || child.exitCode!==null || child.signalCode!==null) continue;
@@ -143,9 +144,9 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
   for (let i=0;i<150;i++) {
     try {
       await fetch(`http://127.0.0.1:${http}/ready`,{signal:AbortSignal.timeout(150)});
-       guiChild ??= start(['gui','--port',`${gui}`,'--server',`ws://127.0.0.1:${socket}`,'--server-http',`http://127.0.0.1:${http}`,...(appOrigins?['--public-origin',url,'--plugin-app-origin-template',`http://{view}.apps.gewu.localhost:${gui}`]:[])]);
+        guiChild ??= start(['gui','--port',`${gui}`,'--server',`ws://127.0.0.1:${socket}`,'--server-http',`http://127.0.0.1:${http}`,...(explicitAppOrigins?['--public-origin',url,'--plugin-app-origin-template',`http://{view}.apps.gewu.localhost:${gui}`]:[])]);
        const status=await new Promise((resolve,reject)=>{
-         const req=httpRequest({hostname:'127.0.0.1',port:gui,path:'/api/config',headers:appOrigins?{Host:`gui.gewu.localhost:${gui}`}:{},timeout:150},res=>{res.resume();resolve(res.statusCode);});
+          const req=httpRequest({hostname:'127.0.0.1',port:gui,path:'/api/config',headers:{Host:new URL(url).host},timeout:150},res=>{res.resume();resolve(res.statusCode);});
          req.on('error',reject);req.on('timeout',()=>req.destroy(Error('GUI probe timed out')));req.end();
        });
        if (status===200) return;

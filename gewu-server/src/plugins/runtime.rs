@@ -1,6 +1,8 @@
 //! Packed-runtime selection, validation, and probe contract.
 
-use gewu_protocol::release::{RUNTIME_SCHEMA, RuntimeManifest, RuntimeRef, Target};
+use gewu_protocol::release::{
+    RUNTIME_SCHEMA, RUNTIME_V2_SCHEMA, RuntimeInstallation, RuntimeManifest, RuntimeRef, Target,
+};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -87,6 +89,9 @@ pub fn current_target() -> Result<Target, RuntimeError> {
         ));
     };
     let libc = if os == "linux" {
+        if !cfg!(target_env = "gnu") {
+            return Err(RuntimeError::Incompatible("Linux requires glibc".into()));
+        }
         Some("glibc".into())
     } else {
         None
@@ -96,6 +101,63 @@ pub fn current_target() -> Result<Target, RuntimeError> {
         arch: arch.into(),
         libc,
     })
+}
+
+pub(super) fn system_version() -> Option<String> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn gnu_get_libc_version() -> *const std::ffi::c_char;
+        }
+        // glibc returns a process-lifetime NUL-terminated version string.
+        unsafe { std::ffi::CStr::from_ptr(gnu_get_libc_version()) }
+            .to_str()
+            .ok()
+            .map(str::to_owned)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/bin/sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+    None
+}
+
+pub(super) fn profile_compatible(
+    runtime: &RuntimeRef,
+    version: Option<&str>,
+    profile: &str,
+) -> bool {
+    if runtime.profile.as_deref().unwrap_or("core") != profile {
+        return false;
+    }
+    let Some(requirements) = &runtime.requirements else {
+        return true;
+    };
+    let minimum = requirements
+        .minimum_glibc
+        .as_deref()
+        .or(requirements.minimum_os_version.as_deref());
+    fn parse(s: &str) -> Option<(u32, u32, u32)> {
+        let mut parts = s.split('.');
+        let version = (
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next().unwrap_or("0").parse().ok()?,
+        );
+        parts.next().is_none().then_some(version)
+    }
+    minimum
+        .and_then(parse)
+        .zip(version.and_then(parse))
+        .is_some_and(|(minimum, current)| current >= minimum)
 }
 
 pub fn target_label(target: &Target) -> String {
@@ -109,9 +171,20 @@ pub fn select_runtime<'a>(
     runtimes: &'a [RuntimeRef],
     target: &Target,
 ) -> Result<&'a RuntimeRef, RuntimeError> {
+    select_runtime_profile(runtimes, target, "core")
+}
+
+pub fn select_runtime_profile<'a>(
+    runtimes: &'a [RuntimeRef],
+    target: &Target,
+    profile: &str,
+) -> Result<&'a RuntimeRef, RuntimeError> {
+    let version = system_version();
     runtimes
         .iter()
-        .find(|runtime| runtime.target == *target)
+        .find(|runtime| {
+            runtime.target == *target && profile_compatible(runtime, version.as_deref(), profile)
+        })
         .ok_or(RuntimeError::Missing)
 }
 
@@ -130,8 +203,13 @@ impl RuntimeBundle {
             std::fs::read(&manifest_path).map_err(|e| RuntimeError::Invalid(e.to_string()))?;
         let value: Value =
             serde_json::from_slice(&bytes).map_err(|e| RuntimeError::Invalid(e.to_string()))?;
-        let schema: Value = serde_json::from_str(RUNTIME_SCHEMA)
-            .map_err(|e| RuntimeError::Invalid(e.to_string()))?;
+        let schema = match value.get("schemaVersion").and_then(Value::as_str) {
+            Some("gewu.runtime/v1") => RUNTIME_SCHEMA,
+            Some("gewu.runtime/v2") => RUNTIME_V2_SCHEMA,
+            _ => return Err(RuntimeError::Invalid("unknown runtime schema".into())),
+        };
+        let schema: Value =
+            serde_json::from_str(schema).map_err(|e| RuntimeError::Invalid(e.to_string()))?;
         let validator =
             jsonschema::validator_for(&schema).map_err(|e| RuntimeError::Invalid(e.to_string()))?;
         if let Err(error) = validator.validate(&value) {
@@ -212,13 +290,31 @@ impl RuntimeBundle {
         deadline: Duration,
         report: Option<&mut super::diagnostics::Attempt>,
     ) -> std::result::Result<(), RuntimeError> {
+        let deadline = self
+            .manifest
+            .probe_timeout_seconds
+            .map(Duration::from_secs)
+            .unwrap_or(deadline);
+        let mut command = self.command(&self.probe, plugin_root, workspace_root);
+        command.env("GEWU_PLUGIN_HOST_FEATURES", "plugin-websocket");
+        super::diagnostics::run(command, deadline, "runtime probe", report)
+            .await
+            .map_err(|error| RuntimeError::ProbeFailed(error.to_string()))
+    }
+
+    pub(crate) fn command(
+        &self,
+        executable: &Path,
+        plugin_root: &Path,
+        workspace_root: &Path,
+    ) -> Command {
         let environment = RuntimeEnvironment {
             plugin_root: plugin_root.to_path_buf(),
             runtime_root: self.root.clone(),
             workspace_root: workspace_root.to_path_buf(),
             target: target_label(&self.manifest.target),
         };
-        let mut command = Command::new(&self.probe);
+        let mut command = Command::new(executable);
         command.env_clear().current_dir(workspace_root);
         for key in ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"] {
             if let Some(value) = std::env::var_os(key) {
@@ -228,10 +324,49 @@ impl RuntimeBundle {
         for (key, value) in environment.variables() {
             command.env(key, value);
         }
-        command.env("GEWU_PLUGIN_HOST_FEATURES", "plugin-websocket");
-        super::diagnostics::run(command, deadline, "runtime probe", report)
-            .await
-            .map_err(|error| RuntimeError::ProbeFailed(error.to_string()))
+        command
+    }
+
+    pub(crate) async fn prepare(
+        &self,
+        report: Option<&mut super::diagnostics::Attempt>,
+    ) -> anyhow::Result<()> {
+        if let Some(RuntimeInstallation::PixiPack {
+            archive,
+            unpacker,
+            environment_name,
+        }) = &self.manifest.installation
+        {
+            let archive = contained(&self.root, Path::new(archive))?;
+            let unpacker = contained(&self.root, Path::new(unpacker))?;
+            anyhow::ensure!(
+                archive.is_file() && unpacker.is_file() && environment_name == "env",
+                "invalid Pixi pack inputs"
+            );
+            let mut command = Command::new(unpacker);
+            command
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(&self.root)
+                .arg("--output-directory")
+                .arg(&self.root)
+                .args(["--env-name", "env"])
+                .arg(archive);
+            let certs = self.root.join("certs/ca-bundle.crt");
+            if certs.is_file() {
+                command
+                    .env("SSL_CERT_FILE", &certs)
+                    .env("SSL_CERT_DIR", self.root.join("certs"));
+            }
+            super::diagnostics::run(
+                command,
+                Duration::from_secs(900),
+                "prepare packed runtime",
+                report,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     pub fn environment(&self, plugin_root: &Path, workspace_root: &Path) -> RuntimeEnvironment {

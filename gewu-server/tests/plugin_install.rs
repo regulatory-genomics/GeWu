@@ -31,6 +31,15 @@ fn artifact(path: &Path) -> Artifact {
 
 #[tokio::test]
 async fn install_verifies_extracts_probes_and_commits_only_after_success() {
+    exercise_bundled_install(false).await;
+}
+
+#[tokio::test]
+async fn pixi_pack_is_prepared_and_probed_at_its_final_prefix() {
+    exercise_bundled_install(true).await;
+}
+
+async fn exercise_bundled_install(packed: bool) {
     let temp = tempfile::tempdir().unwrap();
     let package = temp.path().join("demo.package.zip");
     let runtime = temp.path().join("demo.runtime.zip");
@@ -44,7 +53,12 @@ async fn install_verifies_extracts_probes_and_commits_only_after_success() {
         ],
     );
     let target = current_target().unwrap();
-    let runtime_manifest = serde_json::json!({"schemaVersion":"gewu.runtime/v1","id":"demo-runtime","version":"1.0.0","plugin":"demo","target":target,"launcher":"bin/launch","probe":"bin/probe","capabilities":[]}).to_string();
+    let mut runtime_manifest = serde_json::json!({"schemaVersion":"gewu.runtime/v1","id":"demo-runtime","version":"1.0.0","plugin":"demo","target":target,"launcher":"bin/launch","probe":"bin/probe","capabilities":[]});
+    if packed {
+        runtime_manifest["schemaVersion"] = "gewu.runtime/v2".into();
+        runtime_manifest["installation"] = serde_json::json!({"kind":"pixi-pack","archive":"payload/environment.tar","unpacker":"tools/pixi-unpack","environmentName":"env"});
+    }
+    let runtime_manifest = runtime_manifest.to_string();
     zip_file(
         &runtime,
         &[
@@ -52,13 +66,21 @@ async fn install_verifies_extracts_probes_and_commits_only_after_success() {
             ("bin/launch", b"#!/bin/sh\nexit 0\n", 0o755),
             (
                 "bin/probe",
-                b"#!/bin/sh\ntest -n \"$GEWU_RUNTIME_ROOT\"\ntest -n \"$GEWU_PLUGIN_ROOT\"\n",
+                if packed { b"#!/bin/sh\nset -eu\nread -r root < \"$GEWU_RUNTIME_ROOT/env/prefix\"\ntest \"$root\" = \"$GEWU_RUNTIME_ROOT\"\n" }
+                else { b"#!/bin/sh\nset -eu\ntest -n \"$GEWU_RUNTIME_ROOT\"\ntest -n \"$GEWU_PLUGIN_ROOT\"\n" },
                 0o755,
             ),
+            ("tools/pixi-unpack", b"#!/bin/sh\nset -eu\ntest \"$1\" = --output-directory\ntest \"$3\" = --env-name\ntest \"$4\" = env\ntest -f \"$5\"\nmkdir \"$2/env\"\nprintf '%s\\n' \"$2\" > \"$2/env/prefix\"\n", 0o755),
+            ("payload/environment.tar", b"test payload", 0o644),
         ],
     );
     let release = Release {
-        schema_version: "gewu.release/v1".into(),
+        schema_version: if packed {
+            "gewu.release/v3"
+        } else {
+            "gewu.release/v1"
+        }
+        .into(),
         release_id: "demo-1.0.0".into(),
         plugin: "demo".into(),
         version: "1.0.0".into(),
@@ -78,7 +100,13 @@ async fn install_verifies_extracts_probes_and_commits_only_after_success() {
                 sha256: gewu_server::plugins::artifacts::sha256_bytes(runtime_manifest.as_bytes()),
                 bytes: runtime_manifest.len() as u64,
             },
+            runtime_schema: None,
+            profile: None,
+            requirements: None,
+            unpacked_bytes: None,
+            installed_bytes_upper_bound: None,
         }],
+        required_features: vec![],
         runtime_plan: None,
         capabilities: vec![],
         permissions: vec![],
@@ -108,6 +136,16 @@ async fn install_verifies_extracts_probes_and_commits_only_after_success() {
         .await
         .unwrap();
     assert_eq!(generation.release_id, "demo-1.0.0");
+    if packed {
+        let installed = manager.state.root().join(generation.runtime_path.unwrap());
+        assert_eq!(
+            std::fs::read_to_string(installed.join("env/prefix"))
+                .unwrap()
+                .trim(),
+            installed.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert!(installed.starts_with(manager.state.root().join("runtimes")));
+    }
     assert_eq!(
         manager.state.load().unwrap().plugins["demo"]
             .active_generation
@@ -157,6 +195,7 @@ async fn external_provider_reuses_the_host_interpreter_without_a_runtime_archive
         },
         package: artifact(&package),
         runtimes: vec![],
+        required_features: vec![],
         runtime_plan: Some(gewu_protocol::RuntimePlan {
             schema_version: "gewu.runtime-plan/v1".into(),
             policies: vec!["external".into()],
@@ -247,6 +286,7 @@ async fn a_failed_external_probe_does_not_activate_a_generation() {
         },
         package: artifact(&package),
         runtimes: vec![],
+        required_features: vec![],
         runtime_plan: Some(gewu_protocol::RuntimePlan {
             schema_version: "gewu.runtime-plan/v1".into(),
             policies: vec!["external".into()],

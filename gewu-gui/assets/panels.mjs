@@ -107,8 +107,13 @@ function compareVersions(left, right) {
 
 export function latestReleases(releases = []) {
   const selected = new Map();
+  const usable = (r) => r.installCompatible !== false && !r.revocation;
   for (const release of releases) {
     const current = selected.get(release.plugin);
+    if (current && usable(release) !== usable(current)) {
+      if (usable(release)) selected.set(release.plugin, release);
+      continue;
+    }
     const channel = current ? (CHANNEL_RANK[release.channel] ?? 0) - (CHANNEL_RANK[current.channel] ?? 0) : 1;
     if (!current || channel > 0 || (channel === 0 && compareVersions(release.version, current.version) > 0)) {
       selected.set(release.plugin, release);
@@ -367,7 +372,10 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
       ]);
       const installed = data.installed ?? {};
       const catalog = inventory.plugins ?? [];
-      const latest = latestReleases(data.releases);
+      const latest = latestReleases(data.releases.map(release => ({...release,
+        installCompatible: release.installCompatible !== false &&
+          !(data.appOriginReady === false && release.requiredFeatures?.includes('webapp-origin')),
+      })));
       list.replaceChildren();
       const catalogMeta = node('p', `${latest.length} plugin(s) · latest release · ${data.releases.length} release(s) in catalog · ${data.repository} · expires ${data.expiresAt}`);
       catalogMeta.className = 'catalog-meta';
@@ -405,6 +413,11 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
         }
 
         const runtimeOptions = release.runtimeOptions ?? [];
+        const prebuilt = release.schemaVersion === 'gewu.release/v3';
+        const blocker = prebuilt && release.requiredFeatures?.includes('webapp-origin') && data.appOriginReady === false
+          ? 'The GeWu GUI needs an app origin configured by the host administrator.'
+          : prebuilt && !runtimeOptions.some(option => option.available && (option.profile ?? 'core') === 'core')
+            ? 'This release requires a different GeWu version or execution platform.' : '';
         const runtimeSelect = node('select');
         runtimeSelect.setAttribute('aria-label', `Runtime for ${release.plugin}`);
         const auto = node('option', runtimeOptionLabel({kind: 'auto'}));
@@ -418,8 +431,11 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
         }
         const advanced = node('details');
         advanced.className = 'plugin-card-advanced';
-        advanced.append(node('summary', 'Advanced'), runtimeSelect);
-        advanced.append(node('p', `Auto order: ${(release.runtimePlan?.policies ?? ['bundled']).join(' → ')}. To use a specific interpreter, add --executable /absolute/path/to/python to the copied install command.`));
+        advanced.append(node('summary', 'Advanced'));
+        if (!prebuilt) {
+          advanced.append(runtimeSelect);
+          advanced.append(node('p', `Auto order: ${(release.runtimePlan?.policies ?? ['bundled']).join(' → ')}. To use a specific interpreter, add --executable /absolute/path/to/python to the copied install command.`));
+        }
         for (const option of runtimeOptions.filter(option => !option.available)) advanced.append(node('p', runtimeOptionLabel(option)));
 
         const actions = node('div');
@@ -500,11 +516,29 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
           row.classList.add('is-installing');
           setStatus(`Installing via ${runtimeOptionLabel({kind: policy})}… large runtimes may take several minutes.`, 'progress');
           setBadge('Installing…', 'progress');
+          const stages = {release_selection: 'Checking compatibility', runtime_selection: 'Selecting runtime',
+            package_download: 'Downloading plugin', runtime_download: 'Downloading runtime', extract: 'Unpacking',
+            runtime_preparation: 'Preparing runtime', runtime_probe: 'Checking plugin operation',
+            commit: 'Activating', registry_refresh: 'Refreshing Plugins'};
+          let polling = false;
+          let finished = false;
+          const statusTimer = setInterval(async () => {
+            if (polling || finished) return;
+            polling = true;
+            try {
+              const {report: current} = await request({action: 'marketplace_install_report', attemptId});
+              const label = stages[current?.stage];
+              if (!finished && label) setStatus(`${label}…`, 'progress');
+            } catch { /* The report may not exist yet. */ }
+            finally { polling = false; }
+          }, 1500);
           try {
             const result = await request({action: 'marketplace_install', pluginId: release.plugin, version: release.version, channel: release.channel, runtime: policy, attemptId});
             selectedRuntime = result.runtime;
+            finished = true;
             await showInstalled();
           } catch (error) {
+            finished = true;
             const read = () => request({action: 'marketplace_install_report', attemptId});
             const describe = async () => {
               try { report = await read(); } catch { report = undefined; }
@@ -560,12 +594,15 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
               }));
             };
             await describe();
+          } finally {
+            clearInterval(statusTimer);
           }
         });
         install.className = runtimeReady ? 'installed' : 'primary';
-        install.disabled = runtimeReady;
+        install.disabled = runtimeReady || Boolean(blocker);
         install.hidden = runtimeReady;
         if (runtimeReady) setStatus('Ready to open', 'ok');
+        else if (blocker) setStatus(blocker, 'warn');
         const showInstructions = async (source) => {
           const textarea = node('textarea');
           textarea.readOnly = true;
@@ -586,6 +623,25 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
           if (!source) await copyText();
         };
         actions.append(install, button('Copy install instructions', () => showInstructions(false)));
+        if (prebuilt && !blocker) {
+          for (const option of runtimeOptions.filter(option => option.available && ['pdf', 'tex'].includes(option.profile))) {
+            const label = option.profile === 'pdf' ? 'PDF export' : 'TeX rendering';
+            const prepare = button(`Prepare ${label} (${Math.ceil(option.bytes / 1e6)} MB)`, async () => {
+              prepare.disabled = true;
+              setStatus(`Preparing ${label}…`, 'progress');
+              try {
+                const result = await request({action: 'marketplace_install', pluginId: release.plugin, version: release.version,
+                  channel: release.channel, runtime: 'bundled', profile: option.profile, attemptId: installAttemptId()});
+                selectedRuntime = result.runtime;
+                await showInstalled();
+              } catch (error) {
+                setStatus(brief(error.message), 'error');
+                prepare.disabled = false;
+              }
+            });
+            advanced.append(prepare);
+          }
+        }
         advanced.append(button('Install from source', () => showInstructions(true)));
         row.append(actions, status, runtimeInfo, next, details, advanced);
         const rollback = button('Rollback', async () => {

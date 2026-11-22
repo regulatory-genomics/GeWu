@@ -23,7 +23,7 @@ async fn cancel_ack_does_not_replace_terminal_and_adapter_exits() {
         binding_resource: None,
         settings: Object::new(),
     };
-    let (adapter, _) = Adapter::start(command, activation, Limits::default())
+    let (adapter, _) = Adapter::start(command, activation, Limits::default(), None)
         .await
         .unwrap();
     let (progress, mut events) = tokio::sync::mpsc::channel(2);

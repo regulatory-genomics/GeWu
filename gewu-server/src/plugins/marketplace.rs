@@ -4,12 +4,14 @@ use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures::StreamExt;
 use gewu_protocol::release::{
-    Artifact, MARKETPLACE_SCHEMA, MARKETPLACE_V2_SCHEMA, MarketplaceIndex, Release,
+    Artifact, MARKETPLACE_SCHEMA, MARKETPLACE_V2_SCHEMA, MARKETPLACE_V3_SCHEMA, MarketplaceIndex,
+    RELEASE_V2_SCHEMA, RELEASE_V3_SCHEMA, Release, ReleaseSelectionError, Target,
 };
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde_json::Value;
 use std::{
     fmt,
+    fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -75,6 +77,7 @@ pub struct MarketplaceClient {
     repository: MarketplaceRepository,
     cache_dir: PathBuf,
     max_bytes: usize,
+    offline: bool,
 }
 
 impl MarketplaceClient {
@@ -88,6 +91,18 @@ impl MarketplaceClient {
         deadline: Duration,
         report: &mut Attempt,
     ) -> Result<GenerationState> {
+        if release.schema_version == "gewu.release/v3"
+            && let Some(RuntimeSelection::Bundled(runtime)) = selections.first()
+            && let Some(budget) = runtime.installed_bytes_upper_bound
+        {
+            let estimate = self.install_bytes(manager, release, runtime, budget)?;
+            #[cfg(unix)]
+            anyhow::ensure!(
+                available_bytes(manager.state.root())? >= estimate,
+                "GeWu needs {estimate} available bytes to install {}",
+                release.plugin
+            );
+        }
         report.stage("package_download");
         let package = self
             .download_artifact(&release.package, &manager.artifacts)
@@ -150,11 +165,41 @@ impl MarketplaceClient {
             repository,
             cache_dir: cache_dir.into(),
             max_bytes: DEFAULT_MAX_BYTES,
+            offline: false,
         }
     }
 
     pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = max_bytes;
+        self
+    }
+
+    fn install_bytes(
+        &self,
+        manager: &InstallManager,
+        release: &Release,
+        runtime: &gewu_protocol::release::RuntimeRef,
+        budget: u64,
+    ) -> Result<u64> {
+        let missing = |a: &Artifact| -> Result<u64> {
+            Ok(
+                if fs::metadata(manager.artifacts.blob_path(&a.sha256)?)
+                    .is_ok_and(|m| m.len() == a.bytes)
+                {
+                    0
+                } else {
+                    a.bytes
+                },
+            )
+        };
+        Ok(budget
+            .saturating_add(missing(&release.package)?)
+            .saturating_add(missing(&runtime.artifact)?)
+            .saturating_add(release.package.bytes.saturating_mul(4)))
+    }
+
+    pub fn offline(mut self, offline: bool) -> Self {
+        self.offline = offline;
         self
     }
 
@@ -187,6 +232,7 @@ impl MarketplaceClient {
         let schema = match schema_version {
             "gewu.marketplace/v1" => MARKETPLACE_SCHEMA,
             "gewu.marketplace/v2" => MARKETPLACE_V2_SCHEMA,
+            "gewu.marketplace/v3" => MARKETPLACE_V3_SCHEMA,
             _ => {
                 return Err(MarketplaceError::InvalidIndex(
                     "unsupported marketplace schema".into(),
@@ -199,8 +245,31 @@ impl MarketplaceClient {
         });
         let schema: Value = serde_json::from_str(schema)
             .map_err(|error| MarketplaceError::InvalidIndex(error.to_string()))?;
-        let validator = jsonschema::validator_for(&schema)
-            .map_err(|error| MarketplaceError::InvalidIndex(error.to_string()))?;
+        fn invalid(error: impl fmt::Display) -> MarketplaceError {
+            MarketplaceError::InvalidIndex(error.to_string())
+        }
+        let registry = jsonschema::Registry::new()
+            .add(
+                "urn:gewu:release:v2",
+                serde_json::from_str::<Value>(RELEASE_V2_SCHEMA).expect("embedded schema"),
+            )
+            .map_err(invalid)?
+            .add(
+                "urn:gewu:release:v3",
+                serde_json::from_str::<Value>(RELEASE_V3_SCHEMA).expect("embedded schema"),
+            )
+            .map_err(invalid)?
+            .add(
+                "urn:gewu:marketplace:v2",
+                serde_json::from_str::<Value>(MARKETPLACE_V2_SCHEMA).expect("embedded schema"),
+            )
+            .map_err(invalid)?
+            .prepare()
+            .map_err(invalid)?;
+        let validator = jsonschema::options()
+            .with_registry(&registry)
+            .build(&schema)
+            .map_err(invalid)?;
         if let Err(error) = validator.validate(&signed) {
             return Err(MarketplaceError::InvalidIndex(format!(
                 "schema validation failed at {}",
@@ -213,6 +282,21 @@ impl MarketplaceClient {
             return Err(MarketplaceError::InvalidIndex(
                 "repository or key identity mismatch".into(),
             ));
+        }
+        for release in &index.releases {
+            if release.schema_version == "gewu.release/v3" {
+                for (i, runtime) in release.runtimes.iter().enumerate() {
+                    if runtime.installed_bytes_upper_bound < runtime.unpacked_bytes
+                        || release.runtimes[..i]
+                            .iter()
+                            .any(|r| r.target == runtime.target && r.profile == runtime.profile)
+                    {
+                        return Err(MarketplaceError::InvalidIndex(
+                            "invalid runtime size or duplicate target/profile".into(),
+                        ));
+                    }
+                }
+            }
         }
         Ok(index)
     }
@@ -228,12 +312,38 @@ impl MarketplaceClient {
         let index = Self::verify(index_bytes, signature_bytes, &self.repository)?;
         std::fs::create_dir_all(&self.cache_dir)
             .map_err(|e| MarketplaceError::Cache(e.to_string()))?;
-        atomic_bytes(&self.cache_dir.join("index.v1.json"), index_bytes)?;
-        atomic_bytes(&self.cache_dir.join("index.v1.json.sig"), signature_bytes)?;
+        let _lock =
+            super::state::lock_file(&self.cache_dir.join("snapshot.lock")).map_err(cache_error)?;
+        if let Ok(old) = self.load_cached()
+            && old.schema_version == "gewu.marketplace/v3"
+            && (index.schema_version != old.schema_version || index.generated_at < old.generated_at)
+        {
+            return Err(MarketplaceError::InvalidIndex(
+                "marketplace snapshot would go backwards".into(),
+            ));
+        }
+        let pair = (
+            std::str::from_utf8(index_bytes).map_err(cache_error)?,
+            std::str::from_utf8(signature_bytes).map_err(cache_error)?,
+        );
+        atomic_bytes(
+            &self.cache_dir.join("snapshot.json"),
+            &serde_json::to_vec(&pair).map_err(cache_error)?,
+        )?;
         Ok(index)
     }
 
     pub fn load_cached(&self) -> Result<MarketplaceIndex, MarketplaceError> {
+        let snapshot = self.cache_dir.join("snapshot.json");
+        if snapshot.exists() {
+            let (index, signature): (String, String) =
+                serde_json::from_slice(&read_bounded(&snapshot, self.max_bytes.saturating_mul(4))?)
+                    .map_err(cache_error)?;
+            if index.len() > self.max_bytes || signature.len() > self.max_bytes {
+                return Err(MarketplaceError::TooLarge);
+            }
+            return Self::verify(index.as_bytes(), signature.as_bytes(), &self.repository);
+        }
         let index = read_bounded(&self.cache_dir.join("index.v1.json"), self.max_bytes)?;
         let signature = read_bounded(&self.cache_dir.join("index.v1.json.sig"), self.max_bytes)?;
         Self::verify(&index, &signature, &self.repository)
@@ -245,6 +355,36 @@ impl MarketplaceClient {
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| MarketplaceError::Network(e.to_string()))?;
+        // The pointer only names an immutable, same-origin digest. The content
+        // and its detached signature are still independently verified.
+        let base = reqwest::Url::parse(&self.repository.index_url)
+            .map_err(|e| MarketplaceError::InvalidIndex(e.to_string()))?;
+        if base.path().ends_with("/index.v1.json") {
+            let pointer = base.join("catalog/current.v3.json").map_err(cache_error)?;
+            match fetch_bounded(&client, pointer.as_str(), 4096).await {
+                Ok(bytes) => {
+                    #[derive(serde::Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Pointer {
+                        sha256: String,
+                    }
+                    let pointer: Pointer = serde_json::from_slice(&bytes).map_err(cache_error)?;
+                    super::artifacts::validate_digest(&pointer.sha256).map_err(cache_error)?;
+                    let artifact = base
+                        .join(&format!("catalog/snapshots/{}/index.json", pointer.sha256))
+                        .map_err(cache_error)?;
+                    let index = fetch_bounded(&client, artifact.as_str(), self.max_bytes).await?;
+                    if super::artifacts::sha256_bytes(&index) != pointer.sha256 {
+                        return Err(MarketplaceError::InvalidSignature);
+                    }
+                    let signature =
+                        fetch_bounded(&client, &format!("{artifact}.sig"), self.max_bytes).await?;
+                    return self.cache(&index, &signature);
+                }
+                Err(MarketplaceError::HttpStatus(404)) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let index = fetch_bounded(&client, &self.repository.index_url, self.max_bytes).await?;
         let signature =
             fetch_bounded(&client, &self.repository.signature_url, self.max_bytes).await?;
@@ -256,6 +396,26 @@ impl MarketplaceClient {
         artifact: &Artifact,
         store: &ArtifactStore,
     ) -> Result<PathBuf, MarketplaceError> {
+        let blob = store.blob_path(&artifact.sha256).map_err(cache_error)?;
+        let partial = store.root().join("partial").join(&artifact.sha256);
+        let _lock = super::state::lock_file_async(partial.with_extension("lock"))
+            .await
+            .map_err(cache_error)?;
+        if let Ok(metadata) = fs::metadata(&blob)
+            && metadata.len() == artifact.bytes
+            && super::artifacts::sha256_file(&blob).map_err(cache_error)? == artifact.sha256
+        {
+            return Ok(blob);
+        }
+        if self.offline {
+            return Err(MarketplaceError::Cache(format!(
+                "offline: missing verified artifact {}",
+                artifact.sha256
+            )));
+        }
+        if blob.exists() {
+            fs::remove_file(&blob).map_err(cache_error)?;
+        }
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             // Artifacts can be hundreds of megabytes on a slow uplink. Bound
@@ -277,7 +437,9 @@ impl MarketplaceClient {
                 MarketplaceError::InvalidIndex("artifact size is out of range".into())
             })?;
         if artifact.bytes > DOWNLOAD_CHUNK {
-            return self.download_ranged(&client, &url, artifact, store).await;
+            return self
+                .download_ranged(&client, &url, artifact, store, &partial)
+                .await;
         }
         let bytes = fetch_bounded(&client, &url, limit).await?;
         if bytes.len() as u64 != artifact.bytes {
@@ -299,14 +461,29 @@ impl MarketplaceClient {
         url: &str,
         artifact: &Artifact,
         store: &ArtifactStore,
+        partial: &Path,
     ) -> Result<PathBuf, MarketplaceError> {
-        std::fs::create_dir_all(store.root())
-            .map_err(|error| MarketplaceError::Cache(error.to_string()))?;
-        let mut file = tempfile::Builder::new()
-            .prefix(".artifact-download-")
-            .tempfile_in(store.root())
-            .map_err(|error| MarketplaceError::Cache(error.to_string()))?;
-        let mut offset = 0u64;
+        let receipt = partial.with_extension("json");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(partial)
+            .map_err(cache_error)?;
+        let mut offset = fs::read(&receipt)
+            .ok()
+            .and_then(|data| serde_json::from_slice::<(String, u64, u64)>(&data).ok())
+            .filter(|(origin, size, offset)| {
+                origin == url
+                    && *size == artifact.bytes
+                    && (*offset == *size || *offset % DOWNLOAD_CHUNK == 0)
+            })
+            .map_or(0, |(_, _, offset)| offset);
+        if offset > artifact.bytes || offset > file.metadata().map_err(cache_error)?.len() {
+            offset = 0;
+        }
+        file.set_len(offset).map_err(cache_error)?;
         while offset < artifact.bytes {
             let end = (offset + DOWNLOAD_CHUNK - 1).min(artifact.bytes - 1);
             let mut last_error = None;
@@ -314,8 +491,9 @@ impl MarketplaceClient {
                 if attempt > 0 {
                     tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))).await;
                 }
-                match fetch_chunk(client, url, offset, end, file.as_file_mut()).await {
-                    Ok(()) => {
+                match fetch_chunk(client, url, offset, end, artifact.bytes, &mut file).await {
+                    Ok(next) => {
+                        offset = next;
                         last_error = None;
                         break;
                     }
@@ -326,14 +504,23 @@ impl MarketplaceClient {
             if let Some(error) = last_error {
                 return Err(error);
             }
-            offset = end + 1;
+            file.sync_all().map_err(cache_error)?;
+            atomic_bytes(
+                &receipt,
+                &serde_json::to_vec(&(url, artifact.bytes, offset)).map_err(cache_error)?,
+            )?;
         }
-        file.as_file()
-            .sync_all()
-            .map_err(|error| MarketplaceError::Cache(error.to_string()))?;
-        store
-            .put_file(file.path(), &artifact.sha256, artifact.bytes)
-            .map_err(|error| MarketplaceError::Cache(error.to_string()))
+        drop(file);
+        if super::artifacts::sha256_file(partial).map_err(cache_error)? != artifact.sha256 {
+            let _ = fs::remove_file(partial);
+            let _ = fs::remove_file(&receipt);
+            return Err(MarketplaceError::InvalidSignature);
+        }
+        let blob = store.blob_path(&artifact.sha256).map_err(cache_error)?;
+        fs::create_dir_all(blob.parent().unwrap()).map_err(cache_error)?;
+        fs::rename(partial, &blob).map_err(cache_error)?;
+        let _ = fs::remove_file(&receipt);
+        Ok(blob)
     }
 
     pub fn search<'a>(index: &'a MarketplaceIndex, query: &str) -> Vec<&'a Release> {
@@ -363,6 +550,72 @@ impl MarketplaceClient {
             release.plugin == plugin && version.is_none_or(|version| release.version == version)
         })
     }
+}
+
+#[cfg(unix)]
+fn available_bytes(root: &Path) -> std::io::Result<u64> {
+    use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
+    let directory = root
+        .ancestors()
+        .find(|path| path.is_dir())
+        .unwrap_or(Path::new("."));
+    let path = CString::new(directory.as_os_str().as_bytes())?;
+    let mut info = MaybeUninit::<libc::statvfs>::uninit();
+    // A successful statvfs call initializes the full output struct.
+    if unsafe { libc::statvfs(path.as_ptr(), info.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(info
+        .f_bavail
+        .saturating_mul(info.f_frsize as libc::fsblkcnt_t) as u64)
+}
+
+fn cache_error(error: impl fmt::Display) -> MarketplaceError {
+    MarketplaceError::Cache(error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn select_for_install<'a>(
+    index: &'a MarketplaceIndex,
+    plugin: &str,
+    version: Option<&str>,
+    channel: &str,
+    target: &Target,
+    host_version: &str,
+    policy: &str,
+    app_origin: bool,
+    profile: &str,
+) -> Result<&'a Release, ReleaseSelectionError> {
+    let system_version = super::runtime::system_version();
+    index.select_matching(plugin, version, channel, &now_rfc3339(), |release| {
+        release.check_host(host_version)?;
+        if release
+            .required_features
+            .iter()
+            .any(|feature| match feature.as_str() {
+                "runtime-v2" | "offline-pixi-pack" => false,
+                "webapp-origin" => !app_origin,
+                _ => true,
+            })
+        {
+            return Err(ReleaseSelectionError::IncompatibleHost);
+        }
+        let bundle = matches!(policy, "bundled" | "auto")
+            && release.runtimes.iter().any(|r| {
+                &r.target == target
+                    && super::runtime::profile_compatible(r, system_version.as_deref(), profile)
+            });
+        let provider = profile == "core"
+            && policy != "bundled"
+            && release
+                .runtime_plan
+                .as_ref()
+                .is_some_and(|plan| plan.select(policy, target).is_some());
+        (bundle || provider)
+            .then_some(())
+            .ok_or(ReleaseSelectionError::RuntimeUnavailable)
+    })
 }
 
 pub fn now_rfc3339() -> String {
@@ -403,10 +656,10 @@ async fn fetch_chunk(
     url: &str,
     start: u64,
     end: u64,
-    file: &mut std::fs::File,
-) -> Result<(), MarketplaceError> {
+    total: u64,
+    file: &mut File,
+) -> Result<u64, MarketplaceError> {
     use std::io::{Seek, SeekFrom, Write};
-    let expected = end - start + 1;
     file.set_len(start)
         .map_err(|error| MarketplaceError::Cache(error.to_string()))?;
     file.seek(SeekFrom::Start(start))
@@ -414,17 +667,32 @@ async fn fetch_chunk(
     let response = client
         .get(url)
         .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .send()
         .await
         .map_err(|error| MarketplaceError::Network(format!("chunk at {start}: {error}")))?;
-    if response.status() == reqwest::StatusCode::OK {
-        return Err(MarketplaceError::InvalidIndex(
-            "server ignored the range request".into(),
-        ));
-    }
-    if !response.status().is_success() {
-        return Err(MarketplaceError::HttpStatus(response.status().as_u16()));
-    }
+    let (start, expected) = match response.status() {
+        reqwest::StatusCode::OK => {
+            file.set_len(0).map_err(cache_error)?;
+            file.seek(SeekFrom::Start(0)).map_err(cache_error)?;
+            (0, total)
+        }
+        reqwest::StatusCode::PARTIAL_CONTENT => {
+            let expected_header = format!("bytes {start}-{end}/{total}");
+            if response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                != Some(&expected_header)
+            {
+                return Err(MarketplaceError::Network(format!(
+                    "unexpected Content-Range for {expected_header}"
+                )));
+            }
+            (start, end - start + 1)
+        }
+        status => return Err(MarketplaceError::HttpStatus(status.as_u16())),
+    };
     let mut received = 0u64;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -444,7 +712,7 @@ async fn fetch_chunk(
             "chunk at {start} ended after {received} of {expected} bytes"
         )));
     }
-    Ok(())
+    Ok(start + received)
 }
 
 async fn fetch_bounded(

@@ -1240,6 +1240,7 @@ version = "0.1.1"
 dependencies = [
  "gewu-core",
  "jsonschema",
+ "semver",
  "serde",
  "serde_json",
 ]
@@ -1287,6 +1288,7 @@ dependencies = [
  "image",
  "json-strip-comments",
  "jsonschema",
+ "libc",
  "mime_guess",
  "percent-encoding",
  "reqwest",

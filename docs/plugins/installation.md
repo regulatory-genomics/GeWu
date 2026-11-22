@@ -2,6 +2,26 @@
 
 ## From the signed marketplace (preferred)
 
+Prebuilt (release/v3) plugins need no language runtime or package manager
+installed separately. GeWu selects a bundle for the execution host, verifies
+the signed metadata and artifact digests, prepares the runtime in its final
+private directory, and runs the plugin's functional smoke check before
+activation. On a remote GeWu installation, the execution target is the server,
+not the computer displaying the browser UI.
+
+For cached artifacts, `--offline` prevents artifact downloads and excludes
+managed runtime resolution. The cached signed catalog must still be current.
+`--dry-run` uses the cached catalog to show the target, profile and estimated
+missing download bytes without preparing a runtime. It does not refresh the
+catalog; run `gewu plugin search <plugin> --refresh` first if needed.
+
+Optional PDF or TeX runtimes, where published for a target, can be prepared
+from the release's Advanced menu or with `--profile pdf` / `--profile tex`.
+They get a separate generation; rollback restores the previous one. Ordinary
+installs select the core profile. Opening server-backed Studio views requires
+an isolated application origin; local GeWu GUI defaults to `gui.gewu.localhost`, and a
+remote administrator configures the public and per-view origins once.
+
 GeWu ships the official Ed25519 public key and the public catalog:
 
 For the quickest setup, choose **Install** in Marketplace or use the exact
@@ -245,3 +265,18 @@ service headers and view assets are never injected into the model context.
 Use `plugin_describe` and `plugin_call` for discovery, debugging and generic
 fallbacks. Stable typed tools are the normal Agent surface because they avoid
 making the Agent manage instance and view identifiers for every domain action.
+
+## Linux execution baseline
+
+The release runtime carries the user-space pieces that a clean server may
+lack: a matching Python/Node interpreter, application libraries, a minimal
+fontconfig database and (for the Pixi packer) a CA bundle. A clean host still
+needs a supported glibc (Linux x86_64 2.28+) and, when a remote GeWu server is
+used, the plugin runs on that server rather than on the browser's computer.
+
+The repository's `scripts/check-plugin-clean-install.py` verifies signed
+artifacts with a fresh HOME, hostile PATH entries for common package managers,
+and no network besides loopback. `--linux-rootfs` runs the same check inside an
+extracted clean userspace. This is a development/release gate, not a user
+prerequisite. Verify macOS on actual hardware separately; a Linux pass is not
+evidence for macOS or a different libc/SELinux policy.

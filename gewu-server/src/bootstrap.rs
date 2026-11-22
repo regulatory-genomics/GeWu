@@ -495,6 +495,10 @@ pub fn open_request_log(file_config: &crate::config::Config) -> Result<Option<Re
 
 /// Perform the full startup sequence shared by `run` and `serve`.
 pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
+    bootstrap_with_host_version(args, env!("CARGO_PKG_VERSION")).await
+}
+
+pub async fn bootstrap_with_host_version(args: &CommonArgs, version: &str) -> Result<Bootstrap> {
     init_tracing(&args.log_level)?;
 
     let loaded_config = LoadedConfig::load(args.llm_config.as_deref())?;
@@ -508,7 +512,8 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
         &file_config.plugins,
         loaded_config.path.as_deref(),
         file_config.plugin_host.clone(),
-    )?;
+    )?
+    .with_host_version(version);
     let startup_directory = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     let workspace_roots = Arc::new(crate::config::resolve_workspace_roots(
         file_config,

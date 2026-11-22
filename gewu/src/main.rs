@@ -120,7 +120,9 @@ async fn main() -> Result<()> {
     let no_update_check = cli.no_update_check;
     match cli.command {
         Some(Command::Plugin { action }) => plugin::run(action).await,
-        Some(Command::Serve { args }) => gewu_server::cli::serve_command(args).await,
+        Some(Command::Serve { args }) => {
+            gewu_server::cli::serve_with_host_version(args, env!("CARGO_PKG_VERSION")).await
+        }
         Some(Command::Gui { args }) => {
             gewu_gui::run_with_updates(args, env!("CARGO_PKG_VERSION"), !no_update_check).await
         }

@@ -9,10 +9,13 @@ use std::collections::BTreeMap;
 
 pub const RELEASE_SCHEMA: &str = include_str!("../schema/release.v1.schema.json");
 pub const RELEASE_V2_SCHEMA: &str = include_str!("../schema/release.v2.schema.json");
+pub const RELEASE_V3_SCHEMA: &str = include_str!("../schema/release.v3.schema.json");
 pub const RUNTIME_SCHEMA: &str = include_str!("../schema/runtime.v1.schema.json");
+pub const RUNTIME_V2_SCHEMA: &str = include_str!("../schema/runtime.v2.schema.json");
 pub const RUNTIME_PLAN_SCHEMA: &str = include_str!("../schema/runtime-plan.v1.schema.json");
 pub const MARKETPLACE_SCHEMA: &str = include_str!("../schema/marketplace.v1.schema.json");
 pub const MARKETPLACE_V2_SCHEMA: &str = include_str!("../schema/marketplace.v2.schema.json");
+pub const MARKETPLACE_V3_SCHEMA: &str = include_str!("../schema/marketplace.v3.schema.json");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -46,6 +49,25 @@ pub struct RuntimeRef {
     pub target: Target,
     pub artifact: Artifact,
     pub manifest: Artifact,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requirements: Option<SystemRequirements>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpacked_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_bytes_upper_bound: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SystemRequirements {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_glibc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_os_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +205,8 @@ pub struct Release {
     pub runtimes: Vec<RuntimeRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_plan: Option<RuntimePlan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_features: Vec<String>,
     pub capabilities: Vec<String>,
     pub permissions: Vec<String>,
     pub provenance: Provenance,
@@ -227,6 +251,26 @@ pub struct RuntimeManifest {
     pub launcher: String,
     pub probe: String,
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation: Option<RuntimeInstallation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RuntimeInstallation {
+    Ready,
+    PixiPack {
+        archive: String,
+        unpacker: String,
+        environment_name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +280,7 @@ pub enum ReleaseSelectionError {
     Expired,
     IncompatibleApi,
     RuntimeUnavailable,
+    IncompatibleHost,
 }
 
 impl std::fmt::Display for ReleaseSelectionError {
@@ -246,6 +291,9 @@ impl std::fmt::Display for ReleaseSelectionError {
             Self::Expired => "marketplace index has expired",
             Self::IncompatibleApi => "release requires an incompatible plugin API",
             Self::RuntimeUnavailable => "release has no compatible runtime",
+            Self::IncompatibleHost => {
+                "release requires a different GeWu version; check for a host update"
+            }
         };
         f.write_str(message)
     }
@@ -278,7 +326,14 @@ impl MarketplaceIndex {
         target: &Target,
         now: &str,
     ) -> Result<(&Release, &RuntimeRef), ReleaseSelectionError> {
-        let release = self.select_release_version(plugin, version, channel, now)?;
+        let release = self.select_matching(plugin, version, channel, now, |release| {
+            release
+                .runtimes
+                .iter()
+                .any(|r| r.target == *target)
+                .then_some(())
+                .ok_or(ReleaseSelectionError::RuntimeUnavailable)
+        })?;
         let runtime = release
             .runtimes
             .iter()
@@ -296,30 +351,64 @@ impl MarketplaceIndex {
         channel: &str,
         now: &str,
     ) -> Result<&Release, ReleaseSelectionError> {
+        self.select_matching(plugin, version, channel, now, |_| Ok(()))
+    }
+
+    pub fn select_matching(
+        &self,
+        plugin: &str,
+        version: Option<&str>,
+        channel: &str,
+        now: &str,
+        compatible: impl Fn(&Release) -> Result<(), ReleaseSelectionError>,
+    ) -> Result<&Release, ReleaseSelectionError> {
         if now >= self.expires_at.as_str() {
             return Err(ReleaseSelectionError::Expired);
         }
-        let release = self
+        let mut candidates: Vec<_> = self
             .releases
             .iter()
-            .find(|release| {
-                release.plugin == plugin
-                    && release.channel == channel
-                    && version.is_none_or(|version| release.version == version)
+            .filter(|r| {
+                r.plugin == plugin && r.channel == channel && version.is_none_or(|v| r.version == v)
             })
-            .ok_or(ReleaseSelectionError::NotFound)?;
-        if release.revocation.is_some() {
-            return Err(ReleaseSelectionError::Revoked);
+            .filter_map(|r| semver::Version::parse(&r.version).ok().map(|v| (v, r)))
+            .collect();
+        candidates.sort_by(|(a, _), (b, _)| b.cmp(a));
+        let mut failure = None;
+        for (_, release) in candidates {
+            let result = if release.revocation.is_some() {
+                Err(ReleaseSelectionError::Revoked)
+            } else if release.gewu.api != "gewu.plugin/v1"
+                || !matches!(
+                    release.schema_version.as_str(),
+                    "gewu.release/v1" | "gewu.release/v2" | "gewu.release/v3"
+                )
+            {
+                Err(ReleaseSelectionError::IncompatibleApi)
+            } else {
+                compatible(release)
+            };
+            match result {
+                Ok(()) => return Ok(release),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
         }
-        if release.gewu.api != "gewu.plugin/v1" {
-            return Err(ReleaseSelectionError::IncompatibleApi);
+        Err(failure.unwrap_or(ReleaseSelectionError::NotFound))
+    }
+}
+
+impl Release {
+    pub fn check_host(&self, version: &str) -> Result<(), ReleaseSelectionError> {
+        let requirement = semver::VersionReq::parse(&self.gewu.host)
+            .map_err(|_| ReleaseSelectionError::IncompatibleHost)?;
+        let version =
+            semver::Version::parse(version).map_err(|_| ReleaseSelectionError::IncompatibleHost)?;
+        if requirement.matches(&version) {
+            Ok(())
+        } else {
+            Err(ReleaseSelectionError::IncompatibleHost)
         }
-        if !matches!(
-            release.schema_version.as_str(),
-            "gewu.release/v1" | "gewu.release/v2"
-        ) {
-            return Err(ReleaseSelectionError::IncompatibleApi);
-        }
-        Ok(release)
     }
 }

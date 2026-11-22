@@ -4,13 +4,33 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 const STATE_VERSION: u32 = 1;
+
+pub(crate) fn lock_file(path: &Path) -> Result<File> {
+    let file = open_lock(path)?;
+    file.lock()?;
+    Ok(file)
+}
+
+fn open_lock(path: &Path) -> Result<File> {
+    fs::create_dir_all(path.parent().context("lock path has no parent")?)?;
+    Ok(OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?)
+}
+
+pub(crate) async fn lock_file_async(path: PathBuf) -> Result<File> {
+    tokio::task::spawn_blocking(move || lock_file(&path)).await?
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -137,10 +157,23 @@ impl StateStore {
     ) -> Result<(PathBuf, tempfile::TempDir)> {
         let destination = self.generation_root(plugin, &generation.release_id)?;
         if destination.exists() {
-            bail!(
-                "generation is already installed: {plugin}/{}",
-                generation.release_id
-            );
+            let _lock = lock_file(&self.root.join("plugins/state.lock"))?;
+            let _lease = self.lock_retired_generation(plugin, &generation.release_id)?;
+            if self
+                .load()?
+                .plugins
+                .get(plugin)
+                .is_some_and(|row| row.generations.contains_key(&generation.release_id))
+            {
+                bail!(
+                    "generation is already installed: {plugin}/{}",
+                    generation.release_id
+                );
+            }
+            // A crash after rename but before committing state leaves an unreferenced directory.
+            if destination.exists() {
+                fs::remove_dir_all(&destination)?;
+            }
         }
         let parent = destination.parent().unwrap();
         fs::create_dir_all(parent)?;
@@ -151,6 +184,82 @@ impl StateStore {
     }
 
     pub fn commit_active(
+        &self,
+        plugin: &str,
+        generation: GenerationState,
+        channel: &str,
+    ) -> Result<InstallationState> {
+        ensure_component(plugin)?;
+        let _lock = lock_file(&self.root.join("plugins/state.lock"))?;
+        self.commit_active_locked(plugin, generation, channel)
+    }
+
+    pub(crate) fn publish_generation(
+        &self,
+        plugin: &str,
+        generation: GenerationState,
+        channel: &str,
+        stage: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        let _lock = lock_file(&self.root.join("plugins/state.lock"))?;
+        ensure!(!destination.exists(), "generation already exists");
+        fs::rename(stage, destination)?;
+        let id = generation.release_id.clone();
+        if let Err(error) = self.commit_active_locked(plugin, generation, channel) {
+            // If the fsync failed after replace, preserve any directory the new state references.
+            if self.load().is_ok_and(|state| {
+                state
+                    .plugins
+                    .get(plugin)
+                    .is_none_or(|row| !row.generations.contains_key(&id))
+            }) {
+                let _ = fs::remove_dir_all(destination);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn generation_lock(&self, plugin: &str, generation: &str) -> Result<File> {
+        ensure_component(plugin)?;
+        ensure_component(generation)?;
+        open_lock(&self.root.join("leases").join(plugin).join(generation))
+    }
+
+    pub(crate) fn lease_package(&self, plugin: &str, package: &Path) -> Result<Option<File>> {
+        let Ok(root) = self.root.canonicalize() else {
+            return Ok(None);
+        };
+        let generations = root.join("plugins").join(plugin).join("generations");
+        let package = package
+            .canonicalize()
+            .unwrap_or_else(|_| package.to_path_buf());
+        let Ok(path) = package.strip_prefix(generations) else {
+            return Ok(None);
+        };
+        let generation = path
+            .parent()
+            .and_then(Path::to_str)
+            .context("invalid generation package path")?;
+        let lock = self.generation_lock(plugin, generation)?;
+        lock.try_lock_shared()
+            .context("plugin generation is being removed")?;
+        ensure!(
+            package.is_dir(),
+            "plugin generation was removed; reload installed plugins"
+        );
+        Ok(Some(lock))
+    }
+
+    fn lock_retired_generation(&self, plugin: &str, generation: &str) -> Result<File> {
+        let lock = self.generation_lock(plugin, generation)?;
+        lock.try_lock()
+            .context("plugin generation is in use; close it before removing")?;
+        Ok(lock)
+    }
+
+    fn commit_active_locked(
         &self,
         plugin: &str,
         generation: GenerationState,
@@ -170,18 +279,21 @@ impl StateStore {
                 });
         plugin_state.channel = channel.to_string();
         plugin_state.enabled = true;
-        plugin_state.previous_generation = plugin_state.active_generation.clone();
+        if plugin_state.active_generation.as_deref() != Some(&generation.release_id) {
+            plugin_state.previous_generation = plugin_state.active_generation.clone();
+        }
         plugin_state.active_generation = Some(generation.release_id.clone());
         plugin_state
             .generations
             .insert(generation.release_id.clone(), generation);
         let active = plugin_state.active_generation.clone().unwrap();
         self.save(&state)?;
-        self.write_active_pointer(plugin, &active)?;
+        self.sync_active_pointer(plugin, &active);
         Ok(state)
     }
 
     pub fn rollback(&self, plugin: &str) -> Result<String> {
+        let _lock = lock_file(&self.root.join("plugins/state.lock"))?;
         let mut state = self.load()?;
         let plugin_state = state
             .plugins
@@ -199,11 +311,13 @@ impl StateStore {
         plugin_state.active_generation = Some(previous.clone());
         plugin_state.previous_generation = Some(active);
         self.save(&state)?;
-        self.write_active_pointer(plugin, &previous)?;
+        self.sync_active_pointer(plugin, &previous);
         Ok(previous)
     }
 
     pub fn remove_generation(&self, plugin: &str, release_id: &str) -> Result<()> {
+        let _lock = lock_file(&self.root.join("plugins/state.lock"))?;
+        let _lease = self.lock_retired_generation(plugin, release_id)?;
         let old_state = self.load()?;
         let plugin_state = old_state
             .plugins
@@ -303,6 +417,7 @@ impl StateStore {
     }
 
     pub fn set_enabled(&self, plugin: &str, enabled: bool) -> Result<()> {
+        let _lock = lock_file(&self.root.join("plugins/state.lock"))?;
         let mut state = self.load()?;
         let plugin_state = state
             .plugins
@@ -313,11 +428,18 @@ impl StateStore {
     }
 
     pub fn uninstall(&self, plugin: &str) -> Result<()> {
+        ensure_component(plugin)?;
+        let _lock = lock_file(&self.root.join("plugins/state.lock"))?;
         let mut state = self.load()?;
         let plugin_state = state
             .plugins
             .remove(plugin)
             .context("plugin has no installation state")?;
+        let _leases = plugin_state
+            .generations
+            .keys()
+            .map(|id| self.lock_retired_generation(plugin, id))
+            .collect::<Result<Vec<_>>>()?;
         let prefixes: Vec<_> = plugin_state
             .generations
             .values()
@@ -360,6 +482,12 @@ impl StateStore {
             &serde_json::json!({"releaseId": release_id}),
         )
     }
+
+    fn sync_active_pointer(&self, plugin: &str, release_id: &str) {
+        if let Err(error) = self.write_active_pointer(plugin, release_id) {
+            tracing::warn!(%error, %plugin, "could not update derived active pointer");
+        }
+    }
 }
 
 fn ensure_component(value: &str) -> Result<()> {
@@ -389,7 +517,7 @@ fn newest_generation<'a>(
         .map(|(id, _)| id.clone())
 }
 
-fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path.parent().context("state path has no parent")?;
     let bytes = serde_json::to_vec_pretty(value)?;
     let temporary = tempfile::Builder::new()

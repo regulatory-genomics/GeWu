@@ -7,6 +7,64 @@ fn valid() -> Value {
 }
 
 #[test]
+fn catalog_order_does_not_pick_older_or_revoked_releases() {
+    let mut index: SignedMarketplaceIndex =
+        serde_json::from_str(include_str!("fixtures/release-v1/marketplace.json")).unwrap();
+    let base: Release = serde_json::from_value(valid()).unwrap();
+    index.index.releases = ["0.9.0", "0.10.0", "1.0.0"]
+        .into_iter()
+        .map(|version| {
+            let mut release = base.clone();
+            release.version = version.into();
+            if version == "1.0.0" {
+                release.revocation = Some(Revocation {
+                    reason: "withdrawn".into(),
+                    revoked_at: "2026-11-19T00:00:00Z".into(),
+                });
+            }
+            release
+        })
+        .collect();
+    let now = "2026-11-19T00:00:00Z";
+    assert_eq!(
+        index
+            .index
+            .select_release_version("paper", None, "stable", now)
+            .unwrap()
+            .version,
+        "0.10.0"
+    );
+    assert_eq!(
+        index
+            .index
+            .select_release_version("paper", Some("1.0.0"), "stable", now)
+            .unwrap_err(),
+        ReleaseSelectionError::Revoked
+    );
+}
+
+#[test]
+fn bundle_selection_falls_back_to_the_latest_release_for_this_target() {
+    let mut index: SignedMarketplaceIndex =
+        serde_json::from_str(include_str!("fixtures/release-v1/marketplace.json")).unwrap();
+    let base: Release = serde_json::from_value(valid()).unwrap();
+    let target = base.runtimes[0].target.clone();
+    let mut newest = base.clone();
+    newest.version = "99.0.0".into();
+    newest.runtimes[0].target.arch = "aarch64".into();
+    index.index.releases = vec![newest, base.clone()];
+    assert_eq!(
+        index
+            .index
+            .select("paper", "stable", &target, "2026-11-19T00:00:00Z")
+            .unwrap()
+            .0
+            .version,
+        base.version
+    );
+}
+
+#[test]
 fn release_runtime_and_marketplace_fixtures_match_their_schemas() {
     let release: Value =
         serde_json::from_str(include_str!("fixtures/release-v1/valid.json")).unwrap();

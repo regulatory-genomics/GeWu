@@ -4,7 +4,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {startFixture,openPreview} from './fixtures.mjs';
 
-test('native webapp runs across origins with authenticated paths, versions, SSE and revocation',async({page})=>{
+for (const appOrigins of [true, 'default']) test(`native webapp works with ${appOrigins === true ? 'configured' : 'default'} origins, SSE and revocation`,async({page})=>{
   const diagnostics=[];
   page.on('pageerror',error=>diagnostics.push(error.message));
   page.on('response',response=>{if(response.status()>=400){const u=new URL(response.url());diagnostics.push(`${response.status()} ${u.origin}${u.pathname}`);}});
@@ -15,8 +15,14 @@ test('native webapp runs across origins with authenticated paths, versions, SSE 
   manifest.views=[{id:'studio',title:'Native Studio fixture',kind:'webapp',placement:'main',serviceId:'native',entryPath:'/native/app',resourceTypes:['text'],stateSchema:{type:'object'}}];
   manifest.views.push({...manifest.views[0],id:'secondary',title:'Secondary Studio',placement:'sidebar'});
   await writeFile(join(temp,'plugin.json'),JSON.stringify(manifest));
-  const fixture=await startFixture({packagePath:temp,useDemo:true,appOrigins:true});
+  const fixture=await startFixture({packagePath:temp,useDemo:true,appOrigins});
   try {
+    if (appOrigins === 'default') {
+      const old = fixture.url.replace('gui.gewu.localhost', '127.0.0.1');
+      const response = await page.request.get(old, {maxRedirects: 0});
+      expect(response.status()).toBe(307);
+      expect(response.headers().location).toBe(`${fixture.url}/`);
+    }
     await page.goto(fixture.url);await openPreview(page);
     await page.locator('.plugin-row').filter({hasText:'Demo adapter'}).getByRole('button',{name:'Open…',exact:true}).click();
     const studio=page.frameLocator('iframe[title="Native Studio fixture"]');

@@ -787,6 +787,20 @@ impl PluginHost {
                         let mut value = serde_json::to_value(release)?;
                         value["runtimeOptions"] =
                             json!(self.marketplace_runtime_options(release, &target));
+                        value["installCompatible"] = json!(
+                            super::marketplace::select_for_install(
+                                &index,
+                                &release.plugin,
+                                Some(&release.version),
+                                &release.channel,
+                                &target,
+                                &self.host_version,
+                                "auto",
+                                true,
+                                "core",
+                            )
+                            .is_ok()
+                        );
                         Ok::<_, anyhow::Error>(value)
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -805,6 +819,8 @@ impl PluginHost {
                 channel,
                 runtime,
                 attempt_id,
+                app_origin,
+                profile,
             } => {
                 let root = self
                     .installation_root
@@ -822,10 +838,14 @@ impl PluginHost {
                     let (client, index) = self.marketplace_index(true).await?;
                     report.stage("release_selection");
                     let target = super::runtime::current_target()?;
-                    let release = index.select_release_version(&plugin_id, version.as_deref(), &channel, &super::marketplace::now_rfc3339())?;
+                    let profile = profile.as_deref().unwrap_or("core");
+                    ensure!(matches!(profile, "core" | "pdf" | "tex"), "unsupported runtime profile");
+                    let release = super::marketplace::select_for_install(&index, &plugin_id, version.as_deref(), &channel, &target, &self.host_version, &runtime, app_origin, profile)?;
                     report.release(release, &target);
                     report.stage("runtime_selection");
-                    let selections = if runtime == "auto" {
+                    let selections = if profile != "core" {
+                        vec![RuntimeSelection::Bundled(super::runtime::select_runtime_profile(&release.runtimes, &target, profile)?)]
+                    } else if runtime == "auto" {
                         RuntimeSelection::auto_candidates_reported(release, &target, None, Some(&mut report)).await?
                     } else {
                         vec![RuntimeSelection::select(release, &runtime, &target, None)?]
@@ -871,15 +891,19 @@ impl PluginHost {
         target: &gewu_protocol::release::Target,
     ) -> Vec<Value> {
         let Some(plan) = &release.runtime_plan else {
+            let version = super::runtime::system_version();
             return release
                 .runtimes
                 .iter()
                 .filter(|runtime| runtime.target == *target)
+                .filter(|runtime| super::runtime::profile_compatible(runtime, version.as_deref(), runtime.profile.as_deref().unwrap_or("core")))
                 .map(|runtime| {
                     json!({
                         "id": runtime.id,
                         "kind": "bundled",
-                        "available": true,
+                        "profile": runtime.profile.as_deref().unwrap_or("core"),
+                        "bytes": runtime.artifact.bytes,
+                        "available": release.check_host(&self.host_version).is_ok(),
                         "detail": format!("downloads {} MB", runtime.artifact.bytes.div_ceil(1_000_000)),
                     })
                 })

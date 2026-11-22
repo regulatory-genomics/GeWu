@@ -78,6 +78,7 @@ impl Adapter {
         mut command: Command,
         activation: Activation,
         limits: Limits,
+        lease: Option<std::fs::File>,
     ) -> Result<(Self, Activated)> {
         command
             .env("GEWU_PLUGIN_HOST_FEATURES", "plugin-websocket")
@@ -144,6 +145,8 @@ impl Adapter {
             let clean = (cooperative && scope.wait(limits.shutdown).await.is_ok())
                 || scope.stop(limits.cleanup).await.is_ok();
             logs.abort();
+            // Activation cancellation must not release files still used by this process tree.
+            drop(lease);
             let _ = finished.send(Some(clean));
         });
         match adapter.request(Operation::Activate(activation), None).await {

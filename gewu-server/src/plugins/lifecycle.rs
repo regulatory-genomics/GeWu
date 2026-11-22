@@ -305,7 +305,27 @@ impl InstallManager {
             release.package.bytes,
         )?;
         let package_sha256 = sha256_file(&package_blob)?;
-        let generation_id = release.release_id.clone();
+        let generation_id = match &selection {
+            RuntimeSelection::Bundled(runtime)
+                if matches!(runtime.profile.as_deref(), Some("pdf" | "tex")) =>
+            {
+                format!(
+                    "{}-{}",
+                    release.release_id,
+                    runtime.profile.as_deref().unwrap()
+                )
+            }
+            _ => release.release_id.clone(),
+        };
+        let fixed_runtime = if release.schema_version == "gewu.release/v3" {
+            let RuntimeSelection::Bundled(runtime) = &selection else {
+                anyhow::bail!("release/v3 requires a bundled runtime");
+            };
+            super::artifacts::validate_digest(&runtime.artifact.sha256)?;
+            Some(format!("runtimes/{}", runtime.artifact.sha256))
+        } else {
+            None
+        };
 
         // Prepare acquisition inputs before staging so a slow download or
         // provider install never leaves a half-written generation behind.
@@ -401,12 +421,17 @@ impl InstallManager {
                 "plugins/{}/generations/{generation_id}/package",
                 release.plugin
             ),
-            runtime_path: Some(format!(
-                "plugins/{}/generations/{generation_id}/runtime",
-                release.plugin
-            )),
+            runtime_path: Some(fixed_runtime.clone().unwrap_or_else(|| {
+                format!(
+                    "plugins/{}/generations/{generation_id}/runtime",
+                    release.plugin
+                )
+            })),
             package_sha256,
-            runtime_sha256: None,
+            runtime_sha256: match &selection {
+                RuntimeSelection::Bundled(r) => Some(r.artifact.sha256.clone()),
+                _ => None,
+            },
             installed_at: release.provenance.created_at.clone(),
             runtime: Some(identity),
         };
@@ -428,6 +453,7 @@ impl InstallManager {
                 "package manifest does not match the release"
             );
             match &selection {
+                RuntimeSelection::Bundled(_) if fixed_runtime.is_some() => {}
                 RuntimeSelection::Bundled(runtime) => {
                     let blob = runtime_blob
                         .as_ref()
@@ -435,15 +461,7 @@ impl InstallManager {
                     self.artifacts.extract_zip(blob, &runtime_root)?;
                     let loaded = RuntimeBundle::load(&runtime_root, &release.plugin, &host_target)
                         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                    let manifest_bytes = std::fs::read(runtime_root.join("runtime.json"))?;
-                    ensure!(
-                        sha256_bytes(&manifest_bytes) == runtime.manifest.sha256,
-                        "runtime manifest digest does not match the release"
-                    );
-                    ensure!(
-                        loaded.manifest.version == runtime.version,
-                        "runtime version does not match the release"
-                    );
+                    check_bundle(&loaded, runtime, "gewu.runtime/v1")?;
                 }
                 RuntimeSelection::External { provider, .. } => {
                     let resolved = executable
@@ -476,15 +494,60 @@ impl InstallManager {
             }
             stage
         };
-        let bundle = RuntimeBundle::load(stage.join("runtime"), &release.plugin, &host_target)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let bundle = if let (Some(relative), RuntimeSelection::Bundled(runtime)) =
+            (&fixed_runtime, &selection)
+        {
+            if let Some(report) = report.as_mut() {
+                report.stage("runtime_preparation");
+            }
+            let root = self.state.root().join(relative);
+            let _lock = super::state::lock_file_async(root.with_extension("prepare.lock")).await?;
+            let receipt = root.with_extension("prepared.json");
+            let complete = if receipt.exists() && root.exists() {
+                let prefix: PathBuf = serde_json::from_slice(&std::fs::read(&receipt)?)?;
+                ensure!(
+                    prefix == root.canonicalize()?,
+                    "prepared runtime was moved; restore the original installation path"
+                );
+                true
+            } else {
+                false
+            };
+            if !complete {
+                if receipt.exists() {
+                    std::fs::remove_file(&receipt)?;
+                }
+                if root.exists() {
+                    std::fs::remove_dir_all(&root)?;
+                }
+                self.artifacts.extract_zip(
+                    runtime_blob.as_deref().context("missing runtime blob")?,
+                    &root,
+                )?;
+            }
+            let bundle = RuntimeBundle::load(&root, &release.plugin, &host_target)?;
+            check_bundle(&bundle, runtime, "gewu.runtime/v2")?;
+            if !complete {
+                bundle.prepare(report.as_deref_mut()).await?;
+                super::state::atomic_json(&receipt, &bundle.root)?;
+            }
+            bundle
+        } else {
+            RuntimeBundle::load(stage.join("runtime"), &release.plugin, &host_target)?
+        };
         if let Some(report) = report.as_mut() {
             report.stage("runtime_probe");
         }
+        let smoke = fixed_runtime
+            .as_ref()
+            .map(|_| tempfile::tempdir())
+            .transpose()?;
         bundle
             .probe_reported(
                 &stage.join("package"),
-                workspace_root,
+                smoke
+                    .as_ref()
+                    .map_or(workspace_root, tempfile::TempDir::path),
                 probe_deadline,
                 report.as_deref_mut(),
             )
@@ -492,16 +555,33 @@ impl InstallManager {
         if let Some(report) = report.as_mut() {
             report.stage("commit");
         }
-        std::fs::rename(stage, &generation_root)?;
-        self.state
-            .commit_active(&release.plugin, generation.clone(), &release.channel)?;
+        self.state.publish_generation(
+            &release.plugin,
+            generation.clone(),
+            &release.channel,
+            stage,
+            &generation_root,
+        )?;
         Ok(generation)
     }
 }
 
-fn sha256_bytes(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(bytes))
+fn check_bundle(bundle: &RuntimeBundle, runtime: &RuntimeRef, schema: &str) -> Result<()> {
+    let manifest = std::fs::read(bundle.root.join("runtime.json"))?;
+    ensure!(
+        manifest.len() as u64 == runtime.manifest.bytes
+            && super::artifacts::sha256_bytes(&manifest) == runtime.manifest.sha256,
+        "runtime manifest digest or length does not match the release"
+    );
+    ensure!(
+        bundle.manifest.version == runtime.version && bundle.manifest.id == runtime.id,
+        "runtime identity does not match the release"
+    );
+    ensure!(
+        bundle.manifest.schema_version == schema,
+        "runtime schema does not match the release"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -542,6 +622,7 @@ mod tests {
             package: artifact("demo.package.zip"),
             runtimes,
             runtime_plan: Some(plan),
+            required_features: vec![],
             capabilities: vec![],
             permissions: vec![],
             provenance: Provenance {
@@ -610,6 +691,11 @@ mod tests {
             target: target(),
             artifact: artifact("demo.runtime.zip"),
             manifest: artifact("demo.runtime.zip.json"),
+            runtime_schema: None,
+            profile: None,
+            requirements: None,
+            unpacked_bytes: None,
+            installed_bytes_upper_bound: None,
         };
         let release = release(plan, vec![runtime]);
         assert!(matches!(
@@ -649,6 +735,11 @@ mod tests {
             target: target(),
             artifact: artifact("demo.runtime.zip"),
             manifest: artifact("demo.runtime.zip.json"),
+            runtime_schema: None,
+            profile: None,
+            requirements: None,
+            unpacked_bytes: None,
+            installed_bytes_upper_bound: None,
         };
         let release = release(plan, vec![runtime]);
         assert!(matches!(
