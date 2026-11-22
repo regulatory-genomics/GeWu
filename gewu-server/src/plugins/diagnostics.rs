@@ -51,6 +51,13 @@ impl Attempt {
             .ok()
             .map(|path| path.to_string_lossy().into_owned());
         let cli_version = request.get("gewuVersion").cloned().unwrap_or(Value::Null);
+        // The binary that performs selection is authoritative; the server crate
+        // has its own workspace version.
+        let host_version = request
+            .get("hostVersion")
+            .or_else(|| request.get("gewuVersion"))
+            .cloned()
+            .unwrap_or_else(|| json!(env!("CARGO_PKG_VERSION")));
         let mut this = Self {
             root: root.into(),
             dir,
@@ -65,7 +72,7 @@ impl Attempt {
                 "origin": if owner.is_some() {"gui"} else {"cli"}, "owner":owner,
                 "request":request, "startedAt":super::marketplace::now_rfc3339(),
                 "outcome":"running", "stage":"catalog", "attempts":[], "processes":[],
-                "hostVersion":env!("CARGO_PKG_VERSION"), "cliVersion":cli_version,
+                "hostVersion":host_version, "cliVersion":cli_version,
                 "gewuExecutable":executable,
                 "installationRoot":root, "workingDirectory":cwd, "osRelease":os_release(),
                 "target":super::runtime::current_target().ok(), "logTruncated":false,

@@ -24,6 +24,24 @@ fn download_progress_is_bounded_and_cleared_when_the_stage_changes() {
 }
 
 #[test]
+fn reports_the_host_version_used_for_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let report = Attempt::start(
+        root,
+        None,
+        json!({"plugin": "demo", "gewuVersion": "0.1.7"}),
+        None,
+        root,
+    )
+    .unwrap();
+    let id = report.id().to_string();
+    let view = diagnostics::read(root, &id, None).unwrap();
+    assert_eq!(view["report"]["hostVersion"], "0.1.7");
+    assert_eq!(view["report"]["cliVersion"], "0.1.7");
+}
+
+#[test]
 fn reads_only_own_attempt_and_recognizes_interruption_without_writing() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
