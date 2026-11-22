@@ -60,7 +60,19 @@ async fn agent_catalog_discovers_large_tools_without_dumping_every_schema() {
         .await
         .expect("A large application must remain discoverable");
     let list: Value = serde_json::from_str(&list.output).unwrap();
-    assert_eq!(list["instances"][0]["tools"].as_array().unwrap().len(), 6);
+    assert_eq!(list["instances"][0]["tools"].as_array().unwrap().len(), 5);
+    assert!(
+        list["instances"][0]["tools"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("echo"))
+    );
+    assert!(
+        !list["instances"][0]["tools"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("workflow_echo"))
+    );
     assert!(list["instances"][0]["tools"][0].is_string());
     let ui = host
         .action("w", &root, "s", HostAction::List)

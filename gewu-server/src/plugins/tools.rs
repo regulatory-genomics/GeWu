@@ -391,9 +391,10 @@ impl Tool for PluginTool {
                                         .iter()
                                         .filter(|tool| tool["exposeToAgent"] == true)
                                         .filter(|tool| {
-                                            tool["group"]
-                                                .as_str()
-                                                .is_some_and(|group| group_enabled(&state, group))
+                                            group_enabled(
+                                                &state,
+                                                tool["group"].as_str().unwrap_or("workspace"),
+                                            )
                                         })
                                         .filter_map(|tool| {
                                             tool["name"].as_str().map(|name| json!(name))
