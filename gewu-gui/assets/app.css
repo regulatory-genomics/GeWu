@@ -3427,6 +3427,35 @@ body {
   font: 10px/1.45 var(--mono);
   overflow-wrap: anywhere;
 }
+.plugin-card-progress {
+  display: block;
+  width: 100%;
+  height: 4px;
+  margin: 1px 0 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  appearance: none;
+  background: var(--line);
+}
+.plugin-card-progress[hidden] { display: none; }
+.plugin-card-progress::-webkit-progress-bar { background: var(--line); }
+.plugin-card-progress::-webkit-progress-value { background: var(--warn); transition: width .25s ease; }
+.plugin-card-progress::-moz-progress-bar { background: var(--warn); transition: width .25s ease; }
+.plugin-card-progress[data-kind="indeterminate"] {
+  background: linear-gradient(90deg, var(--line) 0 35%, var(--warn) 50%, var(--line) 65% 100%);
+  background-size: 220% 100%;
+  animation: plugin-install-indeterminate 1.2s linear infinite;
+}
+@keyframes plugin-install-indeterminate {
+  from { background-position: 120% 0; }
+  to { background-position: -120% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .plugin-card-progress[data-kind="indeterminate"] { animation: none; }
+  .plugin-card-progress::-webkit-progress-value { transition: none; }
+  .plugin-card-progress::-moz-progress-bar { transition: none; }
+}
 .plugin-card-status:empty, .plugin-card-runtime:empty { display: none; }
 .plugin-card-status[data-kind="progress"] { color: var(--warn); }
 .plugin-card-status[data-kind="ok"] { color: var(--green); }

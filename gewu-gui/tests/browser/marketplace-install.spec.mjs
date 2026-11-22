@@ -101,6 +101,11 @@ test('Marketplace shows one latest release per plugin and copies the right repai
     await expect(fallback.locator('.plugin-card-runtime')).toContainText('Using existing environment');
     const slow = page.locator('.plugin-marketplace .plugin-row').filter({hasText:'demo-slow 0.1.0'});
     await slow.getByRole('button', {name:'Install',exact:true}).click();
+    await expect(slow.locator('progress')).toBeVisible();
+    await page.reload();
+    await openPreview(page);
+    await page.getByRole('button', {name:'Marketplace', exact:true}).click();
+    await expect(page.locator('.plugin-marketplace .plugin-row').filter({hasText:'demo-slow 0.1.0'}).locator('progress')).toBeVisible();
     await prompt.fill('concurrency probe');
     await prompt.press('Enter');
     await expect(page.getByText('session responsive while installing', {exact:true})).toBeVisible({timeout:2500});
@@ -111,6 +116,7 @@ test('Marketplace shows one latest release per plugin and copies the right repai
       const state = JSON.parse(await readFile(join(fixture.home, '.gewu/plugins/state.json'), 'utf8'));
       return state.plugins['demo-slow']?.activeGeneration;
     }, {timeout:20000}).toBe('demo-slow-0.1.0');
+    await expect(page.locator('.plugin-marketplace .plugin-row').filter({hasText:'demo-slow 0.1.0'}).locator('progress')).toBeHidden();
     await page.getByRole('button', {name:'Marketplace', exact:true}).click();
     await expect(good.locator('.plugin-card-description')).toHaveText('Create scientific figures.');
     await expect(good.getByRole('button', {name:'Install from source',exact:true})).not.toBeVisible();

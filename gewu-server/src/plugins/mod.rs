@@ -615,8 +615,10 @@ impl PluginHost {
                     &package::wire_validator("ResourceRef")?,
                     &serde_json::to_value(&resource)?,
                 )?;
-                ensure!(resource.uri.starts_with("workspace:///"),
-                    "bindingResource.uri must reference an existing workspace path, e.g. workspace:///demo.svg");
+                ensure!(
+                    resource.uri.starts_with("workspace:///"),
+                    "bindingResource.uri must reference an existing workspace path, e.g. workspace:///demo.svg"
+                );
                 let path = workspace_path(&root, &resource.uri).with_context(|| {
                     format!(
                         "cannot bind '{}' ({}) under workspace root {}",

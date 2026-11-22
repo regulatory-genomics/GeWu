@@ -107,7 +107,7 @@ impl MarketplaceClient {
         }
         report.stage("package_download");
         let package = self
-            .download_artifact(&release.package, &manager.artifacts)
+            .download_artifact(&release.package, &manager.artifacts, Some(&mut *report))
             .await?;
         let mut failures = Vec::new();
         for selection in selections {
@@ -123,8 +123,12 @@ impl MarketplaceClient {
                 let runtime_archive = if let RuntimeSelection::Bundled(runtime) = &selection {
                     report.stage("runtime_download");
                     Some(
-                        self.download_artifact(&runtime.artifact, &manager.artifacts)
-                            .await?,
+                        self.download_artifact(
+                            &runtime.artifact,
+                            &manager.artifacts,
+                            Some(&mut *report),
+                        )
+                        .await?,
                     )
                 } else {
                     None
@@ -397,6 +401,7 @@ impl MarketplaceClient {
         &self,
         artifact: &Artifact,
         store: &ArtifactStore,
+        report: Option<&mut Attempt>,
     ) -> Result<PathBuf, MarketplaceError> {
         let blob = store.blob_path(&artifact.sha256).map_err(cache_error)?;
         let partial = store.root().join("partial").join(&artifact.sha256);
@@ -440,7 +445,7 @@ impl MarketplaceClient {
             })?;
         if artifact.bytes > DOWNLOAD_CHUNK {
             return self
-                .download_ranged(&client, &url, artifact, store, &partial)
+                .download_ranged(&client, &url, artifact, store, &partial, report)
                 .await;
         }
         let bytes = fetch_bounded(&client, &url, limit).await?;
@@ -464,6 +469,7 @@ impl MarketplaceClient {
         artifact: &Artifact,
         store: &ArtifactStore,
         partial: &Path,
+        mut report: Option<&mut Attempt>,
     ) -> Result<PathBuf, MarketplaceError> {
         let receipt = partial.with_extension("json");
         let mut file = OpenOptions::new()
@@ -520,6 +526,9 @@ impl MarketplaceClient {
                 &receipt,
                 &serde_json::to_vec(&(url, artifact.bytes, offset)).map_err(cache_error)?,
             )?;
+            if let Some(report) = report.as_deref_mut() {
+                report.progress(offset, artifact.bytes);
+            }
         }
         drop(file);
         if super::artifacts::sha256_file(partial).map_err(cache_error)? != artifact.sha256 {

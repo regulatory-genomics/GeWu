@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {dismissedKey, latestReleases, marketplaceStatus, runtimeOptionLabel, stateKey} from '../assets/panels.mjs';
+import {dismissedKey, installProgress, latestReleases, marketplaceStatus, runtimeOptionLabel, stateKey} from '../assets/panels.mjs';
 import * as panels from '../assets/panels.mjs';
 
 const scope = (workspace, session) => ({workspace, session_id: session, id: 1});
@@ -31,6 +31,19 @@ test('normal handoff installs the selected signed release with Auto, without sou
   assert.match(text, /external → bundled/);
   assert.doesNotMatch(text, /SDK|staged-package|Build the application/);
   assert.match(panels.installInstructions({plugin:'demo', version:'1.0.0', channel:'stable'}), /Runtime order: bundled/);
+});
+
+test('install progress uses real download bytes inside the runtime phase', () => {
+  const partial = installProgress({stage: 'runtime_download', progress: {completedBytes: 163_916_475, totalBytes: 327_832_950}});
+  assert.equal(partial.indeterminate, false);
+  assert.equal(partial.value, 50);
+  assert.match(partial.label, /runtime/i);
+  const complete = installProgress({stage: 'runtime_download', progress: {completedBytes: 327_832_950, totalBytes: 327_832_950}});
+  assert.equal(complete.value, 75);
+  const unknown = installProgress({stage: 'runtime_download'});
+  assert.equal(unknown.indeterminate, true);
+  assert.equal(installProgress({stage: 'runtime_probe'}).value, 92);
+  assert.equal(installProgress({stage: 'registry_refresh'}).value, 100);
 });
 
 test('workspace and conversation delimiters do not alias saved panel state', () => {

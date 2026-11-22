@@ -10,6 +10,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures::stream;
 use gewu_protocol::release::Artifact;
 use gewu_server::plugins::artifacts::{ArtifactStore, sha256_bytes};
+use gewu_server::plugins::diagnostics::{self, Attempt};
 use gewu_server::plugins::marketplace::{MarketplaceClient, MarketplaceRepository};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::sync::{
@@ -158,11 +159,36 @@ async fn large_artifacts_retry_short_ranges_and_verify_the_complete_digest() {
         sha256: sha256_bytes(&bytes),
         bytes: bytes.len() as u64,
     };
-    let path = client.download_artifact(&artifact, &store).await.unwrap();
+    let mut report = Attempt::start(
+        temp.path(),
+        None,
+        serde_json::json!({"plugin":"demo"}),
+        None,
+        temp.path(),
+    )
+    .unwrap();
+    let attempt = report.id().to_string();
+    report.stage("runtime_download");
+    let path = client
+        .download_artifact(&artifact, &store, Some(&mut report))
+        .await
+        .unwrap();
     assert_eq!(std::fs::read(path).unwrap(), bytes);
     assert!(store.root().join("sha256").exists());
+    let persisted = diagnostics::read(temp.path(), &attempt, None).unwrap();
+    assert_eq!(
+        persisted["report"]["progress"]["totalBytes"],
+        bytes.len() as u64
+    );
+    assert_eq!(
+        persisted["report"]["progress"]["completedBytes"],
+        bytes.len() as u64
+    );
     server.abort();
-    let cached = client.download_artifact(&artifact, &store).await.unwrap();
+    let cached = client
+        .download_artifact(&artifact, &store, None)
+        .await
+        .unwrap();
     assert_eq!(std::fs::read(cached).unwrap(), bytes);
 }
 
@@ -192,9 +218,17 @@ async fn a_new_client_resumes_after_the_last_complete_range() {
     let temp = tempfile::tempdir().unwrap();
     let store = ArtifactStore::new(temp.path().join("store"));
     let client = || MarketplaceClient::new(repository().0, temp.path());
-    assert!(client().download_artifact(&artifact, &store).await.is_err());
+    assert!(
+        client()
+            .download_artifact(&artifact, &store, None)
+            .await
+            .is_err()
+    );
     state.fail_tail.store(false, Ordering::SeqCst);
-    let path = client().download_artifact(&artifact, &store).await.unwrap();
+    let path = client()
+        .download_artifact(&artifact, &store, None)
+        .await
+        .unwrap();
     assert_eq!(state.first_request.load(Ordering::SeqCst), 2);
     assert_eq!(std::fs::read(path).unwrap(), bytes);
     server.abort();
@@ -267,7 +301,7 @@ async fn a_range_ignored_by_the_server_restarts_cleanly_after_a_short_body() {
         bytes: bytes.len() as u64,
     };
     let path = client
-        .download_artifact(&artifact, &store)
+        .download_artifact(&artifact, &store, None)
         .await
         .expect("a truncated 200 response must restart from zero");
     assert_eq!(std::fs::read(path).unwrap(), bytes);

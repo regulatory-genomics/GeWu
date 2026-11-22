@@ -27,6 +27,50 @@ function brief(value, limit = 280) {
   return line.length > limit ? `${line.slice(0, limit - 1)}…` : line;
 }
 
+const INSTALL_RANGES = {
+  release_selection: [0, 5],
+  runtime_selection: [5, 10],
+  package_download: [10, 25],
+  runtime_download: [25, 75],
+  artifact_verify: [75, 80],
+  extract: [80, 86],
+  runtime_preparation: [86, 92],
+  runtime_probe: [92, 98],
+  commit: [98, 100],
+  registry_refresh: [100, 100],
+};
+
+const INSTALL_LABELS = {
+  release_selection: 'Checking compatibility',
+  runtime_selection: 'Selecting runtime',
+  package_download: 'Downloading plugin',
+  runtime_download: 'Downloading runtime',
+  artifact_verify: 'Verifying artifacts',
+  extract: 'Unpacking',
+  runtime_preparation: 'Preparing runtime',
+  runtime_probe: 'Checking plugin operation',
+  commit: 'Activating',
+  registry_refresh: 'Refreshing Plugins',
+};
+
+export function installProgress(report = {}) {
+  const stage = report.stage;
+  const range = INSTALL_RANGES[stage];
+  if (!range) return {indeterminate: true, value: null, label: INSTALL_LABELS[stage] ?? 'Installing'};
+  const total = Number(report.progress?.totalBytes);
+  const completed = Number(report.progress?.completedBytes);
+  if (Number.isFinite(total) && total > 0 && Number.isFinite(completed)) {
+    const ratio = Math.min(1, Math.max(0, completed / total));
+    return {
+      indeterminate: false,
+      value: Math.round(range[0] + (range[1] - range[0]) * ratio),
+      label: INSTALL_LABELS[stage] ?? 'Installing',
+    };
+  }
+  return {indeterminate: stage !== 'registry_refresh', value: range[0], label: INSTALL_LABELS[stage] ?? 'Installing'};
+}
+
+
 export function installInstructions(release) {
   const policies = release.runtimePlan?.policies ?? ['bundled'];
   return `# Install ${release.plugin} ${release.version} (${release.channel})
@@ -143,6 +187,7 @@ function runtimeDescription(runtime) {
 /// live instance and never starts a stopped one.
 export function panelHost(root, rpc, {onShow, onHide} = {}) {
   let scope, active = 'plugins', seq = 0, syncing = null, manager, changesView, marketplaceView, managerSignature = '';
+  const installPolls = new Set();
   let dismissed = new Set();
   const panels = new Map();
   const tabs = node('nav');
@@ -344,6 +389,8 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
   /// installation always goes through the same verified InstallManager path.
   async function loadMarketplace(query = '') {
     if (!marketplaceView) return;
+    for (const timer of installPolls) clearInterval(timer);
+    installPolls.clear();
     const request = requestFor();
     const pane = node('div');
     pane.className = 'plugin-marketplace';
@@ -445,6 +492,11 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
         status.setAttribute('role', 'status');
         const runtimeInfo = node('p', runtimeDescription(selectedRuntime));
         runtimeInfo.className = 'plugin-card-runtime';
+        const progress = node('progress');
+        progress.className = 'plugin-card-progress';
+        progress.max = 100;
+        progress.hidden = true;
+        progress.setAttribute('aria-label', `Installation progress for ${release.plugin}`);
         const next = node('div');
         next.className = 'plugin-card-next';
         const details = node('div');
@@ -481,7 +533,71 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
             next.append(open);
           }
         };
+        const jobKey = `gewu.marketplace.install.v1:${JSON.stringify([scope?.workspace, scope?.session_id ?? scope?.id, release.plugin, release.version, release.channel])}`;
+        let installPoll = null;
+        const stopInstallPoll = () => {
+          if (installPoll) {
+            clearInterval(installPoll);
+            installPolls.delete(installPoll);
+            installPoll = null;
+          }
+        };
+        const clearInstallJob = () => {
+          try { localStorage.removeItem(jobKey); } catch {}
+        };
+        const setInstallProgress = (report) => {
+          const state = installProgress(report);
+          progress.hidden = false;
+          if (state.indeterminate) {
+            progress.removeAttribute('value');
+            progress.dataset.kind = 'indeterminate';
+          } else {
+            progress.value = state.value;
+            delete progress.dataset.kind;
+          }
+          if (state.label) setStatus(`${state.label}…`, 'progress');
+        };
+        const showInstallFailure = (report) => {
+          const stage = report?.stage;
+          const cause = report?.error ?? 'The installation report is no longer available';
+          stopInstallPoll();
+          clearInstallJob();
+          progress.hidden = true;
+          row.classList.remove('is-installing');
+          row.classList.add('is-warn');
+          setStatus(`Install ${report?.outcome === 'interrupted' ? 'interrupted' : 'failed'}${stage ? ` · ${stage}` : ''}: ${brief(cause)}`, 'error');
+          setBadge('Install failed', 'error');
+          install.textContent = 'Retry';
+          install.className = 'primary';
+          install.disabled = false;
+          install.hidden = false;
+          runtimeSelect.disabled = false;
+        };
+        const startInstallPoll = (attemptId, startedAt = Date.now()) => {
+          stopInstallPoll();
+          const tick = async () => {
+            try {
+              const {report: current} = await request({action: 'marketplace_install_report', attemptId});
+              setInstallProgress(current);
+              if (current?.outcome === 'succeeded') {
+                await showInstalled();
+              } else if (current?.outcome === 'failed' || current?.outcome === 'interrupted') {
+                showInstallFailure(current);
+              }
+            } catch (error) {
+              if (Date.now() - startedAt > 30 * 60 * 1000) {
+                showInstallFailure({error: error.message});
+              }
+            }
+          };
+          installPoll = setInterval(tick, 1000);
+          installPolls.add(installPoll);
+          tick();
+        };
         const showInstalled = async () => {
+          stopInstallPoll();
+          clearInstallJob();
+          progress.hidden = true;
           install.textContent = 'Installed';
           install.className = 'installed';
           install.disabled = true;
@@ -514,42 +630,37 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
           runtimeSelect.disabled = true;
           row.classList.remove('is-installed');
           row.classList.add('is-installing');
+          progress.hidden = false;
+          progress.removeAttribute('value');
+          progress.dataset.kind = 'indeterminate';
           setStatus(`Installing via ${runtimeOptionLabel({kind: policy})}… large runtimes may take several minutes.`, 'progress');
           setBadge('Installing…', 'progress');
-          const stages = {release_selection: 'Checking compatibility', runtime_selection: 'Selecting runtime',
-            package_download: 'Downloading plugin', runtime_download: 'Downloading runtime', extract: 'Unpacking',
-            runtime_preparation: 'Preparing runtime', runtime_probe: 'Checking plugin operation',
-            commit: 'Activating', registry_refresh: 'Refreshing Plugins'};
-          let polling = false;
-          let finished = false;
-          const statusTimer = setInterval(async () => {
-            if (polling || finished) return;
-            polling = true;
-            try {
-              const {report: current} = await request({action: 'marketplace_install_report', attemptId});
-              const label = stages[current?.stage];
-              if (!finished && label) setStatus(`${label}…`, 'progress');
-            } catch { /* The report may not exist yet. */ }
-            finally { polling = false; }
-          }, 1500);
+          const startedAt = Date.now();
+          write(jobKey, {attemptId, startedAt});
+          startInstallPoll(attemptId, startedAt);
           try {
             const result = await request({action: 'marketplace_install', pluginId: release.plugin, version: release.version, channel: release.channel, runtime: policy, attemptId});
             selectedRuntime = result.runtime;
-            finished = true;
             await showInstalled();
           } catch (error) {
-            finished = true;
-            const read = () => request({action: 'marketplace_install_report', attemptId});
+            const readReport = () => request({action: 'marketplace_install_report', attemptId});
             const describe = async () => {
-              try { report = await read(); } catch { report = undefined; }
+              try { report = await readReport(); } catch { report = undefined; }
               const {outcome, stage, error: cause} = report?.report ?? {};
               if (outcome === 'succeeded') return showInstalled();
               if (outcome === 'running' || (!outcome && /timed out|Disconnected/i.test(error.message))) {
-                setStatus(outcome === 'running' ? `Still installing · ${stage}` : 'Installation status unknown', 'progress');
+                progress.hidden = false;
+                progress.removeAttribute('value');
+                progress.dataset.kind = 'indeterminate';
+                setStatus(outcome === 'running' ? `Still installing · ${stage}` : 'Installation continues on the host', 'progress');
                 setBadge('Installing…', 'progress');
+                if (outcome === 'running') startInstallPoll(attemptId, startedAt);
                 next.replaceChildren(button('Check status', describe));
                 return;
               }
+              stopInstallPoll();
+              clearInstallJob();
+              progress.hidden = true;
               setStatus(`${outcome === 'interrupted' ? 'Install interrupted' : 'Install failed'}${stage ? ` · ${stage}` : ''}: ${brief(cause ?? error.message)}`, 'error');
               setBadge('Install failed', 'error');
               row.classList.remove('is-installing');
@@ -594,8 +705,6 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
               }));
             };
             await describe();
-          } finally {
-            clearInterval(statusTimer);
           }
         });
         install.className = runtimeReady ? 'installed' : 'primary';
@@ -603,6 +712,22 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
         install.hidden = runtimeReady;
         if (runtimeReady) setStatus('Ready to open', 'ok');
         else if (blocker) setStatus(blocker, 'warn');
+        const restored = read(jobKey, null);
+        if (restored?.attemptId) {
+          if (runtimeReady) clearInstallJob();
+          else {
+            row.classList.add('is-installing');
+            install.disabled = true;
+            install.hidden = false;
+            install.textContent = 'Installing…';
+            progress.hidden = false;
+            progress.removeAttribute('value');
+            progress.dataset.kind = 'indeterminate';
+            setStatus('Resuming installation…', 'progress');
+            setBadge('Installing…', 'progress');
+            startInstallPoll(restored.attemptId, restored.startedAt);
+          }
+        }
         const showInstructions = async (source) => {
           const textarea = node('textarea');
           textarea.readOnly = true;
@@ -643,7 +768,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
           }
         }
         advanced.append(button('Install from source', () => showInstructions(true)));
-        row.append(actions, status, runtimeInfo, next, details, advanced);
+        row.append(actions, status, progress, runtimeInfo, next, details, advanced);
         const rollback = button('Rollback', async () => {
           try {
             const result = await request({action: 'marketplace_rollback', pluginId: release.plugin});
@@ -887,6 +1012,8 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
   async function switchTab(next) {
     if (!next) return;
     if (scope && scope.id === next.id && scope.workspace === next.workspace && scope.session_id === next.session_id) return;
+    for (const timer of installPolls) clearInterval(timer);
+    installPolls.clear();
     scope = next;
     dismissed = new Set(read(dismissedKey(next), []));
     for (const panel of panels.values()) panel.dispose?.();
