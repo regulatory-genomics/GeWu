@@ -297,6 +297,9 @@ impl InstallManager {
         if let Some(report) = report.as_mut() {
             report.stage("artifact_verify");
         }
+        // A second install, removal or rollback of this plugin must not race
+        // the staging/probe/commit sequence. Downloads happen before this lock.
+        let _mutation = self.state.lock_plugin_mutation(&release.plugin)?;
         let host_target =
             super::runtime::current_target().map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let package_blob = self.artifacts.put_file(

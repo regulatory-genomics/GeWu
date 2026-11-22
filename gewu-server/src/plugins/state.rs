@@ -104,6 +104,10 @@ impl StateStore {
     }
 
     pub fn load(&self) -> Result<InstallationState> {
+        self.read_state()
+    }
+
+    fn read_state(&self) -> Result<InstallationState> {
         let path = self.state_path();
         if !path.exists() {
             return Ok(InstallationState::default());
@@ -115,6 +119,70 @@ impl StateStore {
             "unsupported plugin installation state version"
         );
         Ok(state)
+    }
+
+    /// Restore the pre-state-first deletion window from the old implementation.
+    /// A generation is never guessed: exactly one matching trash directory must
+    /// exist, or recovery stops with an actionable error.
+    pub fn recover(&self) -> Result<()> {
+        let _lock = lock_file(&self.root.join("plugins/state.lock"))?;
+        let state = self.read_state()?;
+        for (plugin, row) in &state.plugins {
+            for release_id in row.generations.keys() {
+                let destination = self.generation_root(plugin, release_id)?;
+                if destination.exists() {
+                    continue;
+                }
+                let parent = destination
+                    .parent()
+                    .context("generation path has no parent")?;
+                if !parent.exists() {
+                    continue;
+                }
+                let mut matches = Vec::new();
+                for entry in fs::read_dir(parent)? {
+                    let path = entry?.path();
+                    if !path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(".generation-remove-"))
+                    {
+                        continue;
+                    }
+                    let manifest = path.join("package/plugin.json");
+                    let Ok(bytes) = fs::read(manifest) else {
+                        continue;
+                    };
+                    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                        continue;
+                    };
+                    let same_id = value.get("id").and_then(|v| v.as_str()) == Some(plugin);
+                    let same_version =
+                        value
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|version| {
+                                release_id == &format!("{plugin}-{version}")
+                                    || release_id.starts_with(&format!("{plugin}-{version}-"))
+                            });
+                    if same_id && same_version {
+                        matches.push(path);
+                    }
+                }
+                match matches.as_slice() {
+                    [trash] => fs::rename(trash, &destination).with_context(|| {
+                        format!("could not restore interrupted removal for {plugin}/{release_id}")
+                    })?,
+                    [] => bail!(
+                        "generation {plugin}/{release_id} is missing and no matching .generation-remove-* directory exists"
+                    ),
+                    _ => bail!(
+                        "generation {plugin}/{release_id} is missing and multiple .generation-remove-* candidates match"
+                    ),
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn save(&self, state: &InstallationState) -> Result<()> {
@@ -190,6 +258,7 @@ impl StateStore {
         channel: &str,
     ) -> Result<InstallationState> {
         ensure_component(plugin)?;
+        let _mutation = self.lock_plugin_mutation(plugin)?;
         let _lock = lock_file(&self.root.join("plugins/state.lock"))?;
         self.commit_active_locked(plugin, generation, channel)
     }
@@ -225,6 +294,17 @@ impl StateStore {
         ensure_component(plugin)?;
         ensure_component(generation)?;
         open_lock(&self.root.join("leases").join(plugin).join(generation))
+    }
+
+    /// Serialize mutations of one plugin. The lock lives outside the plugin
+    /// directory so uninstall cannot delete it while another process waits.
+    pub(crate) fn lock_plugin_mutation(&self, plugin: &str) -> Result<File> {
+        ensure_component(plugin)?;
+        let lock = open_lock(&self.root.join("locks/plugins").join(plugin))?;
+        lock.try_lock().with_context(|| {
+            format!("another installation operation is already running for {plugin}")
+        })?;
+        Ok(lock)
     }
 
     pub(crate) fn lease_package(&self, plugin: &str, package: &Path) -> Result<Option<File>> {
@@ -293,6 +373,7 @@ impl StateStore {
     }
 
     pub fn rollback(&self, plugin: &str) -> Result<String> {
+        let _mutation = self.lock_plugin_mutation(plugin)?;
         let _lock = lock_file(&self.root.join("plugins/state.lock"))?;
         let mut state = self.load()?;
         let plugin_state = state
@@ -316,8 +397,9 @@ impl StateStore {
     }
 
     pub fn remove_generation(&self, plugin: &str, release_id: &str) -> Result<()> {
-        let _lock = lock_file(&self.root.join("plugins/state.lock"))?;
+        let _mutation = self.lock_plugin_mutation(plugin)?;
         let _lease = self.lock_retired_generation(plugin, release_id)?;
+        let _lock = lock_file(&self.root.join("plugins/state.lock"))?;
         let old_state = self.load()?;
         let plugin_state = old_state
             .plugins
@@ -363,40 +445,19 @@ impl StateStore {
             destination.exists(),
             "generation directory is missing: {plugin}/{release_id}"
         );
-        let parent = destination
-            .parent()
-            .context("generation path has no parent")?;
-        let trash = parent.join(format!(".generation-remove-{}", uuid::Uuid::new_v4()));
-        fs::rename(&destination, &trash)?;
 
         let mut new_state = old_state.clone();
         let plugin_state = new_state.plugins.get_mut(plugin).unwrap();
         plugin_state.generations.remove(release_id);
         plugin_state.active_generation = Some(new_active.clone());
         plugin_state.previous_generation = new_previous;
-        if let Err(error) = self.save(&new_state) {
-            let _ = fs::rename(&trash, &destination);
-            return Err(error);
+        // State commits first. A crash here leaves an unreferenced directory,
+        // never a state entry pointing at a directory that was moved away.
+        self.save(&new_state)?;
+        self.sync_active_pointer(plugin, &new_active);
+        if let Err(error) = fs::remove_dir_all(&destination) {
+            tracing::warn!(%error, %plugin, %release_id, "retired generation left for collection");
         }
-        if let Err(error) = self.write_active_pointer(plugin, &new_active) {
-            let restore_state = self.save(&old_state);
-            let restore_pointer = self.write_active_pointer(
-                plugin,
-                old_state
-                    .plugins
-                    .get(plugin)
-                    .and_then(|state| state.active_generation.as_deref())
-                    .context("old active generation is missing")?,
-            );
-            let restore_generation = fs::rename(&trash, &destination);
-            if restore_state.is_err() || restore_pointer.is_err() || restore_generation.is_err() {
-                bail!("could not restore plugin state after active pointer failure: {error}");
-            }
-            return Err(error);
-        }
-        fs::remove_dir_all(&trash).with_context(|| {
-            format!("could not remove retired generation {plugin}/{release_id}")
-        })?;
         if let Some(prefix) = retired_runtime {
             let prefix_text = prefix.to_string_lossy().to_string();
             if !new_state.plugins[plugin]
@@ -417,6 +478,7 @@ impl StateStore {
     }
 
     pub fn set_enabled(&self, plugin: &str, enabled: bool) -> Result<()> {
+        let _mutation = self.lock_plugin_mutation(plugin)?;
         let _lock = lock_file(&self.root.join("plugins/state.lock"))?;
         let mut state = self.load()?;
         let plugin_state = state
@@ -429,7 +491,7 @@ impl StateStore {
 
     pub fn uninstall(&self, plugin: &str) -> Result<()> {
         ensure_component(plugin)?;
-        let _lock = lock_file(&self.root.join("plugins/state.lock"))?;
+        let _mutation = self.lock_plugin_mutation(plugin)?;
         let mut state = self.load()?;
         let plugin_state = state
             .plugins
@@ -447,10 +509,13 @@ impl StateStore {
             .filter_map(|runtime| runtime.prefix.as_deref())
             .map(PathBuf::from)
             .collect();
+        let _lock = lock_file(&self.root.join("plugins/state.lock"))?;
         self.save(&state)?;
         let path = self.root.join("plugins").join(plugin);
-        if path.exists() {
-            fs::remove_dir_all(path)?;
+        if path.exists()
+            && let Err(error) = fs::remove_dir_all(&path)
+        {
+            tracing::warn!(%error, %plugin, "uninstalled plugin directory left for collection");
         }
         for prefix in prefixes {
             self.remove_managed_prefix(&prefix)?;

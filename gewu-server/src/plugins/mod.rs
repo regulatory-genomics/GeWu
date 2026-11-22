@@ -159,6 +159,9 @@ impl PluginHost {
             .as_ref()
             .and_then(|path| path.parent().map(Path::to_path_buf));
         let installation_state = installation_root.as_ref().map(state::StateStore::new);
+        if let Some(store) = installation_state.as_ref() {
+            store.recover()?;
+        }
         let installation = installation_state
             .as_ref()
             .map(state::StateStore::load)
