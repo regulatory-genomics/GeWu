@@ -80,7 +80,7 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str, inbox: &Steering)
                                 spinner_frame = 0;
                             }
                         }
-                        AgentEvent::ToolStart { tool, input } => {
+                        AgentEvent::ToolStart { tool, input, .. } => {
                             stop_spinner(&mut spinner_active, is_tty)?;
                             if tool == "bash"
                                 && let Some(command) = extract_bash_command(&input)
