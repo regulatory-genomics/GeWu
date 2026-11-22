@@ -453,6 +453,7 @@ impl PluginHost {
                     "version":meta.as_ref().map(|p| &p.manifest.version),
                     "scope":meta.as_ref().map(|p| p.manifest.scope),
                     "views":meta.as_ref().map(|p| &p.manifest.views),
+                    "skills":meta.as_ref().map(|p| p.skills.iter().map(|s| json!({"name":s.name,"description":s.description})).collect::<Vec<_>>()),
                     "package":entry.package, "sources":entry.sources,
                     "reason":if meta.is_none() {"package unavailable"} else if package.is_some() {"enabled"} else {"disabled by default"},
                 })

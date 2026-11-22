@@ -191,9 +191,12 @@ impl PluginHost {
             .active_for_session(workspace, &root, Some(session))
             .await;
         let mut seen = HashSet::new();
-        let skills: Vec<_> = active
-            .iter()
-            .flat_map(|i| &i.package.skills)
+        // Package instructions are metadata; reading them must not start a backend.
+        let packages: Vec<_> = self.entries.read().unwrap().values()
+            .filter_map(|(entry, package)| package.clone().or_else(|| super::package::Package::read(&entry.package).ok()))
+            .collect();
+        let skills: Vec<_> = packages.iter()
+            .flat_map(|package| &package.skills)
             .filter(|s| seen.insert(s.name.clone()))
             .cloned()
             .collect();
@@ -252,6 +255,25 @@ impl PluginHost {
         }
         tools
     }
+
+    async fn agent_instance(&self, mut value: Value, workspace: &str, root: &std::path::Path, session: &str) -> anyhow::Result<Value> {
+        let active = self.active_for_session(workspace, root, Some(session)).await;
+        let instance = active.iter().find(|instance| value["id"] == instance.activation.instance_id)
+            .ok_or_else(|| anyhow::anyhow!("application instance is no longer active"))?;
+        let state = self.session_state(session, &instance.package.manifest.id).await?;
+        value["tools"] = json!(instance.definitions().filter(|tool| tool.expose_to_agent && group_enabled(&state, &tool.group))
+            .map(|tool| &tool.name).collect::<Vec<_>>());
+        value["scope"] = json!(instance.package.manifest.scope);
+        if instance.package.manifest.scope == Scope::Session {
+            value["openHint"] = json!("Session-scoped: use plugin_open with pluginId only, without bindingResource. Opening Preview does not create application content; follow the package instructions.");
+        }
+        value["instructions"] = json!(instance.package.skills.iter().take(1).map(|skill| {
+            let end = skill.content.floor_char_boundary(6000);
+            json!({"name":skill.name,"content":&skill.content[..end],"complete":end == skill.content.len(),
+                "readMore":{"tool":"plugin_skill","args":{"name":skill.name}}})
+        }).collect::<Vec<_>>());
+        Ok(value)
+    }
 }
 
 #[async_trait::async_trait]
@@ -293,10 +315,13 @@ impl Tool for PluginTool {
                             .await?;
                         if let Some(instances) = catalog["instances"].as_array_mut() {
                             for instance in instances {
+                                let plugin = instance["pluginId"].as_str().ok_or_else(|| anyhow::anyhow!("instance is missing pluginId"))?;
+                                let state = host.session_state(session, plugin).await?;
                                 if let Some(tools) = instance["tools"].as_array_mut() {
                                     *tools = tools
                                         .iter()
-                                        .filter(|tool| tool["exposeToAgent"] == true)
+                                         .filter(|tool| tool["exposeToAgent"] == true)
+                                        .filter(|tool| tool["group"].as_str().is_some_and(|group| group_enabled(&state, group)))
                                         .filter_map(|tool| {
                                             tool["name"].as_str().map(|name| json!(name))
                                         })
@@ -307,13 +332,10 @@ impl Tool for PluginTool {
                         catalog
                     }
                     Gateway::Activate => {
-                        let mut instance = host.action(workspace, root, session, HostAction::Activate {
+                        let instance = host.action(workspace, root, session, HostAction::Activate {
                             plugin_id: text("pluginId")?.into(),
                         }).await?;
-                        instance["tools"] = json!(instance["tools"].as_array().into_iter().flatten()
-                            .filter(|tool| tool["exposeToAgent"] == true)
-                            .filter_map(|tool| tool["name"].as_str()).collect::<Vec<_>>());
-                        instance
+                        host.agent_instance(instance, workspace, root, session).await?
                     }
                     Gateway::Open => {
                         let resource = args
@@ -321,7 +343,7 @@ impl Tool for PluginTool {
                             .cloned()
                             .map(serde_json::from_value)
                             .transpose()?;
-                        host.action(
+                        let mut instance = host.action(
                             workspace,
                             root,
                             session,
@@ -330,20 +352,9 @@ impl Tool for PluginTool {
                                 binding_resource: resource,
                             },
                         )
-                        .await
-                        .map(|mut value| {
-                            value["workspaceRoot"] = root.to_string_lossy().into_owned().into();
-                            value["tools"] = json!(
-                                value["tools"]
-                                    .as_array()
-                                    .into_iter()
-                                    .flatten()
-                                    .filter(|t| t["exposeToAgent"] == true)
-                                    .filter_map(|t| t["name"].as_str())
-                                    .collect::<Vec<_>>()
-                            );
-                            value
-                        })?
+                        .await?;
+                        instance["workspaceRoot"] = root.to_string_lossy().into_owned().into();
+                        host.agent_instance(instance, workspace, root, session).await?
                     }
                     Gateway::Close => {
                         host.action(
