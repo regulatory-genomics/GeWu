@@ -1,6 +1,46 @@
 import {expect, test} from '@playwright/test';
 import {openPreview, startFixture} from './fixtures.mjs';
 
+test('agent plugin_open mounts Preview while the same turn is still running', async ({page}) => {
+  let resume;
+  const gate = new Promise(resolve => {resume=resolve;});
+  let allowOpen;
+  const opening = new Promise(resolve => {allowOpen=resolve;});
+  let sawEmptyCatalog = false;
+  page.on('websocket', socket => socket.on('framereceived', ({payload}) => {
+    const message = JSON.parse(payload);
+    if (message.type === 'plugin' && message.result?.instances?.length === 0) sawEmptyCatalog = true;
+  }));
+  const fixture = await startFixture({contextProvider:true, respond:async(turn,res)=>{
+    const afterTool = turn.messages.some(message=>message.role === 'tool');
+    res.writeHead(200,{'content-type':'text/event-stream'});
+    const send = (delta,finish_reason) => res.write(`data: ${JSON.stringify({id:'open-fixture',object:'chat.completion.chunk',choices:[{index:0,delta,finish_reason}]})}\n\n`);
+    if (!afterTool) {
+      await opening;
+      send({role:'assistant',tool_calls:[{index:0,id:'open-1',type:'function',function:{name:'plugin_open',arguments:'{"pluginId":"demo"}'}}]},null);
+      send({},'tool_calls');
+    } else {
+      await gate;
+      send({role:'assistant',content:'The application is visible.'},null);
+      send({},'stop');
+    }
+    res.end('data: [DONE]\n\n');
+  }});
+  try {
+    await page.goto(fixture.url);
+    await page.getByRole('textbox',{name:'Message'}).fill('Open the demo and keep working.');
+    sawEmptyCatalog = false;
+    await page.getByRole('button',{name:/^Send/}).click();
+    await expect.poll(()=>sawEmptyCatalog).toBe(true);
+    allowOpen();
+    await expect(page.frameLocator('iframe[title="Demo View"]').getByRole('heading')).toHaveText('GeWu connected',{timeout:10000});
+    await expect(page.getByRole('tab',{name:'PREVIEW'})).toHaveAttribute('aria-selected','true');
+    await expect(page.getByText('The application is visible.',{exact:true})).toHaveCount(0);
+    resume();
+    await expect(page.getByText('The application is visible.',{exact:true})).toBeVisible();
+  } finally {allowOpen();resume();await fixture.close();}
+});
+
 test('an agent can use a headless provider without opening Preview', async ({page}) => {
   const fixture = await startFixture({contextProvider:true});
   try {

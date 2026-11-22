@@ -500,6 +500,10 @@ import {panelHost} from './panels.mjs';
     pluginTabs = message.tabs;
     panels.switchTab(pluginTabs.find(tab=>tab.id===message.active));
     mountPanels();
+    schedulePanelSync();
+  }
+
+  function schedulePanelSync() {
     clearTimeout(panelSyncTimer);
     panelSyncTimer = setTimeout(() => panels.sync(), 120);
   }
@@ -562,6 +566,8 @@ import {panelHost} from './panels.mjs';
         break;
       case "tool_card":
         replaceToolCard(message.first, message.html);
+        // plugin_open can change view intent before the agent turn finishes.
+        schedulePanelSync();
         break;
       case "tool_card_start":
         startToolCard(message.first, message.html, message.assistant);
