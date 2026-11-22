@@ -44,7 +44,7 @@ enum Action {
     Gateway(Arc<PluginHost>, String, PathBuf, String, Gateway),
 }
 
-fn group_enabled(state: &super::SessionPluginState, group: &str) -> bool {
+pub(super) fn group_enabled(state: &super::SessionPluginState, group: &str) -> bool {
     let has = |profile: &str| state.profiles.iter().any(|item| item == profile);
     match group {
         "workspace" => has("workspace-basic"),
@@ -58,6 +58,7 @@ fn group_enabled(state: &super::SessionPluginState, group: &str) -> bool {
 #[derive(Clone, Copy)]
 enum Gateway {
     List,
+    Activate,
     Open,
     Close,
     Describe,
@@ -91,6 +92,13 @@ impl PluginHost {
                 "List configured applications and the instances open in this workspace.",
                 json!({}),
                 json!([]),
+            ),
+            (
+                Gateway::Activate,
+                "plugin_activate",
+                "Use a configured application for this session without opening Preview. Then use plugin_describe and plugin_call with the returned instance id.",
+                json!({"pluginId":{"type":"string"}}),
+                json!(["pluginId"]),
             ),
             (
                 Gateway::Open,
@@ -298,34 +306,55 @@ impl Tool for PluginTool {
                         }
                         catalog
                     }
+                    Gateway::Activate => {
+                        let mut instance = host.action(workspace, root, session, HostAction::Activate {
+                            plugin_id: text("pluginId")?.into(),
+                        }).await?;
+                        instance["tools"] = json!(instance["tools"].as_array().into_iter().flatten()
+                            .filter(|tool| tool["exposeToAgent"] == true)
+                            .filter_map(|tool| tool["name"].as_str()).collect::<Vec<_>>());
+                        instance
+                    }
                     Gateway::Open => {
                         let resource = args
                             .get("bindingResource")
                             .cloned()
                             .map(serde_json::from_value)
                             .transpose()?;
-                        let i = host
-                            .open_for_session(
-                                text("pluginId")?,
-                                workspace,
-                                root,
-                                resource,
-                                Some(session),
-                            )
-                            .await?;
-                        json!({
-                            "id":i.activation.instance_id,
-                            "pluginId":i.package.manifest.id,
-                            "views":i.package.manifest.views,
-                            "tools":i.definitions().filter(|t|t.expose_to_agent).map(|t|&t.name).collect::<Vec<_>>(),
-                            "workspaceRoot":i.activation.workspace_root,
-                            "bindingResource":i.activation.binding_resource,
-                        })
+                        host.action(
+                            workspace,
+                            root,
+                            session,
+                            HostAction::Open {
+                                plugin_id: text("pluginId")?.into(),
+                                binding_resource: resource,
+                            },
+                        )
+                        .await
+                        .map(|mut value| {
+                            value["workspaceRoot"] = root.to_string_lossy().into_owned().into();
+                            value["tools"] = json!(
+                                value["tools"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter(|t| t["exposeToAgent"] == true)
+                                    .filter_map(|t| t["name"].as_str())
+                                    .collect::<Vec<_>>()
+                            );
+                            value
+                        })?
                     }
                     Gateway::Close => {
-                        host.close_for_session(workspace, root, text("instanceId")?, Some(session))
-                            .await?;
-                        json!({"closed":true})
+                        host.action(
+                            workspace,
+                            root,
+                            session,
+                            HostAction::Close {
+                                instance_id: text("instanceId")?.into(),
+                            },
+                        )
+                        .await?
                     }
                     Gateway::Describe | Gateway::Call => {
                         let id = text("instanceId")?;
@@ -340,7 +369,7 @@ impl Tool for PluginTool {
                         if matches!(kind, Gateway::Call) {
                             if args.get("async").and_then(Value::as_bool) == Some(true) {
                                 let call = host
-                                    .action(
+                                    .action_with_agent(
                                         workspace,
                                         root,
                                         session,
@@ -353,7 +382,9 @@ impl Tool for PluginTool {
                                                 .cloned()
                                                 .unwrap_or_default(),
                                             view_id: None,
+                                            context_ref: None,
                                         },
+                                        Some(ctx),
                                     )
                                     .await?;
                                 return Ok(ToolResult::new(
@@ -515,12 +546,14 @@ async fn invoke(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("tool args must be an object"))?;
     let id = uuid::Uuid::new_v4().to_string();
-    let app_context = host.resolve_context(
+    let mut app_context = host.resolve_context(
         &instance.activation.workspace_id,
         &ctx.session_id,
         instance,
         None,
     )?;
+    host.pin_agent_call(&mut app_context, instance, tool, ctx)
+        .await?;
     let context = app_context.call_context(id.clone(), None);
     let (tx, mut rx) = mpsc::channel(8);
     let mut guard = CancelOnDrop {

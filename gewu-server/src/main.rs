@@ -163,6 +163,10 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str, inbox: &Steering)
                             stop_spinner(&mut spinner_active, is_tty)?;
                             error!("Error from agent: {}", error);
                         }
+                        AgentEvent::Cancelled { reason } => {
+                            stop_spinner(&mut spinner_active, is_tty)?;
+                            println!("\n{DIM}[cancelled] {reason}{RESET}");
+                        }
                     },
                     Err(e) => error!("Stream error: {}", e),
                 }

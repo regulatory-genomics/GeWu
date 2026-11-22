@@ -39,6 +39,9 @@ pub enum HostAction {
         plugin_id: String,
         binding_resource: Option<ResourceRef>,
     },
+    Activate {
+        plugin_id: String,
+    },
     Close {
         instance_id: String,
     },
@@ -47,6 +50,8 @@ pub enum HostAction {
         tool: String,
         args: Object,
         view_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_ref: Option<ResourceRef>,
     },
     Calls,
     CallStatus {
@@ -165,6 +170,17 @@ pub struct Manifest {
     pub views: Vec<View>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings_schema: Option<Object>,
+    /// Opt-in: this application can supply a bounded context snapshot that the
+    /// host injects into each model request. The named tool must be an exposed
+    /// backend read tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_provider: Option<ContextProvider>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextProvider {
+    pub tool: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +284,10 @@ pub struct CallContext {
     pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding_resource: Option<ResourceRef>,
+    /// The context snapshot the model saw when it produced this call. Opaque to
+    /// the host; only the provider that published it interprets the revision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_ref: Option<ResourceRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource: Option<ResourceRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -403,7 +423,7 @@ fn is_default_tool_group(group: &str) -> bool {
     group == "workspace"
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Effect {
     Read,

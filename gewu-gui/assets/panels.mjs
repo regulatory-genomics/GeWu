@@ -144,12 +144,16 @@ function runtimeDescription(runtime) {
 export function panelHost(root, rpc, {onShow, onHide} = {}) {
   let scope, active = 'plugins', seq = 0, syncing = null, manager, changesView, marketplaceView, managerSignature = '';
   let dismissed = new Set();
+  let tabEpoch = 0;
   const panels = new Map();
   const tabs = node('nav');
   tabs.setAttribute('aria-label', 'Application views');
   const body = node('div');
   body.className = 'plugin-body';
-  root.replaceChildren(tabs, body);
+  const sidebars = node('aside');
+  sidebars.className = 'plugin-sidebars';
+  sidebars.setAttribute('aria-label', 'Session context');
+  root.replaceChildren(tabs, sidebars, body);
 
   const fail = (target, error) => target.append(node('p', String(error.message ?? error)));
   const requestFor = (tab = scope?.id) => (action) => rpc(tab, action);
@@ -176,6 +180,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
     market.setAttribute('aria-pressed', String(active === 'marketplace'));
     tabs.append(market);
     for (const [id, panel] of panels) {
+      if (panel.sidebar) continue;
       const item = button(panel.title, () => { active = id; render(); });
       item.setAttribute('aria-pressed', String(active === id));
       tabs.append(item);
@@ -185,6 +190,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
       }
       panel.content.hidden = id !== active;
     }
+    sidebars.hidden = ![...panels.values()].some(panel => panel.sidebar);
     if (manager) manager.hidden = active !== 'plugins';
     if (changesView) changesView.hidden = active !== 'changes';
     if (marketplaceView) marketplaceView.hidden = active !== 'marketplace';
@@ -196,8 +202,12 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
     panels.delete(id);
     panel.dispose?.();
     panel.content.remove();
-    dismiss(panel.instanceId, false);
-    active = [...panels.keys()].at(-1) ?? 'plugins';
+    if (panel.sidebar) write(panel.intentKey, false);
+    else {
+      if (panel.intentKey) write(panel.intentKey, false);
+      dismiss(panel.instanceId, false);
+      active = [...panels].filter(([, item]) => !item.sidebar).at(-1)?.[0] ?? 'plugins';
+    }
     render();
     if (active === 'plugins') refresh();
   }
@@ -214,9 +224,21 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
 
   async function openView(instance, view, resource, {reveal = true} = {}) {
     const id = `${instance.id}/${view.id}`;
-    if (panels.has(id)) { if (reveal) { active = id; render(); } return; }
+    const sidebar = view.placement === 'sidebar' && ['webview', 'webapp'].includes(view.kind);
+    if (panels.has(id)) { if (reveal && !sidebar) { active = id; render(); } return; }
     const request = requestFor();
     const panel = add(id, view.title, instance.id, view.id);
+    panel.sidebar = sidebar;
+    const savedKey = stateKey(scope, instance, view);
+    panel.intentKey = `${savedKey}:visible`;
+    if (sidebar) {
+      const header = node('header');
+      header.append(node('strong', view.title), button(`Close ${view.title}`, () => close(id)));
+      panel.content.append(header);
+      sidebars.append(panel.content);
+      panel.content.hidden = false;
+    }
+    if (reveal) write(panel.intentKey, true);
     let disposed = false, release = () => {};
     panel.dispose = () => {
       if (disposed) return;
@@ -233,8 +255,9 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
       await openView(instance, view, resource, {reveal: active === id});
       render();
     };
-    if (reveal) { active = id; render(); onShow?.(); }
-    const state = read(stateKey(scope, instance, view), {});
+    if (reveal && !sidebar) { active = id; render(); onShow?.(); }
+    else if (sidebar) render();
+    const state = read(savedKey, {});
     try {
       const binding = await request({action: 'attach', instanceId: instance.id, viewType: view.id, resource});
       const {viewId} = binding;
@@ -256,7 +279,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
           return {...context, state};
         }, {
           getContext: (_, ctx) => ctx,
-          callTool: ({tool, args}) => request({action: 'call', instanceId: instance.id, viewId, tool, args}),
+          callTool: ({tool, args, contextRef}) => request({action: 'call', instanceId: instance.id, viewId, tool, args, contextRef}),
           resolveResource: ({resource}) => request({action: 'resource', instanceId: instance.id, viewId, resource}),
           openResource: ({resource}) => { openResultResource(instance, resource); return {opened: true}; },
           downloadResource: async ({resource}) => {
@@ -264,7 +287,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
             const link=document.createElement('a');link.href=url;link.download=resource.uri.split('/').at(-1)||'artifact';document.body.append(link);link.click();link.remove();return {downloaded:true};
           },
           publishContext: ({summary}) => request({action: 'publish_context', viewId, summary}),
-          saveState: async ({state: next}) => { const saved = await request({action: 'save_state', viewId, state: next}); write(stateKey(scope, instance, view), saved); return saved; },
+          saveState: async ({state: next}) => { const saved = await request({action: 'save_state', viewId, state: next}); if (!disposed) write(savedKey, saved); return saved; },
           requestService: ({serviceId, path, method}) => request({action: 'service', viewId, serviceId, path, method}),
           getCall: ({callId}) => request({action: 'call_status', callId}),
           cancelCall: ({callId}) => request({action: 'cancel', callId}),
@@ -680,11 +703,11 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
   function sync() {
     if (!scope?.session_id || syncing) return syncing;
     const request = requestFor();
-    const key = scope.id;
+    const epoch = tabEpoch;
     syncing = (async () => {
       try {
         const {instances} = await request({action: 'list'});
-        if (scope?.id !== key) return;
+        if (tabEpoch !== epoch) return;
         const live = new Set(instances.map((i) => i.id));
         for (const [id, panel] of [...panels]) {
           if (panel.instanceId && !live.has(panel.instanceId)) {
@@ -695,30 +718,41 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
           }
         }
         for (const instance of instances) {
+          if (tabEpoch !== epoch) return;
+          for (const sidebar of instance.views?.filter(v => v.placement === 'sidebar' && ['webview','webapp'].includes(v.kind)) ?? []) {
+            if (read(`${stateKey(scope, instance, sidebar)}:visible`, false)) {
+              await openView(instance, sidebar, undefined, {reveal:false});
+              if (tabEpoch !== epoch) return;
+            }
+          }
           const view = primaryView(instance);
           if (!view || dismissed.has(instance.id)) continue;
+          if (instance.autoPreview === false && !read(`${stateKey(scope, instance, view)}:visible`, false)) continue;
           if (panels.has(`${instance.id}/${view.id}`)) continue;
           // Reattaching a live app must not steal the file or result the user is viewing.
           const reveal = active !== 'changes' && (!panels.has(active) || !!panels.get(active).instanceId);
           await openView(instance, view, undefined, {reveal});
         }
+        if (tabEpoch !== epoch) return;
         render();
         // Re-rendering the manager under the pointer steals clicks; only do it
         // when the set of open instances actually changed.
         const signature = instances.map((i) => i.id).join(',');
         if (active === 'plugins' && signature !== managerSignature) refresh();
       } catch {}
-      finally { syncing = null; }
+      finally { if (tabEpoch === epoch) syncing = null; }
     })();
     return syncing;
   }
 
   async function openPlugin(plugin, request = requestFor()) {
+    const epoch = tabEpoch;
     const resource = plugin.scope === 'resource'
       ? promptResource(`Workspace folder of the ${plugin.title ?? plugin.id} document`, plugin.views?.[0]?.resourceTypes?.[0] ?? 'document')
       : undefined;
     if (plugin.scope === 'resource' && !resource) return;
     const instance = await request({action: 'open', pluginId: plugin.id, bindingResource: resource});
+    if (tabEpoch !== epoch) return;
     dismiss(instance.id, true);
     const view = primaryView(instance);
     if (view) await openView(instance, view);
@@ -807,6 +841,17 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
         if (effective && plugin.settingsValid !== false) actions.append(button('Open\u2026', async () => {
           try { await openPlugin(plugin); } catch (error) { fail(view, error); }
         }));
+        if (effective && plugin.settingsValid !== false && plugin.scope !== 'resource' && !running.length) {
+          for (const sidebar of plugin.views?.filter(v => v.placement === 'sidebar' && ['webview','webapp'].includes(v.kind)) ?? []) {
+            actions.append(button(sidebar.title, async () => {
+              const epoch = tabEpoch;
+              try {
+                const instance = await request({action:'activate', pluginId:plugin.id});
+                if (epoch === tabEpoch) await openView(instance, sidebar);
+              } catch (error) { if (epoch === tabEpoch) fail(view, error); }
+            }));
+          }
+        }
         row.append(actions);
         if (effective && (plugin.id === 'tachyon' || plugin.scope === 'session')) {
           const profiles = node('span');
@@ -862,7 +907,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
     if (instance.bindingResource) row.append(node('code', instance.bindingResource.uri));
     const primary = primaryView(instance);
     for (const item of instance.views ?? []) {
-      if (primary && item.id === primary.id) continue;
+      if (primary && item.id === primary.id && instance.autoPreview !== false) continue;
       row.append(button(item.title, () => {
         const resource = item.kind === 'builtin' && item.renderer !== 'diff'
           ? promptResource(`Workspace content path for ${item.title}`, item.resourceTypes?.[0])
@@ -888,9 +933,12 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
     if (!next) return;
     if (scope && scope.id === next.id && scope.workspace === next.workspace && scope.session_id === next.session_id) return;
     scope = next;
+    tabEpoch++;
+    syncing = null;
     dismissed = new Set(read(dismissedKey(next), []));
     for (const panel of panels.values()) panel.dispose?.();
     panels.clear();
+    sidebars.replaceChildren();
     body.replaceChildren();
     manager = node('div');
     manager.className = 'plugin-manager';

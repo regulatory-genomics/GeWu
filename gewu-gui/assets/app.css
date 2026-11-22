@@ -3333,6 +3333,9 @@ body {
 .plugin-host :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .plugin-host nav { display: flex; flex-wrap: wrap; flex: 0 0 auto; }
 .plugin-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.plugin-sidebars { max-height: 48%; flex: 0 1 auto; overflow: auto; border-bottom: 1px solid var(--line); }
+.plugin-sidebars header { display: flex; align-items: center; justify-content: space-between; }
+.plugin-sidebars .plugin-panel iframe { min-height: 14rem; }
 .plugin-manager { overflow-y: auto; min-height: 0; flex: 1; }
 .plugin-manager h3 { margin: 12px 0 4px; font-size: 11px; letter-spacing: 0.08em; color: var(--text-faint); text-transform: uppercase; }
 .plugin-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 8px 0; border-bottom: 1px solid var(--line); }

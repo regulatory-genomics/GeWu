@@ -70,8 +70,9 @@ use tracing::{info, trace, warn};
 use uuid::Uuid;
 
 use self::execution::{
-    DoomLoopDetector, LlmResponseAggregator, ToolCallPlan, TurnDisposition, classify_turn,
-    execute_tool_call, normalize_tool_result, plan_tool_call, prepare_provider_messages,
+    DoomLoopDetector, LlmResponseAggregator, ToolCallPlan, TurnDisposition,
+    attach_inference_context, classify_turn, execute_tool_call, normalize_tool_result,
+    plan_tool_call, prepare_provider_messages,
 };
 
 /// Maximum number of tool calls from a single LLM turn that execute at the
@@ -116,6 +117,8 @@ pub struct Agent {
     session_state: SessionState,
     /// Session-selected filesystem root, when supplied by the host.
     working_directory: Option<PathBuf>,
+    /// Optional per-request context projection (application-owned).
+    inference_context: Option<Arc<dyn crate::traits::InferenceContextSource>>,
 }
 
 /// Builder for constructing `Agent` instances.
@@ -146,6 +149,8 @@ pub struct AgentBuilder {
     session_id: Option<String>,
     /// Filesystem root handed to path-sensitive tools.
     working_directory: Option<PathBuf>,
+    /// Optional per-request context projection (application-owned).
+    inference_context: Option<Arc<dyn crate::traits::InferenceContextSource>>,
 }
 
 /// Extracts a readable message from a panic payload.
@@ -188,6 +193,7 @@ impl Default for AgentBuilder {
             session_state: None,
             session_id: None,
             working_directory: None,
+            inference_context: None,
         }
     }
 }
@@ -217,6 +223,14 @@ impl Agent {
     /// Swap the catalog at a turn boundary without resetting its prompt or reminder.
     pub fn replace_tools(&mut self, tools: Arc<Vec<Arc<dyn Tool>>>) -> Arc<Vec<Arc<dyn Tool>>> {
         std::mem::replace(&mut self.tools, tools)
+    }
+
+    /// Bind a source to this agent only; spawned agents must bind their own.
+    pub fn set_inference_context(
+        &mut self,
+        source: Option<Arc<dyn crate::traits::InferenceContextSource>>,
+    ) {
+        self.inference_context = source;
     }
 
     /// Changes the filesystem root used by subsequent tool calls.
@@ -391,8 +405,27 @@ impl Agent {
                     yield event;
                 }
 
+                if let Some(max) = self.max_turns
+                    && turn >= max {
+                        yield AgentEvent::Error { error: "Max turns reached without final answer.".to_string() };
+                        break;
+                    }
+                turn += 1;
+
+                let mut snapshot = crate::traits::InferenceContext::default();
+                if let Some(source) = &self.inference_context {
+                    match source.inference_context().await {
+                        Ok(current) => snapshot = current,
+                        Err(error) => {
+                            yield AgentEvent::Status {
+                                message: format!("application context unavailable: {error}"),
+                            };
+                        }
+                    }
+                }
                 let context_tokens = crate::compaction::active_context(self.memory.messages())
-                    .estimate_tokens();
+                    .estimate_tokens()
+                    .saturating_add(snapshot.text.len().div_ceil(4));
                 let compacting = crate::compaction::is_overflow(context_tokens, self.context_limit);
                 if compacting {
                     yield AgentEvent::Status { message: "Compacting context…".into() };
@@ -409,15 +442,16 @@ impl Agent {
                     yield self.usage_event();
                 }
 
-                if let Some(max) = self.max_turns
-                    && turn >= max {
-                        yield AgentEvent::Error { error: "Max turns reached without final answer.".to_string() };
-                        break;
-                    }
-                turn += 1;
-
                 let mut aggregator = LlmResponseAggregator::new();
-                let messages = prepare_provider_messages(self.memory.messages(), &self.system_prompt);
+                let mut messages =
+                    prepare_provider_messages(self.memory.messages(), &self.system_prompt);
+                // One snapshot per request. It is transient: it never enters
+                // memory, and its metadata is pinned to every tool call the
+                // request produces so an action cannot drift to newer state.
+                let inference_metadata = snapshot.metadata;
+                if !snapshot.text.trim().is_empty() {
+                    attach_inference_context(&mut messages, &snapshot.text);
+                }
                 trace!("LLM request messages: {:?}", messages);
                 let tools_clone = self.tools.clone();
 
@@ -639,6 +673,7 @@ impl Agent {
                     let semaphore = semaphore.clone();
                     let inbox = inbox.clone();
                     let working_directory = self.working_directory.clone();
+                    let inference_metadata = inference_metadata.clone();
                     let progress_tx = progress_tx.clone();
                     executing += 1;
                     join_set.spawn(async move {
@@ -647,6 +682,7 @@ impl Agent {
                         let mut ctx = ToolContext::new(&session_id, &message_id)
                             .with_enforcement(enforcement)
                             .with_session_state(session_state);
+                        ctx.metadata.extend(inference_metadata.clone());
                         ctx.inbox = Some(inbox);
                         ctx.progress = Some(ProgressSink::new(&tool_name, progress_tx));
                         if let Some(working_directory) = working_directory {
@@ -905,6 +941,7 @@ impl AgentTemplate {
             provider_usage: TokenUsage::default(),
             reminder,
             working_directory: self.working_directory,
+            inference_context: None,
         }
     }
 }
@@ -1000,6 +1037,19 @@ impl AgentBuilder {
         self
     }
 
+    /// Supplies a bounded work-state projection for every model request.
+    ///
+    /// The text is transient (never stored in memory) and its metadata is
+    /// copied into the tool contexts of the same request, so a decision can be
+    /// pinned to the snapshot it saw.
+    pub fn with_inference_context(
+        mut self,
+        source: Arc<dyn crate::traits::InferenceContextSource>,
+    ) -> Self {
+        self.inference_context = Some(source);
+        self
+    }
+
     /// Sets the request log used to record every LLM request.
     ///
     /// When set, each request sent to the LLM provider is recorded as one JSONL
@@ -1068,6 +1118,7 @@ impl AgentBuilder {
             tool_policy: self.tool_policy,
             session_state: self.session_state.unwrap_or_else(SessionState::in_memory),
             working_directory: self.working_directory,
+            inference_context: self.inference_context,
         };
         Ok(agent)
     }

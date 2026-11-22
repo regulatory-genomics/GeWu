@@ -17,6 +17,11 @@ pub(super) struct AppContext {
     pub generation: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding_resource: Option<ResourceRef>,
+    /// Snapshot identity this inference actually saw; filled at call time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_ref: Option<ResourceRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub view_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -36,6 +41,8 @@ impl AppContext {
             instance_id: instance.activation.instance_id.clone(),
             generation: instance.activation.generation,
             binding_resource: instance.activation.binding_resource.clone(),
+            context_ref: None,
+            inference_id: None,
             view_id: None,
             view_epoch: None,
             resource: None,
@@ -67,6 +74,7 @@ impl AppContext {
             session_id: Some(self.session_id.clone()),
             run_id,
             binding_resource: self.binding_resource.clone(),
+            context_ref: self.context_ref.clone(),
             resource: self.resource.clone(),
             view_id: self.view_id.clone(),
             view_epoch: self.view_epoch,

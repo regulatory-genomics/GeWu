@@ -5,6 +5,7 @@ pub mod builtin;
 mod changes;
 mod context;
 pub mod diagnostics;
+mod inference;
 mod invocation;
 pub mod lifecycle;
 pub mod marketplace;
@@ -1022,6 +1023,21 @@ impl Instance {
             catalog.service_endpoints.iter().all(|s| ids.insert(&s.id)),
             "duplicate service id"
         );
+        if let Some(provider) = &package.manifest.context_provider {
+            let declared = tools.get(&provider.tool).with_context(|| {
+                format!(
+                    "contextProvider tool {:?} is not in the activated catalog",
+                    provider.tool
+                )
+            })?;
+            ensure!(
+                declared.definition.target == Target::Backend
+                    && declared.definition.effect == Effect::Read
+                    && declared.definition.expose_to_agent,
+                "contextProvider tool {:?} must be an exposed backend read tool",
+                provider.tool
+            );
+        }
         Ok(Self {
             package,
             activation,
@@ -1054,6 +1070,7 @@ impl Instance {
             session_id: session,
             run_id: None,
             binding_resource: self.activation.binding_resource.clone(),
+            context_ref: None,
             resource: None,
             view_id: None,
             view_epoch: None,

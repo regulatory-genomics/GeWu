@@ -14,7 +14,7 @@ async function port() {
   const {port}=server.address(); server.close(); await once(server,'close'); return port;
 }
 
-export async function startFixture({packagePath, settings = {}, useDemo = !packagePath, disabled = false, marketplace, appOrigins = false, respond, installed} = {}) {
+export async function startFixture({packagePath, settings = {}, useDemo = !packagePath, disabled = false, marketplace, appOrigins = false, respond, installed, contextProvider = false} = {}) {
   const temp=await mkdtemp(join(process.env.GEWU_TEST_TMP ?? process.env.TMPDIR ?? '/tmp','gewu-addon-'));
   const root=join(temp,'workspace');
   const other=join(temp,'other');
@@ -28,6 +28,13 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
     await cp(packagePath ?? join(repo,'gewu-server/tests/fixtures/plugin-adapter'),pkg,{recursive:true});
   }
   const manifest=JSON.parse(await readFile(join(pkg,'plugin.json'),'utf8'));
+  if (contextProvider) {
+    manifest.scope = 'session';
+    manifest.contextProvider = {tool:'context.get'};
+    manifest.settingsSchema.properties.contextFixture = {type:'boolean'};
+    manifest.views.push({...manifest.views[0], id:'session-context', title:'Demo Context', placement:'sidebar'});
+    await writeFile(join(pkg,'plugin.json'), JSON.stringify(manifest));
+  }
   if (useDemo && !installed) await cp(join(repo,'sdk/python/gewu_plugin.py'),join(pkg,'gewu_plugin.py'));
   const requests=[];
   let nativeStream;
@@ -77,7 +84,8 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
     res.writeHead(200,{'content-type':'text/event-stream'});
     // Any plugin conformance spec can say `call <tool> <json>`; the agent, not
     // the browser, is the surface that names plugin tools.
-    const askedCall = /^call\s+(\S+)\s+(\{[^\n]*\})$/m.exec(asked.trim());
+    const command = Array.isArray(askedMessage?.content) ? askedMessage.content.find(p => p.type === 'text')?.text ?? asked : asked;
+    const askedCall = /^call\s+(\S+)\s+(\{[^\n]*\})$/m.exec(command.trim());
     if (askedCall && !afterTool) {
       const name = turn.tools?.find(t => t.function.name === askedCall[1]
         || t.function.name.endsWith(`.${askedCall[1]}`)
@@ -110,7 +118,7 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
   const config=join(temp,'config.json');
   await writeFile(config,JSON.stringify({
     model:'local/fixture',endpoints:{local:{base_url:`${origin}/v1`,api_key:'test-only',models:{fixture:{provider:'openai-compatible'}}}},
-    workspaces:{other},plugins:marketplace ? {} : {[manifest.id]:{package:installed ? '' : pkg,enabled:!disabled,settings:useDemo && !installed ? {service:origin} : settings}},
+    workspaces:{other},plugins:marketplace ? {} : {[manifest.id]:{package:installed ? '' : pkg,enabled:!disabled,settings:useDemo && !installed ? {service:origin, ...(contextProvider ? {contextFixture:true} : {})} : settings}},
   }));
   const [socket,tcp,http,gui]=await Promise.all([port(),port(),port(),port()]);
   let output='';

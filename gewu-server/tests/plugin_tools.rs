@@ -269,6 +269,7 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
                 tool: "echo".into(),
                 args: json!({"value":7}).as_object().unwrap().clone(),
                 view_id: None,
+                context_ref: None,
             },
         )
         .await
@@ -538,6 +539,7 @@ async fn resource_instances_are_shared_but_visible_only_to_attached_sessions() {
                 tool: "view_echo".into(),
                 args: json!({"value":13}).as_object().unwrap().clone(),
                 view_id: None,
+                context_ref: None,
             },
         )
         .await

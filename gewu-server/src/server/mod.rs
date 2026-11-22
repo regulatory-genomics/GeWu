@@ -1270,6 +1270,7 @@ async fn handle_request(
             let mark_session = matches!(
                 &action,
                 gewu_protocol::plugin::HostAction::Open { .. }
+                    | gewu_protocol::plugin::HostAction::Activate { .. }
                     | gewu_protocol::plugin::HostAction::SaveText { .. }
             );
             let result = state
@@ -2440,13 +2441,13 @@ async fn start_session_turn(
 ) {
     let (mut messages, original_tools) = {
         let mut agent = session.agent.lock().await;
+        let plugins = &state.bootstrap.plugins;
+        let root = PathBuf::from(&session.workspace.path);
         let plugin_tools = if session.agent_name == "build" {
-            state
-                .bootstrap
-                .plugins
+            plugins
                 .tools(
                     &session.workspace.id,
-                    PathBuf::from(&session.workspace.path),
+                    root.clone(),
                     &session.session_id,
                     agent.tools(),
                 )
@@ -2454,6 +2455,11 @@ async fn start_session_turn(
         } else {
             Vec::new()
         };
+        agent.set_inference_context(Some(plugins.context_source(
+            &session.workspace.id,
+            root,
+            &session.session_id,
+        )));
         let previous = if plugin_tools.is_empty() {
             None
         } else {
@@ -2589,6 +2595,7 @@ async fn start_session_turn(
             if let Some(tools) = original_tools {
                 agent.replace_tools(tools);
             }
+            agent.set_inference_context(None);
             patch_dangling_tool_calls(&mut agent).await;
 
             if failure.is_some() {

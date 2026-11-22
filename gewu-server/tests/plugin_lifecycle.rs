@@ -43,6 +43,7 @@ async fn cancel_ack_does_not_replace_terminal_and_adapter_exits() {
                             session_id: None,
                             run_id: None,
                             binding_resource: None,
+                            context_ref: None,
                             resource: None,
                             view_id: None,
                             view_epoch: None,

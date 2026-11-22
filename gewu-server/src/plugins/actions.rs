@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use gewu_protocol::plugin::*;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::Path,
     sync::{
         Arc,
@@ -23,6 +23,7 @@ pub(super) struct Calls {
     completed: VecDeque<String>,
     views: HashMap<String, ViewBinding>,
     focus: HashMap<(String, String), String>,
+    previews: HashSet<(String, String)>,
     changes: VecDeque<(String, String, Value)>,
 }
 
@@ -207,6 +208,9 @@ impl PluginHost {
 
     fn remove_views_for(&self, owner: &str, instance_id: &str, all: bool) {
         let mut state = self.calls.lock().unwrap();
+        state
+            .previews
+            .retain(|(session, instance)| instance != instance_id || (!all && session != owner));
         state.views.retain(|_, view| {
             view.instance.activation.instance_id != instance_id || (!all && view.owner != owner)
         });
@@ -249,6 +253,18 @@ impl PluginHost {
         root: &Path,
         owner: &str,
         action: HostAction,
+    ) -> Result<Value> {
+        self.action_with_agent(workspace, root, owner, action, None)
+            .await
+    }
+
+    pub(super) async fn action_with_agent(
+        &self,
+        workspace: &str,
+        root: &Path,
+        owner: &str,
+        action: HostAction,
+        agent: Option<&gewu_core::types::ToolContext>,
     ) -> Result<Value> {
         match action {
             HostAction::SetEnabled { plugin_id, enabled } => {
@@ -329,6 +345,9 @@ impl PluginHost {
                     "instances":self.active_for_session(workspace, root, Some(owner)).await.iter().map(|i| {
                         let mut info = i.public_info();
                         info["focused"] = json!(focused.as_deref() == Some(i.activation.instance_id.as_str()));
+                        if i.package.manifest.context_provider.is_some() {
+                            info["autoPreview"] = json!(self.calls.lock().unwrap().previews.contains(&(owner.into(), i.activation.instance_id.clone())));
+                        }
                         info
                     }).collect::<Vec<_>>()
                 }))
@@ -336,8 +355,21 @@ impl PluginHost {
             HostAction::Open {
                 plugin_id,
                 binding_resource,
-            } => Ok(self
-                .open_for_session(&plugin_id, workspace, root, binding_resource, Some(owner))
+            } => {
+                let instance = self
+                    .open_for_session(&plugin_id, workspace, root, binding_resource, Some(owner))
+                    .await?;
+                if instance.package.manifest.context_provider.is_some() {
+                    self.calls
+                        .lock()
+                        .unwrap()
+                        .previews
+                        .insert((owner.into(), instance.activation.instance_id.clone()));
+                }
+                Ok(instance.public_info())
+            }
+            HostAction::Activate { plugin_id } => Ok(self
+                .open_for_session(&plugin_id, workspace, root, None, Some(owner))
                 .await?
                 .public_info()),
             HostAction::Close { instance_id } => {
@@ -352,13 +384,27 @@ impl PluginHost {
                 tool,
                 args,
                 view_id,
+                context_ref,
             } => {
                 let instance = self
                     .find(workspace, root, &instance_id, Some(owner))
                     .await?;
                 let id = Uuid::new_v4().to_string();
-                let app_context =
+                let mut app_context =
                     self.resolve_context(workspace, owner, &instance, view_id.as_deref())?;
+                if let Some(agent) = agent {
+                    self.pin_agent_call(&mut app_context, &instance, &tool, agent)
+                        .await?;
+                } else if instance.package.manifest.context_provider.is_some() {
+                    if let Some(reference) = &context_ref {
+                        package::validate(
+                            &package::wire_validator("ContextRef")?,
+                            &serde_json::to_value(reference)?,
+                        )?;
+                    }
+                    app_context.context_ref = context_ref;
+                }
+                let from_agent = agent.is_some();
                 let context = app_context.call_context(id.clone(), None);
                 let state = self.calls.clone();
                 {
@@ -392,7 +438,7 @@ impl PluginHost {
                         args,
                         context,
                         Some(progress),
-                        false,
+                        from_agent,
                         false,
                     );
                     tokio::pin!(work);
@@ -1081,8 +1127,16 @@ fn repair_focus(state: &mut Calls) {
 }
 
 async fn native_view(view: &ViewBinding, id: &str, name: &str) -> Result<Value> {
-    if !view.instance.definitions().any(|t| t.name == name) {
+    let Some(tool) = view.instance.definitions().find(|t| t.name == name) else {
         return Ok(Value::Null);
+    };
+    let mut args = Object::new();
+    if tool
+        .input_schema
+        .get("properties")
+        .is_some_and(|props| props.get("viewType").is_some())
+    {
+        args.insert("viewType".into(), view.view_type.clone().into());
     }
     let mut context = view
         .instance
@@ -1092,7 +1146,7 @@ async fn native_view(view: &ViewBinding, id: &str, name: &str) -> Result<Value> 
     context.view_epoch = Some(view.instance.activation.generation);
     match view
         .instance
-        .invoke(name, Object::new(), context, None, false, true)
+        .invoke(name, args, context, None, false, true)
         .await?
     {
         ToolOutput::Success { data, .. } => Ok(Value::Object(data)),
