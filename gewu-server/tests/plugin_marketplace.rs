@@ -1,17 +1,19 @@
 use axum::{
     Router,
+    body::Body,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use futures::stream;
 use gewu_protocol::release::Artifact;
 use gewu_server::plugins::artifacts::{ArtifactStore, sha256_bytes};
 use gewu_server::plugins::marketplace::{MarketplaceClient, MarketplaceRepository};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -195,5 +197,82 @@ async fn a_new_client_resumes_after_the_last_complete_range() {
     let path = client().download_artifact(&artifact, &store).await.unwrap();
     assert_eq!(state.first_request.load(Ordering::SeqCst), 2);
     assert_eq!(std::fs::read(path).unwrap(), bytes);
+    server.abort();
+}
+
+#[derive(Clone)]
+struct FallbackState {
+    bytes: Arc<Vec<u8>>,
+    starts: Arc<Mutex<Vec<usize>>>,
+    trick: Arc<AtomicUsize>,
+}
+
+async fn ignore_one_range(State(state): State<FallbackState>, headers: HeaderMap) -> Response {
+    let range = headers
+        .get("range")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    let (start, end) = range
+        .strip_prefix("bytes=")
+        .unwrap()
+        .split_once('-')
+        .unwrap();
+    let start: usize = start.parse().unwrap();
+    state.starts.lock().unwrap().push(start);
+    if start > 0 && state.trick.fetch_add(1, Ordering::SeqCst) == 0 {
+        // A proxy that ignores Range must not poison a later resume: this
+        // complete but short 200 body is shorter than the advertised artifact.
+        return (StatusCode::OK, Body::from(vec![state.bytes[0]])).into_response();
+    }
+    let end = end.parse::<usize>().unwrap().min(state.bytes.len() - 1);
+    let body = state.bytes[start..=end].to_vec();
+    (
+        StatusCode::PARTIAL_CONTENT,
+        [(
+            "content-range",
+            format!("bytes {start}-{end}/{}", state.bytes.len()),
+        )],
+        Body::from_stream(stream::once(async move { Ok::<_, std::io::Error>(body) })),
+    )
+        .into_response()
+}
+
+#[tokio::test]
+async fn a_range_ignored_by_the_server_restarts_cleanly_after_a_short_body() {
+    let bytes: Vec<u8> = (0..(32 * 1024 * 1024 + 1))
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let state = FallbackState {
+        bytes: Arc::new(bytes.clone()),
+        starts: Default::default(),
+        trick: Default::default(),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/artifact", get(ignore_one_range))
+                .with_state(state.clone()),
+        )
+        .into_future(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::new(temp.path().join("store"));
+    let client = MarketplaceClient::new(repository().0, temp.path());
+    let artifact = Artifact {
+        url: format!("http://{address}/artifact"),
+        sha256: sha256_bytes(&bytes),
+        bytes: bytes.len() as u64,
+    };
+    let path = client
+        .download_artifact(&artifact, &store)
+        .await
+        .expect("a truncated 200 response must restart from zero");
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+    let starts = state.starts.lock().unwrap().clone();
+    assert_eq!(starts[0], 0);
+    assert!(starts.iter().skip(1).any(|start| *start == 0), "{starts:?}");
     server.abort();
 }
