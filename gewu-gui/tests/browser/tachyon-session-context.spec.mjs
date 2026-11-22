@@ -38,6 +38,11 @@ test('agent and GUI share bindings and one Canvas for two datasets', async ({pag
       await expect(page.locator('main').getByText(command,{exact:false})).toBeVisible();
       await expect(page.getByText('The adapter returned a result.',{exact:true})).toHaveCount(count+1,{timeout:25000});
     };
+    const lastResult = () => {
+      const message = fixture.requests.at(-1).messages.filter(message=>message.role === 'tool').at(-1);
+      const text = typeof message.content === 'string' ? message.content : message.content.map(part=>part.text ?? '').join('');
+      return JSON.parse(text.split('\n[GeWu plugin result:')[0]);
+    };
     await ask('plugin_activate',{pluginId:'tachyon'});
     await ask('context.update',{expected_revision:0,datasets:[{uri:'tachyon://dataset/local/first',type:'tachyon.dataset',revision:'sha256:first'}]});
     // Legacy page tools cannot run against a session document; the agent must
@@ -46,6 +51,8 @@ test('agent and GUI share bindings and one Canvas for two datasets', async ({pag
     expect(advertised).not.toContain('canvas_add');
     expect(advertised).not.toContain('workspace_describe');
     expect(advertised.some(name => name.endsWith('.canvas.commit'))).toBe(true);
+    await ask('canvas.get',{});
+    expect(lastResult().data.render.status).toBe('not_open');
     await openPreview(page);
     await expect(page.locator('iframe[title="Tachyon Workspace"]')).toHaveCount(0);
     await page.getByRole('button',{name:'Tachyon Context',exact:true}).click();
@@ -58,27 +65,30 @@ test('agent and GUI share bindings and one Canvas for two datasets', async ({pag
     await sidebar.getByRole('button',{name:'Open session Canvas'}).click();
 
     const canvas = page.frameLocator('iframe[title="Tachyon Workspace"]');
+    await expect.poll(async () => canvas.locator('.react-flow').evaluate(el => el.getBoundingClientRect().height)).toBeGreaterThan(250);
+    await expect(canvas.getByRole('button',{name:'Zoom In',exact:true})).toBeVisible();
+    await page.setViewportSize({width:1440,height:900});
+    await expect.poll(async () => canvas.locator('.react-flow').evaluate(el => el.getBoundingClientRect().height)).toBeGreaterThan(250);
     // An agent commit made while the Canvas is open must appear through the
     // revision poll without a manual reload.
-    await ask('canvas.commit',{command_id:'agent-add-view',expected_canvas_revision:0,expected_context_revision:2,edit:{op:'upsert_node',node:{
-      id:'agent-view',type:'workspace_view',position:{x:320,y:40},width:640,height:480,
-      data:{kind:'workspace_view',label:'Agent view',payload:{schema:'tachyon.workspace-view.v2',component:'cohort',
-        target:{uri:'tachyon://dataset/local/first',type:'tachyon.dataset',revision:'sha256:first'},title:'Agent view',config:{}}}}}});
+    await ask('canvas.view.upsert',{command_id:'agent-add-view',expected_canvas_revision:0,expected_context_revision:2,
+      id:'agent-view',component:'cohort',title:'Agent view',
+      target:{uri:'tachyon://dataset/local/first',type:'tachyon.dataset',revision:'sha256:first'},config:{}});
     await expect(canvas.getByText('Agent view',{exact:true})).toBeVisible({timeout:10000});
-    const select = canvas.getByRole('combobox',{name:'Dataset for new view'});
-    await expect(select.getByRole('option')).toHaveCount(2);
-    const add = canvas.getByRole('button',{name:'Add dataset view'});
-    await canvas.getByRole('combobox',{name:'Scientific view type'}).selectOption('cohort');
     for (const id of ['first','second']) {
       // The second axis was absent at startup, discovery, binding and the
       // first dataset's query. Only its own view may open it.
       if (id === 'second') await writeFile(join(datasets,id,'observations.tsv'), 'observation_id\tlabel\nsame-id\ttwo\n');
+      await canvas.getByRole('button',{name:'+ Add',exact:true}).click();
+      const select = canvas.getByRole('combobox',{name:'Dataset for new view'});
+      await expect(select.getByRole('option')).toHaveCount(2);
       await select.selectOption(`tachyon://dataset/local/${id}`);
-      await add.click();
+      await canvas.getByRole('menuitem',{name:/Cohort/}).click();
       await expect(canvas.getByText(`Cohort · ${id}`,{exact:true})).toBeVisible({timeout:15000});
     }
     await expect(canvas.getByRole('checkbox',{name:'one',exact:true}).first()).toBeVisible();
     await expect(canvas.getByRole('checkbox',{name:'two',exact:true}).first()).toBeVisible();
+    await expect.poll(async () => { await ask('canvas.get',{}); return lastResult().data.render.status; },{timeout:12000}).toBe('ready');
     await expect(sidebar.getByRole('status')).toHaveText('Binding revision 2');
     await page.getByRole('button',{name:'Close',exact:true}).click();
     await sidebar.getByRole('button',{name:'Open session Canvas'}).click();
@@ -90,6 +100,7 @@ test('agent and GUI share bindings and one Canvas for two datasets', async ({pag
     await expect(canvas.getByRole('checkbox',{name:'one',exact:true}).first()).toBeVisible();
     await expect(canvas.getByText('Cohort · second',{exact:true})).toBeVisible();
   } finally {
+    if (fixture) await test.info().attach('fixture-log',{body:fixture.log(),contentType:'text/plain'});
     await fixture?.close();
     await rm(datasets,{recursive:true,force:true});
   }
