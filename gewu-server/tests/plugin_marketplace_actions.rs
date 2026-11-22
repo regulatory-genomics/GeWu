@@ -13,11 +13,24 @@ async fn marketplace_search_reads_the_signed_offline_cache() {
     let cache = home.path().join(".gewu/marketplace/official");
     std::fs::create_dir_all(&cache).unwrap();
     let keypair = Ed25519KeyPair::from_seed_unchecked(&[9u8; 32]).unwrap();
-    let index = br#"{"schemaVersion":"gewu.marketplace/v1","repository":"official","generatedAt":"2026-11-19T00:00:00Z","expiresAt":"2027-11-19T00:00:00Z","keyId":"official-v1","releases":[]}"#;
-    std::fs::write(cache.join("index.v1.json"), index).unwrap();
+    let index = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion":"gewu.marketplace/v1","repository":"official",
+        "generatedAt":"2026-11-19T00:00:00Z","expiresAt":"2027-11-19T00:00:00Z","keyId":"official-v1",
+        "releases":[{
+            "schemaVersion":"gewu.release/v1","releaseId":"demo-1.0.0","plugin":"demo","version":"1.0.0",
+            "channel":"beta","gewu":{"api":"gewu.plugin/v1","host":">=99.0.0"},
+            "package":{"url":"https://example.invalid/package.zip","sha256":"a".repeat(64),"bytes":1},
+            "runtimes":[{"id":"demo-runtime","version":"1.0.0","target":{"os":"linux","arch":"x86_64","libc":"glibc"},
+                "artifact":{"url":"https://example.invalid/runtime.zip","sha256":"c".repeat(64),"bytes":1},
+                "manifest":{"url":"https://example.invalid/runtime.json","sha256":"d".repeat(64),"bytes":1}}],
+            "capabilities":[],"permissions":[],
+            "provenance":{"builder":"test","source":"https://github.com/example/demo","sourceCommit":"b".repeat(40),"buildInputs":[],"createdAt":"2026-11-19T00:00:00Z"}
+        }]
+    })).unwrap();
+    std::fs::write(cache.join("index.v1.json"), &index).unwrap();
     std::fs::write(
         cache.join("index.v1.json.sig"),
-        BASE64.encode(keypair.sign(index).as_ref()),
+        BASE64.encode(keypair.sign(&index).as_ref()),
     )
     .unwrap();
     // SAFETY: this binary has one test, so no other thread reads the environment.
@@ -43,7 +56,17 @@ async fn marketplace_search_reads_the_signed_offline_cache() {
         .await
         .unwrap();
     assert_eq!(value["repository"], "official");
-    assert_eq!(value["releases"], serde_json::json!([]));
+    assert_eq!(value["releases"][0]["installCompatible"], false);
+    assert_eq!(
+        value["releases"][0]["installBlocker"]["code"],
+        "host_version"
+    );
+    assert!(
+        value["releases"][0]["installBlocker"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(">=99.0.0")
+    );
     assert!(value["installed"].is_object());
 }
 

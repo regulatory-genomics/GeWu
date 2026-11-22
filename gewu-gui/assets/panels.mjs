@@ -88,12 +88,31 @@ After installation:
 `;
 }
 
-export function sourceInstallInstructions(release) {
-  const provenance = release.provenance ?? {};
-  const sources = Object.fromEntries((provenance.buildInputs ?? []).map(entry => {
+export function sourceLinks(release) {
+  return Object.fromEntries((release.provenance?.buildInputs ?? []).flatMap(entry => {
     const at = entry.indexOf('=');
-    return at < 0 ? [entry, ''] : [entry.slice(0, at), entry.slice(at + 1)];
+    if (at < 0) return [];
+    const role = entry.slice(0, at), value = entry.slice(at + 1);
+    if (!['application-source', 'plugin-source', 'runtime-recipe', 'installation-guide'].includes(role)) return [];
+    try {
+      const url = new URL(value);
+      if (url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash
+          && /\/(?:tree|blob|commit)\/[a-f0-9]{40}(?:\/|$)/i.test(url.pathname)) return [[role, url.href]];
+    } catch {}
+    return [];
   }));
+}
+
+export function sourceInstallInstructions(release, context = {}) {
+  const provenance = release.provenance ?? {};
+  const sources = sourceLinks(release);
+  const host = `Host: ${context.hostVersion ?? 'not supplied'}; target: ${JSON.stringify(context.target ?? 'not supplied')}
+Reason: ${context.error ?? release.installBlocker?.message ?? 'Manual source installation requested'}
+Attempt: ${context.attemptId ?? 'not started'}
+Source installation cannot bypass Host/API requirements. Platform support is not guaranteed; check the guide for verified and unverified platforms.`;
+  if (!sources['installation-guide'] || release.revocation) {
+    return `# Source installation: ${release.plugin} ${release.version}\n\n${host}\n\nSource installation guide: not supplied for this version, or release revoked. No executable source-install instructions are available. Report this blocker to the publisher.`;
+  }
   const source = value => {
     try {
       const url = new URL(value?.replace(/^git@github.com:/, 'https://github.com/'));
@@ -103,6 +122,8 @@ export function sourceInstallInstructions(release) {
     return 'not supplied';
   };
   return `# Install ${release.plugin} ${release.version} (${release.channel}) from source
+
+${host}
 
 Run on the GeWu host, as the user who runs GeWu. Build the plugin adapter from the pinned source. Reuse a compatible application runtime when available; create an isolated environment only for missing dependencies. Preserve existing documents and working installations. Do not compile Python, Chromium or other application dependencies from source unless explicitly requested or required by the recipe.
 
@@ -486,8 +507,10 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
         const prebuilt = release.schemaVersion === 'gewu.release/v3';
         const blocker = prebuilt && release.requiredFeatures?.includes('webapp-origin') && data.appOriginReady === false
           ? 'The GeWu GUI needs an app origin configured by the host administrator.'
-          : prebuilt && !runtimeOptions.some(option => option.available && (option.profile ?? 'core') === 'core')
-            ? 'This release requires a different GeWu version or execution platform.' : '';
+          : release.installBlocker?.message ?? (prebuilt && !runtimeOptions.some(option => option.available && (option.profile ?? 'core') === 'core')
+            ? 'This release requires a different GeWu version or execution platform.' : '');
+        let sourceContext = {hostVersion:data.hostVersion, target:data.target, error:blocker};
+        const hasSourceGuide = Boolean(sourceLinks(release)['installation-guide']) && !release.revocation;
         const runtimeSelect = node('select');
         runtimeSelect.setAttribute('aria-label', `Runtime for ${release.plugin}`);
         const auto = node('option', runtimeOptionLabel({kind: 'auto'}));
@@ -589,6 +612,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
           install.disabled = false;
           install.hidden = false;
           runtimeSelect.disabled = false;
+          sourceContext = {...sourceContext, error:cause, attemptId:job.attemptId};
           const summary = () => response?.markdown ?? `# GeWu plugin installation repair (incomplete report)\n\nPlugin: ${release.plugin} ${release.version} (${release.channel})\nAttempt: ${job.attemptId}\nError: ${brief(cause)}\n\nRead the host-local install-report for this attempt.`;
           const view = (value = response?.detailsMarkdown ?? summary()) => {
             const links = node('p');
@@ -623,6 +647,8 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
               textarea.select();
             }
           }));
+          if (hasSourceGuide) next.append(button('View source installation guide', () => showInstructions(true)));
+          else next.append(node('p', 'This version has not supplied a source installation guide.'));
         };
         const showInstalled = async job => {
           clearInstallJob(job);
@@ -739,7 +765,7 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
           const textarea = node('textarea');
           textarea.readOnly = true;
           textarea.rows = 10;
-          textarea.value = source ? sourceInstallInstructions(release) : installInstructions(release);
+          textarea.value = source ? sourceInstallInstructions(release, sourceContext) : installInstructions(release);
           textarea.setAttribute('aria-label', source ? 'Source installation instructions' : 'Installation instructions');
           const copyText = async () => {
             try {
@@ -752,9 +778,25 @@ export function panelHost(root, rpc, {onShow, onHide} = {}) {
           };
           const copy = button('Copy instructions', copyText);
           details.replaceChildren(textarea, copy);
+          if (source && hasSourceGuide) {
+            const link = node('a', 'Open version-pinned source guide');
+            link.href = sourceLinks(release)['installation-guide'];
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            details.prepend(link);
+          }
           if (!source) await copyText();
         };
         actions.append(install, button('Copy install instructions', () => showInstructions(false)));
+        if (blocker) {
+          if (hasSourceGuide) {
+            actions.append(button('View source installation guide', () => showInstructions(true)), button('Copy installation info for Agent', async () => {
+              const text = sourceInstallInstructions(release, sourceContext);
+              try { await navigator.clipboard.writeText(text); }
+              catch { await showInstructions(true); }
+            }));
+          } else actions.append(node('p', 'This version has not supplied a source installation guide.'));
+        }
         if (prebuilt && !blocker) {
           for (const option of runtimeOptions.filter(option => option.available && ['pdf', 'tex'].includes(option.profile))) {
             const label = option.profile === 'pdf' ? 'PDF export' : 'TeX rendering';

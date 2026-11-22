@@ -1,12 +1,22 @@
 # Repair a Marketplace install
 
 On the GeWu website, open Marketplace and choose **Install**. The installation
-runs on the GeWu server. When it fails, the failure card shows a short stage and
-cause. **View details** shows the full provider attempts, bounded log excerpt and
-source links. **Copy repair info for Agent** copies a concise handoff instead:
-the failure summary, commit-pinned sources, installation guide, host context,
-recovery commands and acceptance checks. On HTTP or when clipboard permission is
-denied, the page displays the same short handoff as selectable text.
+runs on the GeWu server. When it fails, or when no runtime matches the server's
+platform, the card states the reason by category (Host version, plugin API, app
+origin, runtime target, system library or profile) and offers **View source
+installation guide** for the exact release. **View details** shows the full
+provider attempts, bounded log excerpt and source links. **Copy repair info for
+Agent** copies a concise handoff instead: the failure summary, commit-pinned
+sources, installation guide, host context, recovery commands and acceptance
+checks. On HTTP or when clipboard permission is denied, the page displays the
+same short handoff as selectable text.
+
+A source guide is a manual fallback, not an automatic installer and not a way
+around compatibility checks: a release that requires a newer Host, a missing
+feature or an unconfigured app origin still needs that fixed first. ARM64 or
+another platform is only supported when the guide says it was verified there.
+If a release supplies no pinned guide, the card says so instead of inventing
+commands.
 
 Recovery commands name only providers declared for this host. Before the adapter
 probe, inspect `plugin.json` for required settings and binding scope; a

@@ -10,18 +10,34 @@ test('source installation handoff pins the release without choosing an undeclare
   assert.equal(typeof panels.sourceInstallInstructions, 'function');
   const release = {plugin: 'demo', version: '1.2.3', channel: 'beta', releaseId: 'demo-1.2.3',
     package: {sha256: 'b'.repeat(64)}, provenance: {source: 'https://github.com/example/demo', sourceCommit: 'a'.repeat(40),
-      buildInputs: ['installation-guide=https://example.org/INSTALL.md', 'plugin-source=https://example.org/adapter',
+      buildInputs: [`installation-guide=https://example.org/blob/${'a'.repeat(40)}/INSTALL.md`, `plugin-source=https://example.org/tree/${'a'.repeat(40)}/adapter`,
         'runtime-recipe=https://user:secret@example.org/recipe', 'application-source=javascript:alert(1)']}};
   const text = panels.sourceInstallInstructions(release);
   assert.match(text, /demo 1\.2\.3 \(beta\)/);
   assert.ok(text.includes('a'.repeat(40)));
   assert.ok(text.includes('b'.repeat(64)));
-  assert.match(text, /https:\/\/example.org\/INSTALL.md/);
-  assert.match(text, /https:\/\/example.org\/adapter/);
+  assert.match(text, /https:\/\/example.org\/blob\/[a-f0-9]{40}\/INSTALL.md/);
+  assert.match(text, /https:\/\/example.org\/tree\/[a-f0-9]{40}\/adapter/);
   assert.doesNotMatch(text, /secret|javascript:|--runtime managed|--runtime bundled/);
   assert.match(text, /--resource-type/);
   assert.match(text, /gewu plugin install/);
   assert.match(panels.sourceInstallInstructions({plugin: 'legacy', version: '0.1.0', channel: 'stable'}), /not supplied/);
+});
+
+test('missing or unpinned guides do not produce executable source instructions', () => {
+  const release = {plugin:'demo',version:'1.0.0',channel:'beta',provenance:{buildInputs:['installation-guide=https://example.org/blob/main/INSTALL.md']}};
+  const text = panels.sourceInstallInstructions(release);
+  assert.match(text, /not supplied/);
+  assert.doesNotMatch(text, /gewu plugin install|blob\/main/);
+});
+
+test('source handoff includes the execution host and blocker without promising ARM support', () => {
+  const release = {plugin:'demo',version:'1.0.0',channel:'beta',provenance:{buildInputs:[`installation-guide=https://example.org/blob/${'a'.repeat(40)}/INSTALL.md`]}};
+  const text = panels.sourceInstallInstructions(release, {hostVersion:'0.1.7',target:{os:'linux',arch:'aarch64',libc:'glibc'},error:'No compatible runtime'});
+  assert.match(text, /0\.1\.7/);
+  assert.match(text, /aarch64/);
+  assert.match(text, /No compatible runtime/);
+  assert.match(text, /not.*guarantee|unverified/i);
 });
 
 test('normal handoff installs the selected signed release with Auto, without source prerequisites', () => {

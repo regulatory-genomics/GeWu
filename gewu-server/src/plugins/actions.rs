@@ -833,20 +833,16 @@ impl PluginHost {
                         let mut value = serde_json::to_value(release)?;
                         value["runtimeOptions"] =
                             json!(self.marketplace_runtime_options(release, &target));
-                        value["installCompatible"] = json!(
-                            super::marketplace::select_for_install(
-                                &index,
-                                &release.plugin,
-                                Some(&release.version),
-                                &release.channel,
-                                &target,
-                                &self.host_version,
-                                "auto",
-                                true,
-                                "core",
-                            )
-                            .is_ok()
+                        let blocker = super::marketplace::install_blocker(
+                            release,
+                            &target,
+                            &self.host_version,
+                            "auto",
+                            true,
+                            "core",
                         );
+                        value["installCompatible"] = json!(blocker.is_none());
+                        value["installBlocker"] = json!(blocker);
                         Ok::<_, anyhow::Error>(value)
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -857,6 +853,8 @@ impl PluginHost {
                     "expiresAt": index.expires_at,
                     "releases": releases,
                     "installed": self.marketplace_installations(),
+                    "hostVersion": self.host_version,
+                    "target": target,
                 }))
             }
             HostAction::MarketplaceInstall {
@@ -875,7 +873,7 @@ impl PluginHost {
                 let mut report = super::diagnostics::Attempt::start(
                     root,
                     attempt_id.as_deref(),
-                    json!({"plugin":plugin_id,"version":version,"channel":channel,"policy":runtime}),
+                    json!({"plugin":plugin_id,"version":version,"channel":channel,"policy":runtime,"gewuVersion":self.host_version}),
                     Some((workspace, owner)),
                     root,
                 )?;
@@ -886,8 +884,7 @@ impl PluginHost {
                     let target = super::runtime::current_target()?;
                     let profile = profile.as_deref().unwrap_or("core");
                     ensure!(matches!(profile, "core" | "pdf" | "tex"), "unsupported runtime profile");
-                    let release = super::marketplace::select_for_install(&index, &plugin_id, version.as_deref(), &channel, &target, &self.host_version, &runtime, app_origin, profile)?;
-                    report.release(release, &target);
+                    let release = super::marketplace::select_for_install_reported(&index, &plugin_id, version.as_deref(), &channel, &target, &self.host_version, &runtime, app_origin, profile, Some(&mut report))?;
                     report.stage("runtime_selection");
                     let selections = if profile != "core" {
                         vec![RuntimeSelection::Bundled(super::runtime::select_runtime_profile(&release.runtimes, &target, profile)?)]

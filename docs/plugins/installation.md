@@ -28,7 +28,12 @@ For the quickest setup, choose **Install** in Marketplace or use the exact
 release's **Copy install instructions** action. The default instructions run
 the signed Marketplace installer with `--runtime auto`, then require a plugin
 check and one real operation. Source-building instructions are under
-**Advanced → Install from source**.
+**Advanced → Install from source**, and appear on the card when this server has
+no matching runtime or an install fails. They are a manual fallback for the
+exact release: a version-pinned guide plus a copyable handoff for an agent
+running on the GeWu host. They do not bypass Host, feature or app-origin
+requirements, and a platform is unsupported until its guide records a real
+verification.
 
 ```sh
 gewu plugin search manimble

@@ -593,10 +593,9 @@ async fn marketplace_install(
     let index = load_index(&client, refresh && !dry_run).await?;
     if let Some(report) = report.as_mut() { report.stage("release_selection"); }
     let target = runtime::current_target()?;
-    let release = gewu_server::plugins::marketplace::select_for_install(
-        &index, id, version, channel, &target, env!("CARGO_PKG_VERSION"), policy, true, profile)?;
+    let release = gewu_server::plugins::marketplace::select_for_install_reported(
+        &index, id, version, channel, &target, env!("CARGO_PKG_VERSION"), policy, true, profile, report.as_mut())?;
     if let Some(report) = report.as_mut() {
-        report.release(release, &target);
         report.stage("runtime_selection");
     }
     let mut selections = if profile != "core" {

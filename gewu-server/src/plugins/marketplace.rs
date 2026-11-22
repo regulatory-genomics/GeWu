@@ -607,35 +607,189 @@ pub fn select_for_install<'a>(
     app_origin: bool,
     profile: &str,
 ) -> Result<&'a Release, ReleaseSelectionError> {
-    let system_version = super::runtime::system_version();
     index.select_matching(plugin, version, channel, &now_rfc3339(), |release| {
-        release.check_host(host_version)?;
-        if release
-            .required_features
-            .iter()
-            .any(|feature| match feature.as_str() {
-                "runtime-v2" | "offline-pixi-pack" => false,
-                "webapp-origin" => !app_origin,
-                _ => true,
-            })
-        {
-            return Err(ReleaseSelectionError::IncompatibleHost);
-        }
-        let bundle = matches!(policy, "bundled" | "auto")
-            && release.runtimes.iter().any(|r| {
-                &r.target == target
-                    && super::runtime::profile_compatible(r, system_version.as_deref(), profile)
-            });
-        let provider = profile == "core"
-            && policy != "bundled"
-            && release
-                .runtime_plan
-                .as_ref()
-                .is_some_and(|plan| plan.select(policy, target).is_some());
-        (bundle || provider)
-            .then_some(())
-            .ok_or(ReleaseSelectionError::RuntimeUnavailable)
+        install_blocker(release, target, host_version, policy, app_origin, profile)
+            .map_or(Ok(()), |blocker| Err(blocker.selection_error()))
     })
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct InstallBlocker {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl InstallBlocker {
+    fn selection_error(&self) -> ReleaseSelectionError {
+        match self.code {
+            "revoked" => ReleaseSelectionError::Revoked,
+            "plugin_api" => ReleaseSelectionError::IncompatibleApi,
+            "host_version" | "host_feature" | "app_origin" => {
+                ReleaseSelectionError::IncompatibleHost
+            }
+            _ => ReleaseSelectionError::RuntimeUnavailable,
+        }
+    }
+}
+
+pub fn install_blocker(
+    release: &Release,
+    target: &Target,
+    host_version: &str,
+    policy: &str,
+    app_origin: bool,
+    profile: &str,
+) -> Option<InstallBlocker> {
+    let blocked = |code, message| Some(InstallBlocker { code, message });
+    if release.revocation.is_some() {
+        return blocked("revoked", "This release has been revoked.".into());
+    }
+    if release.gewu.api != "gewu.plugin/v1" {
+        return blocked(
+            "plugin_api",
+            format!("This release requires plugin API {}.", release.gewu.api),
+        );
+    }
+    if release.check_host(host_version).is_err() {
+        return blocked(
+            "host_version",
+            format!(
+                "GeWu {host_version} does not meet this release's Host requirement {}. Source installation cannot bypass Host compatibility.",
+                release.gewu.host
+            ),
+        );
+    }
+    for feature in &release.required_features {
+        match feature.as_str() {
+            "runtime-v2" | "offline-pixi-pack" => {}
+            "webapp-origin" if app_origin => {}
+            "webapp-origin" => {
+                return blocked(
+                    "app_origin",
+                    "The GeWu GUI needs an app origin configured by the host administrator.".into(),
+                );
+            }
+            _ => {
+                return blocked(
+                    "host_feature",
+                    format!(
+                        "This Host does not support required feature {feature}. Source installation cannot add Host features."
+                    ),
+                );
+            }
+        }
+    }
+    if profile == "core"
+        && policy != "bundled"
+        && release
+            .runtime_plan
+            .as_ref()
+            .is_some_and(|plan| plan.select(policy, target).is_some())
+    {
+        return None;
+    }
+    let target_name = super::runtime::target_label(target);
+    let runtimes: Vec<_> = release
+        .runtimes
+        .iter()
+        .filter(|r| &r.target == target)
+        .collect();
+    if !matches!(policy, "auto" | "bundled") || runtimes.is_empty() {
+        return blocked(
+            "runtime_target",
+            format!(
+                "No {policy} runtime is published for {target_name}. Source installation may be possible; check the guide's platform support."
+            ),
+        );
+    }
+    let matching: Vec<_> = runtimes
+        .iter()
+        .filter(|r| r.profile.as_deref().unwrap_or("core") == profile)
+        .collect();
+    if matching.is_empty() {
+        return blocked(
+            "runtime_profile",
+            format!("No {profile} runtime is published for {target_name}."),
+        );
+    }
+    let system = super::runtime::system_version();
+    if matching
+        .iter()
+        .any(|r| super::runtime::profile_compatible(r, system.as_deref(), profile))
+    {
+        return None;
+    }
+    blocked(
+        "runtime_requirements",
+        format!(
+            "The {profile} runtime for {target_name} requires a newer system library/OS than {}. Requirements: {}.",
+            system.as_deref().unwrap_or("unknown"),
+            serde_json::to_string(&matching.iter().map(|r| &r.requirements).collect::<Vec<_>>())
+                .unwrap_or_default()
+        ),
+    )
+}
+
+/// A recovery-only candidate never authorizes installation of an incompatible release.
+#[allow(clippy::too_many_arguments)]
+pub fn select_for_install_reported<'a>(
+    index: &'a MarketplaceIndex,
+    plugin: &str,
+    version: Option<&str>,
+    channel: &str,
+    target: &Target,
+    host_version: &str,
+    policy: &str,
+    app_origin: bool,
+    profile: &str,
+    report: Option<&mut Attempt>,
+) -> Result<&'a Release> {
+    match select_for_install(
+        index,
+        plugin,
+        version,
+        channel,
+        target,
+        host_version,
+        policy,
+        app_origin,
+        profile,
+    ) {
+        Ok(release) => {
+            if let Some(report) = report {
+                report.release(release, target);
+            }
+            Ok(release)
+        }
+        Err(error) => {
+            let candidate = index
+                .select_release_version(plugin, version, channel, &now_rfc3339())
+                .ok();
+            let Some(release) = candidate else {
+                return Err(error.into());
+            };
+            let blocker =
+                install_blocker(release, target, host_version, policy, app_origin, profile);
+            let guide = release.provenance.build_inputs.iter().find_map(|entry| {
+                entry
+                    .strip_prefix("installation-guide=")
+                    .and_then(super::diagnostics::pinned_source_url)
+            });
+            if let Some(report) = report {
+                report.release(release, target);
+                report.compatibility(blocker.as_ref());
+            }
+            let message = blocker
+                .map(|b| b.message)
+                .unwrap_or_else(|| error.to_string());
+            match guide {
+                Some(url) => anyhow::bail!("{message}\nSource installation guide (manual): {url}"),
+                None => anyhow::bail!(
+                    "{message}\nThis version has not supplied a source installation guide."
+                ),
+            }
+        }
+    }
 }
 
 pub fn now_rfc3339() -> String {

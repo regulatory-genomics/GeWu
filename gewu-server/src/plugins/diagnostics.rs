@@ -139,7 +139,7 @@ impl Attempt {
                         | "runtime-recipe"
                         | "installation-guide"
                 )
-                && let Some(url) = source_url(url)
+                && let Some(url) = pinned_source_url(url)
             {
                 sources.insert(role.into(), json!(url));
             }
@@ -171,6 +171,11 @@ impl Attempt {
         self.provider = Some(json!({"kind":kind,"id":id,"sha256":sha256}));
     }
 
+    pub fn compatibility(&mut self, blocker: Option<&super::marketplace::InstallBlocker>) {
+        self.report["compatibility"] = json!(blocker);
+        self.save();
+    }
+
     pub fn provider_result(&mut self, result: &Result<super::state::GenerationState>) {
         if let Some(mut provider) = self.provider.take() {
             provider["stage"] = self.report["stage"].clone();
@@ -200,7 +205,12 @@ impl Attempt {
         }
         self.save();
         result.map_err(|error| {
-            let message = summary(&error);
+            let mut message = summary(&error);
+            if let Some(guide) = self.report["release"]["sources"]["installation-guide"].as_str()
+                && !message.contains(guide)
+            {
+                message.push_str(&format!("\nSource installation guide (manual): {guide}"));
+            }
             if self.unavailable {
                 anyhow!("{message} (install diagnostics unavailable)")
             } else {
@@ -351,6 +361,20 @@ pub fn source_url(value: &str) -> Option<String> {
         && url.query().is_none()
         && url.fragment().is_none())
     .then(|| url.to_string())
+}
+
+pub fn pinned_source_url(value: &str) -> Option<String> {
+    let value = source_url(value)?;
+    let url = reqwest::Url::parse(&value).ok()?;
+    let parts: Vec<_> = url.path_segments()?.collect();
+    parts
+        .windows(2)
+        .any(|pair| {
+            matches!(pair[0], "tree" | "blob" | "commit")
+                && pair[1].len() == 40
+                && pair[1].bytes().all(|b| b.is_ascii_hexdigit())
+        })
+        .then_some(value)
 }
 
 fn bounded(value: &str, max: usize) -> &str {
@@ -540,6 +564,11 @@ fn markdown(report: &Value) -> String {
     ));
     if let Some(notes) = release["releaseNotes"].as_str() {
         out.push_str(&format!("\nRelease notes: {notes}\n"));
+    }
+    if let Some(message) = report["compatibility"]["message"].as_str() {
+        out.push_str(&format!(
+            "Compatibility: {message}\nSource installation cannot bypass Host/API requirements.\n\n"
+        ));
     }
 
     out.push_str("\n## What to do\n\n");
