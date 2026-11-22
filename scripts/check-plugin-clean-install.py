@@ -5,6 +5,7 @@ Input is the publisher's test mirror, plus one installed operation per plugin.
 The controller needs Python and bubblewrap; the GeWu process inherits no builder environment.
 """
 import argparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import re
@@ -12,7 +13,62 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
+from urllib.parse import unquote, urlsplit
+
+
+def mirror_server(root, port=48874):
+    """Serve one signed mirror with byte ranges; loopback-only by construction."""
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def _target(self):
+            path = unquote(urlsplit(self.path).path).lstrip("/")
+            target = (root / path).resolve()
+            if target != root and root not in target.parents:
+                return None
+            return target if target.is_file() else None
+
+        def do_GET(self):
+            target = self._target()
+            if target is None:
+                self.send_error(404)
+                return
+            size = target.stat().st_size
+            start, end = 0, size - 1
+            header = self.headers.get("Range")
+            if header:
+                match = re.fullmatch(r"bytes=(\d+)-(\d*)", header)
+                if not match:
+                    self.send_error(416)
+                    return
+                start = int(match[1])
+                end = int(match[2]) if match[2] else size - 1
+                if start > end or end >= size:
+                    self.send_error(416)
+                    return
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            else:
+                self.send_response(200)
+            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            with target.open("rb") as stream:
+                stream.seek(start)
+                remaining = end - start + 1
+                while remaining:
+                    chunk = stream.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
 
 
 def main():
@@ -24,6 +80,8 @@ def main():
     parser.add_argument("--plugin", action="append")
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--linux-rootfs", type=Path, help="Test inside an extracted clean Linux userspace")
+    parser.add_argument("--download-first", action="store_true",
+                        help="Download from a loopback Range mirror, then test with it stopped")
     parser.add_argument("--isolated", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if not args.isolated and not args.linux_rootfs:
@@ -58,15 +116,16 @@ def main():
         # Stage the two original downloads and signed catalog; the host performs all verification.
         cache = home / ".gewu/marketplace/official"
         cache.mkdir(parents=True)
-        for name in ("index.v1.json", "index.v1.json.sig"):
-            shutil.copyfile(args.mirror / name, cache / name)
         store = home / ".gewu/store/sha256"
         store.mkdir(parents=True)
-        for digest in (artifact, runtime):
-            files = list((args.mirror / "releases/blobs/sha256" / digest).glob("*.zip"))
-            if len(files) != 1:
-                parser.error(f"expected one ZIP for {digest}")
-            shutil.copyfile(files[0], store / digest)
+        if not args.download_first:
+            for name in ("index.v1.json", "index.v1.json.sig"):
+                shutil.copyfile(args.mirror / name, cache / name)
+            for digest in (artifact, runtime):
+                files = list((args.mirror / "releases/blobs/sha256" / digest).glob("*.zip"))
+                if len(files) != 1:
+                    parser.error(f"expected one ZIP for {digest}")
+                shutil.copyfile(files[0], store / digest)
         path = out / "bin"
         path.mkdir()
         for name in ("python", "python3", "node", "uv", "pixi", "micromamba", "npm", "ghc"):
@@ -75,6 +134,9 @@ def main():
             executable.chmod(0o755)
         env = {"PATH": str(path) + ":/usr/bin:/bin", "HOME": str(home), "LANG": "C.UTF-8",
                "GEWU_MARKETPLACE_PUBLIC_KEY": args.public_key.read_text().strip()}
+        server = mirror_server(args.mirror.resolve()) if args.download_first else None
+        if server:
+            env["GEWU_MARKETPLACE_BASE_URL"] = f"http://127.0.0.1:{server.server_port}"
         gewu = str(args.gewu.resolve())
         start = time.monotonic()
         with (out / "acceptance.log").open("w") as log:
@@ -89,8 +151,14 @@ def main():
                                "--chdir", str(workspace), "/usr/bin/gewu", "plugin", *argv]
                 subprocess.run(command, cwd=workspace, env=env,
                                stdout=log, stderr=subprocess.STDOUT, check=True, timeout=1200)
-            run("marketplace-install", entry["id"], "--channel", entry.get("channel", "beta"),
-                "--version", entry["version"], "--offline")
+            try:
+                run("marketplace-install", entry["id"], "--channel", entry.get("channel", "beta"),
+                    "--version", entry["version"], *(() if args.download_first else ("--offline",)))
+            finally:
+                if server:
+                    server.shutdown()
+                    server.server_close()
+                    env.pop("GEWU_MARKETPLACE_BASE_URL", None)
             check = ["check", entry["id"], "--probe", "--workspace", str(workspace), "--session", "acceptance"]
             if "resource" in entry:
                 check += ["--resource", entry["resource"], "--resource-type", entry["resourceType"]]

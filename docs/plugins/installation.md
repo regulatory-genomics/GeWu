@@ -276,7 +276,9 @@ used, the plugin runs on that server rather than on the browser's computer.
 
 The repository's `scripts/check-plugin-clean-install.py` verifies signed
 artifacts with a fresh HOME, hostile PATH entries for common package managers,
-and no network besides loopback. `--linux-rootfs` runs the same check inside an
-extracted clean userspace. This is a development/release gate, not a user
-prerequisite. Verify macOS on actual hardware separately; a Linux pass is not
-evidence for macOS or a different libc/SELinux policy.
+and no network besides loopback. `--download-first` starts a loopback mirror
+that supports byte ranges, installs with no pre-filled artifact cache, then
+stops the mirror before the real-operation check. `--linux-rootfs` runs the same
+check inside an extracted clean userspace. This is a development/release gate,
+not a user prerequisite. Verify macOS on actual hardware separately; a Linux
+pass is not evidence for macOS or a different libc/SELinux policy.
