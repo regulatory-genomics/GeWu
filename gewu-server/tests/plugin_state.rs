@@ -33,6 +33,56 @@ fn concurrent_commits_preserve_both_plugins() {
 }
 
 #[test]
+fn uninstall_preserves_another_plugins_update_while_waiting_for_state_lock() {
+    use std::{
+        fs::OpenOptions,
+        time::{Duration, Instant},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let store = StateStore::new(temp.path());
+    let paper = generation("paper-1.0.0");
+    store.stage_generation("paper", &paper, |_| Ok(())).unwrap();
+    store.commit_active("paper", paper, "stable").unwrap();
+    store
+        .commit_active("manimble", generation("manimble-1.0.0"), "stable")
+        .unwrap();
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(temp.path().join("plugins/state.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let worker_store = store.clone();
+    let worker = std::thread::spawn(move || worker_store.uninstall("paper"));
+    let lease = temp.path().join("leases/paper/paper-1.0.0");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(file) = OpenOptions::new().read(true).write(true).open(&lease)
+            && file.try_lock().is_err()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "uninstall did not acquire its generation lease"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // This writer owns the state lock while uninstall is waiting for it.
+    let mut state = store.load().unwrap();
+    state.plugins.get_mut("manimble").unwrap().enabled = false;
+    store.save(&state).unwrap();
+    lock.unlock().unwrap();
+    worker.join().unwrap().unwrap();
+    let state = store.load().unwrap();
+    assert!(!state.plugins.contains_key("paper"));
+    assert!(
+        !state.plugins["manimble"].enabled,
+        "uninstall replaced another plugin's newer state"
+    );
+}
+
+#[test]
 fn active_pointer_is_atomic_and_rollback_keeps_user_data_outside_plugin_root() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");

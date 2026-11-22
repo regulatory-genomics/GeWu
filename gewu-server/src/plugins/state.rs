@@ -492,8 +492,8 @@ impl StateStore {
     pub fn uninstall(&self, plugin: &str) -> Result<()> {
         ensure_component(plugin)?;
         let _mutation = self.lock_plugin_mutation(plugin)?;
-        let mut state = self.load()?;
-        let plugin_state = state
+        let plugin_state = self
+            .load()?
             .plugins
             .remove(plugin)
             .context("plugin has no installation state")?;
@@ -510,6 +510,9 @@ impl StateStore {
             .map(PathBuf::from)
             .collect();
         let _lock = lock_file(&self.root.join("plugins/state.lock"))?;
+        // Other plugins may have committed while we acquired this plugin's leases.
+        let mut state = self.load()?;
+        state.plugins.remove(plugin);
         self.save(&state)?;
         let path = self.root.join("plugins").join(plugin);
         if path.exists()
