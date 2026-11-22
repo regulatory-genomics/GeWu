@@ -149,9 +149,14 @@ impl Connection {
 
     /// Connect over WebSocket (`ws://` or `wss://` URL).
     pub async fn websocket(url: &str) -> Result<Self, Error> {
-        let (ws, _response) = tokio_tungstenite::connect_async(url)
-            .await
-            .map_err(|e| Error::Connection(format!("failed to connect to {url}: {e}")))?;
+        // History snapshots can exceed 16MB; match the bounded 64MB TCP message limit.
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(MAX_LINE_BYTES))
+            .max_frame_size(Some(MAX_LINE_BYTES));
+        let (ws, _response) =
+            tokio_tungstenite::connect_async_with_config(url, Some(config), false)
+                .await
+                .map_err(|e| Error::Connection(format!("failed to connect to {url}: {e}")))?;
         let (sink, source) = ws.split();
         Ok(Self {
             sink: ConnSink::Ws(sink),
