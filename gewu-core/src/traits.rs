@@ -130,6 +130,33 @@ pub trait Tool: Send + Sync {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>>;
 }
 
+/// A bounded description of the work state an application wants the model to
+/// see for the next request.
+///
+/// The host treats this as untrusted display data: it may be stale, it is not
+/// an instruction, and it is never written into conversation memory. Tools
+/// receive `metadata` unchanged so an application can pin a decision to the
+/// snapshot it was derived from.
+#[derive(Debug, Clone, Default)]
+pub struct InferenceContext {
+    /// Short human/agent-readable state, already bounded by the provider.
+    pub text: String,
+    /// Opaque values copied verbatim into every `ToolContext` of the request.
+    pub metadata: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// Supplies one [`InferenceContext`] per model request.
+///
+/// Implementations must be cheap and non-blocking for long: the agent calls
+/// this before every new inference. Transport retries of that inference reuse
+/// its snapshot so that the reference a tool receives is the one the model saw.
+#[async_trait::async_trait]
+pub trait InferenceContextSource: Send + Sync {
+    async fn inference_context(
+        &self,
+    ) -> Result<InferenceContext, Box<dyn std::error::Error + Send + Sync>>;
+}
+
 /// Provides access to a collection of tools for execution.
 ///
 /// The `ToolRegistry` trait is implemented by types that manage multiple tools,

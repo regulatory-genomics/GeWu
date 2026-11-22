@@ -293,6 +293,13 @@ impl SessionModel {
                 self.blocks.push(Block::Error(error.clone()));
                 Some(self.blocks.len() - 1)
             }
+            AgentEvent::Cancelled { reason } => {
+                // Cancelling is not a failure: close the open thought and
+                // leave the transcript without inventing an error.
+                self.end_thought();
+                self.status = Some(reason.clone());
+                None
+            }
             AgentEvent::Steered { text } => {
                 // A user message injected mid-run renders like any other
                 // user turn, at the point of the transcript where it landed.

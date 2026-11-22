@@ -304,6 +304,12 @@ pub enum AgentEvent {
     },
     /// An error occurred during agent execution.
     Error { error: String },
+    /// The run was stopped by its owner instead of finishing or failing.
+    ///
+    /// The agent loop itself never emits this: cancelling means dropping the
+    /// stream. A host that owns the cancellation token emits it so the
+    /// frontend can distinguish "stopped by the user" from a real error.
+    Cancelled { reason: String },
 }
 
 impl AgentEvent {
