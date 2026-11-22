@@ -179,7 +179,13 @@ async fn external_provider_reuses_the_host_interpreter_without_a_runtime_archive
             commands: vec!["python3".into()],
         },
         probe: ProbeSpec {
-            args: vec!["-c".into(), format!("from pathlib import Path; p=Path({:?}); assert not p.exists(), 'external probe executed twice'; p.write_text('ok')", probe_marker.to_str().unwrap())],
+            args: vec![
+                "-c".into(),
+                format!(
+                    "from pathlib import Path; p=Path({:?}); assert not p.exists(), 'external probe executed twice'; p.write_text('ok')",
+                    probe_marker.to_str().unwrap()
+                ),
+            ],
             timeout_seconds: Some(10),
         },
         binaries: Default::default(),

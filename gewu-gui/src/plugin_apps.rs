@@ -357,11 +357,7 @@ pub(crate) async fn dispatch(
             .headers()
             .get(header::LOCATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                reqwest::Url::parse(&url)
-                    .ok()
-                    .and_then(|u| u.join(v).ok())
-            })
+            .and_then(|v| reqwest::Url::parse(&url).ok().and_then(|u| u.join(v).ok()))
         else {
             return (
                 StatusCode::BAD_GATEWAY,
@@ -369,7 +365,12 @@ pub(crate) async fn dispatch(
             )
                 .into_response();
         };
-        if next.origin() != origin || !next.path().strip_prefix(&s.relay).is_some_and(|path| path.starts_with('/')) {
+        if next.origin() != origin
+            || !next
+                .path()
+                .strip_prefix(&s.relay)
+                .is_some_and(|path| path.starts_with('/'))
+        {
             return (
                 StatusCode::BAD_GATEWAY,
                 "the GeWu server redirects outside this view",
@@ -377,9 +378,15 @@ pub(crate) async fn dispatch(
                 .into_response();
         }
         let path = next.path().strip_prefix(&s.relay).unwrap();
-        let location = format!("{path}{}{}",
-            next.query().map(|query| format!("?{query}")).unwrap_or_default(),
-            next.fragment().map(|fragment| format!("#{fragment}")).unwrap_or_default());
+        let location = format!(
+            "{path}{}{}",
+            next.query()
+                .map(|query| format!("?{query}"))
+                .unwrap_or_default(),
+            next.fragment()
+                .map(|fragment| format!("#{fragment}"))
+                .unwrap_or_default()
+        );
         response = response.header(header::LOCATION, location);
     }
     for name in [

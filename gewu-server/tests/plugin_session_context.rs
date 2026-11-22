@@ -51,23 +51,70 @@ async fn headless_context_is_session_local_and_both_gateways_keep_the_original_r
     );
 
     let cold = host.tools("workspace", root.into(), "a", &[]).await;
-    assert!(host.active_for_session("workspace", root, Some("a")).await.is_empty(),
-        "building tools for ordinary chat must not activate a provider");
+    assert!(
+        host.active_for_session("workspace", root, Some("a"))
+            .await
+            .is_empty(),
+        "building tools for ordinary chat must not activate a provider"
+    );
     let source = host.context_source("workspace", root.into(), "a");
     assert!(source.inference_context().await.unwrap().text.is_empty());
-    let skill = cold.iter().find(|tool| tool.name() == "plugin_skill").expect("instructions are available before activation");
-    let guide = skill.execute(json!({"name":"demo:guide"}), &ToolContext::new("a","guide")).await.unwrap();
+    let skill = cold
+        .iter()
+        .find(|tool| tool.name() == "plugin_skill")
+        .expect("instructions are available before activation");
+    let guide = skill
+        .execute(
+            json!({"name":"demo:guide"}),
+            &ToolContext::new("a", "guide"),
+        )
+        .await
+        .unwrap();
     assert!(guide.output.contains("Read context.get"));
-    assert!(host.active_for_session("workspace",root,Some("a")).await.is_empty());
-    let activate = cold.iter().find(|tool| tool.name() == "plugin_activate").unwrap();
-    let activation = activate.execute(json!({"pluginId":"demo"}), &ToolContext::new("a", "activate")).await.unwrap();
+    assert!(
+        host.active_for_session("workspace", root, Some("a"))
+            .await
+            .is_empty()
+    );
+    let activate = cold
+        .iter()
+        .find(|tool| tool.name() == "plugin_activate")
+        .unwrap();
+    let activation = activate
+        .execute(
+            json!({"pluginId":"demo"}),
+            &ToolContext::new("a", "activate"),
+        )
+        .await
+        .unwrap();
     let activation: Value = serde_json::from_str(&activation.output).unwrap();
-    assert!(!activation["tools"].as_array().unwrap().contains(&json!("workflow_echo")), "default profiles cannot call workflow tools");
-    assert!(activation["instructions"][0]["content"].as_str().unwrap().contains("Read context.get"));
-    let listed = cold.iter().find(|tool| tool.name() == "plugin_list").unwrap()
-        .execute(json!({}), &ToolContext::new("a","list")).await.unwrap();
+    assert!(
+        !activation["tools"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("workflow_echo")),
+        "default profiles cannot call workflow tools"
+    );
+    assert!(
+        activation["instructions"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Read context.get")
+    );
+    let listed = cold
+        .iter()
+        .find(|tool| tool.name() == "plugin_list")
+        .unwrap()
+        .execute(json!({}), &ToolContext::new("a", "list"))
+        .await
+        .unwrap();
     let listed: Value = serde_json::from_str(&listed.output).unwrap();
-    assert!(!listed["instances"][0]["tools"].as_array().unwrap().contains(&json!("workflow_echo")));
+    assert!(
+        !listed["instances"][0]["tools"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("workflow_echo"))
+    );
     let tools = host.tools("workspace", root.into(), "a", &[]).await;
     let active = host.active_for_session("workspace", root, Some("a")).await;
     assert_eq!(
@@ -92,7 +139,16 @@ async fn headless_context_is_session_local_and_both_gateways_keep_the_original_r
             .await
             .is_empty()
     );
-    host.action("workspace", root, "b", HostAction::Activate { plugin_id: "demo".into() }).await.unwrap();
+    host.action(
+        "workspace",
+        root,
+        "b",
+        HostAction::Activate {
+            plugin_id: "demo".into(),
+        },
+    )
+    .await
+    .unwrap();
     let other = host
         .context_source("workspace", root.into(), "b")
         .inference_context()

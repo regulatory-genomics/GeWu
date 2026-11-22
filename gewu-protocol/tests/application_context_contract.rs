@@ -81,7 +81,10 @@ fn a_call_context_carries_the_snapshot_it_was_derived_from() {
     }))
     .unwrap();
     assert_eq!(
-        context.context_ref.as_ref().and_then(|r| r.revision.as_deref()),
+        context
+            .context_ref
+            .as_ref()
+            .and_then(|r| r.revision.as_deref()),
         Some("c12-v9")
     );
 

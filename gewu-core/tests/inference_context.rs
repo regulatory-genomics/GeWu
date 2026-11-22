@@ -22,9 +22,7 @@ struct CountingSource {
 
 #[async_trait]
 impl InferenceContextSource for CountingSource {
-    async fn inference_context(
-        &self,
-    ) -> Result<InferenceContext, Box<dyn Error + Send + Sync>> {
+    async fn inference_context(&self) -> Result<InferenceContext, Box<dyn Error + Send + Sync>> {
         let revision = self.calls.fetch_add(1, Ordering::SeqCst);
         self.seen.lock().unwrap().push(BTreeMap::from([(
             "context_ref".to_string(),
@@ -32,10 +30,7 @@ impl InferenceContextSource for CountingSource {
         )]));
         Ok(InferenceContext {
             text: format!("bound datasets: [] (revision {revision})"),
-            metadata: BTreeMap::from([(
-                "context_ref".to_string(),
-                json!(format!("r{revision}")),
-            )]),
+            metadata: BTreeMap::from([("context_ref".to_string(), json!(format!("r{revision}")))]),
         })
     }
 }
@@ -92,10 +87,7 @@ impl LlmProvider for ScriptedLlm {
         &'a self,
         _request: Value,
     ) -> Result<
-        futures::stream::BoxStream<
-            'a,
-            Result<ProviderEvent, Box<dyn Error + Send + Sync>>,
-        >,
+        futures::stream::BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
         Box<dyn Error + Send + Sync>,
     > {
         let round = self.round.fetch_add(1, Ordering::SeqCst);
@@ -115,8 +107,12 @@ impl LlmProvider for ScriptedLlm {
             ]
         } else {
             vec![
-                Ok(ProviderEvent::ContentDelta { delta: "done".into() }),
-                Ok(ProviderEvent::Finish { reason: Some("stop".into()) }),
+                Ok(ProviderEvent::ContentDelta {
+                    delta: "done".into(),
+                }),
+                Ok(ProviderEvent::Finish {
+                    reason: Some("stop".into()),
+                }),
             ]
         };
         Ok(futures::stream::iter(events).boxed())
@@ -148,9 +144,15 @@ async fn each_request_gets_one_transient_context_and_pinned_metadata() {
         .build()
         .unwrap();
 
-    let events: Vec<AgentEvent> = agent.ask("go").filter_map(|e| async move { e.ok() }).collect().await;
+    let events: Vec<AgentEvent> = agent
+        .ask("go")
+        .filter_map(|e| async move { e.ok() })
+        .collect()
+        .await;
     assert!(
-        events.iter().any(|event| matches!(event, AgentEvent::Finish { .. })),
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Finish { .. })),
         "{events:?}"
     );
 
@@ -174,7 +176,10 @@ async fn each_request_gets_one_transient_context_and_pinned_metadata() {
     assert_eq!(revisions, vec!["revision 0", "revision 1"]);
 
     // The tool saw the revision of the request that produced it.
-    assert_eq!(observed.lock().unwrap().as_slice(), &[Some("r0".to_string())]);
+    assert_eq!(
+        observed.lock().unwrap().as_slice(),
+        &[Some("r0".to_string())]
+    );
 
     // Live context is not durable memory.
     let memory = serde_json::to_string(agent.memory.messages()).unwrap();
@@ -202,7 +207,11 @@ async fn a_failing_source_does_not_block_the_turn() {
         .with_inference_context(Arc::new(Broken))
         .build()
         .unwrap();
-    let events: Vec<AgentEvent> = agent.ask("go").filter_map(|e| async move { e.ok() }).collect().await;
+    let events: Vec<AgentEvent> = agent
+        .ask("go")
+        .filter_map(|e| async move { e.ok() })
+        .collect()
+        .await;
     assert!(
         events.iter().any(|event| matches!(event, AgentEvent::Status { message } if message.contains("context unavailable"))),
         "{events:?}"

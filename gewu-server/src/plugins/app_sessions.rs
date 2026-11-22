@@ -285,7 +285,10 @@ async fn relay(
             return StatusCode::FORBIDDEN.into_response();
         }
         // The browser can replay 307/308 bodies; each hop re-enters this authenticated relay.
-        response = response.header(header::LOCATION, format!("{prefix}{}", &next[url::Position::BeforePath..]));
+        response = response.header(
+            header::LOCATION,
+            format!("{prefix}{}", &next[url::Position::BeforePath..]),
+        );
     }
     for name in [
         "content-type",

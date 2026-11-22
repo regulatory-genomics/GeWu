@@ -56,12 +56,17 @@ impl InferenceContextSource for PluginContextSource {
             .active_for_session(&self.workspace, &self.root, Some(&self.session))
             .await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let pending = active.iter()
-            .filter(|instance| instance.package.manifest.scope != gewu_protocol::plugin::Scope::Resource
-                && instance.package.manifest.context_provider.is_some())
+        let pending = active
+            .iter()
+            .filter(|instance| {
+                instance.package.manifest.scope != gewu_protocol::plugin::Scope::Resource
+                    && instance.package.manifest.context_provider.is_some()
+            })
             .map(|instance| async move {
                 let data = tokio::time::timeout_at(deadline, snapshot(instance, &self.session))
-                    .await.ok().and_then(Result::ok);
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
                 (instance, data)
             });
         let mut displayed = Vec::new();
@@ -71,7 +76,10 @@ impl InferenceContextSource for PluginContextSource {
         for (instance, data) in futures::future::join_all(pending).await {
             let id = &instance.package.manifest.id;
             let (mut entry, mut pin) = if let Some(data) = data {
-                let pin = (instance.activation.instance_id.clone(), data["contextRef"].clone());
+                let pin = (
+                    instance.activation.instance_id.clone(),
+                    data["contextRef"].clone(),
+                );
                 (json!({"pluginId":id,"snapshot":data}), Some(pin))
             } else {
                 (json!({"pluginId":id,"status":"unavailable"}), None)

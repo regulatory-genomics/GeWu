@@ -291,7 +291,9 @@ pub(super) fn attach_inference_context(messages: &mut Vec<Message>, text: &str) 
     {
         content.push(part);
     } else {
-        messages.push(Message::User { content: vec![part] });
+        messages.push(Message::User {
+            content: vec![part],
+        });
     }
 }
 
