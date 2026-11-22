@@ -170,6 +170,7 @@ async fn external_provider_reuses_the_host_interpreter_without_a_runtime_archive
         ],
     );
     let target = current_target().unwrap();
+    let probe_marker = temp.path().join("external-probe-ran");
     let provider = RuntimeProvider::External {
         id: "host-python".into(),
         target: target.clone(),
@@ -178,7 +179,7 @@ async fn external_provider_reuses_the_host_interpreter_without_a_runtime_archive
             commands: vec!["python3".into()],
         },
         probe: ProbeSpec {
-            args: vec!["-c".into(), "print('ok')".into()],
+            args: vec!["-c".into(), format!("from pathlib import Path; p=Path({:?}); assert not p.exists(), 'external probe executed twice'; p.write_text('ok')", probe_marker.to_str().unwrap())],
             timeout_seconds: Some(10),
         },
         binaries: Default::default(),
@@ -232,6 +233,7 @@ async fn external_provider_reuses_the_host_interpreter_without_a_runtime_archive
         .await
         .unwrap();
     let identity = generation.runtime.expect("runtime identity");
+    assert_eq!(std::fs::read_to_string(probe_marker).unwrap(), "ok");
     assert_eq!(identity.kind, "external");
     assert_eq!(identity.provider, "host-python");
     assert!(identity.executable.is_some());

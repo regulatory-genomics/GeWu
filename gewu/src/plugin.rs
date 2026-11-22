@@ -602,7 +602,7 @@ async fn marketplace_install(
     let mut selections = if profile != "core" {
         vec![RuntimeSelection::Bundled(runtime::select_runtime_profile(&release.runtimes, &target, profile)?)]
     } else if policy == "auto" && !dry_run {
-        RuntimeSelection::auto_candidates_reported(release, &target, executable, report.as_mut()).await?
+        RuntimeSelection::auto_candidates(release, &target, executable)?
     } else {
         vec![RuntimeSelection::select(
             release, policy, &target, executable,

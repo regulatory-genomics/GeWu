@@ -187,14 +187,6 @@ impl Attempt {
         }
     }
 
-    pub fn selection_error(&self) -> Option<&str> {
-        self.report["attempts"]
-            .as_array()?
-            .last()?
-            .get("error")?
-            .as_str()
-    }
-
     pub fn finish<T>(&mut self, result: Result<T>) -> Result<T> {
         self.report["outcome"] = json!(if result.is_ok() {
             "succeeded"

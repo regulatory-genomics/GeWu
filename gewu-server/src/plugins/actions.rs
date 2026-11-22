@@ -892,7 +892,7 @@ impl PluginHost {
                     let selections = if profile != "core" {
                         vec![RuntimeSelection::Bundled(super::runtime::select_runtime_profile(&release.runtimes, &target, profile)?)]
                     } else if runtime == "auto" {
-                        RuntimeSelection::auto_candidates_reported(release, &target, None, Some(&mut report)).await?
+                        RuntimeSelection::auto_candidates(release, &target, None)?
                     } else {
                         vec![RuntimeSelection::select(release, &runtime, &target, None)?]
                     };

@@ -33,19 +33,11 @@ pub enum RuntimeSelection<'a> {
 }
 
 impl<'a> RuntimeSelection<'a> {
-    pub async fn auto_candidates(
+    /// Enumerate in signed policy order without executing any provider.
+    pub fn auto_candidates(
         release: &'a Release,
         target: &Target,
         executable: Option<&Path>,
-    ) -> Result<Vec<Self>> {
-        Self::auto_candidates_reported(release, target, executable, None).await
-    }
-
-    pub async fn auto_candidates_reported(
-        release: &'a Release,
-        target: &Target,
-        executable: Option<&Path>,
-        mut report: Option<&mut Attempt>,
     ) -> Result<Vec<Self>> {
         let mut candidates = Vec::new();
         if let Some(plan) = &release.runtime_plan {
@@ -55,91 +47,34 @@ impl<'a> RuntimeSelection<'a> {
                     .iter()
                     .filter(|provider| provider.kind() == kind && provider.target() == target)
                 {
-                    match provider {
-                        RuntimeProvider::External { probe, .. } => {
-                            if let Some(report) = report.as_mut() {
-                                report.provider("external", provider.id(), None);
-                            }
-                            let result = match providers::resolve_external(provider, executable) {
-                                Ok(path) => providers::probe_external_reported(
-                                    &path,
-                                    probe,
-                                    report.as_deref_mut(),
-                                )
-                                .await
-                                .map(|()| path),
-                                Err(error) => Err(error),
-                            };
-                            match result {
-                                Ok(path) => candidates.push(Self::External {
-                                    provider,
-                                    executable: Some(path),
-                                }),
-                                Err(error) => {
-                                    if let Some(report) = report.as_mut() {
-                                        report.provider_result(&Err(error.into()));
-                                    }
-                                }
-                            }
-                        }
-                        RuntimeProvider::Managed { manager, .. } => {
-                            if providers::managed_available(manager) {
-                                candidates.push(Self::Managed { provider });
-                            } else if let Some(report) = report.as_mut() {
-                                report.provider("managed", provider.id(), None);
-                                report.provider_result(&Err(anyhow::anyhow!(
-                                    "{manager} was not found on the GeWu host"
-                                )));
-                            }
-                        }
-                        RuntimeProvider::Bundled { id, .. } => {
-                            if let Some(runtime) = release
-                                .runtimes
-                                .iter()
-                                .find(|runtime| runtime.id == *id && runtime.target == *target)
-                            {
-                                candidates.push(Self::Bundled(runtime));
-                            }
-                        }
+                    if let Some(candidate) = Self::from_provider(release, provider, executable) {
+                        candidates.push(candidate);
                     }
                 }
             }
         }
-        if candidates.is_empty() {
-            candidates.push(Self::Bundled(
-                select_runtime(&release.runtimes, target).with_context(|| {
-                    format!(
-                        "no usable runtime for {} on {}{}",
-                        release.plugin,
-                        super::runtime::target_label(target),
-                        report
-                            .as_deref()
-                            .and_then(Attempt::selection_error)
-                            .map(|reason| format!(": {reason}"))
-                            .unwrap_or_default()
-                    )
-                })?,
-            ));
+        if !candidates.iter().any(|candidate| matches!(candidate, Self::Bundled(_)))
+            && let Ok(runtime) = select_runtime(&release.runtimes, target) {
+            candidates.push(Self::Bundled(runtime));
         }
+        ensure!(!candidates.is_empty(), "no runtime for {} on {}", release.plugin, super::runtime::target_label(target));
         Ok(candidates)
     }
 
-    /// Prefer the first provider that actually works on this host. External
-    /// providers are probed before selection so a stale interpreter falls
-    /// through to a managed environment or a bundled runtime.
-    pub async fn select_auto(
+    fn from_provider(
         release: &'a Release,
-        target: &Target,
+        provider: &'a RuntimeProvider,
         executable: Option<&Path>,
-    ) -> Result<Self> {
-        Self::auto_candidates(release, target, executable)
-            .await?
-            .into_iter()
-            .next()
-            .context("auto runtime selection produced no candidates")
+    ) -> Option<Self> {
+        match provider {
+            RuntimeProvider::External { .. } => Some(Self::External { provider, executable:executable.map(Path::to_path_buf) }),
+            RuntimeProvider::Managed { .. } => Some(Self::Managed { provider }),
+            RuntimeProvider::Bundled { id, target, .. } => release.runtimes.iter()
+                .find(|runtime| runtime.id == *id && runtime.target == *target && runtime.profile.as_deref().unwrap_or("core") == "core")
+                .map(Self::Bundled),
+        }
     }
-    /// Choose a runtime without touching the filesystem. `auto` follows the
-    /// plan's declared policy order and falls back to a bundled runtime.
+    /// Plan without running probes or installations; execution tries candidates lazily.
     pub fn select(
         release: &'a Release,
         policy: &str,
@@ -150,73 +85,19 @@ impl<'a> RuntimeSelection<'a> {
             matches!(policy, "auto" | "external" | "managed" | "bundled"),
             "unknown runtime policy {policy}; expected auto, external, managed, or bundled"
         );
-        if policy != "bundled"
-            && let Some(plan) = &release.runtime_plan
-        {
-            if policy == "auto" {
-                // Prefer the first provider that is actually usable on this
-                // host, so auto falls through instead of failing on a stale
-                // Python or a missing micromamba.
-                for kind in &plan.policies {
-                    for provider in plan
-                        .providers
-                        .iter()
-                        .filter(|p| p.kind() == kind && p.target() == target)
-                    {
-                        match provider {
-                            RuntimeProvider::External { .. } => {
-                                if providers::resolve_external(provider, executable).is_ok() {
-                                    return Ok(Self::External {
-                                        provider,
-                                        executable: executable.map(Path::to_path_buf),
-                                    });
-                                }
-                            }
-                            RuntimeProvider::Managed { manager, .. } => {
-                                if providers::managed_available(manager) {
-                                    return Ok(Self::Managed { provider });
-                                }
-                            }
-                            RuntimeProvider::Bundled { .. } => {
-                                if let Some(runtime) = release
-                                    .runtimes
-                                    .iter()
-                                    .find(|runtime| runtime.target == *target)
-                                {
-                                    return Ok(Self::Bundled(runtime));
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if let Some(provider) = plan.select(policy, target) {
-                return Ok(match provider {
-                    RuntimeProvider::External { .. } => Self::External {
-                        provider,
-                        executable: executable.map(Path::to_path_buf),
-                    },
-                    RuntimeProvider::Managed { .. } => Self::Managed { provider },
-                    RuntimeProvider::Bundled { id, .. } => Self::Bundled(
-                        release
-                            .runtimes
-                            .iter()
-                            .find(|runtime| &runtime.id == id && runtime.target == *target)
-                            .or_else(|| {
-                                release
-                                    .runtimes
-                                    .iter()
-                                    .find(|runtime| runtime.target == *target)
-                            })
-                            .context("bundled provider has no matching runtime reference")?,
-                    ),
-                });
-            } else {
-                anyhow::bail!(
-                    "release {} has no {policy} runtime for {}",
-                    release.release_id,
-                    super::runtime::target_label(target)
-                );
-            }
+        if policy == "auto" {
+            return Self::auto_candidates(release, target, executable)?.into_iter()
+                .find(|candidate| match candidate {
+                    Self::External {provider, executable} => providers::resolve_external(provider, executable.as_deref()).is_ok(),
+                    Self::Managed {provider:RuntimeProvider::Managed {manager, ..}} => providers::managed_available(manager),
+                    Self::Bundled(_) => true,
+                    _ => false,
+                }).context("no runtime provider is available on this host");
+        }
+        if policy != "bundled" && let Some(plan) = &release.runtime_plan {
+            return plan.select(policy, target)
+                .and_then(|provider| Self::from_provider(release, provider, executable))
+                .with_context(|| format!("release {} has no {policy} runtime for {}", release.release_id, super::runtime::target_label(target)));
         }
         let bundled = select_runtime(&release.runtimes, target)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -294,6 +175,7 @@ impl InstallManager {
         probe_deadline: Duration,
         mut report: Option<&mut Attempt>,
     ) -> Result<GenerationState> {
+        let mut probe_deadline = probe_deadline;
         if let Some(report) = report.as_mut() {
             report.stage("artifact_verify");
         }
@@ -374,9 +256,7 @@ impl InstallManager {
                     RuntimeProvider::External { probe, .. } => probe,
                     _ => unreachable!("selection is external"),
                 };
-                providers::probe_external_reported(&resolved, probe, report.as_deref_mut())
-                    .await
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                probe_deadline = Duration::from_secs(probe.timeout_seconds.unwrap_or(120));
                 executable = Some(resolved);
                 RuntimeIdentity {
                     provider: provider.id().into(),
@@ -721,35 +601,25 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn select_auto_probes_external_and_falls_back_after_failure() {
-        let mut stale = external("stale-python", vec!["python3"]);
-        if let RuntimeProvider::External { probe, .. } = &mut stale {
-            probe.args = vec!["-c".into(), "raise SystemExit(7)".into()];
+    #[test]
+    fn enumerating_candidates_does_not_probe_an_unused_external_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("unused-fallback");
+        let mut fallback = external("fallback", vec!["python3"]);
+        if let RuntimeProvider::External { probe, .. } = &mut fallback {
+            probe.args = vec!["-c".into(), format!("open({:?}, 'w').write('ran')", marker.to_str().unwrap())];
         }
-        let plan = RuntimePlan {
-            schema_version: "gewu.runtime-plan/v1".into(),
-            policies: vec!["external".into(), "bundled".into()],
-            providers: vec![stale],
-        };
         let runtime = RuntimeRef {
-            id: "demo-runtime".into(),
-            version: "1.0.0".into(),
-            target: target(),
-            artifact: artifact("demo.runtime.zip"),
-            manifest: artifact("demo.runtime.zip.json"),
-            runtime_schema: None,
-            profile: None,
-            requirements: None,
-            unpacked_bytes: None,
-            installed_bytes_upper_bound: None,
+            id:"demo-runtime".into(), version:"1.0.0".into(), target:target(),
+            artifact:artifact("runtime.zip"), manifest:artifact("runtime.json"), runtime_schema:None,
+            profile:None, requirements:None, unpacked_bytes:None, installed_bytes_upper_bound:None,
         };
-        let release = release(plan, vec![runtime]);
-        assert!(matches!(
-            RuntimeSelection::select_auto(&release, &target(), None)
-                .await
-                .unwrap(),
-            RuntimeSelection::Bundled(_)
-        ));
+        let bundled = RuntimeProvider::Bundled { id:runtime.id.clone(), version:runtime.version.clone(),
+            target:runtime.target.clone(), artifact:runtime.artifact.clone(), manifest:runtime.manifest.clone() };
+        let release = release(RuntimePlan {schema_version:"gewu.runtime-plan/v1".into(),
+            policies:vec!["bundled".into(), "external".into()], providers:vec![bundled, fallback]}, vec![runtime]);
+        let candidates = RuntimeSelection::auto_candidates(&release, &target(), None).unwrap();
+        assert!(matches!(candidates[0], RuntimeSelection::Bundled(_)));
+        assert!(!marker.exists(), "enumeration executed a provider that may never be tried");
     }
 }
