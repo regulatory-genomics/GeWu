@@ -149,23 +149,10 @@ impl PluginHost {
         tool: &str,
         ctx: &ToolContext,
     ) -> Result<()> {
-        let definition = instance
-            .definitions()
-            .find(|d| d.name == tool)
-            .context("unknown plugin tool")?;
-        ensure!(
-            definition.expose_to_agent,
-            "tool is not exposed to the agent"
-        );
+        let definition = self.agent_tool(instance, &app.session_id, tool).await?;
         if instance.package.manifest.context_provider.is_none() {
             return Ok(());
         }
-        let profile = self.session_state(&app.session_id, &app.plugin_id).await?;
-        ensure!(
-            super::tools::group_enabled(&profile, &definition.group),
-            "PLUGIN_PROFILE_DISABLED: this session has not enabled the {} tool group",
-            definition.group
-        );
         let meta = ctx.metadata.get(SNAPSHOT_KEY).filter(|value| {
             value["sessionId"] == app.session_id && value["workspaceId"] == app.workspace_id
         });

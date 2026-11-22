@@ -73,6 +73,21 @@ enum Gateway {
 
 /// Ordinary tools supplied to the existing Agent at the start of a turn.
 impl PluginHost {
+    pub(super) async fn agent_tool<'a>(
+        &self,
+        instance: &'a Instance,
+        session: &str,
+        name: &str,
+    ) -> anyhow::Result<&'a ToolDefinition> {
+        let tool = instance.definitions().find(|tool| tool.name == name)
+            .ok_or_else(|| anyhow::anyhow!("unknown plugin tool"))?;
+        anyhow::ensure!(tool.expose_to_agent, "tool is not exposed to the agent");
+        let state = self.session_state(session, &instance.package.manifest.id).await?;
+        anyhow::ensure!(group_enabled(&state, &tool.group),
+            "PLUGIN_PROFILE_DISABLED: this session has not enabled the {} tool group", tool.group);
+        Ok(tool)
+    }
+
     pub async fn tools(
         self: &Arc<Self>,
         workspace: &str,
@@ -429,12 +444,7 @@ impl Tool for PluginTool {
                             )
                             .await?);
                         }
-                        serde_json::to_value(
-                            instance
-                                .definitions()
-                                .find(|t| t.expose_to_agent && t.name == tool)
-                                .ok_or_else(|| anyhow::anyhow!("tool is not exposed"))?,
-                        )?
+                        serde_json::to_value(host.agent_tool(&instance, session, tool).await?)?
                     }
                     Gateway::SetEnabled => {
                         let enabled = args
