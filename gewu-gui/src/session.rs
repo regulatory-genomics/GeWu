@@ -237,6 +237,13 @@ enum Incoming {
     Update(bool),
 }
 
+// Older servers return session ownership conflicts as protocol error text.
+fn in_use_elsewhere(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("is open on another GeWu server"))
+}
+
 impl GuiSession {
     /// Connect upstream and load the stored sessions into tabs.
     pub async fn new(
@@ -270,10 +277,7 @@ impl GuiSession {
             }
         };
 
-        let tools = admin.list_tools().await.map_err(|e| {
-            debug!("could not list tools: {e}");
-            e.to_string()
-        });
+        let tools = Ok(Vec::new());
 
         let models = match admin.list_models().await {
             Ok(models) => models,
@@ -283,10 +287,7 @@ impl GuiSession {
             }
         };
 
-        let mut file_cache = BTreeMap::new();
-        if let Ok(entries) = admin.list_files("").await {
-            file_cache.insert(String::new(), entries);
-        }
+        let file_cache = BTreeMap::new();
 
         let mut workspace = Workspace::new();
 
@@ -354,6 +355,26 @@ impl GuiSession {
         })
     }
 
+    pub fn focus_browser_chat(&mut self, resume: &str) {
+        let selected = self
+            .workspace
+            .tabs
+            .iter()
+            .find(|tab| {
+                tab.model.session_id.as_deref() == Some(resume)
+                    || (resume.is_empty()
+                        && tab.model.session_id.is_none()
+                        && tab.workspace.is_empty())
+            })
+            .map(|tab| tab.id);
+        if let Some(id) = selected {
+            self.workspace.switch_to_id(id);
+        } else {
+            let id = self.workspace.open_blank();
+            self.workspace.tab_mut(id).expect("new tab").model_label = self.model_label.clone();
+        }
+    }
+
     /// Serve one browser WebSocket until it disconnects.
     pub async fn run(mut self, socket: WebSocket) -> Result<()> {
         let (mut sender, mut receiver) = socket.split();
@@ -394,6 +415,27 @@ impl GuiSession {
             }
             if let Err(e) = self.observe(id, session_id, true).await {
                 warn!("failed to restore observer for tab {id}: {e}");
+                if in_use_elsewhere(&e) {
+                    self.workspace
+                        .tab_mut(id)
+                        .expect("restored tab")
+                        .in_use_elsewhere = true;
+                }
+            }
+        }
+        if self.workspace.active_tab().in_use_elsewhere {
+            if let Some(id) = self
+                .workspace
+                .tabs
+                .iter()
+                .rev()
+                .find(|t| !t.in_use_elsewhere)
+                .map(|t| t.id)
+            {
+                self.workspace.switch_to_id(id);
+            } else {
+                self.workspace.open_blank();
+                self.workspace.active_tab().model_label = self.model_label.clone();
             }
         }
         // Resolve the active root and visible file cache before the first
@@ -429,6 +471,14 @@ impl GuiSession {
                         }
                     };
                     if let Err(e) = self.handle_client(msg, &mut sender, &tab_tx).await {
+                        if in_use_elsewhere(&e) {
+                            self.send_error(
+                                &mut sender,
+                                "This conversation is in use in another GeWu instance.",
+                            )
+                            .await?;
+                            continue;
+                        }
                         warn!("handling browser message failed: {e}");
                         break;
                     }
@@ -478,8 +528,7 @@ impl GuiSession {
             status: view::status_html(tab, &self.models),
             sidebar: view::sidebar_tabs_with_workspaces_html(
                 &self.tools,
-                root.map(|workspace| workspace.path.as_str())
-                    .or(self.working_directory.as_deref()),
+                root.map(|workspace| workspace.path.as_str()),
                 &self.workspaces,
                 &tab.workspace,
                 &self.expanded_dirs,
@@ -496,7 +545,14 @@ impl GuiSession {
     fn visible_workspaces(&self) -> Vec<WorkspaceSummary> {
         self.workspaces
             .iter()
-            .filter(|root| !self.closed_workspaces.contains(&root.id))
+            .filter(|root| {
+                !self.closed_workspaces.contains(&root.id)
+                    && self
+                        .workspace
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.workspace == root.id)
+            })
             .cloned()
             .collect()
     }
@@ -505,7 +561,6 @@ impl GuiSession {
         let tab = self.workspace.tab(self.workspace.active_id())?;
         self.workspace_root(&tab.workspace)
             .map(|workspace| workspace.path.clone())
-            .or_else(|| self.working_directory.clone())
     }
 
     /// Session sidebar HTML, including any available release notice.
@@ -674,7 +729,17 @@ impl GuiSession {
     /// Reload every visible tree level from the upstream and push the fresh
     /// rendering to the browser.
     async fn send_refreshed_tree(&mut self, sender: &mut Sender) -> Result<()> {
+        let old_tools = self.tools.clone();
         self.refresh_tree_cache().await?;
+        if self.tools != old_tools {
+            send_msg(
+                sender,
+                &ServerMsg::Tools {
+                    html: view::sidebar_tools_content_html(&self.tools),
+                },
+            )
+            .await?;
+        }
         send_msg(
             sender,
             &ServerMsg::FileTree {
@@ -695,12 +760,23 @@ impl GuiSession {
         if self
             .workspace
             .tab(self.workspace.active_id())
-            .is_some_and(|tab| tab.model.session_id.is_none() && tab.workspace == "cwd")
+            .is_some_and(|tab| tab.in_use_elsewhere || tab.workspace.is_empty())
         {
             self.file_cache.clear();
+            self.tools = Ok(Vec::new());
             return Ok(());
         }
-        let client = self.file_client().await?;
+        let client = match self.file_client().await {
+            Ok(client) => client,
+            Err(error) => {
+                // Switching to a saved transcript owned by another process must
+                // not tear down this browser's other tabs or show stale files.
+                debug!("file tree unavailable for active tab: {error}");
+                self.file_cache.clear();
+                return Ok(());
+            }
+        };
+        self.tools = client.list_tools().await.map_err(|e| e.to_string());
         let paths: Vec<String> = std::iter::once(String::new())
             .chain(self.expanded_dirs.iter().cloned())
             .collect();
@@ -716,6 +792,10 @@ impl GuiSession {
     /// selected workspace, rather than the server default, is applied.
     async fn file_client(&mut self) -> Result<Client> {
         let tab_id = self.workspace.active_id();
+        anyhow::ensure!(
+            !self.workspace.active_tab().workspace.is_empty(),
+            "Choose a workspace to access files."
+        );
         self.ensure_session(tab_id).await?;
         Ok(self.client(tab_id).expect("just ensured"))
     }
@@ -806,7 +886,7 @@ impl GuiSession {
                 .find(|root| root.id == workspace.id)
             {
                 *root = workspace.clone();
-            } else {
+            } else if !workspace.id.is_empty() {
                 self.workspaces.push(workspace.clone());
             }
             let tab = self.workspace.tab_mut(tab_id).expect("known tab");
@@ -874,6 +954,10 @@ impl GuiSession {
             return Ok(());
         };
 
+        if self.workspace.active_tab().in_use_elsewhere {
+            return Ok(());
+        }
+
         if let Err(e) = self.ensure_client(tab_id).await {
             self.workspace
                 .tab_mut(tab_id)
@@ -932,7 +1016,49 @@ impl GuiSession {
         sender: &mut Sender,
         tab_tx: &mpsc::UnboundedSender<TabEvent>,
     ) -> Result<()> {
+        if self.workspace.active_tab().workspace.is_empty()
+            && matches!(
+                &msg,
+                ClientMsg::UploadFiles { .. }
+                    | ClientMsg::AttachFiles { .. }
+                    | ClientMsg::ReadFile { .. }
+                    | ClientMsg::Download { .. }
+                    | ClientMsg::PreviewFile { .. }
+                    | ClientMsg::ToggleDir { .. }
+            )
+        {
+            return self
+                .send_error(sender, "Choose a workspace to access files.")
+                .await;
+        }
         match msg {
+            ClientMsg::Settings { tab } => {
+                let result: Result<()> = async {
+                    self.ensure_session(tab).await?;
+                    let client = self.client(tab).expect("session ensured");
+                    let settings = client.settings().await?;
+                    let workspaces = client.info().await?.workspaces;
+                    let efforts = gewu_protocol::REASONING_EFFORTS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    send_msg(
+                        sender,
+                        &ServerMsg::Settings {
+                            tab,
+                            settings,
+                            models: self.models.clone(),
+                            efforts,
+                            workspaces,
+                        },
+                    )
+                    .await
+                }
+                .await;
+                if let Err(error) = result {
+                    self.send_error(sender, error.to_string()).await?;
+                }
+            }
             ClientMsg::RevertChat { tab, block, undo } => {
                 self.close_zoom_for_tab(tab, sender).await?;
                 let Some(tab_state) = self.workspace.tab(tab) else {
@@ -1144,10 +1270,12 @@ impl GuiSession {
             ClientMsg::CreateTab { workspace, path } => {
                 let known = self.workspaces.iter().any(|root| root.id == workspace)
                     || workspace.starts_with("runtime:");
-                if !known || path.trim().is_empty() {
+                if !(workspace.is_empty() && path.is_empty()) && (!known || path.trim().is_empty())
+                {
                     return self.send_error(sender, "invalid session workspace").await;
                 }
-                if !self.workspaces.iter().any(|root| root.id == workspace) {
+                if !workspace.is_empty() && !self.workspaces.iter().any(|root| root.id == workspace)
+                {
                     self.workspaces.push(WorkspaceSummary {
                         id: workspace.clone(),
                         path,
@@ -1294,6 +1422,12 @@ impl GuiSession {
                     if previous != tab {
                         self.close_zoom(sender).await?;
                     }
+                    if self.workspace.active_tab().in_use_elsewhere
+                        && let Some(id) = self.workspace.active_tab().model.session_id.clone()
+                        && self.observe(tab, id, true).await.is_ok()
+                    {
+                        self.workspace.active_tab().in_use_elsewhere = false;
+                    }
                     self.expanded_dirs.clear();
                     self.file_cache.clear();
                     self.send_active_full(sender).await?;
@@ -1333,6 +1467,94 @@ impl GuiSession {
                 }
                 if self.workspace.active_id() == tab {
                     self.send_thought_body(tab, block, sender).await?;
+                }
+            }
+            ClientMsg::CheckWorkflow { tab, spec } => {
+                let result: Result<()> = async {
+                    let graph: gewu_tools::workflow::spec::WorkflowSpec =
+                        serde_json::from_value(spec)?;
+                    let agents = self.admin.list_agents().await?;
+                    graph
+                        .validate(&agents.iter().map(String::as_str).collect::<Vec<_>>())
+                        .map_err(anyhow::Error::msg)
+                }
+                .await;
+                let message = match result {
+                    Ok(()) => "Graph validated".into(),
+                    Err(e) => e.to_string(),
+                };
+                send_msg(sender, &ServerMsg::WorkflowChecked { tab, message }).await?;
+            }
+            ClientMsg::ImportWorkflow { tab } => {
+                let reply = self.workspace.tab(tab).and_then(|t| {
+                    t.model.blocks.iter().rev().find_map(|b| match b {
+                        Block::Assistant(text) => Some(text),
+                        _ => None,
+                    })
+                });
+                match reply
+                    .context("Ask for a workflow JSON draft in chat first")
+                    .and_then(|s| gewu_tools::workflow::spec::from_assistant_reply(s))
+                {
+                    Ok(spec) => send_msg(sender, &ServerMsg::WorkflowImport { tab, spec }).await?,
+                    Err(e) => self.send_error(sender, e.to_string()).await?,
+                }
+            }
+            ClientMsg::PreviewWorkflow { seq, spec } => {
+                let html = crate::workflow::draft_preview(spec);
+                send_msg(sender, &ServerMsg::WorkflowPreview { seq, html }).await?;
+            }
+            ClientMsg::EditWorkflow { tab, update } => {
+                let result: Result<()> = async {
+                    self.ensure_session(tab).await?;
+                    let client = self.client(tab).expect("session ensured");
+                    if !self.conns.get(&tab).is_some_and(|conn| conn.observing) {
+                        let id = self
+                            .workspace
+                            .tab(tab)
+                            .and_then(|tab| tab.model.session_id.clone())
+                            .expect("session ensured");
+                        self.observe(tab, id, true).await?;
+                    }
+                    let draft = client.workflow_draft(update).await?;
+                    let runs = client.inspect(gewu_protocol::InspectSection::Tasks).await?;
+                    send_msg(
+                        sender,
+                        &ServerMsg::WorkflowDraft {
+                            tab,
+                            draft,
+                            runs,
+                            example: gewu_tools::workflow::spec::EXAMPLE.into(),
+                        },
+                    )
+                    .await
+                }
+                .await;
+                if let Err(e) = result {
+                    self.send_error(sender, e.to_string()).await?;
+                }
+            }
+            ClientMsg::RunWorkflowDraft { tab, revision } => {
+                let result: Result<()> = async {
+                    self.ensure_session(tab).await?;
+                    let client = self.client(tab).expect("session ensured");
+                    let draft = client.workflow_draft(None).await?;
+                    anyhow::ensure!(
+                        draft.revision == revision,
+                        "Workflow changed. Reload before running."
+                    );
+                    let run_id = client.start_workflow(draft.spec).await?;
+                    send_msg(
+                        sender,
+                        &ServerMsg::Notice {
+                            message: format!("Started workflow {run_id}"),
+                        },
+                    )
+                    .await
+                }
+                .await;
+                if let Err(e) = result {
+                    self.send_error(sender, e.to_string()).await?;
                 }
             }
             ClientMsg::ZoomWorkflow { tab, block } => {
@@ -1781,7 +2003,6 @@ impl GuiSession {
 
     fn ensure_blank_tab(&mut self) {
         if self.workspace.is_empty() {
-            self.closed_workspaces.remove("cwd");
             let id = self.workspace.open_blank();
             self.workspace.tab_mut(id).expect("just added").model_label = self.model_label.clone();
         }
@@ -2032,7 +2253,27 @@ impl GuiSession {
                         }
                     }
                 }
+                Some(Ok(ServerMessage::DraftChanged { revision, .. })) => {
+                    send_msg(
+                        sender,
+                        &ServerMsg::DraftChanged {
+                            tab: event.tab_id,
+                            revision,
+                        },
+                    )
+                    .await?;
+                }
                 Some(Ok(ServerMessage::WorkflowProgress { run, .. })) => {
+                    if event.tab_id == active_id {
+                        send_msg(
+                            sender,
+                            &ServerMsg::WorkflowRunUpdate {
+                                tab: event.tab_id,
+                                run: run.clone(),
+                            },
+                        )
+                        .await?;
+                    }
                     // Live workflow state: re-render the start card's whole
                     // group with the new node colors. If the start card's
                     // output is not in yet, the later ToolFinish re-renders

@@ -126,6 +126,7 @@ pub fn estimate_message_tokens(msg: &Message) -> usize {
             reasoning,
             replay,
             tool_calls,
+            ..
         } => {
             // Anthropic replays ordered native blocks, including opaque
             // signatures. Estimate that payload rather than counting the

@@ -27,6 +27,7 @@ pub const TRANSCRIPT_MAX_BLOCKS: usize = 150;
 /// One tab: a conversation plus its view state.
 #[derive(Debug)]
 pub struct Tab {
+    pub in_use_elsewhere: bool,
     pub agent: String,
     pub workspace: String,
     /// Stable id, unaffected by closing other tabs.
@@ -68,8 +69,9 @@ pub struct Tab {
 impl Tab {
     fn new(id: u64) -> Self {
         Self {
+            in_use_elsewhere: false,
             agent: "build".into(),
-            workspace: "cwd".into(),
+            workspace: String::new(),
             id,
             model: SessionModel::new(),
             model_label: None,
@@ -140,6 +142,7 @@ impl Tab {
         TabInfo {
             id: self.id,
             label: tab_title(self),
+            in_use_elsewhere: self.in_use_elsewhere,
             busy: self.busy(),
             waiting: self.busy() && self.model.has_pending_question(),
             session_id: self.model.session_id.clone(),

@@ -115,8 +115,8 @@ async fn session_root(state: &ServerState, session_id: &str) -> Result<String, D
         .map_err(DownloadError::internal)?;
     let workspace_id = stored.unwrap_or_else(|| "cwd".to_string());
     let workspace = state
-        .workspace(&workspace_id)
-        .or_else(|_| state.workspace("cwd"))
+        .restored_workspace(session_id, &workspace_id)
+        .await
         .map_err(DownloadError::internal)?;
     Ok(workspace.path)
 }

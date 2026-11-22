@@ -134,11 +134,15 @@ impl gewu_core::traits::RetryClassify for OpenAIError {
 /// Configuration for the OpenAI API client.
 #[derive(Debug, Clone)]
 pub struct OpenAIConfig {
-    api_key: String,
+    api_key: tokio::sync::watch::Sender<String>,
     base_url: String,
 }
 
 impl OpenAIConfig {
+    fn authorization(&self) -> String {
+        format!("Bearer {}", *self.api_key.borrow())
+    }
+
     /// Creates a new configuration.
     ///
     /// # Arguments
@@ -147,7 +151,7 @@ impl OpenAIConfig {
     /// * `base_url` - The base URL of the API (e.g., <https://api.openai.com/v1>).
     pub fn new(api_key: &str, base_url: &str) -> Self {
         Self {
-            api_key: api_key.to_string(),
+            api_key: tokio::sync::watch::channel(api_key.to_owned()).0,
             base_url: base_url.trim_end_matches('/').to_string(),
         }
     }
@@ -161,6 +165,9 @@ pub struct OpenAIClient {
 }
 
 impl OpenAIClient {
+    pub(crate) fn update_api_key(&self, key: &str) {
+        self.config.api_key.send_replace(key.to_owned());
+    }
     pub fn with_config(config: OpenAIConfig) -> Self {
         Self {
             config,
@@ -198,10 +205,7 @@ impl<'a> ChatCompletions<'a> {
             .client
             .http_client
             .post(&url)
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.client.config.api_key),
-            )
+            .header("Authorization", self.client.config.authorization())
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .json(&request)
@@ -364,10 +368,7 @@ impl<'a> Models<'a> {
             .client
             .http_client
             .get(&url)
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.client.config.api_key),
-            )
+            .header("Authorization", self.client.config.authorization())
             .send()
             .await?;
 

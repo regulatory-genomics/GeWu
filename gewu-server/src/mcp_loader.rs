@@ -49,6 +49,7 @@ pub async fn load_mcp_tools(
                         .unwrap()
                     });
                     tools.push(Arc::new(McpToolWrapper {
+                        server_name: server_name.clone(),
                         client: client_arc.clone(),
                         name: tool.name,
                         description: tool.description.unwrap_or_default(),

@@ -86,6 +86,7 @@ fn format_message(message: &Message) -> (&'static str, String) {
             reasoning,
             replay: _,
             tool_calls,
+            ..
         } => {
             let mut output = content.clone().unwrap_or_default();
             if let Some(reasoning) = reasoning.as_deref().filter(|r| !r.is_empty()) {
@@ -233,6 +234,7 @@ mod tests {
             &Message::Assistant {
                 content: Some("second".to_string()),
                 reasoning: None,
+                reasoning_ms: None,
                 replay: None,
                 tool_calls: None,
             },
@@ -259,6 +261,7 @@ mod tests {
         let assistant = Message::Assistant {
             content: None,
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call-1".to_string(),

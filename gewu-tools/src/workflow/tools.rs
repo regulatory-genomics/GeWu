@@ -99,14 +99,16 @@ impl Tool for WorkflowStartTool {
             )
             .await
             .map_err(tool_error)?;
-        Ok(ToolResult::new(
+        let mut result = ToolResult::new(
             "workflow_start",
             format!(
                 "Started workflow run {run_id}. It executes in the background; check on it with \
                  workflow_status (run_id: \"{run_id}\"). This session is notified when it \
                  finishes."
             ),
-        ))
+        );
+        result.metadata.insert("run_id".into(), run_id.into());
+        Ok(result)
     }
 }
 

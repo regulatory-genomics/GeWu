@@ -91,6 +91,9 @@ use uuid::Uuid;
 /// ```
 #[async_trait]
 pub trait Tool: Send + Sync {
+    fn mcp_server(&self) -> Option<&str> {
+        None
+    }
     /// Returns the unique name of this tool.
     ///
     /// This name is used by the LLM to request this tool and must be
@@ -412,6 +415,9 @@ pub trait LlmProvider: Send + Sync {
     /// loops report each failed attempt through it; the default does
     /// nothing (useful for test doubles).
     fn set_status_sink(&self, _sink: Option<StatusSink>) {}
+
+    /// Replace the credential used by subsequent requests on a local provider.
+    fn update_api_key(&self, _key: &str) {}
 
     /// Lists available models for this provider.
     async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>>;

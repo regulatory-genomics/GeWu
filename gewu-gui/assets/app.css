@@ -2903,6 +2903,12 @@ body {
   color: var(--text);
 }
 
+.session-occupied {
+  flex: none;
+  color: var(--text-dim);
+  font-size: 0.8em;
+}
+
 .session-label {
   flex: 0 1 auto;
   min-width: 0;
@@ -3254,3 +3260,44 @@ body {
     transition-delay: 0s !important;
   }
 }
+
+#session-settings,
+#workflow-editor {
+  width: min(48rem, 90vw);
+  color: inherit;
+  background: var(--panel, #20252e);
+  border: 1px solid var(--border, #525a68);
+  border-radius: 8px;
+  padding: 1.25rem;
+}
+#session-settings::backdrop, #workflow-editor::backdrop { background: rgb(0 0 0 / 55%); }
+#workflow-editor h2 { margin: 0 0 .6rem; }
+#workflow-source {
+  display: block;
+  box-sizing: border-box;
+  margin: .6rem 0;
+  width: 100%;
+  height: min(45vh, 26rem);
+  padding: .7rem;
+  font: .9rem/1.5 monospace;
+  color: inherit;
+  background: var(--bg, #151922);
+}
+.workflow-actions { display: flex; flex-wrap: wrap; gap: .65rem; }
+.workflow-actions button { color: inherit; padding: .35rem .7rem; }
+#workflow-runs { max-height: 7rem; overflow: auto; white-space: pre-wrap; }
+#workflow-preview { overflow: auto; max-height: 9rem; }
+#workflow-editor { max-height: 90vh; overflow: auto; }
+
+#open-settings, #edit-workflow { width: auto; padding-inline: .55rem; }
+
+#session-settings { width: min(32rem, 90vw); }
+#settings-info { white-space: pre-line; color: var(--text-muted); }
+#settings-fields label {
+  display: grid;
+  grid-template-columns: minmax(7rem, 1fr) minmax(0, 2fr);
+  align-items: center;
+  gap: .6rem;
+  margin: .7rem 0;
+}
+#settings-fields select { min-width: 0; width: 100%; }

@@ -49,7 +49,7 @@ impl LlmProvider for MockLlm {
         let response = responses.remove(0);
 
         let s = async_stream::try_stream! {
-            if let Message::Assistant { content, reasoning, tool_calls, replay } = response {
+            if let Message::Assistant { content, reasoning, tool_calls, replay, .. } = response {
                 if let Some(replay) = replay {
                     yield ProviderEvent::ReasoningReplay { replay };
                 }
@@ -122,12 +122,14 @@ async fn test_agent_loop() {
         Message::Assistant {
             content: None,
             reasoning: Some("I should call the tool".into()),
+            reasoning_ms: None,
             replay: Some(replay.clone()),
             tool_calls: Some(vec![tool_call]),
         },
         Message::Assistant {
             content: Some("Done: Tool output".to_string()),
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: None,
         },
@@ -187,6 +189,7 @@ async fn test_agent_emits_usage_at_turn_boundaries() {
     let responses = vec![Message::Assistant {
         content: Some("Done".to_string()),
         reasoning: None,
+        reasoning_ms: None,
         replay: None,
         tool_calls: None,
     }];
@@ -246,12 +249,14 @@ async fn test_apply_patch_metadata_through_agent_loop() {
             Message::Assistant {
                 content: None,
                 reasoning: None,
+                reasoning_ms: None,
                 replay: None,
                 tool_calls: Some(vec![tool_call]),
             },
             Message::Assistant {
                 content: Some("patched".to_string()),
                 reasoning: None,
+                reasoning_ms: None,
                 replay: None,
                 tool_calls: None,
             },
@@ -336,6 +341,7 @@ async fn test_parallel_tool_calls_run_concurrently_in_call_order() {
         Message::Assistant {
             content: None,
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: Some(vec![
                 make_call(1, "call_1"),
@@ -346,6 +352,7 @@ async fn test_parallel_tool_calls_run_concurrently_in_call_order() {
         Message::Assistant {
             content: Some("all done".to_string()),
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: None,
         },
@@ -410,6 +417,7 @@ async fn test_malformed_tool_calls_still_record_tool_results() {
         Message::Assistant {
             content: None,
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: Some(vec![
                 ToolCall {
@@ -433,6 +441,7 @@ async fn test_malformed_tool_calls_still_record_tool_results() {
         Message::Assistant {
             content: Some("recovered".to_string()),
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: None,
         },

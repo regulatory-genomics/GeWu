@@ -48,9 +48,11 @@
             autocapitalize="sentences"
             spellcheck="true"
             aria-label="Message"></textarea>
+          <button type="button" id="open-settings" class="icon-button" aria-label="Settings" title="Session settings" disabled>Settings</button>
+          <button id="edit-workflow" disabled class="icon-button" type="button" title="Design a shared workflow" aria-label="Design a shared workflow">Workflow</button>
           <button id="attach" class="icon-button" type="button" title="Attach files" aria-label="Attach files">+</button>
           <button id="interrupt" class="icon-button stop hidden" type="button" title="Interrupt (Esc)" aria-label="Interrupt">■</button>
-          <button id="send" class="send" type="submit">Send <kbd>⏎</kbd></button>
+          <button id="send" class="send" type="submit" disabled>Send <kbd>⏎</kbd></button>
         </form>
       </footer>
 
@@ -66,6 +68,24 @@
   <input id="attachment-upload" type="file" multiple hidden>
 
   <div id="file-preview" class="preview-overlay hidden" role="dialog" aria-modal="true" aria-label="File preview"></div>
+
+  <dialog id="session-settings" aria-labelledby="settings-heading">
+    <h2 id="settings-heading">Settings</h2>
+    <p id="settings-info"></p>
+    <div id="settings-fields"></div>
+    <p id="settings-message" role="status"></p>
+    <form method="dialog"><button>Close</button></form>
+  </dialog>
+
+  <dialog id="workflow-editor" aria-labelledby="workflow-heading">
+    <h2 id="workflow-heading">Workflow</h2>
+    <label for="workflow-source" id="workflow-revision">Shared draft</label>
+    <textarea id="workflow-source" aria-label="Workflow JSON" spellcheck="false"></textarea>
+    <div id="workflow-preview" aria-label="Draft graph"></div>
+    <p id="workflow-feedback" role="status"></p>
+    <div class="workflow-actions"><button type="button" data-flow="example">Example</button><button type="button" data-flow="step">Add step</button><button type="button" data-flow="import">Import last reply</button><button type="button" data-flow="validate">Validate</button><button type="button" data-flow="reload">Reload</button><button type="button" data-flow="save">Save</button><button type="button" data-flow="run">Run</button><button type="button" data-flow="close">Close</button></div>
+    <pre id="workflow-runs" aria-label="Workflow runs"></pre>
+  </dialog>
 
   <div id="workflow-zoom" class="wf-zoom-overlay hidden" role="dialog" aria-modal="true" aria-label="Workflow graph"></div>
 

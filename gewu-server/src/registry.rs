@@ -63,6 +63,8 @@ pub struct ProfileInputs<'a> {
     /// Live workflow progress channel, when the process has an observer
     /// (the server forwards it to clients; the CLI has none).
     pub workflow_progress: Option<tokio::sync::broadcast::Sender<RunProgress>>,
+    /// Keep control of live runs when a top-level session switches profiles.
+    pub session_workflows: Option<&'a std::sync::OnceLock<Arc<WorkflowManager>>>,
     /// Broker backing the `question` tool. `None` disables asking (CLI,
     /// subagents, workflow agents).
     pub question_broker: Option<Arc<QuestionBroker>>,
@@ -78,7 +80,7 @@ pub struct ModelCatalog {
 /// Tool registry plus the flattened tool list reported to clients.
 type RegistryBundle = (Arc<dyn ToolRegistry>, Vec<Arc<dyn Tool>>);
 /// Assembled tools, the profile's system prompt, and its tool registry.
-type ProfileBundle = (Vec<Arc<dyn Tool>>, String, Arc<dyn ToolRegistry>);
+pub(crate) type ProfileBundle = (Vec<Arc<dyn Tool>>, String, Arc<dyn ToolRegistry>);
 
 pub fn list_available_agents() -> Vec<AgentConfig> {
     vec![
@@ -392,6 +394,7 @@ impl SqliteAgentFactory {
             context_limit: self.context_limit,
             agents: self.agents.clone(),
             workflow_progress: self.workflow_progress.clone(),
+            session_workflows: None,
             question_broker: None,
             session_id: "",
         })?;
@@ -518,7 +521,11 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 agents.clone(),
                 workflow_progress.clone(),
             );
-            let workflows = workflow_manager(factory.clone(), workflow_progress.clone());
+            let create = || workflow_manager(factory.clone(), workflow_progress.clone());
+            let workflows = match inputs.session_workflows {
+                Some(slot) => slot.get_or_init(create).clone(),
+                None => create(),
+            };
             vec![
                 Box::new(task_tool(factory, agents.clone(), policy.task_allowlist)),
                 Box::new(WorkflowStartTool::new(workflows.clone())),
@@ -652,6 +659,7 @@ fn build_custom_agent_tools(
         context_limit: inputs.context_limit,
         agents: inputs.agents.clone(),
         workflow_progress: inputs.workflow_progress.clone(),
+        session_workflows: None,
         question_broker: None,
         session_id: inputs.session_id,
     })?;
@@ -700,6 +708,7 @@ pub async fn create_agent(
         context_limit,
         agents,
         workflow_progress,
+        session_workflows,
         question_broker,
         session_id,
         working_directory,
@@ -721,6 +730,7 @@ pub async fn create_agent(
         context_limit,
         agents,
         workflow_progress,
+        session_workflows,
         question_broker,
         session_id,
     })?;
@@ -772,6 +782,12 @@ pub async fn create_agent(
 /// tool no longer reads it from here (it receives the parent per call via the
 /// tool context).
 pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
+    if inputs.working_directory.as_os_str().is_empty() {
+        let registry = ToolRegistryImpl {
+            tools: Arc::new(Vec::new()),
+        };
+        return Ok((Vec::new(), "You are GeWu. This is a chat without a workspace. Answer conversational questions directly. When a task requires files, shell commands or workflow execution, ask the user to choose a workspace using /cd in the CLI or Open workspace in the web app.".into(), Arc::new(registry)));
+    }
     let ProfileInputs {
         model_catalog,
         name,
@@ -785,6 +801,7 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
         context_limit,
         agents,
         workflow_progress,
+        session_workflows,
         question_broker,
         session_id,
     } = inputs;
@@ -801,6 +818,7 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
         context_limit,
         agents: agents.clone(),
         workflow_progress,
+        session_workflows,
         question_broker,
         session_id,
     })?;
@@ -1000,6 +1018,7 @@ mod tests {
             context_limit: None,
             agents: Arc::new(BTreeMap::new()),
             workflow_progress: None,
+            session_workflows: None,
             question_broker: None,
             session_id,
         }

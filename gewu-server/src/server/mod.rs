@@ -293,6 +293,12 @@ fn workflow_run_state(progress: &gewu_tools::workflow::RunProgress) -> WorkflowR
             .nodes
             .iter()
             .map(|node| WorkflowNodeState {
+                sessions: node
+                    .sessions
+                    .iter()
+                    .filter(|id| !id.is_empty())
+                    .cloned()
+                    .collect(),
                 id: node.id.clone(),
                 status: node.status.clone(),
                 done: count_u32(node.done),
@@ -345,6 +351,8 @@ async fn forward_workflow_progress(
 /// Per-connection session: one agent plus its identity.
 #[derive(Clone)]
 struct ConnectionSession {
+    // Agents cache SQLite history. Keep one live owner across server processes.
+    _owner: Option<Arc<std::fs::File>>,
     agent: Arc<Mutex<gewu_core::Agent>>,
     session_id: String,
     agent_name: String,
@@ -369,6 +377,8 @@ struct ConnectionSession {
 
 #[derive(Default)]
 struct SessionInbox {
+    workflows: OnceLock<Arc<gewu_tools::workflow::WorkflowManager>>,
+    workflow_control: std::sync::RwLock<Option<Arc<dyn gewu_core::traits::ToolRegistry>>>,
     steering: gewu_core::Steering,
     watcher: OnceLock<AbortHandle>,
 }
@@ -421,6 +431,29 @@ pub async fn serve(
         .await
         .with_context(|| format!("Failed to bind HTTP listener on {}", http_addr))?;
 
+    serve_on(
+        bootstrap,
+        ws_listener,
+        tcp_listener,
+        http_listener,
+        token,
+        tokio::signal::ctrl_c(),
+    )
+    .await
+}
+
+/// Run on already-bound sockets. The owner decides when to shut the service down.
+pub async fn serve_on(
+    bootstrap: Bootstrap,
+    ws_listener: TcpListener,
+    tcp_listener: TcpListener,
+    http_listener: TcpListener,
+    token: Option<String>,
+    shutdown: impl std::future::Future<Output = std::io::Result<()>>,
+) -> Result<()> {
+    let ws_addr = ws_listener.local_addr()?;
+    let tcp_addr = tcp_listener.local_addr()?;
+    let http_addr = http_listener.local_addr()?;
     let (workflow_progress, workflow_rx) = tokio::sync::broadcast::channel(256);
     let state = Arc::new(ServerState {
         bootstrap,
@@ -464,13 +497,12 @@ pub async fn serve(
     drop(conn_tx); // accept loops hold the remaining senders
 
     // Run until Ctrl+C (or until both accept loops exit).
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
+    tokio::pin!(shutdown);
     loop {
         tokio::select! {
-            result = &mut ctrl_c => {
-                result.context("Failed to listen for Ctrl+C")?;
-                info!("Received Ctrl+C, shutting down");
+            result = &mut shutdown => {
+                result.context("waiting for shutdown")?;
+                info!("shutting down");
                 break;
             }
             connection = conn_rx.recv() => {
@@ -537,6 +569,67 @@ async fn accept_loop(
 // ---------------------------------------------------------------------------
 
 impl ServerState {
+    fn session_profile(
+        &self,
+        current: &ConnectionSession,
+        target: &str,
+        workspace: &WorkspaceSummary,
+    ) -> Result<registry::ProfileBundle> {
+        registry::agent_profile(registry::ProfileInputs {
+            model_catalog: Some(registry::ModelCatalog {
+                entries: Arc::new(self.bootstrap.models.clone()),
+                default: self.bootstrap.model_selector.clone(),
+            }),
+            name: target,
+            provider: current.provider.clone(),
+            pool: self.bootstrap.pool.clone(),
+            working_directory: std::path::PathBuf::from(&workspace.path),
+            additional_tools: self.bootstrap.mcp_tools.clone(),
+            skills: self.bootstrap.skills.clone(),
+            enforcement: self.bootstrap.enforcement,
+            image_limits: self.bootstrap.image_limits,
+            context_limit: Some(current.context_limit),
+            agents: self.bootstrap.agents.clone(),
+            session_workflows: Some(&current.inbox.workflows),
+            workflow_progress: Some(self.workflow_progress.clone()),
+            question_broker: Some(self.questions.clone()),
+            session_id: &current.session_id,
+        })
+    }
+
+    async fn bind_workspace(
+        &self,
+        current: &ConnectionSession,
+        workspace: WorkspaceSummary,
+    ) -> Result<ConnectionSession> {
+        let (tools, prompt, registry) =
+            self.session_profile(current, &current.agent_name, &workspace)?;
+        gewu_storage::save_workspace(
+            &self.bootstrap.pool,
+            &current.session_id,
+            &workspace.id,
+            (!workspace.path.is_empty()).then_some(workspace.path.as_str()),
+        )
+        .await?;
+        let mut agent = current.agent.lock().await;
+        let reminder = agent.reminder().clone();
+        let policy = agent.tool_policy().clone();
+        agent.set_profile(prompt, tools, reminder, policy);
+        agent.set_working_directory(PathBuf::from(&workspace.path));
+        *current.inbox.workflow_control.write().unwrap() = Some(registry);
+        let updated = ConnectionSession {
+            workspace,
+            tools: agent.list_tools(),
+            ..current.clone()
+        };
+        drop(agent);
+        self.sessions
+            .lock()
+            .await
+            .insert(current.session_id.clone(), updated.clone());
+        Ok(updated)
+    }
+
     fn workspace_summaries(&self) -> Vec<WorkspaceSummary> {
         self.bootstrap
             .workspace_roots
@@ -549,6 +642,12 @@ impl ServerState {
     }
 
     fn workspace(&self, id: &str) -> Result<WorkspaceSummary> {
+        if id.is_empty() {
+            return Ok(WorkspaceSummary {
+                id: String::new(),
+                path: String::new(),
+            });
+        }
         if let Some(path) = self.bootstrap.workspace_roots.get(id) {
             return Ok(WorkspaceSummary {
                 id: id.to_string(),
@@ -569,6 +668,48 @@ impl ServerState {
             id: id.to_string(),
             path: path.to_string_lossy().to_string(),
         })
+    }
+
+    async fn lock_session(&self, id: &str) -> Result<Option<Arc<std::fs::File>>> {
+        use sha2::{Digest, Sha256};
+        let database: String =
+            sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
+                .fetch_one(&self.bootstrap.pool)
+                .await?;
+        // In-memory SQLite has no other process.
+        if database.is_empty() {
+            return Ok(None);
+        }
+        let dir = PathBuf::from(format!("{database}.sessions"));
+        std::fs::create_dir_all(&dir)?;
+        // Session ids are supplied by clients. Keep filenames bounded and path-safe.
+        let path = dir.join(format!("{:x}", Sha256::digest(id.as_bytes())));
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Arc::new(file))),
+            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+                "session {id} is open on another GeWu server; use --server to connect to that instance"
+            ),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
+    async fn restored_workspace(&self, session: &str, id: &str) -> Result<WorkspaceSummary> {
+        let configured = self.workspace(id);
+        if let Some(path) =
+            gewu_storage::session_workspace_path(&self.bootstrap.pool, session).await?
+        {
+            if configured.as_ref().is_ok_and(|w| w.path == path) {
+                return configured;
+            }
+            return self.workspace_for_path(path);
+        }
+        configured.or_else(|_| self.workspace("cwd"))
     }
 
     fn workspace_for_path(&self, path: impl AsRef<std::path::Path>) -> Result<WorkspaceSummary> {
@@ -665,6 +806,9 @@ impl ServerState {
         requested_workspace: Option<String>,
     ) -> Result<ConnectionSession> {
         if let Some(existing) = current {
+            if let Some(latest) = self.sessions.lock().await.get(&existing.session_id) {
+                *existing = latest.clone();
+            }
             if let Some(requested) = &session_id
                 && requested != &existing.session_id
             {
@@ -688,6 +832,7 @@ impl ServerState {
             return Ok(existing.clone());
         }
 
+        let new_session = session_id.is_none();
         let session_id = session_id.unwrap_or_else(crate::bootstrap::new_session_id);
         // Serialize initialization so multiple observers share one agent.
         let mut sessions = self.sessions.lock().await;
@@ -701,6 +846,7 @@ impl ServerState {
             *current = Some(existing.clone());
             return Ok(existing.clone());
         }
+        let owner = self.lock_session(&session_id).await?;
         let agent_name = match agent_name {
             Some(name) => name,
             None => gewu_storage::session_agent(&self.bootstrap.pool, &session_id).await?,
@@ -719,14 +865,7 @@ impl ServerState {
         let workspace = if use_requested_workspace {
             self.workspace(&workspace_id)?
         } else {
-            self.workspace(&workspace_id).unwrap_or_else(|error| {
-                warn!(
-                    "session {} has invalid workspace '{}': {}; using cwd",
-                    session_id, workspace_id, error
-                );
-                self.workspace("cwd")
-                    .expect("cwd workspace is always configured")
-            })
+            self.restored_workspace(&session_id, &workspace_id).await?
         };
         let workspace_path = std::path::PathBuf::from(&workspace.path);
 
@@ -768,7 +907,8 @@ impl ServerState {
                 anyhow::anyhow!("reasoning effort is unavailable for model '{model}'")
             })?;
 
-        let (agent, _registry) = create_agent(
+        let inbox = Arc::new(SessionInbox::default());
+        let (agent, registry) = create_agent(
             registry::ProfileInputs {
                 model_catalog: Some(registry::ModelCatalog {
                     entries: Arc::new(self.bootstrap.models.clone()),
@@ -784,6 +924,7 @@ impl ServerState {
                 image_limits: self.bootstrap.image_limits,
                 context_limit: Some(entry.context_limit),
                 agents: self.bootstrap.agents.clone(),
+                session_workflows: Some(&inbox.workflows),
                 workflow_progress: Some(self.workflow_progress.clone()),
                 question_broker: Some(self.questions.clone()),
                 session_id: &session_id,
@@ -804,15 +945,34 @@ impl ServerState {
             let mut agent = agent.lock().await;
             patch_dangling_tool_calls(&mut agent).await;
         }
-        if use_requested_workspace {
-            gewu_storage::set_session_workspace(&self.bootstrap.pool, &session_id, &workspace_id)
-                .await?;
+        // Explicit, client-generated ids can also start a brand-new conversation.
+        // Never infer the original directory of an existing legacy transcript.
+        let record_workspace = use_requested_workspace
+            || new_session
+            || (stored_id.is_none()
+                && agent
+                    .lock()
+                    .await
+                    .memory
+                    .messages()
+                    .iter()
+                    .all(|m| matches!(m, Message::System { .. })));
+        if record_workspace {
+            gewu_storage::save_workspace(
+                &self.bootstrap.pool,
+                &session_id,
+                &workspace.id,
+                (!workspace.path.is_empty()).then_some(workspace.path.as_str()),
+            )
+            .await?;
         }
         gewu_storage::set_session_agent(&self.bootstrap.pool, &session_id, &agent_name).await?;
         // Snapshot the tool list once; it never changes for this session.
         let tools = agent.lock().await.list_tools();
 
+        *inbox.workflow_control.write().unwrap() = Some(registry);
         let entry = ConnectionSession {
+            _owner: owner,
             agent,
             session_id,
             agent_name,
@@ -821,7 +981,7 @@ impl ServerState {
             reasoning_effort,
             context_limit: entry.context_limit,
             tools,
-            inbox: Arc::new(SessionInbox::default()),
+            inbox,
             workspace,
         };
         *current = Some(entry.clone());
@@ -1181,6 +1341,11 @@ fn resolve_workspace_path(
     path: &str,
     enforcement: PathEnforcement,
 ) -> Result<PathBuf, RequestError> {
+    if root.is_empty() {
+        return Err(RequestError::Invalid(
+            "Choose a workspace to access files.".into(),
+        ));
+    }
     match enforcement {
         PathEnforcement::None => Ok(Path::new(root).join(path)),
         _ => {
@@ -1225,13 +1390,24 @@ async fn handle_request(
     // session's selected workspace without first sending `usage` or `ask`.
     if matches!(
         &request.op,
-        Op::ListFiles { .. } | Op::ReadFile { .. } | Op::WriteFile { .. }
+        Op::ListFiles { .. }
+            | Op::ReadFile { .. }
+            | Op::WriteFile { .. }
+            | Op::UploadAttachment { .. }
     ) && (session.is_some() || request.session_id.is_some())
     {
         state
             .get_or_create_session(session, request.session_id.clone(), request.agent.clone())
             .await
             .map_err(|e| RequestError::Failed(e.to_string()))?;
+        if session
+            .as_ref()
+            .is_some_and(|s| s.workspace.path.is_empty())
+        {
+            return Err(RequestError::Invalid(
+                "Choose a workspace to access files.".into(),
+            ));
+        }
     }
     match request.op {
         Op::SubscribeSession => {
@@ -1359,27 +1535,9 @@ async fn handle_request(
                     "session is busy on another connection".into(),
                 ));
             }
-            let replacement = registry::agent_profile(registry::ProfileInputs {
-                model_catalog: Some(registry::ModelCatalog {
-                    entries: Arc::new(state.bootstrap.models.clone()),
-                    default: state.bootstrap.model_selector.clone(),
-                }),
-                name: &target,
-                provider: current.provider.clone(),
-                pool: state.bootstrap.pool.clone(),
-                working_directory: std::path::PathBuf::from(&current.workspace.path),
-                additional_tools: state.bootstrap.mcp_tools.clone(),
-                skills: state.bootstrap.skills.clone(),
-                enforcement: state.bootstrap.enforcement,
-                image_limits: state.bootstrap.image_limits,
-                context_limit: Some(current.context_limit),
-                agents: state.bootstrap.agents.clone(),
-                workflow_progress: Some(state.workflow_progress.clone()),
-                question_broker: Some(state.questions.clone()),
-                session_id: &current.session_id,
-            });
+            let replacement = state.session_profile(&current, &target, &current.workspace);
             let result = match replacement {
-                Ok((tools, prompt, _)) => match gewu_storage::set_session_agent(
+                Ok((tools, prompt, registry)) => match gewu_storage::set_session_agent(
                     &state.bootstrap.pool,
                     &current.session_id,
                     &target,
@@ -1396,6 +1554,7 @@ async fn handle_request(
                             &state.bootstrap.mcp_tools,
                         );
                         agent.set_profile(prompt, tools, reminder, policy);
+                        *current.inbox.workflow_control.write().unwrap() = Some(registry);
                         if let Err(e) = gewu_storage::set_reminder(
                             &state.bootstrap.pool,
                             &current.session_id,
@@ -1407,16 +1566,9 @@ async fn handle_request(
                         }
                         let tools = agent.list_tools();
                         *session = Some(ConnectionSession {
-                            agent: current.agent.clone(),
-                            session_id: current.session_id.clone(),
                             agent_name: target.clone(),
-                            model: current.model.clone(),
-                            provider: current.provider.clone(),
-                            reasoning_effort: current.reasoning_effort.clone(),
-                            context_limit: current.context_limit,
                             tools: tools.clone(),
-                            inbox: current.inbox.clone(),
-                            workspace: current.workspace.clone(),
+                            ..current.clone()
                         });
                         state.sessions.lock().await.insert(
                             current.session_id.clone(),
@@ -1443,7 +1595,12 @@ async fn handle_request(
                 ));
             }
             let current = state
-                .get_or_create_session(session, request.session_id, None)
+                .get_or_create_session_with_workspace(
+                    session,
+                    request.session_id,
+                    None,
+                    Some(target.clone()),
+                )
                 .await
                 .map_err(|e| RequestError::Failed(e.to_string()))?;
             if !state.claim_session(&current.session_id).await {
@@ -1452,38 +1609,17 @@ async fn handle_request(
                 ));
             }
             let result = match state.workspace(&target) {
-                Ok(workspace) => {
-                    if let Err(error) = gewu_storage::set_session_workspace(
-                        &state.bootstrap.pool,
-                        &current.session_id,
-                        &workspace.id,
-                    )
-                    .await
-                    {
-                        Err(RequestError::Failed(error.to_string()))
-                    } else {
-                        current
-                            .agent
-                            .lock()
-                            .await
-                            .set_working_directory(std::path::PathBuf::from(&workspace.path));
-                        let replacement = ConnectionSession {
-                            workspace: workspace.clone(),
-                            ..current.clone()
-                        };
-                        *session = Some(replacement.clone());
-                        state
-                            .sessions
-                            .lock()
-                            .await
-                            .insert(current.session_id.clone(), replacement);
+                Ok(workspace) => match state.bind_workspace(&current, workspace.clone()).await {
+                    Ok(updated) => {
+                        *session = Some(updated);
                         Ok(Handled::Reply(ServerMessage::WorkspaceSwitched {
                             id: request.id,
                             session_id: current.session_id.clone(),
                             workspace,
                         }))
                     }
-                }
+                    Err(e) => Err(RequestError::Failed(e.to_string())),
+                },
                 Err(error) => Err(RequestError::Invalid(error.to_string())),
             };
             state.release_session(&current.session_id).await;
@@ -1516,38 +1652,17 @@ async fn handle_request(
                 ));
             }
             let result = match state.workspace_for_path(path) {
-                Ok(workspace) => {
-                    if let Err(error) = gewu_storage::set_session_workspace(
-                        &state.bootstrap.pool,
-                        &current.session_id,
-                        &workspace.id,
-                    )
-                    .await
-                    {
-                        Err(RequestError::Failed(error.to_string()))
-                    } else {
-                        current
-                            .agent
-                            .lock()
-                            .await
-                            .set_working_directory(std::path::PathBuf::from(&workspace.path));
-                        let replacement = ConnectionSession {
-                            workspace: workspace.clone(),
-                            ..current.clone()
-                        };
-                        *session = Some(replacement.clone());
-                        state
-                            .sessions
-                            .lock()
-                            .await
-                            .insert(current.session_id.clone(), replacement);
+                Ok(workspace) => match state.bind_workspace(&current, workspace.clone()).await {
+                    Ok(updated) => {
+                        *session = Some(updated);
                         Ok(Handled::Reply(ServerMessage::WorkspaceAdded {
                             id: request.id,
                             session_id: current.session_id.clone(),
                             workspace,
                         }))
                     }
-                }
+                    Err(e) => Err(RequestError::Failed(e.to_string())),
+                },
                 Err(error) => Err(RequestError::Invalid(error.to_string())),
             };
             state.release_session(&current.session_id).await;
@@ -1603,16 +1718,11 @@ async fn handle_request(
                                     agent.context_limit = entry.context_limit;
                                 }
                                 let replacement = ConnectionSession {
-                                    agent: current.agent.clone(),
-                                    session_id: current.session_id.clone(),
-                                    agent_name: current.agent_name.clone(),
                                     model: target.clone(),
                                     provider,
                                     reasoning_effort: reasoning_effort.clone(),
                                     context_limit: entry.context_limit,
-                                    tools: current.tools.clone(),
-                                    inbox: current.inbox.clone(),
-                                    workspace: current.workspace.clone(),
+                                    ..current.clone()
                                 };
                                 *session = Some(replacement.clone());
                                 state
@@ -1686,16 +1796,9 @@ async fn handle_request(
                                 Ok(()) => {
                                     current.agent.lock().await.set_llm(provider.clone());
                                     let replacement = ConnectionSession {
-                                        agent: current.agent.clone(),
-                                        session_id: current.session_id.clone(),
-                                        agent_name: current.agent_name.clone(),
-                                        model: current.model.clone(),
                                         provider,
                                         reasoning_effort: effort.clone(),
-                                        context_limit: current.context_limit,
-                                        tools: current.tools.clone(),
-                                        inbox: current.inbox.clone(),
-                                        workspace: current.workspace.clone(),
+                                        ..current.clone()
                                     };
                                     *session = Some(replacement.clone());
                                     state
@@ -1768,7 +1871,9 @@ async fn handle_request(
                     .map_err(|e| RequestError::Failed(e.to_string()))?
             };
             let mut workspaces = state.workspace_summaries();
-            if !workspaces.iter().any(|workspace| workspace.id == active.id) {
+            if !active.id.is_empty()
+                && !workspaces.iter().any(|workspace| workspace.id == active.id)
+            {
                 workspaces.push(active.clone());
             }
             Ok(Handled::Reply(ServerMessage::Info {
@@ -1835,6 +1940,276 @@ async fn handle_request(
             }))
         }
 
+        Op::Settings => {
+            let bound = state
+                .get_or_create_session(session, request.session_id, None)
+                .await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            let active = state
+                .sessions
+                .lock()
+                .await
+                .get(&bound.session_id)
+                .cloned()
+                .ok_or_else(|| RequestError::Failed("Session was closed".into()))?;
+            let model = state
+                .bootstrap
+                .models
+                .get(&active.model)
+                .ok_or_else(|| RequestError::Failed("Session model is unavailable".into()))?;
+            let settings = protocol::SessionSettings {
+                model: active.model.clone(),
+                default_model: state.bootstrap.model_selector.clone(),
+                provider: model.provider_name.clone(),
+                effort_override: active.reasoning_effort.clone(),
+                default_effort: model.default_effort.clone(),
+                supports_effort: model.supports_reasoning_effort,
+                agent: active.agent_name.clone(),
+                workspace: active.workspace.path.clone(),
+                context_limit: active.context_limit,
+                path_checks: format!("{:?}", state.bootstrap.enforcement).to_lowercase(),
+            };
+            *session = Some(active);
+            Ok(Handled::Reply(ServerMessage::Settings {
+                id: request.id,
+                settings,
+            }))
+        }
+        Op::Inspect { section } => {
+            use gewu_core::traits::SessionStateStore;
+            use protocol::{InspectSection as Section, InspectionEntry};
+            let current = state
+                .get_or_create_session(session, request.session_id, None)
+                .await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            let owner = &current.session_id;
+            let row = |key: String, label: String, detail: String| InspectionEntry {
+                nodes: vec![],
+                key,
+                label,
+                detail,
+                cancellable: false,
+            };
+            let mut entries = match section {
+                Section::Tasks => state
+                    .workflows
+                    .lock()
+                    .await
+                    .get(owner)
+                    .into_iter()
+                    .flat_map(|runs| runs.values())
+                    .map(|run| {
+                        let nodes = run
+                            .nodes
+                            .iter()
+                            .map(|node| {
+                                format!(
+                                    "{}: {} ({} done, {} failed)",
+                                    node.id, node.status, node.done, node.failed
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        InspectionEntry {
+                            nodes: run.nodes.clone(),
+                            key: run.run_id.clone(),
+                            label: format!(
+                                "{} · {}",
+                                run.name.as_deref().unwrap_or(&run.run_id),
+                                run.status
+                            ),
+                            detail: format!(
+                                "{}\n{}\n{}",
+                                run.run_id,
+                                nodes,
+                                run.error.as_deref().unwrap_or("")
+                            ),
+                            cancellable: run.status == "running"
+                                && current.tools.iter().any(|n| n == "workflow_cancel")
+                                && registry::profile_tool_policy(
+                                    &current.agent_name,
+                                    &state.bootstrap.agents,
+                                    &state.bootstrap.mcp_tools,
+                                )
+                                .check("workflow_cancel")
+                                .is_ok(),
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                Section::Subagents => gewu_storage::child_previews(&state.bootstrap.pool, owner)
+                    .await
+                    .map_err(|e| RequestError::Failed(e.to_string()))?
+                    .into_iter()
+                    .map(|child| {
+                        let assignment = child.assignment.as_deref().unwrap_or("No instruction recorded yet");
+                        let title: String = assignment.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(64).collect();
+                        let reply = child.reply.as_deref().unwrap_or("No reply recorded for this instruction");
+                        let detail = format!("Session: {}\nRole: {}\n\nLatest instruction (preview)\n{assignment}\n\nLatest reply (preview)\n{reply}", child.id, child.profile);
+                        row(child.id, format!("{} · {title}", child.profile), detail)
+                    })
+                    .collect(),
+                Section::Todos => {
+                    let store =
+                        gewu_storage::SqliteSessionStateStore::new(state.bootstrap.pool.clone());
+                    let raw = store
+                        .load(owner, "todos")
+                        .await
+                        .map_err(|e| RequestError::Failed(e.to_string()))?;
+                    let items: Vec<gewu_tools::todo::TodoItem> =
+                        serde_json::from_str(raw.as_deref().unwrap_or("[]"))
+                            .map_err(|e| RequestError::Failed(e.to_string()))?;
+                    items
+                        .into_iter()
+                        .map(|item| {
+                            row(
+                                item.id,
+                                format!("[{}] {}", item.status, item.content),
+                                item.priority
+                                    .map(|n| format!("Priority: {n}"))
+                                    .unwrap_or_default(),
+                            )
+                        })
+                        .collect()
+                }
+                Section::Skills => state
+                    .bootstrap
+                    .skills
+                    .iter()
+                    .filter(|_| current.tools.iter().any(|n| n == "skill"))
+                    .map(|s| {
+                        row(
+                            s.name.clone(),
+                            s.name.clone(),
+                            format!(
+                                "{}\n{}",
+                                s.description.as_deref().unwrap_or(""),
+                                s.location.display()
+                            ),
+                        )
+                    })
+                    .collect(),
+                Section::Mcp => state
+                    .bootstrap
+                    .mcp_tools
+                    .iter()
+                    .filter(|tool| current.tools.iter().any(|n| n == tool.name()))
+                    .map(|tool| {
+                        row(
+                            tool.name().into(),
+                            tool.name().into(),
+                            format!(
+                                "{}\n{}",
+                                tool.mcp_server().unwrap_or("external"),
+                                tool.description()
+                            ),
+                        )
+                    })
+                    .collect(),
+            };
+            if !matches!(section, Section::Todos | Section::Subagents) {
+                entries.sort_by(|left, right| left.key.cmp(&right.key));
+            }
+            Ok(Handled::Reply(ServerMessage::Inspection {
+                id: request.id,
+                entries,
+            }))
+        }
+        Op::WorkflowDraft { update } => {
+            let current = state
+                .get_or_create_session(session, request.session_id, None)
+                .await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            let saving = update.is_some();
+            if let Some(draft) = &update {
+                let _: gewu_tools::workflow::spec::WorkflowSpec =
+                    serde_json::from_value(draft.spec.clone()).map_err(|e| {
+                        RequestError::Invalid(format!("Invalid workflow document: {e}"))
+                    })?;
+            }
+            let draft =
+                gewu_storage::workflow_draft(&state.bootstrap.pool, &current.session_id, update)
+                    .await
+                    .map_err(|e| RequestError::Failed(e.to_string()))?;
+            if saving && let Some(turn) = state.turns.lock().await.get(&current.session_id).cloned()
+            {
+                let line = ServerMessage::DraftChanged {
+                    session_id: current.session_id,
+                    revision: draft.revision,
+                }
+                .to_line();
+                turn.lock()
+                    .await
+                    .subscribers
+                    .retain(|subscriber| subscriber.send(&line));
+            }
+            Ok(Handled::Reply(ServerMessage::WorkflowDraft {
+                id: request.id,
+                draft,
+            }))
+        }
+        operation @ (Op::StartWorkflow { .. } | Op::CancelWorkflow { .. }) => {
+            let (tool, args) = match operation {
+                Op::StartWorkflow { spec } => ("workflow_start", serde_json::json!({"spec": spec})),
+                Op::CancelWorkflow { run_id } => {
+                    ("workflow_cancel", serde_json::json!({"run_id": run_id}))
+                }
+                _ => unreachable!(),
+            };
+            let current = state
+                .get_or_create_session(session, request.session_id, None)
+                .await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            let current = state
+                .sessions
+                .lock()
+                .await
+                .get(&current.session_id)
+                .cloned()
+                .ok_or_else(|| RequestError::Failed("Session was closed".into()))?;
+            if current.workspace.path.is_empty() {
+                return Err(RequestError::Invalid(
+                    "Choose a workspace to run workflows.".into(),
+                ));
+            }
+            registry::profile_tool_policy(
+                &current.agent_name,
+                &state.bootstrap.agents,
+                &state.bootstrap.mcp_tools,
+            )
+            .check(tool)
+            .map_err(|e| RequestError::Failed(e.to_string()))?;
+            let registry = current
+                .inbox
+                .workflow_control
+                .read()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| RequestError::Failed("Workflow control unavailable".into()))?;
+            let mut ctx = gewu_core::types::ToolContext::new(current.session_id, "terminal");
+            ctx.working_directory = Some(current.workspace.path.into());
+            ctx.enforcement = state.bootstrap.enforcement;
+            // The editor follows progress directly. Completing a manual run
+            // must not start an extra model turn in the parent conversation.
+            let result = registry
+                .execute(tool, args, &ctx)
+                .await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            if tool == "workflow_start" {
+                let run_id = result
+                    .metadata
+                    .get("run_id")
+                    .and_then(|id| id.as_str())
+                    .ok_or_else(|| RequestError::Failed("Missing workflow run ID".into()))?;
+                return Ok(Handled::Reply(ServerMessage::WorkflowStarted {
+                    id: request.id,
+                    run_id: run_id.into(),
+                }));
+            }
+            Ok(Handled::Reply(ServerMessage::Inspection {
+                id: request.id,
+                entries: vec![],
+            }))
+        }
         Op::ListTools => {
             let session = state
                 .get_or_create_session(session, request.session_id, request.agent)
@@ -2091,6 +2466,14 @@ async fn handle_request(
                     "op 'delete_session' requires a 'session_id' string".to_string(),
                 ));
             };
+            let _owner = if let Some(session) = state.sessions.lock().await.get(&session_id) {
+                session._owner.clone()
+            } else {
+                state
+                    .lock_session(&session_id)
+                    .await
+                    .map_err(|e| RequestError::Failed(e.to_string()))?
+            };
             state.cancel_turn(&session_id).await;
             if !state.claim_session(&session_id).await {
                 return Err(RequestError::Failed("session is busy".into()));
@@ -2215,6 +2598,11 @@ async fn handle_request(
             // Resolve attachments before claiming the session so a bad
             // attachment cannot strand a claim.
             let root = session.workspace.path.clone();
+            if root.is_empty() && !request.attachments.is_empty() {
+                return Err(RequestError::Invalid(
+                    "Choose a workspace to attach files.".into(),
+                ));
+            }
             let store_dir = state.bootstrap.attachment_store.join(&session.session_id);
             let media = resolve_ask_attachments(
                 &root,
@@ -3255,6 +3643,7 @@ mod tests {
             .unwrap();
         let tools = gewu_core::ToolRegistry::list_tools(&agent);
         ConnectionSession {
+            _owner: None,
             agent: Arc::new(Mutex::new(agent)),
             session_id: "sess-test".to_string(),
             agent_name: "build".to_string(),
@@ -3281,6 +3670,7 @@ mod tests {
             .unwrap();
         let tools = gewu_core::ToolRegistry::list_tools(&agent);
         ConnectionSession {
+            _owner: None,
             agent: Arc::new(Mutex::new(agent)),
             session_id: "sess-test".to_string(),
             agent_name: "build".to_string(),
@@ -3423,6 +3813,7 @@ mod tests {
             .add_message(Message::Assistant {
                 content: None,
                 reasoning: None,
+                reasoning_ms: None,
                 replay: None,
                 tool_calls: Some(vec![gewu_core::types::ToolCall {
                     id: "call-1".to_string(),
@@ -3465,6 +3856,7 @@ mod tests {
             .add_message(Message::Assistant {
                 content: None,
                 reasoning: None,
+                reasoning_ms: None,
                 replay: None,
                 tool_calls: Some(vec![gewu_core::types::ToolCall {
                     id: "call-1".to_string(),
@@ -3686,6 +4078,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn draft_only_session_is_discoverable_and_stale_edits_are_rejected() {
+        let state = server_state_with(TestLlm::plain());
+        let pool = &state.bootstrap.pool;
+        let mut session = None;
+        let request = ClientRequest::workflow_draft(1, Some(protocol::DraftUpdate::default()))
+            .with_session("draft-owner");
+        assert_eq!(
+            protocol::parse_request(&request.to_line()).unwrap(),
+            request
+        );
+        let Handled::Reply(ServerMessage::WorkflowDraft { draft, .. }) =
+            handle_request(&state, &mut session, &mut None, request.clone())
+                .await
+                .unwrap()
+        else {
+            panic!("expected draft")
+        };
+        assert_eq!(draft.revision, 1);
+        assert!(
+            handle_request(&state, &mut session, &mut None, request)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            gewu_storage::list_sessions(pool).await.unwrap()[0].message_count,
+            0
+        );
+        assert_eq!(
+            gewu_storage::workflow_draft(pool, "draft-owner", None)
+                .await
+                .unwrap(),
+            draft
+        );
+        assert_eq!(
+            gewu_storage::workflow_draft(pool, "other", None)
+                .await
+                .unwrap()
+                .revision,
+            0
+        );
+        gewu_storage::delete_session(pool, "draft-owner")
+            .await
+            .unwrap();
+        assert!(gewu_storage::list_sessions(pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn switching_modes_preserves_the_session_workflow_manager_and_its_policy() {
+        let state = server_state_with(TestLlm::plain());
+        let mut session = None;
+        let start = ClientRequest::start_workflow(
+            1,
+            serde_json::json!({"nodes":[{
+                "id":"scan","agent":"explore","for_each":[],"prompt":"Read {{item}}"
+            }]}),
+        )
+        .with_session("mode-test");
+        let Handled::Reply(ServerMessage::WorkflowStarted { run_id, .. }) =
+            handle_request(&state, &mut session, &mut None, start)
+                .await
+                .unwrap()
+        else {
+            panic!("expected workflow run")
+        };
+        for mode in ["plan", "build"] {
+            handle_request(
+                &state,
+                &mut session,
+                &mut None,
+                ClientRequest::switch_agent(2, mode),
+            )
+            .await
+            .unwrap();
+            let cancel = ClientRequest::cancel_workflow(3, run_id.clone());
+            let result = handle_request(&state, &mut session, &mut None, cancel).await;
+            assert_eq!(result.is_ok(), mode == "build");
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_read_the_latest_session_selection_across_connections() {
+        let state = server_state_with(TestLlm::plain());
+        let mut first = None;
+        let mut second = None;
+        let request = ClientRequest::settings(1).with_session("shared");
+        assert_eq!(
+            protocol::parse_request(&request.to_line()).unwrap(),
+            request
+        );
+        let Handled::Reply(ServerMessage::Settings { settings, .. }) =
+            handle_request(&state, &mut first, &mut None, request.clone())
+                .await
+                .unwrap()
+        else {
+            panic!("settings")
+        };
+        assert_eq!(settings.default_effort.as_deref(), Some("high"));
+        assert!(settings.effort_override.is_none());
+        handle_request(
+            &state,
+            &mut second,
+            &mut None,
+            ClientRequest::switch_reasoning_effort(2, Some("low".into())).with_session("shared"),
+        )
+        .await
+        .unwrap();
+        let Handled::Reply(ServerMessage::Settings { settings, .. }) =
+            handle_request(&state, &mut first, &mut None, request)
+                .await
+                .unwrap()
+        else {
+            panic!("settings")
+        };
+        assert_eq!(settings.effort_override.as_deref(), Some("low"));
+        assert_eq!(settings.default_effort.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn inspection_uses_bound_session_and_loaded_server_inventory() {
+        use gewu_core::traits::SessionStateStore;
+        use protocol::InspectSection;
+        let state = server_state_with(TestLlm::plain());
+        let mut session = None;
+        let current = state
+            .get_or_create_session(&mut session, Some("inspect-owner".into()), None)
+            .await
+            .unwrap();
+        let store = gewu_storage::SqliteSessionStateStore::new(state.bootstrap.pool.clone());
+        for (id, description) in [("inspect-owner", "visible"), ("another-owner", "unrelated")] {
+            gewu_storage::record_subagent_session(
+                &state.bootstrap.pool,
+                &format!("{id}-child"),
+                id,
+                description,
+            )
+            .await
+            .unwrap();
+            store
+                .save(
+                    id,
+                    "todos",
+                    serde_json::json!([{"id":"a","status":"pending","content":description}])
+                        .to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        for section in [
+            InspectSection::Subagents,
+            InspectSection::Todos,
+            InspectSection::Mcp,
+            InspectSection::Skills,
+            InspectSection::Tasks,
+        ] {
+            let req = ClientRequest::inspect(1, section);
+            assert_eq!(protocol::parse_request(&req.to_line()).unwrap(), req);
+            let Handled::Reply(ServerMessage::Inspection { entries, .. }) =
+                handle_request(&state, &mut session, &mut None, req)
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected inventory")
+            };
+            if matches!(section, InspectSection::Todos | InspectSection::Subagents) {
+                assert_eq!(entries.len(), 1);
+                assert!(entries[0].label.contains("visible"));
+            } else {
+                assert!(entries.is_empty());
+            }
+        }
+        assert!(
+            handle_request(
+                &state,
+                &mut session,
+                &mut None,
+                ClientRequest::inspect(2, InspectSection::Todos).with_session("another-owner")
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            handle_request(
+                &state,
+                &mut session,
+                &mut None,
+                ClientRequest::cancel_workflow(3, "unknown-run".into())
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(current.session_id, "inspect-owner");
+    }
+
+    #[tokio::test]
     async fn subscribe_replays_live_workflow_progress() {
         let state = server_state_with(TestLlm::plain());
         let run = WorkflowRunState {
@@ -3698,12 +4284,14 @@ mod tests {
             tasks_attempted: 1,
             nodes: vec![
                 WorkflowNodeState {
+                    sessions: vec![],
                     id: "read".into(),
                     status: "ok".into(),
                     done: 1,
                     failed: 0,
                 },
                 WorkflowNodeState {
+                    sessions: vec![],
                     id: "write".into(),
                     status: "pending".into(),
                     done: 0,
@@ -3769,7 +4357,7 @@ mod tests {
                 status: "pending".into(),
                 done: 0,
                 failed: Vec::new(),
-                sessions: Vec::new(),
+                sessions: vec!["child-one".into()],
             }],
             error: None,
         };
@@ -3789,6 +4377,7 @@ mod tests {
         assert_eq!(message["type"], "workflow_progress");
         assert_eq!(message["run"]["run_id"], "r-1");
         assert_eq!(message["run"]["nodes"][0]["status"], "pending");
+        assert_eq!(message["run"]["nodes"][0]["sessions"][0], "child-one");
         assert!(
             state
                 .workflows
@@ -4440,6 +5029,32 @@ mod tests {
 
         let mut session = None;
         let mut running = None;
+        handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::switch_workspace(0, ""),
+        )
+        .await
+        .unwrap();
+        let chat = session.as_ref().unwrap().clone();
+        assert!(chat.workspace.path.is_empty());
+        assert!(chat.tools.is_empty());
+        let path = frontend
+            .path()
+            .join("active.txt")
+            .to_string_lossy()
+            .into_owned();
+        let read = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::read_file(0, path),
+        )
+        .await;
+        assert!(
+            matches!(read, Err(RequestError::Invalid(msg)) if msg.contains("Choose a workspace"))
+        );
         let switched = handle_request(
             &state,
             &mut session,
@@ -4453,6 +5068,10 @@ mod tests {
             Handled::Reply(ServerMessage::WorkspaceSwitched { ref workspace, .. })
                 if workspace.id == "frontend"
         ));
+
+        let selected = session.as_ref().unwrap();
+        assert_eq!(selected.session_id, chat.session_id);
+        assert!(selected.tools.iter().any(|tool| tool == "read_file"));
 
         let read = handle_request(
             &state,
@@ -4576,7 +5195,11 @@ mod tests {
         assert_eq!(entries[0].name, "linked-folder");
         assert_eq!(
             entries[0].path,
-            cwd.path().join("linked-folder").to_string_lossy()
+            cwd.path()
+                .canonicalize()
+                .unwrap()
+                .join("linked-folder")
+                .to_string_lossy()
         );
         let (path, _, _) = state.browse_workspace(&entries[0].path).unwrap();
         assert_eq!(
@@ -4633,6 +5256,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_servers_share_history_but_a_session_has_one_live_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_a = tmp.path().canonicalize().unwrap();
+        let root_b = root_a.join("other");
+        std::fs::create_dir(&root_b).unwrap();
+        let pool = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(root_a.join("history.db"))
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        let make_server = |root: &Path| {
+            let mut state = server_state_with(TestLlm::plain());
+            let boot = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            boot.pool = pool.clone();
+            boot.workspace_roots = Arc::new(BTreeMap::from([("cwd".into(), root.to_path_buf())]));
+            state
+        };
+        let first = make_server(&root_a);
+        let second = make_server(&root_b);
+        let id = first
+            .get_or_create_session(&mut None, None, None)
+            .await
+            .unwrap()
+            .session_id;
+        let err = second
+            .get_or_create_session(&mut None, Some(id.clone()), None)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("another GeWu server"));
+        drop(first);
+        let restored = second
+            .get_or_create_session(&mut None, Some(id), None)
+            .await
+            .unwrap();
+        assert_eq!(Path::new(&restored.workspace.path), root_a);
+    }
+
+    #[tokio::test]
     async fn first_ask_workspace_is_used_when_creating_a_session() {
         let cwd = tempfile::tempdir().unwrap();
         let tachyon = tempfile::tempdir().unwrap();
@@ -4647,7 +5311,7 @@ mod tests {
             bootstrap.working_directory = cwd.path().to_string_lossy().to_string();
             bootstrap.workspace_roots = Arc::new(BTreeMap::from([
                 ("cwd".into(), cwd.path().to_path_buf()),
-                ("tachyon".into(), tachyon.path().to_path_buf()),
+                ("tachyon".into(), tachyon.path().canonicalize().unwrap()),
             ]));
         }
         let mut session = None;
@@ -4686,7 +5350,7 @@ mod tests {
             bootstrap.working_directory = root.path().to_string_lossy().to_string();
             bootstrap.workspace_roots =
                 Arc::new(BTreeMap::from([("cwd".into(), root.path().to_path_buf())]));
-            bootstrap.attachment_store = store.path().to_path_buf();
+            bootstrap.attachment_store = store.path().canonicalize().unwrap();
         }
         let mut session = None;
         let mut running = None;
@@ -6227,6 +6891,7 @@ mod tests {
             .build()
             .unwrap();
         let session = ConnectionSession {
+            _owner: None,
             agent: Arc::new(Mutex::new(agent)),
             session_id: "sess-test".to_string(),
             agent_name: "build".to_string(),
@@ -6665,6 +7330,7 @@ mod tests {
             .add_message(Message::Assistant {
                 content: None,
                 reasoning: None,
+                reasoning_ms: None,
                 replay: None,
                 tool_calls: Some(vec![gewu_core::types::ToolCall {
                     id: "call-1".to_string(),

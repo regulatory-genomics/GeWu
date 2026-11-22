@@ -1,0 +1,27 @@
+[package]
+name = "gewu-cli"
+version = "0.1.7"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive", "env"] }
+gewu-client = { path = "../gewu-client" }
+gewu-core = { path = "../gewu-core" }
+gewu-protocol = { path = "../gewu-protocol" }
+gewu-server = { path = "../gewu-server" }
+gewu-tools = { path = "../gewu-tools" }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+futures = "0.3"
+ratatui = "0.30"
+ratatui-textarea = "0.9"
+tui-markdown = "0.3"
+textwrap = { version = "0.16", features = ["unicode-width"] }
+unicode-width = "0.2"
+tracing = "0.1"
+tempfile = "3"
+zeroize = "1"
+url = "2"

@@ -381,14 +381,16 @@ impl SessionModel {
             Message::Assistant {
                 content,
                 reasoning,
-                replay: _,
+                reasoning_ms,
                 tool_calls,
+                ..
             } => {
-                // Reasoning replays as a finalized thought block (duration is
-                // unknown for stored history, so the label has no time).
                 if let Some(reasoning) = reasoning.as_deref().filter(|r| !r.is_empty()) {
                     self.blocks.push(Block::Thought {
-                        text: "Thought".to_string(),
+                        text: reasoning_ms.map_or_else(
+                            || "Thought · duration unavailable".to_string(),
+                            |ms| format!("Thought {:.1}s", ms as f64 / 1000.0),
+                        ),
                         reasoning: reasoning.to_string(),
                         started: None,
                     });
@@ -1560,6 +1562,7 @@ mod tests {
             Message::Assistant {
                 content: Some("checking".into()),
                 reasoning: None,
+                reasoning_ms: None,
                 replay: None,
                 tool_calls: Some(vec![gewu_protocol::ToolCall {
                     id: "c1".into(),
@@ -1601,12 +1604,14 @@ mod tests {
         m.apply_message(&Message::Assistant {
             content: Some("done".into()),
             reasoning: Some("step by step…".into()),
+            reasoning_ms: Some(9100),
             replay: None,
             tool_calls: None,
         });
         m.apply_message(&Message::Assistant {
             content: Some("no thought".into()),
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: None,
         });
@@ -1614,7 +1619,7 @@ mod tests {
             m.blocks,
             vec![
                 Block::Thought {
-                    text: "Thought".into(),
+                    text: "Thought 9.1s".into(),
                     reasoning: "step by step…".into(),
                     started: None,
                 },
@@ -1638,6 +1643,7 @@ mod tests {
         m.apply_message(&Message::Assistant {
             content: None,
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: Some(vec![call("1", "read_file"), call("2", "bash")]),
         });
@@ -1722,6 +1728,7 @@ mod tests {
         m.apply_message(&Message::Assistant {
             content: None,
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: Some(vec![gewu_protocol::ToolCall {
                 id: "c1".into(),
@@ -1758,6 +1765,7 @@ mod tests {
         m.apply_message(&Message::Assistant {
             content: None,
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: Some(vec![gewu_protocol::ToolCall {
                 id: "c1".into(),

@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub struct TabInfo {
     pub id: u64,
     pub label: String,
+    #[serde(default)]
+    pub in_use_elsewhere: bool,
     pub busy: bool,
     /// Busy on a user-facing form; the sidebar pulse turns amber.
     #[serde(default)]
@@ -23,6 +25,9 @@ pub struct TabInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ClientMsg {
+    Settings {
+        tab: u64,
+    },
     RevertChat {
         tab: u64,
         block: Option<usize>,
@@ -126,6 +131,25 @@ pub enum ClientMsg {
         block: usize,
     },
     /// Open a workflow run's graph in the zoom panel.
+    CheckWorkflow {
+        tab: u64,
+        spec: serde_json::Value,
+    },
+    ImportWorkflow {
+        tab: u64,
+    },
+    PreviewWorkflow {
+        seq: u64,
+        spec: serde_json::Value,
+    },
+    EditWorkflow {
+        tab: u64,
+        update: Option<gewu_protocol::DraftUpdate>,
+    },
+    RunWorkflowDraft {
+        tab: u64,
+        revision: u64,
+    },
     ZoomWorkflow {
         tab: u64,
         block: usize,
@@ -186,8 +210,17 @@ pub struct UploadedFile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
+    Settings {
+        tab: u64,
+        settings: gewu_protocol::SessionSettings,
+        models: Vec<gewu_protocol::ModelSummary>,
+        efforts: Vec<String>,
+        workspaces: Vec<gewu_protocol::WorkspaceSummary>,
+    },
     /// Replace only the tool panel; leave transcript and sidebar tabs intact.
-    Tools { html: String },
+    Tools {
+        html: String,
+    },
     /// Full initial state: tabs, active tab, transcript, status and sidebar HTML.
     Snapshot {
         tabs: Vec<TabInfo>,
@@ -198,16 +231,28 @@ pub enum ServerMsg {
         session_sidebar: String,
     },
     /// Tab bar state changed (open/close/switch/busy marker).
-    Tabs { tabs: Vec<TabInfo>, active: u64 },
+    Tabs {
+        tabs: Vec<TabInfo>,
+        active: u64,
+    },
     /// Replace the workspace-grouped session sidebar.
-    SessionSidebar { html: String },
+    SessionSidebar {
+        html: String,
+    },
     /// Replace the active transcript with freshly rendered HTML.
-    Transcript { html: String },
+    Transcript {
+        html: String,
+    },
     /// Prepend older rendered blocks to the active transcript.
-    TranscriptPrepend { html: String },
+    TranscriptPrepend {
+        html: String,
+    },
     /// Replace one tool card in the active transcript (`first` is its run's
     /// starting block index).
-    ToolCard { first: usize, html: String },
+    ToolCard {
+        first: usize,
+        html: String,
+    },
     /// Append a fresh tool card at the end of the transcript (start of a new
     /// tool run). `assistant` optionally carries the preceding assistant
     /// block's index and final Markdown body, converting it out of its
@@ -218,14 +263,25 @@ pub enum ServerMsg {
         assistant: Option<(usize, String)>,
     },
     /// Append one rendered block at the end of the transcript.
-    BlockAppend { index: usize, html: String },
+    BlockAppend {
+        index: usize,
+        html: String,
+    },
     /// Replace one rendered block in place (whole `.block` node).
-    BlockReplace { index: usize, html: String },
+    BlockReplace {
+        index: usize,
+        html: String,
+    },
     /// Replace one streaming block's rendered Markdown body in place
     /// (throttled to roughly ten updates per second).
-    StreamingBody { index: usize, html: String },
+    StreamingBody {
+        index: usize,
+        html: String,
+    },
     /// Replace the status line.
-    Status { html: String },
+    Status {
+        html: String,
+    },
     /// An error to surface in the floating alert box. `key` makes repeats
     /// of the same failure update one entry in place instead of stacking;
     /// connection-level rejections before a session exists are unkeyed.
@@ -248,25 +304,68 @@ pub enum ServerMsg {
         delay_secs: u64,
     },
     /// A non-error notification to surface as a toast.
-    Notice { message: String },
+    Notice {
+        message: String,
+    },
     /// Replace the rendered file tree.
-    FileTree { html: String },
+    FileTree {
+        html: String,
+    },
     /// Show or replace the server-side workspace browser.
-    WorkspaceBrowser { html: String },
+    WorkspaceBrowser {
+        html: String,
+    },
     /// Show the workspace picker used before creating a new session tab.
-    WorkspacePicker { html: String },
+    WorkspacePicker {
+        html: String,
+    },
     /// Close the server-side workspace browser/picker.
     CloseWorkspaceBrowser,
     /// Show the requested file preview.
-    FilePreview { html: String },
+    FilePreview {
+        html: String,
+    },
     /// A ready-to-use download URL (a short-lived same-origin ticket).
-    DownloadReady { url: String },
+    DownloadReady {
+        url: String,
+    },
     /// A ready-to-use HTML preview URL (a short-lived same-origin ticket).
-    PreviewReady { url: String },
+    PreviewReady {
+        url: String,
+    },
     /// Close the file preview overlay.
     ClosePreview,
     /// Show or refresh the workflow graph zoom panel.
-    WorkflowZoom { run_id: String, html: String },
+    WorkflowChecked {
+        tab: u64,
+        message: String,
+    },
+    WorkflowImport {
+        tab: u64,
+        spec: serde_json::Value,
+    },
+    WorkflowPreview {
+        seq: u64,
+        html: String,
+    },
+    WorkflowDraft {
+        tab: u64,
+        example: String,
+        draft: gewu_protocol::DraftUpdate,
+        runs: Vec<gewu_protocol::InspectionEntry>,
+    },
+    DraftChanged {
+        tab: u64,
+        revision: u64,
+    },
+    WorkflowRunUpdate {
+        tab: u64,
+        run: gewu_protocol::WorkflowRunState,
+    },
+    WorkflowZoom {
+        run_id: String,
+        html: String,
+    },
     /// Close the workflow graph zoom panel.
     CloseWorkflowZoom,
 }
@@ -426,6 +525,7 @@ mod tests {
 
         let msg = ServerMsg::Tabs {
             tabs: vec![TabInfo {
+                in_use_elsewhere: false,
                 id: 1,
                 label: "new".to_string(),
                 busy: false,

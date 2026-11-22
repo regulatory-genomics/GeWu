@@ -164,14 +164,26 @@ impl AnthropicConfig {
 /// HTTP client for Anthropic API requests.
 #[derive(Debug)]
 pub struct Client {
+    override_key: tokio::sync::watch::Sender<Option<String>>,
     /// The configuration used by this client.
     pub config: AnthropicConfig,
     http_client: HttpClient,
 }
 
 impl Client {
+    pub(crate) fn update_api_key(&self, key: &str) {
+        self.override_key.send_replace(Some(key.to_owned()));
+    }
+    fn api_key(&self) -> String {
+        self.override_key
+            .borrow()
+            .as_ref()
+            .unwrap_or(&self.config.api_key)
+            .clone()
+    }
     pub fn with_config(config: AnthropicConfig) -> Self {
         Self {
+            override_key: tokio::sync::watch::channel(None).0,
             config,
             http_client: crate::http::client(),
         }
@@ -290,7 +302,7 @@ impl<'a> Messages<'a> {
             .client
             .http_client
             .post(&url)
-            .header("x-api-key", &self.client.config.api_key)
+            .header("x-api-key", self.client.api_key())
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .header("anthropic-version", "2023-06-01");
@@ -665,7 +677,7 @@ impl<'a> Models<'a> {
             .client
             .http_client
             .get(&url)
-            .header("x-api-key", &self.client.config.api_key)
+            .header("x-api-key", self.client.api_key())
             .header("anthropic-version", "2023-06-01")
             .send()
             .await?;

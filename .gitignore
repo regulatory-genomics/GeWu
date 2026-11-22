@@ -5,3 +5,5 @@ target/
 .vscode/
 .opencode/
 gewu-cli/target/
+**/truncation/tool_*.txt
+/deepseek.json

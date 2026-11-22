@@ -59,6 +59,9 @@ macro_rules! chat_service {
 
         #[async_trait]
         impl LlmProvider for $name {
+            fn update_api_key(&self, key: &str) {
+                self.chat.update_api_key(key);
+            }
             fn build(
                 &self,
                 messages: &[Message],
@@ -115,6 +118,7 @@ mod tests {
         let assistant = |model: &str, origin: &str| Message::Assistant {
             content: Some(format!("{model} answer")),
             reasoning: Some(format!("{model} thought")),
+            reasoning_ms: None,
             replay: Some(ReasoningReplay {
                 origin: format!("chat:{origin}"),
                 model: model.into(),
@@ -174,6 +178,7 @@ mod tests {
                 Message::Assistant {
                     content: None,
                     reasoning: Some("consider tools".into()),
+                    reasoning_ms: None,
                     replay: Some(ReasoningReplay {
                         origin: format!("chat:{endpoint}"),
                         model: "model".into(),
@@ -185,6 +190,7 @@ mod tests {
                 Message::Assistant {
                     content: Some("done".into()),
                     reasoning: None,
+                    reasoning_ms: None,
                     replay: None,
                     tool_calls: None,
                 },
@@ -201,6 +207,7 @@ mod tests {
                 &[Message::Assistant {
                     content: Some("done".into()),
                     reasoning: None,
+                    reasoning_ms: None,
                     replay: None,
                     tool_calls: None,
                 }],

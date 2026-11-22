@@ -51,6 +51,7 @@
     stuck: true,
     scrollTops: new Map(),
     busy: false,
+    inUseElsewhere: false,
     attempt: 0,
     reconnectTimer: null,
     countdownTimer: null,
@@ -257,6 +258,12 @@
     connect();
   }
 
+  function rememberActiveChat(message) {
+    const tab = message.tabs.find(tab => tab.id === message.active);
+    state.activeWorkspace = tab?.workspace;
+    try { sessionStorage.setItem("gewu-active-chat", tab?.session_id || ""); } catch {}
+  }
+
   function connect() {
     if (
       state.ws &&
@@ -268,7 +275,9 @@
     clearReconnect();
 
     const scheme = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${scheme}//${location.host}/ws`;
+    let resume = "";
+    try { resume = sessionStorage.getItem("gewu-active-chat") || ""; } catch {}
+    const url = `${scheme}//${location.host}/ws?chat=${encodeURIComponent(resume)}`;
     const ws = new WebSocket(url);
     state.ws = ws;
 
@@ -366,10 +375,186 @@
     return true;
   }
 
+  const settingsDialog = document.getElementById("session-settings");
+  const settingsInfo = document.getElementById("settings-info");
+  const settingsFields = document.getElementById("settings-fields");
+  const settingsMessage = document.getElementById("settings-message");
+  let settingsTab = null;
+  document.getElementById("open-settings").addEventListener("click", () => {
+    settingsTab = state.active;
+    settingsFields.replaceChildren();
+    settingsMessage.textContent = "";
+    settingsInfo.textContent = "Loading…";
+    settingsDialog.showModal();
+    send({ op: "settings", tab: settingsTab });
+  });
+  settingsDialog.addEventListener("close", () => { settingsTab = null; });
+  settingsDialog.addEventListener("keydown", e => e.stopPropagation());
+  function renderSettings({ tab, settings: s, models, efforts, workspaces }) {
+    if (settingsTab !== tab || !settingsDialog.open) return;
+    settingsInfo.textContent = [
+      "Provider  " + s.provider, "Server default model  " + s.default_model,
+      "Context window  " + s.context_limit + " tokens", "File path checks  " + s.path_checks,
+    ].join("\n");
+    settingsFields.replaceChildren();
+    function choice(title, items, current, request, available = true) {
+      const label = document.createElement("label");
+      label.textContent = title;
+      const select = document.createElement("select");
+      for (const [value, text] of items) select.add(new Option(text, value));
+      select.value = current;
+      select.disabled = state.busy || !available;
+      select.addEventListener("change", () => {
+        settingsMessage.textContent = "";
+        if (send({ tab, ...request(select.value) })) send({ op: "settings", tab });
+      });
+      label.append(select);
+      settingsFields.append(label);
+    }
+    choice("Model", models.map(m => [m.selector, m.label]), s.model, model => ({op:"switch_model", model}));
+    const defaultEffort = s.default_effort === "provider-default" ? "Provider default" : s.default_effort || "Provider default";
+    choice("Reasoning effort", [["", "Model default · " + defaultEffort], ["provider-default","Provider default"],
+      ...efforts.map(e => [e,e])], s.effort_override || "", e => ({op:"switch_reasoning_effort", effort:e || null}), s.supports_effort);
+    choice("Mode", [["build","build"],["plan","plan"]], s.agent, agent => ({op:"switch_agent", agent}));
+    const workspace = workspaces.find(w => w.path === s.workspace);
+    choice("Workspace", [...(s.workspace ? [] : [["","No workspace"]]), ...workspaces.map(w => [w.id,w.path])], workspace?.id || "", workspace => ({op:"switch_workspace", workspace}));
+  }
+
+  const flowDialog = document.getElementById("workflow-editor");
+  const flowSource = document.getElementById("workflow-source");
+  const flowFeedback = document.getElementById("workflow-feedback");
+  let flow = null;
+  let previewSeq = 0;
+  let previewTimer;
+  function previewFlow() {
+    const seq = ++previewSeq;
+    clearTimeout(previewTimer);
+    const preview = document.getElementById("workflow-preview");
+    preview.replaceChildren();
+    previewTimer = setTimeout(() => {
+      if (!flow) return;
+      try { send({ op: "preview_workflow", seq, spec: JSON.parse(flowSource.value) }); }
+      catch { preview.textContent = "Editing JSON…"; }
+    }, 160);
+  }
+  flowSource.addEventListener("input", previewFlow);
+  function loadFlow(update) {
+    if (!flow || flow.pending) return;
+    flow.pending = { text: flowSource.value };
+    if (!send({ op: "edit_workflow", tab: flow.tab, update })) flow.pending = null;
+  }
+  function closeFlow() {
+    if (flow && flowSource.value !== flow.original && !window.confirm("Discard unsaved workflow edits?")) return;
+    flowDialog.close();
+    flow = null;
+  }
+  document.getElementById("edit-workflow").addEventListener("click", () => {
+    flow = { tab: state.active, revision: -1, original: "", runs: new Map(), pending: null };
+    flowSource.value = "";
+    previewFlow();
+    flowSource.disabled = true;
+    document.getElementById("workflow-revision").textContent = "Shared draft";
+    document.getElementById("workflow-runs").textContent = "";
+    flowFeedback.textContent = "Loading…";
+    flowDialog.showModal();
+    loadFlow(null);
+  });
+  flowDialog.addEventListener("keydown", e => e.stopPropagation());
+  flowDialog.addEventListener("cancel", e => { e.preventDefault(); closeFlow(); });
+  flowDialog.addEventListener("click", event => {
+    const action = event.target.closest("[data-flow]")?.dataset.flow;
+    if (!action || !flow) return;
+    const edited = flowSource.value !== flow.original;
+    if (action === "close") return closeFlow();
+    if (action === "reload" && (!edited || window.confirm("Replace edits with the saved revision?"))) loadFlow(null);
+    if (flow.revision < 0) return;
+    if (action === "import" && (!edited || window.confirm("Replace local edits with the last reply?"))) {
+      flow.importText = flowSource.value;
+      send({ op: "import_workflow", tab: flow.tab });
+    }
+    if (["example", "step", "validate"].includes(action)) {
+      try {
+        const spec = JSON.parse(flowSource.value);
+        if (action === "validate") send({ op: "check_workflow", tab: flow.tab, spec });
+        if (action === "example") {
+          if (spec.nodes.length) throw new Error("The example opens in an empty workflow");
+          flowSource.value = flow.example;
+          previewFlow();
+        }
+        if (action === "step") {
+          const prompt = window.prompt("New step instruction")?.trim();
+          if (!prompt) return;
+          let index = 1;
+          while (spec.nodes.some(node => node.id === "step" + index)) index++;
+          spec.nodes.push({ id: "step" + index, agent: "explore", prompt });
+          flowSource.value = JSON.stringify(spec, null, 2);
+          flowFeedback.textContent = spec.edges ? "Connect the new step in edges or conditional_edges." : "Step added to the sequence.";
+          previewFlow();
+        }
+      } catch (error) { flowFeedback.textContent = error.message; }
+    }
+    if (action === "save" && flow.revision >= 0) {
+      try { loadFlow({ revision: flow.revision, spec: JSON.parse(flowSource.value) }); }
+      catch (error) { flowFeedback.textContent = error.message; }
+    }
+    if (action === "run" && flow.revision >= 0) {
+      if (edited || flow.pending) flowFeedback.textContent = "Save the draft before running.";
+      else if (window.confirm("Run this workflow in the session workspace?")) send({ op: "run_workflow_draft", tab: flow.tab, revision: flow.revision });
+    }
+  });
+
   // -- server messages ----------------------------------------------------
 
   function handle(message) {
     switch (message.type) {
+      case "settings":
+        renderSettings(message);
+        break;
+      case "workflow_checked":
+        if (flow && message.tab === flow.tab) flowFeedback.textContent = message.message;
+        break;
+      case "workflow_import":
+        if (flow && message.tab === flow.tab && flowSource.value === flow.importText) {
+          flowSource.value = JSON.stringify(message.spec, null, 2);
+          flowFeedback.textContent = "Imported from the last reply";
+          previewFlow();
+        }
+        break;
+      case "workflow_preview":
+        if (flow && message.seq === previewSeq) document.getElementById("workflow-preview").innerHTML = message.html;
+        break;
+      case "workflow_draft": {
+        if (!flow || message.tab !== flow.tab || !flow.pending) break;
+        const editedDuringRequest = flowSource.value !== flow.pending.text;
+        const reload = flow.newest > message.draft.revision;
+        flow.pending = null;
+        flow.revision = message.draft.revision;
+        flow.example = message.example.trimEnd();
+        flow.original = JSON.stringify(message.draft.spec, null, 2);
+        if (!editedDuringRequest) flowSource.value = flow.original;
+        flowSource.disabled = false;
+        previewFlow();
+        document.getElementById("workflow-revision").textContent = "Shared revision " + flow.revision;
+        flowFeedback.textContent = editedDuringRequest ? "Unsaved edits" : "";
+        for (const run of message.runs) flow.runs.set(run.key, run.label);
+        document.getElementById("workflow-runs").textContent = [...flow.runs.values()].join("\n");
+        if (reload && !editedDuringRequest) loadFlow(null);
+        break;
+      }
+      case "draft_changed":
+        if (flow && message.tab === flow.tab && message.revision > flow.revision) {
+          flow.newest = message.revision;
+          if (flowSource.value === flow.original && !flow.pending) loadFlow(null);
+          else flowFeedback.textContent = "Another editor saved revision " + message.revision;
+        }
+        break;
+      case "workflow_run_update":
+        if (flow && message.tab === flow.tab) {
+          const r = message.run;
+          flow.runs.set(r.run_id, (r.name || r.run_id) + "   " + r.status + "   " + r.tasks_done + " done");
+          document.getElementById("workflow-runs").textContent = [...flow.runs.values()].join("\n");
+        }
+        break;
       case "snapshot":
         state.active = message.active;
         state.ready = true;
@@ -379,6 +564,8 @@
         setStatus(message.status);
         el.sidebar.innerHTML = message.sidebar || "";
         setSessionSidebarHtml(message.session_sidebar);
+        rememberActiveChat(message);
+        state.inUseElsewhere = message.tabs.some((tab) => tab.id === message.active && tab.in_use_elsewhere);
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
         break;
       case "tabs": {
@@ -394,6 +581,8 @@
         for (const id of state.follow.keys()) {
           if (!alive.has(id)) state.follow.delete(id);
         }
+        rememberActiveChat(message);
+        state.inUseElsewhere = message.tabs.some((tab) => tab.id === message.active && tab.in_use_elsewhere);
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
         break;
       }
@@ -426,6 +615,11 @@
         setStatus(message.html);
         break;
       case "error":
+        if (settingsDialog.open) settingsMessage.textContent = message.message;
+        if (flow) {
+          flow.pending = null;
+          flowFeedback.textContent = message.message;
+        }
         state.loadingEarlier = false;
         closePendingPreview();
         if (isUnauthorized(message.message)) {
@@ -850,7 +1044,13 @@
   // -- composer -----------------------------------------------------------
 
   function updateComposer() {
-    el.send.disabled = !state.connected || !state.ready;
+    el.send.disabled = !state.connected || !state.ready || state.inUseElsewhere;
+    el.prompt.readOnly = state.inUseElsewhere;
+    el.prompt.placeholder = state.inUseElsewhere
+      ? "In use in another GeWu instance · select this conversation to retry"
+      : "Enter send · Shift+Enter newline";
+    document.getElementById("edit-workflow").disabled = el.send.disabled;
+    document.getElementById("open-settings").disabled = el.send.disabled;
     el.interrupt.classList.toggle("hidden", !state.busy);
     el.interrupt.disabled = !state.connected;
     el.prompt.classList.toggle("locked", false);
@@ -864,8 +1064,23 @@
   function submitPrompt() {
     const text = el.prompt.value.trim();
     if (!text && !state.attachments.length) return;
+    if (state.inUseElsewhere) return;
     if (!state.ready) {
       showAlert("Still loading the session; try again in a moment");
+      return;
+    }
+    if (text === "/build" || text === "/plan") {
+      if (state.busy) { showAlert("Wait for the current turn before switching modes"); return; }
+      if (send({ op: "switch_agent", tab: state.active, agent: text.slice(1) })) {
+        el.prompt.value = "";
+        autosize();
+      }
+      return;
+    }
+    if (text === "/workflow" || text === "/settings") {
+      el.prompt.value = "";
+      autosize();
+      document.getElementById(text === "/settings" ? "open-settings" : "edit-workflow").click();
       return;
     }
     const message = { op: "ask", tab: state.active, prompt: text };
@@ -1295,6 +1510,10 @@
       setSessionsOpen(false, true);
       return;
     }
+    if (event.target.closest("[data-chat-new]")) {
+      send({ op: "create_tab", workspace: "", path: "" });
+      return;
+    }
     if (event.target.closest("[data-session-new]")) {
       send({ op: "open_tab" });
       return;
@@ -1346,7 +1565,7 @@
     const tab = event.target.closest("[data-session-tab]");
     if (tab) {
       const id = Number(tab.dataset.sessionTab);
-      if (id !== state.active) send({ op: "switch_tab", tab: id });
+      if (id !== state.active || state.inUseElsewhere) send({ op: "switch_tab", tab: id });
       if (narrowScreen()) setSessionsOpen(false, false);
     }
   });
@@ -1359,6 +1578,10 @@
     }
     const createTab = event.target.closest("[data-new-session-create]");
     if (createTab) {
+      if (state.activeWorkspace === "" && !state.inUseElsewhere) {
+        send({ op: "add_workspace", tab: state.active, path: createTab.dataset.newSessionPath });
+        return;
+      }
       expandWorkspace(createTab.dataset.newSessionWorkspace);
       send({
         op: "create_tab",
@@ -1566,6 +1789,7 @@
     fileTreeHost.classList.remove("drag-over");
     if (!event.dataTransfer?.files?.length) return;
     event.preventDefault();
+    if (state.inUseElsewhere) return;
     if (!state.ready) {
       showAlert("Still loading the session; try again in a moment");
       return;

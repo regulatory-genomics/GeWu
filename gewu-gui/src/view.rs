@@ -1381,7 +1381,7 @@ pub fn session_sidebar_html_with_update(
         .unwrap_or_default();
 
     let mut out = format!(
-        "<aside class=\"session-sidebar\" aria-label=\"Sessions by workspace\"><header class=\"session-sidebar-header\"><span class=\"brand-mark session-brand\" title=\"GeWu agent\"><svg class=\"brand-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3.5\" y=\"3.5\" width=\"17\" height=\"17\" rx=\"3.5\"/><circle cx=\"12\" cy=\"12\" r=\"4.25\"/><path d=\"M12 3.5v4.25M12 16.25v4.25M3.5 12h4.25M16.25 12h4.25\"/></svg></span><span class=\"session-sidebar-title\">GeWu <span class=\"session-sidebar-version\">v{}</span></span><button type=\"button\" class=\"session-collapse\" data-sessions-collapse title=\"Close sidebar\" aria-label=\"Close sidebar\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M9 4v16\"/><path d=\"m16 15-3-3 3-3\"/></svg></button></header>{update}<button type=\"button\" class=\"session-new-primary\" data-session-new title=\"Open workspace\" aria-label=\"Open workspace\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3.5 6.5A1.5 1.5 0 0 1 5 5h4l2 2h8a1.5 1.5 0 0 1 1.5 1.5V10\"/><path d=\"M3.5 10.5h17l-2 8h-13l-2-8Z\"/></svg><span>Open workspace</span></button><div class=\"session-section-label\">WORKSPACE</div><div class=\"session-workspace-groups\">",
+        "<aside class=\"session-sidebar\" aria-label=\"Sessions by workspace\"><header class=\"session-sidebar-header\"><span class=\"brand-mark session-brand\" title=\"GeWu agent\"><svg class=\"brand-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3.5\" y=\"3.5\" width=\"17\" height=\"17\" rx=\"3.5\"/><circle cx=\"12\" cy=\"12\" r=\"4.25\"/><path d=\"M12 3.5v4.25M12 16.25v4.25M3.5 12h4.25M16.25 12h4.25\"/></svg></span><span class=\"session-sidebar-title\">GeWu <span class=\"session-sidebar-version\">v{}</span></span><button type=\"button\" class=\"session-collapse\" data-sessions-collapse title=\"Close sidebar\" aria-label=\"Close sidebar\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M9 4v16\"/><path d=\"m16 15-3-3 3-3\"/></svg></button></header>{update}<button type=\"button\" class=\"session-new-primary\" data-chat-new>New chat</button><button type=\"button\" class=\"session-new-primary\" data-session-new title=\"Open workspace\" aria-label=\"Open workspace\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3.5 6.5A1.5 1.5 0 0 1 5 5h4l2 2h8a1.5 1.5 0 0 1 1.5 1.5V10\"/><path d=\"M3.5 10.5h17l-2 8h-13l-2-8Z\"/></svg><span>Open workspace</span></button><div class=\"session-section-label\">WORKSPACE</div><div class=\"session-workspace-groups\">",
         escape(version)
     );
     for (group_index, workspace_id) in workspace_ids.into_iter().enumerate() {
@@ -1401,19 +1401,23 @@ pub fn session_sidebar_html_with_update(
             .unwrap_or_else(|| workspace_id.clone());
         let list_id = format!("session-list-{group_index}");
         let menu_id = format!("session-workspace-menu-{group_index}");
-        let _ = write!(
-            out,
-            "<section class=\"session-workspace-group\" data-session-workspace-group=\"{}\"><header class=\"session-workspace-header\"><button type=\"button\" class=\"session-workspace-toggle\" data-session-workspace-toggle=\"{}\" aria-expanded=\"true\" aria-controls=\"{list_id}\"><span class=\"session-workspace-caret\" aria-hidden=\"true\"></span><span class=\"session-workspace-heading\"><strong>{}</strong><code title=\"{}\">{}</code></span></button><button type=\"button\" class=\"session-workspace-menu-trigger\" data-session-workspace-menu=\"{}\" aria-haspopup=\"menu\" aria-expanded=\"false\" aria-controls=\"{menu_id}\" title=\"Workspace actions\" aria-label=\"Workspace actions for {}\">⋯</button><div id=\"{menu_id}\" class=\"session-workspace-menu\" role=\"menu\" hidden><button type=\"button\" role=\"menuitem\" class=\"session-workspace-close\" data-session-workspace-close=\"{}\" title=\"Close workspace; sessions are kept\" aria-label=\"Close workspace {}\">Close workspace</button></div></header><div class=\"session-list\" id=\"{list_id}\">",
-            escape(&workspace_id),
-            escape(&workspace_id),
-            escape(&label),
-            escape(&path),
-            escape(&path),
-            escape(&workspace_id),
-            escape(&label),
-            escape(&workspace_id),
-            escape(&label),
-        );
+        if workspace_id.is_empty() {
+            out.push_str(r#"<section class="session-workspace-group"><header class="session-workspace-header">Chats</header><div class="session-list">"#);
+        } else {
+            let _ = write!(
+                out,
+                "<section class=\"session-workspace-group\" data-session-workspace-group=\"{}\"><header class=\"session-workspace-header\"><button type=\"button\" class=\"session-workspace-toggle\" data-session-workspace-toggle=\"{}\" aria-expanded=\"true\" aria-controls=\"{list_id}\"><span class=\"session-workspace-caret\" aria-hidden=\"true\"></span><span class=\"session-workspace-heading\"><strong>{}</strong><code title=\"{}\">{}</code></span></button><button type=\"button\" class=\"session-workspace-menu-trigger\" data-session-workspace-menu=\"{}\" aria-haspopup=\"menu\" aria-expanded=\"false\" aria-controls=\"{menu_id}\" title=\"Workspace actions\" aria-label=\"Workspace actions for {}\">⋯</button><div id=\"{menu_id}\" class=\"session-workspace-menu\" role=\"menu\" hidden><button type=\"button\" role=\"menuitem\" class=\"session-workspace-close\" data-session-workspace-close=\"{}\" title=\"Close workspace; sessions are kept\" aria-label=\"Close workspace {}\">Close workspace</button></div></header><div class=\"session-list\" id=\"{list_id}\">",
+                escape(&workspace_id),
+                escape(&workspace_id),
+                escape(&label),
+                escape(&path),
+                escape(&path),
+                escape(&workspace_id),
+                escape(&label),
+                escape(&workspace_id),
+                escape(&label),
+            );
+        }
         let group_tabs: Vec<&TabInfo> = tabs
             .iter()
             .filter(|tab| tab.workspace == workspace_id)
@@ -1422,7 +1426,9 @@ pub fn session_sidebar_html_with_update(
             let active_class = if tab.id == active { " active" } else { "" };
             let busy = if tab.busy { " busy" } else { "" };
             let waiting = if tab.waiting { " waiting" } else { "" };
-            let spinner = if tab.busy {
+            let spinner = if tab.in_use_elsewhere {
+                String::from("<span class=\"session-occupied\">In use</span>")
+            } else if tab.busy {
                 format!(
                     "<span class=\"session-spinner\" aria-label=\"{}\"></span>",
                     if tab.waiting {
@@ -1445,14 +1451,16 @@ pub fn session_sidebar_html_with_update(
                 escape(&tab.label),
             );
         }
-        let _ = write!(
-            out,
-            "<button type=\"button\" class=\"session-add\" data-session-new-workspace=\"{}\" data-session-new-path=\"{}\" title=\"New session in {}\" aria-label=\"New session in {}\"><span class=\"session-add-glyph\" aria-hidden=\"true\">＋</span><span>New session</span></button>",
-            escape(&workspace_id),
-            escape(&path),
-            escape(&label),
-            escape(&label),
-        );
+        if !workspace_id.is_empty() {
+            let _ = write!(
+                out,
+                "<button type=\"button\" class=\"session-add\" data-session-new-workspace=\"{}\" data-session-new-path=\"{}\" title=\"New session in {}\" aria-label=\"New session in {}\"><span class=\"session-add-glyph\" aria-hidden=\"true\">＋</span><span>New session</span></button>",
+                escape(&workspace_id),
+                escape(&path),
+                escape(&label),
+                escape(&label),
+            );
+        }
         out.push_str("</div></section>");
     }
     out.push_str("</div></aside>");
@@ -1475,6 +1483,9 @@ pub fn file_tree_with_workspaces_html(
     expanded: &BTreeSet<String>,
     cache: &BTreeMap<String, Vec<FileEntry>>,
 ) -> String {
+    if _active_workspace.is_empty() {
+        return r#"<section class="side-section file-tree-section" id="file-tree"><p>No workspace selected</p><button type="button" data-workspace-browse-path="">Choose workspace</button></section>"#.into();
+    }
     let root_label = root.unwrap_or("files");
     let mut out =
         String::from("<section class=\"side-section file-tree-section\" id=\"file-tree\">");
@@ -1969,6 +1980,7 @@ mod tests {
         let html = session_sidebar_html_with_update(
             &[
                 TabInfo {
+                    in_use_elsewhere: false,
                     id: 1,
                     label: "tachyon work".into(),
                     busy: false,
@@ -1977,6 +1989,7 @@ mod tests {
                     workspace: "tachyon".into(),
                 },
                 TabInfo {
+                    in_use_elsewhere: false,
                     id: 2,
                     label: "wiki notes".into(),
                     busy: true,
@@ -2009,7 +2022,7 @@ mod tests {
             ),
             "{html}"
         );
-        assert!(html.contains("session-new-primary"), "{html}");
+        assert!(html.contains("data-chat-new"), "{html}");
         assert!(
             html.contains("title=\"Open workspace\" aria-label=\"Open workspace\""),
             "{html}"
@@ -2482,12 +2495,14 @@ mod tests {
             tasks_attempted: 1,
             nodes: vec![
                 gewu_protocol::WorkflowNodeState {
+                    sessions: vec![],
                     id: "read".into(),
                     status: "ok".into(),
                     done: 1,
                     failed: 0,
                 },
                 gewu_protocol::WorkflowNodeState {
+                    sessions: vec![],
                     id: "write".into(),
                     status: "pending".into(),
                     done: 0,

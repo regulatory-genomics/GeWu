@@ -77,6 +77,7 @@ async fn ensure_agents(pool: &SqlitePool) -> Result<()> {
 
 async fn ensure_workspaces(pool: &SqlitePool) -> Result<()> {
     sqlx::query("CREATE TABLE IF NOT EXISTS session_workspaces (session_id TEXT PRIMARY KEY, workspace TEXT NOT NULL)").execute(pool).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS session_workspace_paths (session_id TEXT PRIMARY KEY, path TEXT NOT NULL)").execute(pool).await?;
     Ok(())
 }
 
@@ -184,6 +185,59 @@ pub async fn subagent_depth(pool: &SqlitePool, session_id: &str) -> Result<usize
         depth += 1;
     }
     Ok(depth)
+}
+
+pub async fn child_sessions(pool: &SqlitePool, parent: &str) -> Result<Vec<(String, String)>> {
+    ensure_subagents(pool).await?;
+    Ok(sqlx::query_as("SELECT session_id, description FROM subagent_sessions WHERE parent_session_id = ? ORDER BY created_at, session_id").bind(parent).fetch_all(pool).await?)
+}
+
+/// Bounded, user-visible excerpts for the parent's terminal roster.
+pub struct ChildPreview {
+    pub id: String,
+    pub profile: String,
+    pub assignment: Option<String>,
+    pub reply: Option<String>,
+}
+
+pub async fn child_previews(pool: &SqlitePool, parent: &str) -> Result<Vec<ChildPreview>> {
+    ensure_subagents(pool).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT child.session_id, child.description,
+            (SELECT substr(json_extract(part.value, '$.text'), 1, 320)
+             FROM json_each(request.content, '$.content') part
+             WHERE json_extract(part.value, '$.type') = 'text' LIMIT 1) AS assignment,
+            (SELECT substr(json_extract(m.content, '$.content'), 1, 1000)
+             FROM memory_messages m
+             WHERE m.session_id = child.session_id AND m.id > request.id
+               AND json_extract(m.content, '$.role') = 'assistant'
+               AND json_type(m.content, '$.content') = 'text'
+               AND length(trim(json_extract(m.content, '$.content'))) > 0
+               AND coalesce(json_array_length(m.content, '$.tool_calls'), 0) = 0
+             ORDER BY m.id DESC LIMIT 1) AS reply
+        FROM subagent_sessions child
+        LEFT JOIN memory_messages request ON request.id = (
+            SELECT m.id FROM memory_messages m WHERE m.session_id = child.session_id
+            AND json_extract(m.content, '$.role') = 'user' ORDER BY m.id DESC LIMIT 1
+        )
+        WHERE child.parent_session_id = ?
+        ORDER BY child.created_at DESC, child.session_id
+    "#,
+    )
+    .bind(parent)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(ChildPreview {
+                id: row.try_get("session_id")?,
+                profile: row.try_get("description")?,
+                assignment: row.try_get("assignment")?,
+                reply: row.try_get("reply")?,
+            })
+        })
+        .collect()
 }
 
 /// Every transitive subagent session of `session_id`, order not guaranteed.
@@ -418,12 +472,40 @@ pub async fn set_session_workspace(
     session_id: &str,
     workspace: &str,
 ) -> Result<()> {
+    save_workspace(pool, session_id, workspace, None).await
+}
+
+pub async fn session_workspace_path(pool: &SqlitePool, session_id: &str) -> Result<Option<String>> {
     ensure_workspaces(pool).await?;
+    Ok(
+        sqlx::query_scalar("SELECT path FROM session_workspace_paths WHERE session_id = ?")
+            .bind(session_id)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
+/// Store the server-local absolute path and its display id in one transaction.
+pub async fn save_workspace(
+    pool: &SqlitePool,
+    session_id: &str,
+    workspace: &str,
+    path: Option<&str>,
+) -> Result<()> {
+    ensure_workspaces(pool).await?;
+    let mut tx = pool.begin().await?;
     sqlx::query("INSERT INTO session_workspaces(session_id, workspace) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET workspace = excluded.workspace")
-        .bind(session_id)
-        .bind(workspace)
-        .execute(pool)
-        .await?;
+        .bind(session_id).bind(workspace).execute(&mut *tx).await?;
+    if let Some(path) = path {
+        sqlx::query("INSERT INTO session_workspace_paths(session_id, path) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET path = excluded.path")
+            .bind(session_id).bind(path).execute(&mut *tx).await?;
+    } else {
+        sqlx::query("DELETE FROM session_workspace_paths WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -509,6 +591,44 @@ impl SessionStateStore for SqliteSessionStateStore {
     }
 }
 
+/// Update a shared workflow only if the editor still has its latest revision.
+pub async fn workflow_draft(
+    pool: &SqlitePool,
+    session: &str,
+    update: Option<gewu_protocol::DraftUpdate>,
+) -> Result<gewu_protocol::DraftUpdate> {
+    use gewu_protocol::DraftUpdate;
+    ensure_session_state(pool).await?;
+    let Some(mut draft) = update else {
+        let raw = SqliteSessionStateStore::new(pool.clone())
+            .load(session, "workflow_draft")
+            .await?;
+        return Ok(match raw {
+            Some(s) => serde_json::from_str(&s)?,
+            None => DraftUpdate::default(),
+        });
+    };
+    let previous = i64::try_from(draft.revision)?;
+    draft.revision = u64::try_from(
+        previous
+            .checked_add(1)
+            .context("Workflow revision overflow")?,
+    )?;
+    let value = serde_json::to_string(&draft)?;
+    let changed = if previous == 0 {
+        sqlx::query("INSERT OR IGNORE INTO session_state (session_id,key,value) VALUES (?, 'workflow_draft', json_set(?, '$.updated_at', unixepoch()))")
+            .bind(session).bind(value).execute(pool).await?
+    } else {
+        sqlx::query("UPDATE session_state SET value=json_set(?, '$.updated_at', unixepoch()) WHERE session_id=? AND key='workflow_draft' AND json_extract(value,'$.revision')=?")
+            .bind(value).bind(session).bind(previous).execute(pool).await?
+    };
+    anyhow::ensure!(
+        changed.rows_affected() == 1,
+        "Another editor saved this workflow. Reload the latest revision before saving."
+    );
+    Ok(draft)
+}
+
 /// One stored message together with its database identity.
 #[derive(Debug, Clone)]
 pub struct StoredMessage {
@@ -543,17 +663,27 @@ async fn memory_table_exists(pool: &SqlitePool) -> Result<bool> {
 pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<gewu_protocol::SessionSummary>> {
     session_agent(pool, "").await?;
     ensure_subagents(pool).await?;
+    ensure_workspaces(pool).await?;
     if !memory_table_exists(pool).await? {
         return Ok(Vec::new());
     }
+    ensure_session_state(pool).await?;
     let rows = sqlx::query(
         r#"
+        WITH activity AS (
+            SELECT session_id, created_at, 1 AS messages FROM memory_messages
+            UNION ALL
+            SELECT session_id, json_extract(value, '$.updated_at'), 0 FROM session_state WHERE key='workflow_draft'
+        )
         SELECT
             memory_messages.session_id,
             COALESCE((SELECT agent FROM session_agents WHERE session_agents.session_id = memory_messages.session_id), 'build') AS agent,
-            COUNT(*) AS message_count,
+            CASE WHEN session_workspaces.workspace = '' THEN '' ELSE session_workspace_paths.path END AS workspace_path,
+            SUM(memory_messages.messages) AS message_count,
             datetime(MAX(memory_messages.created_at), 'unixepoch', 'localtime') AS updated_at
-        FROM memory_messages
+        FROM activity AS memory_messages
+        LEFT JOIN session_workspaces ON session_workspaces.session_id = memory_messages.session_id
+        LEFT JOIN session_workspace_paths ON session_workspace_paths.session_id = memory_messages.session_id
         LEFT JOIN subagent_sessions ON subagent_sessions.session_id = memory_messages.session_id
         WHERE subagent_sessions.session_id IS NULL
         GROUP BY memory_messages.session_id
@@ -569,6 +699,7 @@ pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<gewu_protocol::Sessi
             Ok(gewu_protocol::SessionSummary {
                 agent: row.try_get("agent")?,
                 session_id: row.try_get("session_id")?,
+                workspace_path: row.try_get("workspace_path")?,
                 message_count: row.try_get("message_count")?,
                 updated_at: row
                     .try_get::<Option<String>, _>("updated_at")?
@@ -628,6 +759,7 @@ pub async fn delete_session(pool: &SqlitePool, session_id: &str) -> Result<u64> 
             "session_models",
             "session_agents",
             "session_workspaces",
+            "session_workspace_paths",
             "session_reasoning_efforts",
             "chat_reverts",
             "session_state",
@@ -902,6 +1034,36 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     #[tokio::test]
+    async fn child_previews_show_only_the_latest_assignment_and_visible_reply() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        SqliteMemory::new(pool.clone(), "child".into()).await?;
+        record_subagent_session(&pool, "child", "parent", "explore").await?;
+        record_subagent_session(&pool, "sibling", "other", "general").await?;
+        for message in [
+            serde_json::json!({"role":"user","content":[{"type":"text","text":"Old assignment"}]}),
+            serde_json::json!({"role":"assistant","content":"Old result"}),
+            serde_json::json!({"role":"user","content":[{"type":"reminder","text":"Internal"},{"type":"text","text":"Check sample B"}]}),
+            serde_json::json!({"role":"assistant","content":"Reading","tool_calls":[{}],"reasoning":"private"}),
+        ] {
+            sqlx::query("INSERT INTO memory_messages(session_id,content) VALUES ('child',?)")
+                .bind(message.to_string())
+                .execute(&pool)
+                .await?;
+        }
+        let children = child_previews(&pool, "parent").await?;
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].assignment.as_deref(), Some("Check sample B"));
+        assert!(children[0].reply.is_none());
+        sqlx::query("INSERT INTO memory_messages(session_id,content) VALUES ('child',?)")
+            .bind(serde_json::json!({"role":"assistant","content":"Sample B found","reasoning":"private"}).to_string()).execute(&pool).await?;
+        assert_eq!(
+            child_previews(&pool, "parent").await?[0].reply.as_deref(),
+            Some("Sample B found")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn session_model_round_trips() -> Result<()> {
         let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
         assert_eq!(session_model(&pool, "s1").await?, None);
@@ -997,6 +1159,7 @@ mod tests {
             "session_models",
             "session_agents",
             "session_workspaces",
+            "session_workspace_paths",
             "session_reasoning_efforts",
             "chat_reverts",
         ] {
@@ -1157,6 +1320,7 @@ mod tests {
         mem.add_message(Message::Assistant {
             content: Some("answer".to_string()),
             reasoning: Some("step by step".to_string()),
+            reasoning_ms: None,
             replay: Some(gewu_core::types::ReasoningReplay {
                 origin: "anthropic:https://api.anthropic.com".into(),
                 model: "claude-test".into(),
@@ -1169,6 +1333,7 @@ mod tests {
         mem.add_message(Message::Assistant {
             content: Some("plain".to_string()),
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: None,
         })
@@ -1182,6 +1347,7 @@ mod tests {
                 reasoning,
                 replay,
                 tool_calls,
+                ..
             } => {
                 assert_eq!(content.as_deref(), Some("answer"));
                 assert_eq!(reasoning.as_deref(), Some("step by step"));
@@ -1221,6 +1387,7 @@ mod tests {
         let assistant = Message::Assistant {
             content: Some("second".to_string()),
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: None,
         };

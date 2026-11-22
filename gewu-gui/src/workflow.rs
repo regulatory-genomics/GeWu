@@ -755,6 +755,16 @@ fn status_glyph(status: Option<&WfNodeState>, current: bool) -> &'static str {
     }
 }
 
+pub(crate) fn draft_preview(value: serde_json::Value) -> String {
+    let Ok(spec) = serde_json::from_value::<WfSpec>(value) else {
+        return String::new();
+    };
+    if spec.nodes.is_empty() || spec.nodes.len() > 128 {
+        return String::new();
+    }
+    graph_svg(&spec, None, usize::MAX - 1)
+}
+
 fn graph_svg(spec: &WfSpec, snapshot: Option<&WfSnapshot>, uid: usize) -> String {
     let lay = layout(spec);
     let marker = format!("wfa{uid}");

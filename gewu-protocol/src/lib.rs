@@ -60,6 +60,19 @@ pub use gewu_core::types::{
 /// Operations a client can request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
+    Settings,
+    Inspect {
+        section: InspectSection,
+    },
+    WorkflowDraft {
+        update: Option<DraftUpdate>,
+    },
+    StartWorkflow {
+        spec: Value,
+    },
+    CancelWorkflow {
+        run_id: String,
+    },
     RevertChat {
         turn: Option<usize>,
         undo: bool,
@@ -340,8 +353,27 @@ impl Serialize for ClientRequest {
             Op::ListSessions => map.serialize_entry("op", "list_sessions")?,
             Op::GetSession => map.serialize_entry("op", "get_session")?,
             Op::DeleteSession => map.serialize_entry("op", "delete_session")?,
+            Op::Settings => map.serialize_entry("op", "settings")?,
             Op::Info => map.serialize_entry("op", "info")?,
             Op::Usage => map.serialize_entry("op", "usage")?,
+            Op::Inspect { section } => {
+                map.serialize_entry("op", "inspect")?;
+                map.serialize_entry("section", section)?;
+            }
+            Op::WorkflowDraft { update } => {
+                map.serialize_entry("op", "workflow_draft")?;
+                if let Some(update) = update {
+                    map.serialize_entry("update", update)?;
+                }
+            }
+            Op::StartWorkflow { spec } => {
+                map.serialize_entry("op", "start_workflow")?;
+                map.serialize_entry("spec", spec)?;
+            }
+            Op::CancelWorkflow { run_id } => {
+                map.serialize_entry("op", "cancel_workflow")?;
+                map.serialize_entry("run_id", run_id)?;
+            }
             Op::Ping => map.serialize_entry("op", "ping")?,
         }
         if let Some(session_id) = &self.session_id {
@@ -581,6 +613,25 @@ impl ClientRequest {
     /// Build a `ping` request.
     pub fn ping(id: impl Into<Value>) -> Self {
         Self::simple(id, Op::Ping)
+    }
+
+    pub fn inspect(id: impl Into<Value>, section: InspectSection) -> Self {
+        Self::simple(id, Op::Inspect { section })
+    }
+    pub fn workflow_draft(id: impl Into<Value>, update: Option<DraftUpdate>) -> Self {
+        Self::simple(id, Op::WorkflowDraft { update })
+    }
+
+    pub fn settings(id: impl Into<Value>) -> Self {
+        Self::simple(id, Op::Settings)
+    }
+
+    pub fn start_workflow(id: impl Into<Value>, spec: Value) -> Self {
+        Self::simple(id, Op::StartWorkflow { spec })
+    }
+
+    pub fn cancel_workflow(id: impl Into<Value>, run_id: String) -> Self {
+        Self::simple(id, Op::CancelWorkflow { run_id })
     }
 
     /// Build an `info` request (server model + provider).
@@ -929,7 +980,34 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
             Op::DeleteSession
         }
         "subscribe_session" => Op::SubscribeSession,
+        "inspect" => Op::Inspect {
+            section: serde_json::from_value(obj.get("section").cloned().unwrap_or(Value::Null))
+                .map_err(|_| RequestError::Invalid("unknown inspection section".into()))?,
+        },
+        "workflow_draft" => Op::WorkflowDraft {
+            update: obj
+                .get("update")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()
+                .map_err(|e| RequestError::Invalid(format!("invalid draft update: {e}")))?,
+        },
+        "start_workflow" => Op::StartWorkflow {
+            spec: obj
+                .get("spec")
+                .filter(|s| s.is_object())
+                .cloned()
+                .ok_or_else(|| RequestError::Invalid("workflow spec object required".into()))?,
+        },
+        "cancel_workflow" => Op::CancelWorkflow {
+            run_id: obj
+                .get("run_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| RequestError::Invalid("run_id required".into()))?
+                .into(),
+        },
         "ping" => Op::Ping,
+        "settings" => Op::Settings,
         "info" => Op::Info,
         "usage" => Op::Usage,
         "auth" => {
@@ -992,6 +1070,9 @@ pub struct SessionSummary {
     pub agent: String,
     /// Server session id, usable to resume the conversation.
     pub session_id: String,
+    /// Absolute path for a project, empty for a chat, absent from legacy sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
     /// Number of stored messages.
     pub message_count: i64,
     /// Human-readable time of the most recent message.
@@ -1055,6 +1136,9 @@ pub const PROVIDER_DEFAULT_EFFORT: &str = "provider-default";
 /// Live progress of one workflow node, as shown in a run's graph.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowNodeState {
+    /// Child sessions reported by the workflow engine for this node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<String>,
     pub id: String,
     /// `ok`, `failed`, `pending`, or `skipped`.
     pub status: String,
@@ -1080,10 +1164,79 @@ pub struct WorkflowRunState {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectSection {
+    Tasks,
+    Subagents,
+    Todos,
+    Skills,
+    Mcp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectionEntry {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<WorkflowNodeState>,
+    pub key: String,
+    pub label: String,
+    pub detail: String,
+    pub cancellable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSettings {
+    pub model: String,
+    pub default_model: String,
+    pub provider: String,
+    pub effort_override: Option<String>,
+    pub default_effort: Option<String>,
+    pub supports_effort: bool,
+    pub agent: String,
+    pub workspace: String,
+    pub context_limit: usize,
+    pub path_checks: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DraftUpdate {
+    pub revision: u64,
+    pub spec: Value,
+}
+
+impl Default for DraftUpdate {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            spec: serde_json::json!({"name": "Untitled workflow", "nodes": []}),
+        }
+    }
+}
+
 /// Messages the server sends to the client.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    Settings {
+        id: Value,
+        settings: SessionSettings,
+    },
+    WorkflowDraft {
+        id: Value,
+        draft: DraftUpdate,
+    },
+    DraftChanged {
+        session_id: String,
+        revision: u64,
+    },
+    WorkflowStarted {
+        id: Value,
+        run_id: String,
+    },
+    Inspection {
+        id: Value,
+        entries: Vec<InspectionEntry>,
+    },
     /// Consistent reconnect boundary: history before the turn and every
     /// streamed frame through `seq`. Subsequent frames are newer than it.
     SessionSnapshot {
@@ -1397,6 +1550,11 @@ impl ServerMessage {
             ServerMessage::Steered { .. } => "steered",
             ServerMessage::QuestionReplied { .. } => "question_replied",
             ServerMessage::Error { .. } => "error",
+            ServerMessage::WorkflowDraft { .. } => "workflow_draft",
+            ServerMessage::DraftChanged { .. } => "draft_changed",
+            ServerMessage::Settings { .. } => "settings",
+            ServerMessage::WorkflowStarted { .. } => "workflow_started",
+            ServerMessage::Inspection { .. } => "inspection",
             ServerMessage::Pong { .. } => "pong",
             ServerMessage::Info { .. } => "info",
             ServerMessage::Usage { .. } => "usage",
@@ -1427,6 +1585,10 @@ impl ServerMessage {
             ServerMessage::Directories { id, .. } => Some(id),
             ServerMessage::WorkspaceAdded { id, .. } => Some(id),
             ServerMessage::Ready { id, .. }
+            | ServerMessage::WorkflowDraft { id, .. }
+            | ServerMessage::Settings { id, .. }
+            | ServerMessage::WorkflowStarted { id, .. }
+            | ServerMessage::Inspection { id, .. }
             | ServerMessage::Pong { id }
             | ServerMessage::Info { id, .. }
             | ServerMessage::Usage { id, .. }
@@ -1447,6 +1609,7 @@ impl ServerMessage {
             ServerMessage::Event { .. }
             | ServerMessage::Result { .. }
             | ServerMessage::SessionSnapshot { .. }
+            | ServerMessage::DraftChanged { .. }
             | ServerMessage::WorkflowProgress { .. } => None,
         }
     }
@@ -1553,12 +1716,14 @@ mod tests {
                 tasks_attempted: 1,
                 nodes: vec![
                     WorkflowNodeState {
+                        sessions: vec![],
                         id: "read".into(),
                         status: "ok".into(),
                         done: 1,
                         failed: 0,
                     },
                     WorkflowNodeState {
+                        sessions: vec![],
                         id: "write".into(),
                         status: "pending".into(),
                         done: 0,
@@ -1953,6 +2118,7 @@ mod tests {
         let summary = SessionSummary {
             agent: "build".into(),
             session_id: "s1".into(),
+            workspace_path: None,
             message_count: 3,
             updated_at: "now".into(),
         };

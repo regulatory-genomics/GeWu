@@ -1,5 +1,5 @@
 [workspace]
-members = ["gewu",
+members = ["gewu", "gewu-cli",
     "gewu-server",
     "gewu-core",
     "gewu-client", "gewu-gui", "gewu-protocol", "gewu-providers", "gewu-storage",

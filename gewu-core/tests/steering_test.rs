@@ -74,7 +74,7 @@ impl LlmProvider for ScriptedLlm {
             responses.remove(0)
         };
         let s = async_stream::try_stream! {
-            if let Message::Assistant { content, reasoning, tool_calls, replay } = response {
+            if let Message::Assistant { content, reasoning, tool_calls, replay, .. } = response {
                 if let Some(replay) = replay {
                     yield ProviderEvent::ReasoningReplay { replay };
                 }
@@ -135,6 +135,7 @@ async fn background_resume_is_user_level_data() {
         let llm = ScriptedLlm::new(vec![Message::Assistant {
             content: Some("done".into()),
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: None,
         }]);
@@ -197,6 +198,7 @@ async fn background_delivery_at_finish_boundary_resumes_without_user_input() {
     let answer = || Message::Assistant {
         content: Some("answer".into()),
         reasoning: None,
+        reasoning_ms: None,
         replay: None,
         tool_calls: None,
     };
@@ -263,12 +265,14 @@ async fn steer_during_parallel_tool_execution_injects_at_round_boundary() {
         Message::Assistant {
             content: None,
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: Some(vec![tool_call(1), tool_call(2)]),
         },
         Message::Assistant {
             content: Some("steered answer".to_string()),
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: None,
         },
@@ -344,12 +348,14 @@ async fn steer_during_final_answer_extends_the_run() {
         Message::Assistant {
             content: Some("first draft".to_string()),
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: None,
         },
         Message::Assistant {
             content: Some("steered answer".to_string()),
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: None,
         },
@@ -405,6 +411,7 @@ async fn steer_while_idle_is_delivered_at_next_ask_start() {
     let llm = ScriptedLlm::new(vec![Message::Assistant {
         content: Some("combined answer".to_string()),
         reasoning: None,
+        reasoning_ms: None,
         replay: None,
         tool_calls: None,
     }]);

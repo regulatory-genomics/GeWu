@@ -602,7 +602,7 @@ mod tests {
 
         // None: paths resolve as given, even outside the root.
         let resolved = resolve_read_path(dir.path(), &outside_file, PathEnforcement::None).await?;
-        assert_eq!(resolved, fs::canonicalize(&outside_file).await?);
+        assert_eq!(resolved, outside_file);
         assert_eq!(
             resolve_unchecked(dir.path(), "../sibling.txt"),
             dir.path().parent().unwrap().join("sibling.txt")

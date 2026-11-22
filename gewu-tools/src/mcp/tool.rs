@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub struct McpToolWrapper {
+    pub server_name: String,
     pub client: Arc<Mutex<McpClient>>,
     pub name: String,
     pub description: String,
@@ -18,6 +19,9 @@ pub struct McpToolWrapper {
 
 #[async_trait]
 impl Tool for McpToolWrapper {
+    fn mcp_server(&self) -> Option<&str> {
+        Some(&self.server_name)
+    }
     fn name(&self) -> &str {
         &self.name
     }

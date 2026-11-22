@@ -370,6 +370,7 @@ impl OpenAIProvider {
                 reasoning,
                 replay,
                 tool_calls,
+                ..
             } => {
                 let origin = format!("chat:{}", self.base_url);
                 let compatible = replay
@@ -803,6 +804,9 @@ impl ResponseParser for OpenAIProvider {
 
 #[async_trait]
 impl LlmProvider for OpenAIProvider {
+    fn update_api_key(&self, key: &str) {
+        self.client.update_api_key(key);
+    }
     fn build(
         &self,
         messages: &[Message],
@@ -1100,6 +1104,7 @@ impl AnthropicProvider {
                 reasoning,
                 replay,
                 tool_calls,
+                ..
             } => {
                 let origin = format!(
                     "anthropic:{}",
@@ -1585,6 +1590,9 @@ fn classify_anthropic_failure(error: &crate::anthropic::Failure) -> crate::http:
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
+    fn update_api_key(&self, key: &str) {
+        self.client.update_api_key(key);
+    }
     fn build(
         &self,
         messages: &[Message],
@@ -1683,6 +1691,7 @@ mod tests {
         let message = Message::Assistant {
             content: None,
             reasoning: Some(text),
+            reasoning_ms: None,
             replay,
             tool_calls: Some(vec![gewu_core::types::ToolCall {
                 id: "call-1".into(),
@@ -1735,6 +1744,7 @@ mod tests {
         let plain = Message::Assistant {
             content: Some("plain".into()),
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: None,
         };
@@ -1777,6 +1787,7 @@ mod tests {
         let message = Message::Assistant {
             content: Some("checking".into()),
             reasoning: Some("consider".into()),
+            reasoning_ms: None,
             replay,
             tool_calls: None,
         };
@@ -1964,6 +1975,7 @@ mod tests {
         let assistant = Message::Assistant {
             content: None,
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: None,
         };
@@ -2127,6 +2139,7 @@ mod tests {
         let msg = Message::Assistant {
             content: Some("Hello world".to_string()),
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: None,
         };
@@ -2146,6 +2159,7 @@ mod tests {
         let msg = Message::Assistant {
             content: None,
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: Some(vec![CoreToolCall {
                 id: "call_1".to_string(),
@@ -2233,6 +2247,7 @@ mod tests {
         let msg = Message::Assistant {
             content: None,
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: Some(vec![CoreToolCall {
                 id: "toolu_1".to_string(),
@@ -2560,6 +2575,7 @@ mod tests {
         let messages = vec![Message::Assistant {
             content: None,
             reasoning: None,
+            reasoning_ms: None,
             replay: None,
             tool_calls: Some(vec![CoreToolCall {
                 id: "call_1".to_string(),

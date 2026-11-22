@@ -180,7 +180,11 @@ impl Inner {
                 // aborted ask itself, so end its stream here.
                 let interrupted_active_ask = matches!(msg, ServerMessage::Interrupted { .. })
                     && self.active_ask.as_ref().is_some_and(|ask| !ask.persistent);
-                let _ = pending.reply.send(Ok(msg));
+                let reply = match msg {
+                    ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+                    msg => Ok(msg),
+                };
+                let _ = pending.reply.send(reply);
                 if interrupted_active_ask && let Some(ask) = self.active_ask.take() {
                     let _ = ask.tx.send(Err(Error::Interrupted));
                     drop(ask.tx);

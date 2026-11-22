@@ -204,6 +204,7 @@ fn test_message_assistant_with_content() {
     let msg = Message::Assistant {
         content: Some("I can help".to_string()),
         reasoning: Some("thinking".to_string()),
+        reasoning_ms: None,
         replay: None,
         tool_calls: None,
     };
@@ -213,6 +214,7 @@ fn test_message_assistant_with_content() {
         reasoning,
         replay: _,
         tool_calls,
+        ..
     } = msg
     {
         assert_eq!(content.unwrap(), "I can help");
@@ -226,6 +228,7 @@ fn test_message_assistant_with_tool_calls() {
     let msg = Message::Assistant {
         content: None,
         reasoning: None,
+        reasoning_ms: None,
         replay: None,
         tool_calls: Some(vec![ToolCall {
             id: "call_1".to_string(),
@@ -242,6 +245,7 @@ fn test_message_assistant_with_tool_calls() {
         reasoning,
         replay: _,
         tool_calls,
+        ..
     } = msg
     {
         assert!(content.is_none());

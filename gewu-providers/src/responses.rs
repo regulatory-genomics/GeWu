@@ -111,7 +111,7 @@ fn stream_error(error: &Value) -> crate::openai::OpenAIError {
 
 pub struct OpenAIProvider {
     client: reqwest::Client,
-    api_key: String,
+    api_key: tokio::sync::watch::Sender<String>,
     base_url: String,
     model: String,
     max_output_tokens: Option<u32>,
@@ -250,6 +250,7 @@ mod tests {
         let message = Message::Assistant {
             content: None,
             reasoning: Some(reasoning),
+            reasoning_ms: None,
             tool_calls: None,
             replay,
         };
@@ -593,7 +594,7 @@ impl OpenAIProvider {
     pub fn new_with_endpoint(api_key: &str, base_url: &str, model: &str) -> Self {
         Self {
             client: crate::http::client(),
-            api_key: api_key.into(),
+            api_key: tokio::sync::watch::channel(api_key.to_owned()).0,
             base_url: base_url.trim_end_matches('/').into(),
             model: model.into(),
             max_output_tokens: None,
@@ -648,7 +649,8 @@ impl OpenAIProvider {
                 .header("Accept", "text/event-stream"),
             None => self.client.get(format!("{}{path}", self.base_url)),
         };
-        let response = request.bearer_auth(&self.api_key).send().await?;
+        let request = request.bearer_auth(self.api_key.borrow().as_str());
+        let response = request.send().await?;
         if response.status().is_success() {
             return Ok(response);
         }
@@ -680,6 +682,9 @@ fn content(parts: &[ContentPart]) -> Result<Vec<Value>, Failure> {
 
 #[async_trait]
 impl LlmProvider for OpenAIProvider {
+    fn update_api_key(&self, key: &str) {
+        self.api_key.send_replace(key.to_owned());
+    }
     fn build(&self, messages: &[Message], tools: &[Arc<dyn Tool>]) -> Result<Value, Failure> {
         let mut input = Vec::new();
         let mut instructions = Vec::new();
@@ -701,6 +706,7 @@ impl LlmProvider for OpenAIProvider {
                     reasoning,
                     tool_calls,
                     replay,
+                    ..
                 } => {
                     if let Some(replay) = replay
                         .as_ref()

@@ -9,6 +9,7 @@ use crate::types::{
 };
 use anyhow::Result;
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 use super::execute_tool_with_panic_recovery;
@@ -100,6 +101,7 @@ fn repeats_at_threshold(
 pub(super) struct AggregatedResponse {
     pub content: String,
     pub reasoning: String,
+    pub reasoning_ms: Option<u64>,
     pub tool_calls: Vec<ToolCall>,
     pub replay: Option<crate::types::ReasoningReplay>,
 }
@@ -113,6 +115,8 @@ pub(super) struct AggregatedResponse {
 pub(super) struct LlmResponseAggregator {
     content: String,
     reasoning: String,
+    reasoning_started: Option<Instant>,
+    reasoning_elapsed: Duration,
     replay: Option<crate::types::ReasoningReplay>,
     tool_calls: Vec<ToolCall>,
 }
@@ -123,6 +127,8 @@ impl LlmResponseAggregator {
         Self {
             content: String::new(),
             reasoning: String::new(),
+            reasoning_started: None,
+            reasoning_elapsed: Duration::ZERO,
             replay: None,
             tool_calls: Vec::new(),
         }
@@ -148,14 +154,21 @@ impl LlmResponseAggregator {
                 None
             }
             ProviderEvent::ContentDelta { delta } => {
+                if !delta.is_empty() {
+                    self.finish_reasoning();
+                }
                 self.content.push_str(&delta);
                 Some(AgentEvent::ContentDelta { delta })
             }
             ProviderEvent::ReasoningDelta { delta } => {
+                if !delta.is_empty() {
+                    self.reasoning_started.get_or_insert_with(Instant::now);
+                }
                 self.reasoning.push_str(&delta);
                 Some(AgentEvent::ReasoningDelta { delta })
             }
             ProviderEvent::ToolCallStart { id, name } => {
+                self.finish_reasoning();
                 self.tool_calls.push(ToolCall {
                     id,
                     r#type: "function".to_string(),
@@ -172,12 +185,21 @@ impl LlmResponseAggregator {
                 }
                 None
             }
-            ProviderEvent::Finish { .. } => None,
+            ProviderEvent::Finish { .. } => {
+                self.finish_reasoning();
+                None
+            }
             // Provider usage is folded into the agent's session totals by
             // the ask loop (and compaction); the per-request figure is not
             // forwarded as an agent event.
             ProviderEvent::Usage { .. } => None,
             ProviderEvent::Error { error } => Some(AgentEvent::Error { error }),
+        }
+    }
+
+    fn finish_reasoning(&mut self) {
+        if let Some(start) = self.reasoning_started.take() {
+            self.reasoning_elapsed += start.elapsed();
         }
     }
 
@@ -190,7 +212,10 @@ impl LlmResponseAggregator {
     ///
     /// Content, display reasoning, tool calls, and native reasoning replay state.
     pub(super) fn take_parts(&mut self) -> AggregatedResponse {
+        self.finish_reasoning();
+        let elapsed = std::mem::take(&mut self.reasoning_elapsed);
         AggregatedResponse {
+            reasoning_ms: (!self.reasoning.is_empty()).then(|| elapsed.as_millis() as u64),
             content: std::mem::take(&mut self.content),
             reasoning: std::mem::take(&mut self.reasoning),
             tool_calls: std::mem::take(&mut self.tool_calls),
@@ -420,8 +445,11 @@ mod tests {
         let response = aggregator.take_parts();
         assert_eq!(response.content, "é");
         assert_eq!(response.reasoning, "think");
+        assert!(response.reasoning_ms.is_some());
         assert_eq!(response.tool_calls[0].function.arguments, "{}");
-        assert!(aggregator.take_parts().content.is_empty());
+        let empty = aggregator.take_parts();
+        assert!(empty.content.is_empty());
+        assert!(empty.reasoning_ms.is_none());
     }
 
     #[test]

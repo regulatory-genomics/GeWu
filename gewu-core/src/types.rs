@@ -427,6 +427,9 @@ pub enum Message {
         content: Option<String>,
         /// Reasoning (chain-of-thought) text streamed before the answer, if any.
         reasoning: Option<String>,
+        /// Observed duration of streamed reasoning for this response.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_ms: Option<u64>,
         /// Provider-native replay state; opaque values are never displayed.
         replay: Option<ReasoningReplay>,
         /// Tool calls requested by the assistant, if any.

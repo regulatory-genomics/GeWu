@@ -524,6 +524,7 @@ impl Agent {
 
                 self.memory.add_message(Message::Assistant {
                     replay,
+                    reasoning_ms: aggregated.reasoning_ms,
                     content: if content.is_empty() { None } else { Some(content.clone()) },
                     reasoning: if reasoning.is_empty() { None } else { Some(reasoning) },
                     tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },

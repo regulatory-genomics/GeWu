@@ -2,6 +2,8 @@
 //!
 //! ```text
 //! gewu              # start the agent server + web GUI, open the browser
+//! gewu cli          # interactive terminal client
+//! gewu exec "task"  # non-interactive execution
 //! gewu --no-gui     # agent server only
 //! gewu serve        # exactly `gewu-server serve` (headless)
 //! gewu gui          # exactly `gewu-gui` (proxy for a separately started server)
@@ -85,6 +87,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Open the interactive terminal client
+    Cli(gewu_cli::CliArgs),
+    /// Run a single task; read additional input from a pipe
+    Exec(gewu_cli::ExecArgs),
     /// Run only the agent server (same flags as `gewu-server serve`)
     Serve {
         #[command(flatten)]
@@ -113,6 +119,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let no_update_check = cli.no_update_check;
     match cli.command {
+        Some(Command::Cli(args)) => gewu_cli::cli(args, &cli.common, cli.token).await,
+        Some(Command::Exec(args)) => {
+            let code = gewu_cli::exec(args, &cli.common, cli.token).await;
+            if code != 0 {
+                std::process::exit(code.into());
+            }
+            Ok(())
+        }
         Some(Command::Serve { args }) => gewu_server::cli::serve_command(args).await,
         Some(Command::Gui { args }) => {
             gewu_gui::run_with_updates(args, env!("CARGO_PKG_VERSION"), !no_update_check).await

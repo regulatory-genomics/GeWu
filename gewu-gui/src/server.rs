@@ -302,11 +302,20 @@ async fn preview(State(state): State<AppState>, Path(ticket): Path<String>) -> R
         })
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+#[derive(serde::Deserialize)]
+struct BrowserFocus {
+    chat: Option<String>,
 }
 
-async fn handle_socket(mut socket: WebSocket, state: AppState) {
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    axum::extract::Query(focus): axum::extract::Query<BrowserFocus>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_socket(socket, state, focus.chat))
+}
+
+async fn handle_socket(mut socket: WebSocket, state: AppState, chat: Option<String>) {
     match authenticate(&mut socket, state.token.as_deref()).await {
         Ok(true) => {}
         Ok(false) => return,
@@ -325,7 +334,10 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     )
     .await
     {
-        Ok(session) => {
+        Ok(mut session) => {
+            if let Some(resume) = chat {
+                session.focus_browser_chat(&resume);
+            }
             if let Err(e) = session.run(socket).await {
                 warn!("browser session ended with an error: {e:#}");
             }
@@ -596,7 +608,7 @@ mod tests {
                 })],
                 "switch_workspace" => vec![json!({
                     "type": "workspace_switched", "id": id, "session_id": "sess-1",
-                    "workspace": {"id": request["workspace"], "path": if workspace == "cwd" { "/tmp/fake-project" } else { "/canonical/TFSeq" }},
+                    "workspace": {"id": request["workspace"], "path": if workspace.is_empty() { "" } else if workspace == "cwd" { "/tmp/fake-project" } else { "/canonical/TFSeq" }},
                 })],
                 "switch_agent" => vec![json!({
                     "type":"agent_switched", "id":id, "session_id":"sess-1", "agent":agent, "tools":[],
@@ -784,6 +796,26 @@ mod tests {
             }
             if writer.flush().await.is_err() {
                 return;
+            }
+        }
+    }
+
+    async fn choose_test_workspace(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tab: u64,
+    ) {
+        ws.send(WsMessage::text(
+            json!({"op":"switch_workspace","tab":tab,"workspace":"cwd"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let msg = next_json(ws).await;
+            assert_ne!(msg["type"], "error");
+            if msg["type"] == "file_tree" {
+                break;
             }
         }
     }
@@ -1307,6 +1339,7 @@ mod tests {
                 .await
                 .unwrap();
             let initial = next_json(&mut ws).await["active"].as_u64().unwrap();
+            choose_test_workspace(&mut ws, initial).await;
             ws.send(WsMessage::text(
                 json!({"op":"ask","tab":initial,"prompt":"hello"}).to_string(),
             ))
@@ -1332,7 +1365,7 @@ mod tests {
                 if value["type"] == "tabs" {
                     assert_eq!(value["tabs"].as_array().unwrap().len(), 1);
                     assert_ne!(value["active"].as_u64().unwrap(), initial);
-                    assert_eq!(value["tabs"][0]["workspace"], "cwd");
+                    assert_eq!(value["tabs"][0]["workspace"], "");
                     assert!(value["tabs"][0]["session_id"].is_null());
                     break;
                 }
@@ -1340,7 +1373,7 @@ mod tests {
             let sidebar = next_json(&mut ws).await;
             assert_eq!(sidebar["type"], "session_sidebar");
             assert!(
-                sidebar["html"]
+                !sidebar["html"]
                     .as_str()
                     .unwrap()
                     .contains("data-session-workspace-group=\"cwd\"")
@@ -1396,6 +1429,7 @@ mod tests {
             .unwrap();
         let snapshot = next_json(&mut ws).await;
         assert_eq!(snapshot["type"], "snapshot");
+        choose_test_workspace(&mut ws, snapshot["active"].as_u64().unwrap()).await;
 
         // A traversal name is sanitized client-side before it reaches the
         // upstream, so the reply echoes the bare name.
@@ -1443,6 +1477,7 @@ mod tests {
             .unwrap();
         let snapshot = next_json(&mut ws).await;
         assert_eq!(snapshot["type"], "snapshot");
+        choose_test_workspace(&mut ws, snapshot["active"].as_u64().unwrap()).await;
 
         ws.send(WsMessage::text(
             r#"{"op":"upload_files","files":[{"name":"..","content_base64":"aGVsbG8="}]}"#,
@@ -1555,19 +1590,10 @@ mod tests {
         assert_eq!(snapshot["active"], 1);
         assert!(snapshot["status"].as_str().unwrap().contains("fake-model"));
         let sidebar = snapshot["sidebar"].as_str().unwrap();
-        assert!(sidebar.contains("<li>read</li>"), "{sidebar}");
-        assert!(sidebar.contains("<li>grep</li>"), "{sidebar}");
-        let session_sidebar = snapshot["session_sidebar"].as_str().unwrap();
-        assert!(
-            session_sidebar.contains("class=\"session-sidebar-version\">v0.0.0-test</span>"),
-            "{session_sidebar}"
-        );
-        // The working directory appears once as the file tree root.
-        assert!(
-            sidebar
-                .contains("class=\"tree-root\" title=\"/tmp/fake-project\">/tmp/fake-project</p>"),
-            "{sidebar}"
-        );
+        assert!(!sidebar.contains("<li>read</li>"));
+        assert!(sidebar.contains("No workspace selected"));
+        assert!(!sidebar.contains("/tmp/fake-project"));
+        assert_eq!(snapshot["tabs"][0]["workspace"], "");
 
         ws.send(WsMessage::text(r#"{"op":"ask","tab":1,"prompt":"hello"}"#))
             .await

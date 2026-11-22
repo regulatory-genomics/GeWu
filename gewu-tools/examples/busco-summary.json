@@ -1,0 +1,17 @@
+{
+  "name": "BUSCO summary",
+  "nodes": [
+    {
+      "id": "read",
+      "agent": "explore",
+      "for_each": ["results/rice", "results/maize"],
+      "prompt": "Read the existing BUSCO short summary in {{item}}. Return the species, lineage, C, S, D, F, M, n and source path. If missing, report the missing path."
+    },
+    {
+      "id": "summary",
+      "agent": "general",
+      "prompt": "Tabulate these records without filling missing values: {{nodes.read.outputs}}. Include failed reads: {{nodes.read.failed}}."
+    }
+  ],
+  "edges": [["read", "summary"]]
+}

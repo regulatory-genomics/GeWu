@@ -309,6 +309,7 @@ async fn run(cli: RunArgs) -> Result<()> {
             image_limits: boot.image_limits,
             context_limit: boot.context_limit,
             agents: boot.agents.clone(),
+            session_workflows: None,
             workflow_progress: None,
             question_broker: None,
             session_id: &session_id,

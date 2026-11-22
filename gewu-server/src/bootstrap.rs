@@ -145,6 +145,14 @@ pub struct Bootstrap {
 /// instead of failing with "a global default trace dispatcher has already
 /// been set".
 pub fn init_tracing(log_level: &str) -> Result<()> {
+    init_tracing_with_writer(log_level, std::io::stdout)
+}
+
+/// Let script frontends reserve stdout for the task result.
+pub fn init_tracing_with_writer<W>(log_level: &str, writer: W) -> Result<()>
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
     let level = match log_level.to_lowercase().as_str() {
         "error" => tracing::Level::ERROR,
         "warn" => tracing::Level::WARN,
@@ -153,7 +161,10 @@ pub fn init_tracing(log_level: &str) -> Result<()> {
         "trace" => tracing::Level::TRACE,
         _ => tracing::Level::INFO,
     };
-    let subscriber = tracing_subscriber::fmt().with_max_level(level).finish();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_max_level(level)
+        .finish();
     if tracing::subscriber::set_global_default(subscriber).is_err() {
         tracing::debug!("tracing already initialized; keeping the existing dispatcher");
     }
@@ -494,9 +505,15 @@ pub fn open_request_log(file_config: &crate::config::Config) -> Result<Option<Re
 
 /// Perform the full startup sequence shared by `run` and `serve`.
 pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
-    init_tracing(&args.log_level)?;
+    let loaded = LoadedConfig::load(args.llm_config.as_deref())?;
+    bootstrap_with_config(args, &loaded).await
+}
 
-    let loaded_config = LoadedConfig::load(args.llm_config.as_deref())?;
+pub async fn bootstrap_with_config(
+    args: &CommonArgs,
+    loaded_config: &LoadedConfig,
+) -> Result<Bootstrap> {
+    init_tracing(&args.log_level)?;
     if let Some(path) = &loaded_config.path {
         info!("Loaded config from: {}", path.display());
     } else {
@@ -790,6 +807,7 @@ mod tests {
                     &[gewu_core::types::Message::Assistant {
                         content: Some("answer".into()),
                         reasoning: None,
+                        reasoning_ms: None,
                         replay: None,
                         tool_calls: None,
                     }],

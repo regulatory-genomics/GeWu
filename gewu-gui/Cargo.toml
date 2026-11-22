@@ -4,6 +4,7 @@ version = "0.1.1"
 edition = "2024"
 
 [dependencies]
+gewu-tools = { path = "../gewu-tools" }
 gewu-client = { path = "../gewu-client" }
 gewu-protocol = { path = "../gewu-protocol" }
 gewu-update = { path = "../gewu-update" }

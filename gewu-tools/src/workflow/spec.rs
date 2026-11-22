@@ -10,6 +10,27 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Starter document shared by the web and terminal designers.
+pub const EXAMPLE: &str = include_str!("../../examples/busco-summary.json");
+
+/// Extract a workflow from a plain JSON or fenced assistant response.
+pub fn from_assistant_reply(reply: &str) -> anyhow::Result<serde_json::Value> {
+    let documents =
+        std::iter::once(reply.trim()).chain(reply.split("```").skip(1).step_by(2).map(|block| {
+            let block = block.trim();
+            block.strip_prefix("json").unwrap_or(block).trim()
+        }));
+    for document in documents {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(document) {
+            let spec = value.get("spec").unwrap_or(&value);
+            if serde_json::from_value::<WorkflowSpec>(spec.clone()).is_ok() {
+                return Ok(spec.clone());
+            }
+        }
+    }
+    anyhow::bail!("The last reply needs a workflow specification in a JSON code block")
+}
+
 /// Run time limit when the spec does not set one.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 /// Hard cap on `timeout_secs`.

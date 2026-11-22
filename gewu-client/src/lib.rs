@@ -456,6 +456,74 @@ impl Client {
         self.request(request).await.map(|_| ())
     }
 
+    pub async fn settings(&self) -> Result<gewu_protocol::SessionSettings> {
+        match self
+            .request(ClientRequest::settings(self.next_correlation_id()))
+            .await?
+        {
+            ServerMessage::Settings { settings, .. } => Ok(settings),
+            other => Err(unexpected(other, "settings")),
+        }
+    }
+
+    pub async fn inspect(
+        &self,
+        section: gewu_protocol::InspectSection,
+    ) -> Result<Vec<gewu_protocol::InspectionEntry>> {
+        match self
+            .request(ClientRequest::inspect(self.next_correlation_id(), section))
+            .await?
+        {
+            ServerMessage::Inspection { entries, .. } => Ok(entries),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "inspection")),
+        }
+    }
+    pub async fn workflow_draft(
+        &self,
+        update: Option<gewu_protocol::DraftUpdate>,
+    ) -> Result<gewu_protocol::DraftUpdate> {
+        match self
+            .request(ClientRequest::workflow_draft(
+                self.next_correlation_id(),
+                update,
+            ))
+            .await?
+        {
+            ServerMessage::WorkflowDraft { draft, .. } => Ok(draft),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "workflow_draft")),
+        }
+    }
+
+    pub async fn start_workflow(&self, spec: serde_json::Value) -> Result<String> {
+        match self
+            .request(ClientRequest::start_workflow(
+                self.next_correlation_id(),
+                spec,
+            ))
+            .await?
+        {
+            ServerMessage::WorkflowStarted { run_id, .. } => Ok(run_id),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "workflow_started")),
+        }
+    }
+
+    pub async fn cancel_workflow(&self, run_id: String) -> Result<()> {
+        match self
+            .request(ClientRequest::cancel_workflow(
+                self.next_correlation_id(),
+                run_id,
+            ))
+            .await?
+        {
+            ServerMessage::Inspection { .. } => Ok(()),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "inspection")),
+        }
+    }
+
     /// The model, provider, and workspace catalog the server runs with.
     pub async fn info(&self) -> Result<ServerInfo> {
         let request = ClientRequest::info(self.next_correlation_id());
