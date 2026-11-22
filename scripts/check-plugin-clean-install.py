@@ -66,7 +66,14 @@ def mirror_server(root, port=48874):
                     self.wfile.write(chunk)
                     remaining -= len(chunk)
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    for attempt in range(40):
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+            break
+        except OSError as error:
+            if error.errno != 98 or attempt == 39:
+                raise
+            time.sleep(0.25)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
@@ -84,6 +91,8 @@ def main():
                         help="Download from a loopback Range mirror, then test with it stopped")
     parser.add_argument("--isolated", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.download_first and args.linux_rootfs:
+        parser.error("--linux-rootfs uses an isolated netns; stage the signed cache there or run --download-first on the host")
     if not args.isolated and not args.linux_rootfs:
         return subprocess.call(["bwrap", "--unshare-net", "--die-with-parent", "--bind", "/", "/",
                                 "--dev-bind", "/dev", "/dev", "--proc", "/proc",
@@ -101,9 +110,17 @@ def main():
     ids = {e["id"] for e in entries}
     if len(ids) != len(entries) or not set(args.plugin or ()) <= ids:
         parser.error("duplicate or unknown plugin ID")
+    if args.linux_rootfs:
+        # bwrap cannot create a mount point inside its read-only root bind.
+        gewu_mount = args.linux_rootfs / "usr/bin/gewu"
+        gewu_mount.parent.mkdir(parents=True, exist_ok=True)
+        gewu_mount.touch(exist_ok=True)
     for entry in entries:
         if args.plugin and entry["id"] not in args.plugin:
             continue
+        if args.linux_rootfs:
+            (args.linux_rootfs / args.out.resolve().relative_to("/") / entry["id"]).mkdir(
+                parents=True, exist_ok=True)
         artifact = entry["packageSha256"]
         runtime = entry["runtimeSha256"]
         if not all(re.fullmatch(r"[0-9a-f]{64}", s) for s in (artifact, runtime)):

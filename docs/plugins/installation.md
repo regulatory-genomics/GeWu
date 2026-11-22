@@ -279,6 +279,7 @@ artifacts with a fresh HOME, hostile PATH entries for common package managers,
 and no network besides loopback. `--download-first` starts a loopback mirror
 that supports byte ranges, installs with no pre-filled artifact cache, then
 stops the mirror before the real-operation check. `--linux-rootfs` runs the same
-check inside an extracted clean userspace. This is a development/release gate,
+check inside an extracted clean userspace using the cached signed artifacts; it
+cannot combine with `--download-first` because the guest network is unshared. This is a development/release gate,
 not a user prerequisite. Verify macOS on actual hardware separately; a Linux
 pass is not evidence for macOS or a different libc/SELinux policy.
