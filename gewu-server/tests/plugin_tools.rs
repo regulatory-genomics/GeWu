@@ -58,6 +58,41 @@ async fn agent_and_ui_validate_against_the_same_catalog_and_reject_stale_generat
     ] {
         assert!(names.contains(&expected), "missing {expected} in {names:?}");
     }
+    let open = selected
+        .iter()
+        .find(|tool| tool.name() == "plugin_open")
+        .unwrap();
+    let schema = serde_json::to_value(open.schema()).unwrap();
+    let validator = gewu_server::plugins::package::validator(&schema).unwrap();
+    for binding in [
+        json!({"uri":"workspace:///demo.svg", "type":"inkscape.document"}),
+        json!({"uri":"workspace:///my%20figure.svg", "type":"inkscape.document", "revision":"v1"}),
+    ] {
+        assert!(validator.is_valid(&json!({"pluginId":"inkscape", "bindingResource":binding})));
+    }
+    for binding in [
+        json!({"uri":"file:///tmp/demo.svg", "type":"inkscape.document"}),
+        json!({"uri":"workspace:///demo.svg"}),
+        json!({"path":"demo.svg", "type":"inkscape.document"}),
+        json!({"uri":"workspace:///demo.svg", "type":"inkscape.document", "unknown":true}),
+    ] {
+        assert!(
+            !validator.is_valid(&json!({"pluginId":"inkscape", "bindingResource":binding})),
+            "advertised schema accepted {binding}"
+        );
+    }
+    assert!(validator.is_valid(&json!({"pluginId":"gewu-browser"})));
+    let resource_validator = gewu_server::plugins::package::wire_validator("ResourceRef").unwrap();
+    let error = gewu_server::plugins::package::validate(
+        &resource_validator,
+        &json!({"uri":"file:///tmp/demo.svg", "type":"inkscape.document"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("/uri") && error.contains("workspace:///"),
+        "unhelpful resource error: {error}"
+    );
     let echo = selected
         .iter()
         .find(|tool| tool.name().starts_with("plg_demo_echo_"))

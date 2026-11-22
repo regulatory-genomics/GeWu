@@ -160,6 +160,9 @@ impl PluginHost {
             .as_ref()
             .and_then(|path| path.parent().map(Path::to_path_buf));
         let installation_state = installation_root.as_ref().map(state::StateStore::new);
+        if let Some(store) = installation_state.as_ref() {
+            store.recover()?;
+        }
         let installation = installation_state
             .as_ref()
             .map(state::StateStore::load)
@@ -614,24 +617,10 @@ impl PluginHost {
                     &package::wire_validator("ResourceRef")?,
                     &serde_json::to_value(&resource)?,
                 )?;
-                // A plain relative path is accepted at the boundary; resources
-                // are canonicalised to workspace:/// so adapters see one form.
-                if !resource.uri.starts_with("workspace:///") {
-                    let relative = resource.uri.trim_start_matches('/');
-                    ensure!(!relative.is_empty(), "binding resource must not be empty");
-                    resource.uri = format!(
-                        "workspace:///{}",
-                        relative
-                            .split('/')
-                            .map(|segment| percent_encoding::utf8_percent_encode(
-                                segment,
-                                &URI_ESCAPE
-                            )
-                            .to_string())
-                            .collect::<Vec<_>>()
-                            .join("/")
-                    );
-                }
+                ensure!(
+                    resource.uri.starts_with("workspace:///"),
+                    "bindingResource.uri must reference an existing workspace path, e.g. workspace:///demo.svg"
+                );
                 let path = workspace_path(&root, &resource.uri).with_context(|| {
                     format!(
                         "cannot bind '{}' ({}) under workspace root {}",
@@ -657,6 +646,9 @@ impl PluginHost {
             }
             (Scope::Workspace, None) => None,
             (Scope::Session, None) => None,
+            (Scope::Resource, None) => bail!(
+                "resource-scoped plugin requires bindingResource with uri (workspace:///relative-path) and type (from plugin_list views.resourceTypes); create the file or directory first"
+            ),
             (scope, resource) => bail!(
                 "{} plugin does not accept bindingResource={}",
                 match scope {

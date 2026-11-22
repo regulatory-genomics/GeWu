@@ -7,6 +7,7 @@ The controller needs Python and bubblewrap; the GeWu process inherits no builder
 import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -85,20 +86,45 @@ def main():
     parser.add_argument("--public-key", required=True, type=Path)
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--plugin", action="append")
+    parser.add_argument("--require-plugins", help="Comma-separated IDs that must all be present")
+    parser.add_argument("--rounds", type=int, default=1)
+    parser.add_argument("--scenario", choices=("cold", "warm"), default="cold")
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--linux-rootfs", type=Path, help="Test inside an extracted clean Linux userspace")
     parser.add_argument("--download-first", action="store_true",
                         help="Download from a loopback Range mirror, then test with it stopped")
     parser.add_argument("--isolated", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.download_first and args.linux_rootfs:
-        parser.error("--linux-rootfs uses an isolated netns; stage the signed cache there or run --download-first on the host")
-    if not args.isolated and not args.linux_rootfs:
+    if args.rounds < 1:
+        parser.error("--rounds must be positive")
+    if args.scenario == "cold":
+        args.download_first = True
+    elif args.download_first:
+        parser.error("--download-first is only valid for the cold scenario")
+    if args.rounds > 1 and not args.isolated:
+        # Each round gets a new process, HOME and cache. Never mix a retry into
+        # an earlier round's evidence directory.
+        argv = [sys.executable, str(Path(__file__).resolve()), "--gewu", str(args.gewu),
+                "--mirror", str(args.mirror), "--public-key", str(args.public_key),
+                "--manifest", str(args.manifest), "--scenario", args.scenario,
+                "--rounds", "1"]
+        for plugin in args.plugin or ():
+            argv += ["--plugin", plugin]
+        if args.require_plugins:
+            argv += ["--require-plugins", args.require_plugins]
+        if args.linux_rootfs:
+            argv += ["--linux-rootfs", str(args.linux_rootfs)]
+        if args.download_first:
+            argv.append("--download-first")
+        env = dict(os.environ, GEWU_CLEAN_ROUND="1")
+        for number in range(1, args.rounds + 1):
+            subprocess.run(argv + ["--out", str(args.out / f"round-{number}")],
+                           check=True, env=env)
+        return 0
+    if not args.isolated and (not args.linux_rootfs or args.download_first):
         return subprocess.call(["bwrap", "--unshare-net", "--die-with-parent", "--bind", "/", "/",
                                 "--dev-bind", "/dev", "/dev", "--proc", "/proc",
                                 sys.executable, __file__, *sys.argv[1:], "--isolated"])
-    if args.linux_rootfs and args.isolated:
-        args.linux_rootfs = None
     if not args.linux_rootfs and [name for _, name in socket.if_nameindex()] != ["lo"]:
         parser.error("acceptance requires a network namespace with only loopback")
     entries = json.loads(args.manifest.read_text())
@@ -108,8 +134,11 @@ def main():
     ):
         parser.error("expected a nonempty list of plugin entries")
     ids = {e["id"] for e in entries}
+    required = set(filter(None, (args.require_plugins or "").split(",")))
     if len(ids) != len(entries) or not set(args.plugin or ()) <= ids:
         parser.error("duplicate or unknown plugin ID")
+    if not required <= ids:
+        parser.error(f"required plugins are missing from the manifest: {sorted(required - ids)}")
     if args.linux_rootfs:
         # bwrap cannot create a mount point inside its read-only root bind.
         gewu_mount = args.linux_rootfs / "usr/bin/gewu"
@@ -160,9 +189,10 @@ def main():
             def run(*argv):
                 command = [gewu, "plugin", *argv]
                 if args.linux_rootfs:
-                    command = ["/usr/bin/bwrap", "--unshare-net", "--die-with-parent",
+                    command = ["/usr/bin/bwrap", *([] if args.download_first else ["--unshare-net"]),
+                               "--die-with-parent",
                                "--ro-bind", str(args.linux_rootfs.resolve()), "/",
-                               "--dev", "/dev", "--proc", "/proc", "--bind", "/tmp", "/tmp",
+                               "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
                                "--tmpfs", "/dev/shm",
                                "--bind", str(out), str(out), "--ro-bind", gewu, "/usr/bin/gewu",
                                "--chdir", str(workspace), "/usr/bin/gewu", "plugin", *argv]

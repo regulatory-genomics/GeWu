@@ -108,6 +108,19 @@ impl Attempt {
 
     pub fn stage(&mut self, stage: &str) {
         self.report["stage"] = json!(stage);
+        self.report["progress"] = Value::Null;
+        self.save();
+    }
+
+    pub fn progress(&mut self, completed: u64, total: u64) {
+        if total == 0 {
+            self.report["progress"] = Value::Null;
+        } else {
+            self.report["progress"] = json!({
+                "completedBytes": completed.min(total),
+                "totalBytes": total,
+            });
+        }
         self.save();
     }
 

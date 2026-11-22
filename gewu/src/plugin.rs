@@ -173,6 +173,7 @@ pub async fn run(action: Action) -> Result<()> {
         .context("cannot determine home directory")?
         .join(".gewu/plugins");
     let state = StateStore::new(root.parent().context("plugin root has no parent")?);
+    state.recover()?;
     let select = |id: &str, version: Option<&str>| -> Result<package::Package> {
         let mut installed = package::installed(&root)?;
         if let Ok(saved) = state.load() {

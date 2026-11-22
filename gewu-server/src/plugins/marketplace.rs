@@ -41,6 +41,7 @@ pub enum MarketplaceError {
     Redirect,
     TooLarge,
     InvalidSignature,
+    ArtifactDigest,
     InvalidIndex(String),
     Cache(String),
     Expired,
@@ -54,6 +55,7 @@ impl fmt::Display for MarketplaceError {
             Self::Redirect => f.write_str("marketplace redirects are not allowed"),
             Self::TooLarge => f.write_str("marketplace response exceeds the configured limit"),
             Self::InvalidSignature => f.write_str("marketplace signature is invalid"),
+            Self::ArtifactDigest => f.write_str("artifact SHA-256 does not match its metadata"),
             Self::InvalidIndex(message) => write!(f, "marketplace index is invalid: {message}"),
             Self::Cache(message) => write!(f, "marketplace cache error: {message}"),
             Self::Expired => f.write_str("marketplace index has expired"),
@@ -105,7 +107,7 @@ impl MarketplaceClient {
         }
         report.stage("package_download");
         let package = self
-            .download_artifact(&release.package, &manager.artifacts)
+            .download_artifact(&release.package, &manager.artifacts, Some(&mut *report))
             .await?;
         let mut failures = Vec::new();
         for selection in selections {
@@ -121,8 +123,12 @@ impl MarketplaceClient {
                 let runtime_archive = if let RuntimeSelection::Bundled(runtime) = &selection {
                     report.stage("runtime_download");
                     Some(
-                        self.download_artifact(&runtime.artifact, &manager.artifacts)
-                            .await?,
+                        self.download_artifact(
+                            &runtime.artifact,
+                            &manager.artifacts,
+                            Some(&mut *report),
+                        )
+                        .await?,
                     )
                 } else {
                     None
@@ -395,6 +401,7 @@ impl MarketplaceClient {
         &self,
         artifact: &Artifact,
         store: &ArtifactStore,
+        report: Option<&mut Attempt>,
     ) -> Result<PathBuf, MarketplaceError> {
         let blob = store.blob_path(&artifact.sha256).map_err(cache_error)?;
         let partial = store.root().join("partial").join(&artifact.sha256);
@@ -438,7 +445,7 @@ impl MarketplaceClient {
             })?;
         if artifact.bytes > DOWNLOAD_CHUNK {
             return self
-                .download_ranged(&client, &url, artifact, store, &partial)
+                .download_ranged(&client, &url, artifact, store, &partial, report)
                 .await;
         }
         let bytes = fetch_bounded(&client, &url, limit).await?;
@@ -448,7 +455,7 @@ impl MarketplaceClient {
             ));
         }
         if super::artifacts::sha256_bytes(&bytes) != artifact.sha256 {
-            return Err(MarketplaceError::InvalidSignature);
+            return Err(MarketplaceError::ArtifactDigest);
         }
         store
             .put_bytes(&bytes, &artifact.sha256)
@@ -462,6 +469,7 @@ impl MarketplaceClient {
         artifact: &Artifact,
         store: &ArtifactStore,
         partial: &Path,
+        mut report: Option<&mut Attempt>,
     ) -> Result<PathBuf, MarketplaceError> {
         let receipt = partial.with_extension("json");
         let mut file = OpenOptions::new()
@@ -491,9 +499,18 @@ impl MarketplaceClient {
                 if attempt > 0 {
                     tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))).await;
                 }
-                match fetch_chunk(client, url, offset, end, artifact.bytes, &mut file).await {
-                    Ok(next) => {
-                        offset = next;
+                match fetch_chunk(
+                    client,
+                    url,
+                    end,
+                    artifact.bytes,
+                    &partial.with_extension("json"),
+                    &mut file,
+                    &mut offset,
+                )
+                .await
+                {
+                    Ok(()) => {
                         last_error = None;
                         break;
                     }
@@ -509,12 +526,15 @@ impl MarketplaceClient {
                 &receipt,
                 &serde_json::to_vec(&(url, artifact.bytes, offset)).map_err(cache_error)?,
             )?;
+            if let Some(report) = report.as_deref_mut() {
+                report.progress(offset, artifact.bytes);
+            }
         }
         drop(file);
         if super::artifacts::sha256_file(partial).map_err(cache_error)? != artifact.sha256 {
             let _ = fs::remove_file(partial);
             let _ = fs::remove_file(&receipt);
-            return Err(MarketplaceError::InvalidSignature);
+            return Err(MarketplaceError::ArtifactDigest);
         }
         let blob = store.blob_path(&artifact.sha256).map_err(cache_error)?;
         fs::create_dir_all(blob.parent().unwrap()).map_err(cache_error)?;
@@ -654,12 +674,14 @@ fn retryable(error: &MarketplaceError) -> bool {
 async fn fetch_chunk(
     client: &reqwest::Client,
     url: &str,
-    start: u64,
     end: u64,
     total: u64,
+    receipt: &Path,
     file: &mut File,
-) -> Result<u64, MarketplaceError> {
+    offset: &mut u64,
+) -> Result<(), MarketplaceError> {
     use std::io::{Seek, SeekFrom, Write};
+    let start = *offset;
     file.set_len(start)
         .map_err(|error| MarketplaceError::Cache(error.to_string()))?;
     file.seek(SeekFrom::Start(start))
@@ -673,6 +695,14 @@ async fn fetch_chunk(
         .map_err(|error| MarketplaceError::Network(format!("chunk at {start}: {error}")))?;
     let (start, expected) = match response.status() {
         reqwest::StatusCode::OK => {
+            // The server ignored Range. Persist the restart before reading the
+            // body so a short response cannot leave a later retry at the old
+            // offset.
+            *offset = 0;
+            atomic_bytes(
+                receipt,
+                &serde_json::to_vec(&(url, total, 0u64)).map_err(cache_error)?,
+            )?;
             file.set_len(0).map_err(cache_error)?;
             file.seek(SeekFrom::Start(0)).map_err(cache_error)?;
             (0, total)
@@ -712,7 +742,8 @@ async fn fetch_chunk(
             "chunk at {start} ended after {received} of {expected} bytes"
         )));
     }
-    Ok(start + received)
+    *offset = start + received;
+    Ok(())
 }
 
 async fn fetch_bounded(
