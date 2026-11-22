@@ -1,0 +1,5 @@
+{
+[]
+{"id":"r1","op":"launch_shell","params":{}}
+{"id":"r1","op":"activate","params":{"apiVersion":"gewu.plugin/v2","instanceId":"i1","generation":1,"workspaceId":"w1","workspaceRoot":"/example","settings":{}}}
+{"id":"r1","op":"cancel","params":{"callId":"c1","ignored":true}}

@@ -52,6 +52,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod plugin;
+pub mod release;
+
+pub use release::{
+    Artifact, ExecutableHint, GeWuCompatibility, MarketplaceIndex, MarketplaceSignature, ProbeSpec,
+    Provenance, Release, ReleaseSelectionError, Revocation, RuntimeManifest, RuntimePlan,
+    RuntimeProvider, RuntimeRef, SignedMarketplaceIndex, Target,
+};
+
 pub use gewu_core::question::{Question, QuestionOption};
 pub use gewu_core::types::{
     AgentEvent, ContentPart, FunctionCall, Message, TokenUsage, ToolCall, summarize_tool_input,

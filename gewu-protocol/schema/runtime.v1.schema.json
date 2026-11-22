@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:gewu:runtime:v1",
+  "$ref": "#/$defs/RuntimeManifest",
+  "$defs": {
+    "Version": {"const": "gewu.runtime/v1"},
+    "Id": {"type": "string", "pattern": "^[a-z][a-z0-9.-]{0,127}$"},
+    "Semver": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"},
+    "Target": {"type": "object", "additionalProperties": false, "required": ["os", "arch"], "properties": {
+      "os": {"enum": ["linux", "macos"]},
+      "arch": {"enum": ["x86_64", "aarch64"]},
+      "libc": {"type": "string", "minLength": 1}
+    }},
+    "RuntimeManifest": {"type": "object", "additionalProperties": false, "required": ["schemaVersion", "id", "version", "plugin", "target", "launcher", "probe", "capabilities"], "properties": {
+      "schemaVersion": {"$ref": "#/$defs/Version"},
+      "id": {"$ref": "#/$defs/Id"},
+      "version": {"$ref": "#/$defs/Semver"},
+      "plugin": {"$ref": "#/$defs/Id"},
+      "target": {"$ref": "#/$defs/Target"},
+      "launcher": {"type": "string", "pattern": "^[^/\\\\\\u0000]+(?:/[^/\\\\\\u0000]+)*$"},
+      "probe": {"type": "string", "pattern": "^[^/\\\\\\u0000]+(?:/[^/\\\\\\u0000]+)*$"},
+      "capabilities": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+    }}
+  }
+}

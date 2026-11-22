@@ -1,0 +1,4 @@
+{"id":"r1","op":"resolve","params":{"uri":"workspace:///intro.png","type":"demo.image"}}
+{"type":"result","id":"r1","result":{"kind":"file","path":"intro.png","mimeType":"image/png","revision":"rev1"}}
+{"id":"r2","op":"resolve","params":{"uri":"plugin://demo/previews/intro","type":"demo.image"}}
+{"type":"result","id":"r2","result":{"kind":"service","serviceId":"app","path":"/api/scenes/intro","mimeType":"image/png","revision":"rev1"}}
