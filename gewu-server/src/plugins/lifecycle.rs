@@ -12,7 +12,7 @@ use std::{
 };
 
 use super::{
-    artifacts::{ArtifactStore, sha256_file},
+    artifacts::ArtifactStore,
     diagnostics::Attempt,
     package::Package,
     providers,
@@ -189,7 +189,6 @@ impl InstallManager {
             &release.package.sha256,
             release.package.bytes,
         )?;
-        let package_sha256 = sha256_file(&package_blob)?;
         let generation_id = match &selection {
             RuntimeSelection::Bundled(runtime)
                 if matches!(runtime.profile.as_deref(), Some("pdf" | "tex")) =>
@@ -310,7 +309,7 @@ impl InstallManager {
                     release.plugin
                 )
             })),
-            package_sha256,
+            package_sha256: release.package.sha256.clone(),
             runtime_sha256: match &selection {
                 RuntimeSelection::Bundled(r) => Some(r.artifact.sha256.clone()),
                 _ => None,

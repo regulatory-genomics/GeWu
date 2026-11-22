@@ -63,6 +63,9 @@ impl ArtifactStore {
         );
 
         let destination = self.blob_path(expected_sha256)?;
+        if source == destination {
+            return Ok(destination);
+        }
         if destination.exists() {
             ensure!(
                 sha256_file(&destination)? == expected_sha256,
