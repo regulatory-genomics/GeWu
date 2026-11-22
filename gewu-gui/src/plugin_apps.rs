@@ -317,10 +317,9 @@ pub(crate) async fn dispatch(
     let Ok(origin) = reqwest::Url::parse(&state.server_http).map(|u| u.origin()) else {
         return StatusCode::BAD_GATEWAY.into_response();
     };
-    let mut current = url.clone();
     let mut upstream = state
         .http_client
-        .request(method.clone(), current.clone())
+        .request(method.clone(), url.clone())
         .header("x-gewu-app-key", &s.key)
         .header("x-gewu-parent-origin", &config.parent)
         .header("x-gewu-app-origin", &s.origin);
@@ -346,22 +345,20 @@ pub(crate) async fn dispatch(
             request.into_body().into_data_stream(),
         ));
     }
-    let mut reply = match upstream.send().await {
+    let reply = match upstream.send().await {
         Ok(r) => r,
         Err(_) => {
             return (StatusCode::BAD_GATEWAY, "the GeWu server did not answer").into_response();
         }
     };
-    for _ in 0..3 {
-        if !reply.status().is_redirection() || reply.status() == StatusCode::NOT_MODIFIED {
-            break;
-        }
+    let mut response = Response::builder().status(reply.status());
+    if reply.status().is_redirection() && reply.status() != StatusCode::NOT_MODIFIED {
         let Some(next) = reply
             .headers()
             .get(header::LOCATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| {
-                reqwest::Url::parse(&current)
+                reqwest::Url::parse(&url)
                     .ok()
                     .and_then(|u| u.join(v).ok())
             })
@@ -372,37 +369,19 @@ pub(crate) async fn dispatch(
             )
                 .into_response();
         };
-        if next.origin() != origin || !next.path().starts_with(&s.relay) {
+        if next.origin() != origin || !next.path().strip_prefix(&s.relay).is_some_and(|path| path.starts_with('/')) {
             return (
                 StatusCode::BAD_GATEWAY,
                 "the GeWu server redirects outside this view",
             )
                 .into_response();
         }
-        current = next.to_string();
-        reply = match state
-            .http_client
-            .get(current.clone())
-            .header("x-gewu-app-key", &s.key)
-            .header("x-gewu-parent-origin", &config.parent)
-            .header("x-gewu-app-origin", &s.origin)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    "the GeWu server did not answer its redirect",
-                )
-                    .into_response();
-            }
-        };
+        let path = next.path().strip_prefix(&s.relay).unwrap();
+        let location = format!("{path}{}{}",
+            next.query().map(|query| format!("?{query}")).unwrap_or_default(),
+            next.fragment().map(|fragment| format!("#{fragment}")).unwrap_or_default());
+        response = response.header(header::LOCATION, location);
     }
-    if reply.status().is_redirection() && reply.status() != StatusCode::NOT_MODIFIED {
-        return (StatusCode::BAD_GATEWAY, "too many GeWu server redirects").into_response();
-    }
-    let mut response = Response::builder().status(reply.status());
     for name in [
         "content-type",
         "content-length",

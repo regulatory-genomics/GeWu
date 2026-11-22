@@ -191,7 +191,7 @@ async fn relay(
     else {
         return StatusCode::BAD_GATEWAY.into_response();
     };
-    let Ok(mut url) = reqwest::Url::parse(&format!(
+    let Ok(url) = reqwest::Url::parse(&format!(
         "{}{}",
         grant.service.base_url.trim_end_matches('/'),
         raw
@@ -249,16 +249,14 @@ async fn relay(
     if method != Method::GET && method != Method::HEAD {
         request = request.body(reqwest::Body::wrap_stream(body.into_data_stream()));
     }
-    let mut reply = match request.send().await {
+    let reply = match request.send().await {
         Ok(r) => r,
         Err(_) => {
             return (StatusCode::BAD_GATEWAY, "the application did not answer").into_response();
         }
     };
-    for _ in 0..3 {
-        if !reply.status().is_redirection() || reply.status() == StatusCode::NOT_MODIFIED {
-            break;
-        }
+    let mut response = Response::builder().status(reply.status());
+    if reply.status().is_redirection() && reply.status() != StatusCode::NOT_MODIFIED {
         let Some(next) = reply
             .headers()
             .get(header::LOCATION)
@@ -278,25 +276,17 @@ async fn relay(
             )
                 .into_response();
         }
-        if !allowed(&grant.service, next.path(), &Method::GET) {
+        let next_method = match reply.status().as_u16() {
+            301 | 302 if method == Method::POST => &Method::GET,
+            303 if method != Method::HEAD => &Method::GET,
+            _ => &method,
+        };
+        if !allowed(&grant.service, next.path(), next_method) {
             return StatusCode::FORBIDDEN.into_response();
         }
-        url = next;
-        reply = match client.get(url.clone()).send().await {
-            Ok(r) => r,
-            Err(_) => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    "the application did not answer its redirect",
-                )
-                    .into_response();
-            }
-        };
+        // The browser can replay 307/308 bodies; each hop re-enters this authenticated relay.
+        response = response.header(header::LOCATION, format!("{prefix}{}", &next[url::Position::BeforePath..]));
     }
-    if reply.status().is_redirection() && reply.status() != StatusCode::NOT_MODIFIED {
-        return (StatusCode::BAD_GATEWAY, "too many application redirects").into_response();
-    }
-    let mut response = Response::builder().status(reply.status());
     for name in [
         "content-type",
         "content-length",

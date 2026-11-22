@@ -31,12 +31,13 @@ for (const appOrigins of [true, 'default']) test(`native webapp works with ${app
     expect(new URL(frame.url()).origin).not.toBe(new URL(page.url()).origin);
     const result=await frame.evaluate(async()=>{
       const saved=await fetch('/native/echo?file=scene%2Fintro.html',{method:'POST',headers:{'Content-Type':'application/json','If-Match':'"previous"'},body:JSON.stringify({value:'webapp'})});
+      const redirected=await fetch('/native/redirect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:'redirected webapp'})});
       const media=await fetch('/native/range',{headers:{Range:'bytes=1-3'}});
       const conditional=await fetch('/native/conditional',{headers:{'If-None-Match':'"current"'}});
       const stream=await fetch('/native/events');const reader=stream.body.getReader();const event=await reader.read();await reader.cancel();
-      return {saved:await saved.text(),etag:saved.headers.get('etag'),media:await media.text(),status:media.status,conditional:conditional.status,event:new TextDecoder().decode(event.value),secret:document.cookie};
+      return {saved:await saved.text(),redirected:await redirected.text(),redirectStatus:redirected.status,etag:saved.headers.get('etag'),media:await media.text(),status:media.status,conditional:conditional.status,event:new TextDecoder().decode(event.value),secret:document.cookie};
     });
-    expect(result).toMatchObject({saved:'Native service: webapp',etag:'"next"',media:'bcd',status:206,conditional:304,secret:''});
+    expect(result).toMatchObject({saved:'Native service: webapp',redirected:'Native service: redirected webapp',redirectStatus:200,etag:'"next"',media:'bcd',status:206,conditional:304,secret:''});
     expect(result.event).toContain('first');
     const appUrl=frame.url();
     await page.getByRole('button',{name:'Close',exact:true}).click();

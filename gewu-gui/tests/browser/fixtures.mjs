@@ -66,6 +66,10 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
       res.writeHead(200,{'content-type':'text/plain','set-cookie':'private=1','etag':'"next"'}).end(`Native service: ${JSON.parse(body).value}`);
       return;
     }
+    if (appOrigins && pathname === '/native/redirect') {
+      if (req.headers['x-demo-key'] !== 'native-secret') {res.writeHead(401).end();return;}
+      res.writeHead(307, {location:'/native/echo?redirected=1'}).end();return;
+    }
     if (req.url !== '/v1/chat/completions') {res.writeHead(404).end();return;}
     const turn=JSON.parse(body);
     requests.push(turn);

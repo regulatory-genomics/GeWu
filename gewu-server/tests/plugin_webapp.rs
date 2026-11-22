@@ -2,7 +2,7 @@ use axum::{
     Router,
     body::Body,
     extract::OriginalUri,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
     routing::any,
 };
@@ -16,13 +16,28 @@ async fn webapp_relays_query_and_versions_without_browser_credentials_and_revoke
     let native = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", native.local_addr().unwrap());
     let service = Router::new().fallback(any(
-        |OriginalUri(uri): OriginalUri, headers: HeaderMap, body: Body| async move {
+        |OriginalUri(uri): OriginalUri, method: Method, headers: HeaderMap, body: Body| async move {
             assert!(!headers.contains_key("cookie"));
             assert!(!headers.contains_key("authorization"));
+            if headers.get("x-demo-key").is_none_or(|value| value != "native-secret") {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
             assert_eq!(headers["x-demo-key"], "native-secret");
             assert_eq!(headers["if-match"], "\"old\"");
             assert_eq!(headers["sec-fetch-site"], "same-origin");
             let bytes = axum::body::to_bytes(body, 1024).await.unwrap();
+            if uri.path() == "/native/redirect" {
+                return (StatusCode::TEMPORARY_REDIRECT, [("location", "/native/final?next=1")]).into_response();
+            }
+            if uri.path() == "/native/outside" {
+                return (StatusCode::FOUND, [("location", "http://example.invalid/native/final")]).into_response();
+            }
+            if uri.path() == "/native/forbidden" {
+                return (StatusCode::FOUND, [("location", "/private")]).into_response();
+            }
+            if uri.path() == "/native/final" {
+                return format!("{method} {uri}:{}", String::from_utf8_lossy(&bytes)).into_response();
+            }
             (
                 [("etag", "\"new\"")],
                 format!("{uri}:{}", String::from_utf8_lossy(&bytes)),
@@ -115,6 +130,23 @@ async fn webapp_relays_query_and_versions_without_browser_credentials_and_revoke
         reply.text().await.unwrap(),
         "/native/files/scene%2Fintro.html?optional=1&x=a%2Bb:updated"
     );
+    let relay = bound["app"]["relayPath"].as_str().unwrap();
+    for method in [Method::GET, Method::POST, Method::PUT] {
+        let response = client.request(method.clone(), format!("{base}{relay}/native/redirect"))
+            .header("x-gewu-app-key", bound["app"]["relayKey"].as_str().unwrap())
+            .header("if-match", "\"old\"").header("sec-fetch-site", "same-origin")
+            .body("retained").send().await.unwrap();
+        assert_eq!(response.status(), 200, "authenticated redirect failed for {method}");
+        let expected_body = if method == Method::GET { "" } else { "retained" };
+        assert_eq!(response.text().await.unwrap(), format!("{method} /native/final?next=1:{expected_body}"));
+    }
+    for (path, expected) in [("outside", 502), ("forbidden", 403)] {
+        let response = client.get(format!("{base}{relay}/native/{path}"))
+            .header("x-gewu-app-key", bound["app"]["relayKey"].as_str().unwrap())
+            .header("if-match", "\"old\"").header("sec-fetch-site", "same-origin")
+            .send().await.unwrap();
+        assert_eq!(response.status(), expected);
+    }
     let view = bound["viewId"].as_str().unwrap().to_string();
     host.action(
         "w",
