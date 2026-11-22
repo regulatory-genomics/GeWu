@@ -2,7 +2,7 @@ import {once} from 'node:events';
 import {createServer as createHttp, request as httpRequest} from 'node:http';
 import {createServer as createTcp} from 'node:net';
 import {spawn} from 'node:child_process';
-import {cp, mkdtemp, readFile, mkdir, rm, writeFile} from 'node:fs/promises';
+import {cp, mkdtemp, readFile, mkdir, rm, symlink, writeFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {join} from 'node:path';
 
@@ -14,15 +14,21 @@ async function port() {
   const {port}=server.address(); server.close(); await once(server,'close'); return port;
 }
 
-export async function startFixture({packagePath, settings = {}, useDemo = !packagePath, disabled = false, marketplace, appOrigins = false, respond} = {}) {
+export async function startFixture({packagePath, settings = {}, useDemo = !packagePath, disabled = false, marketplace, appOrigins = false, respond, installed} = {}) {
   const temp=await mkdtemp(join(process.env.GEWU_TEST_TMP ?? process.env.TMPDIR ?? '/tmp','gewu-addon-'));
   const root=join(temp,'workspace');
   const other=join(temp,'other');
-  const pkg=join(temp,'plugin');
+  const pkg=installed?.package ?? join(temp,'plugin');
   for (const dir of [root,other]) { await mkdir(dir); await writeFile(join(dir,'example.txt'),'original text'); }
-  await cp(packagePath ?? join(repo,'gewu-server/tests/fixtures/plugin-adapter'),pkg,{recursive:true});
+  if (installed) {
+    // The host resolves the active generation and runtime from ~/.gewu, so use
+    // the installed state instead of a source package or a PATH interpreter.
+    await symlink(join(installed.home,'.gewu'),join(temp,'.gewu'),'dir');
+  } else {
+    await cp(packagePath ?? join(repo,'gewu-server/tests/fixtures/plugin-adapter'),pkg,{recursive:true});
+  }
   const manifest=JSON.parse(await readFile(join(pkg,'plugin.json'),'utf8'));
-  if (useDemo) await cp(join(repo,'sdk/python/gewu_plugin.py'),join(pkg,'gewu_plugin.py'));
+  if (useDemo && !installed) await cp(join(repo,'sdk/python/gewu_plugin.py'),join(pkg,'gewu_plugin.py'));
   const requests=[];
   let nativeStream;
   const provider=createHttp(async (req,res)=>{
@@ -104,7 +110,7 @@ export async function startFixture({packagePath, settings = {}, useDemo = !packa
   const config=join(temp,'config.json');
   await writeFile(config,JSON.stringify({
     model:'local/fixture',endpoints:{local:{base_url:`${origin}/v1`,api_key:'test-only',models:{fixture:{provider:'openai-compatible'}}}},
-    workspaces:{other},plugins:marketplace ? {} : {[manifest.id]:{package:pkg,enabled:!disabled,settings:useDemo ? {service:origin} : settings}},
+    workspaces:{other},plugins:marketplace ? {} : {[manifest.id]:{package:installed ? '' : pkg,enabled:!disabled,settings:useDemo && !installed ? {service:origin} : settings}},
   }));
   const [socket,tcp,http,gui]=await Promise.all([port(),port(),port(),port()]);
   let output='';
