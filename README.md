@@ -107,3 +107,27 @@ the left sidebar. Each session remembers its root across restarts; switching
 is rejected while a turn is running.
 
 Agent state is stored in `~/.gewu/gewu.db` (override with `--db-path`).
+
+### Application plugins
+
+Open **PREVIEW** in the right sidebar to manage application plugins, view their
+panels and browse the signed Marketplace. The build agent can discover and call
+opened applications; the plan profile keeps its existing tool policy.
+
+See [installation](docs/plugins/installation.md), the
+[adapter protocol](docs/plugins/protocol-v1.md) and
+[authoring guide](docs/plugins/authoring.md).
+
+## Verify
+
+Use Rust 1.96.0, Python 3.11+ with `jsonschema`, Node.js and Playwright Chromium:
+
+```sh
+npm --prefix gewu-gui/tests/browser ci
+npm --prefix gewu-gui/tests/browser exec -- playwright install chromium
+RUSTUP_TOOLCHAIN=1.96.0 bash scripts/check-plugin-host.sh --contracts --browser
+```
+
+This runs workspace tests, adapter/package contracts and fixture browser tests.
+Real application packages and native runtimes use the separate
+[application gate](docs/plugins/compatibility.md).
