@@ -196,6 +196,57 @@ async fn list_and_load_sessions() {
 }
 
 #[tokio::test]
+async fn websocket_loads_large_history_without_closing_the_admin_client() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+        let request = ws.next().await.unwrap().unwrap().into_text().unwrap();
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        let messages = serde_json::json!([
+            {"role": "user", "content": [{"type": "text", "text": "x".repeat(17 * 1024 * 1024)}]}
+        ]);
+        ws.send(WsMessage::text(fake::session_line(
+            &request["id"].to_string(),
+            "large",
+            messages,
+        )))
+        .await
+        .unwrap();
+        let ping = ws.next().await.unwrap().unwrap().into_text().unwrap();
+        let ping: serde_json::Value = serde_json::from_str(&ping).unwrap();
+        ws.send(WsMessage::text(fake::pong_line(&ping["id"].to_string())))
+            .await
+            .unwrap();
+    });
+    let client = Client::websocket(&format!("ws://127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let messages = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.get_session("large"),
+    )
+    .await
+    .unwrap()
+    .expect("history below the 64MB message cap must load");
+    assert_eq!(messages.len(), 1);
+    let loaded = serde_json::to_value(&messages[0]).unwrap();
+    assert_eq!(
+        loaded["content"][0]["text"].as_str().unwrap().len(),
+        17 * 1024 * 1024
+    );
+    client
+        .ping()
+        .await
+        .expect("loading history must not poison subsequent GUI requests");
+    client.close().await;
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn ask_streams_events_then_result() {
     let server = fake::spawn(|| {
         VecDeque::from([Step::Reply(vec![
