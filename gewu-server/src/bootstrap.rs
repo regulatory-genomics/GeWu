@@ -108,6 +108,7 @@ pub struct Bootstrap {
     pub provider: Arc<dyn LlmProvider>,
     pub pool: SqlitePool,
     pub mcp_tools: Vec<Arc<dyn gewu_core::traits::Tool>>,
+    pub plugins: Arc<crate::plugins::PluginHost>,
     pub skills: Vec<gewu_tools::SkillInfo>,
     pub log_writer: Option<RequestLog>,
     pub model: String,
@@ -494,6 +495,10 @@ pub fn open_request_log(file_config: &crate::config::Config) -> Result<Option<Re
 
 /// Perform the full startup sequence shared by `run` and `serve`.
 pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
+    bootstrap_with_host_version(args, env!("CARGO_PKG_VERSION")).await
+}
+
+pub async fn bootstrap_with_host_version(args: &CommonArgs, version: &str) -> Result<Bootstrap> {
     init_tracing(&args.log_level)?;
 
     let loaded_config = LoadedConfig::load(args.llm_config.as_deref())?;
@@ -503,6 +508,12 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
         info!("No config file found");
     }
     let file_config = &loaded_config.config;
+    let plugins = crate::plugins::PluginHost::from_config(
+        &file_config.plugins,
+        loaded_config.path.as_deref(),
+        file_config.plugin_host.clone(),
+    )?
+    .with_host_version(version);
     let startup_directory = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     let workspace_roots = Arc::new(crate::config::resolve_workspace_roots(
         file_config,
@@ -591,8 +602,9 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
 
     Ok(Bootstrap {
         provider,
-        pool,
+        pool: pool.clone(),
         mcp_tools,
+        plugins: Arc::new(plugins.with_store(pool)),
         skills,
         log_writer,
         model,

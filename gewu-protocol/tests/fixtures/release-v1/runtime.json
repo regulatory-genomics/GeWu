@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "gewu.runtime/v1",
+  "id": "paper-runtime",
+  "version": "0.2.0",
+  "plugin": "paper",
+  "target": {"os": "linux", "arch": "x86_64", "libc": "glibc-2.28"},
+  "launcher": "bin/launch",
+  "probe": "bin/probe",
+  "capabilities": ["html", "docx", "pdf"]
+}

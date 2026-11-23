@@ -205,3 +205,4 @@ gewu-gui
 Conversation state lives in `gewu-client::session`, which replays history
 and applies streamed events. Rendering stays in Rust; the browser script only
 swaps in HTML snapshots and appends text deltas.
+The **Applications** panel shows configured plugins, running calls, and views. The GUI can run on a different machine from the agent server; set `--server-http` as well as `--server` so resource tickets can reach the backend. See [plugin installation](../docs/plugins/installation.md).

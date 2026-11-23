@@ -364,6 +364,26 @@ impl Client {
         }
     }
 
+    pub async fn plugin(
+        &self,
+        workspace: String,
+        action: gewu_protocol::plugin::HostAction,
+    ) -> Result<serde_json::Value> {
+        let request = ClientRequest {
+            id: self.next_correlation_id().into(),
+            op: gewu_protocol::Op::Plugin(action),
+            session_id: None,
+            agent: None,
+            workspace: Some(workspace),
+            attachments: Vec::new(),
+        };
+        match self.request(request).await? {
+            ServerMessage::Plugin { result, .. } => Ok(result),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "plugin")),
+        }
+    }
+
     pub async fn list_files(&self, path: impl Into<String>) -> Result<Vec<FileEntry>> {
         let path = path.into();
         let request = ClientRequest::list_files(self.next_correlation_id(), path.clone());

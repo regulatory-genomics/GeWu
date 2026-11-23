@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:gewu:application-context:v1",
+  "$ref": "#/$defs/Snapshot",
+  "$defs": {
+    "Snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "contextRef", "summary"],
+      "properties": {
+        "schema": { "const": "gewu.application-context/1" },
+        "contextRef": { "$ref": "#/$defs/Ref" },
+        "summary": {
+          "type": "object",
+          "description": "Provider-owned, bounded description of the current work state."
+        },
+        "coverage": { "$ref": "#/$defs/Coverage" },
+        "readMore": {
+          "type": "array",
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/ReadMore" }
+        }
+      }
+    },
+    "Ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "type"],
+      "properties": {
+        "uri": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "type": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,127}$" },
+        "revision": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "mimeType": { "type": "string", "maxLength": 256 }
+      }
+    },
+    "Coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["complete"],
+      "properties": {
+        "complete": { "type": "boolean" },
+        "total": { "type": "integer", "minimum": 0 },
+        "omitted": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "ReadMore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool"],
+      "properties": {
+        "tool": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "args": { "type": "object" }
+      }
+    }
+  }
+}

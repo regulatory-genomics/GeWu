@@ -2,6 +2,7 @@ pub mod bootstrap;
 pub mod cli;
 pub mod config;
 pub mod mcp_loader;
+pub use gewu_server::plugins;
 mod memory_view;
 pub mod registry;
 pub mod server;
@@ -161,6 +162,10 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str, inbox: &Steering)
                         AgentEvent::Error { error } => {
                             stop_spinner(&mut spinner_active, is_tty)?;
                             error!("Error from agent: {}", error);
+                        }
+                        AgentEvent::Cancelled { reason } => {
+                            stop_spinner(&mut spinner_active, is_tty)?;
+                            println!("\n{DIM}[cancelled] {reason}{RESET}");
                         }
                     },
                     Err(e) => error!("Stream error: {}", e),

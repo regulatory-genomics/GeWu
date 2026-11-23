@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:gewu:release-descriptor:v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["plugin", "version", "packageFiles"],
+  "properties": {
+    "plugin": {"type": "string", "pattern": "^[a-z][a-z0-9.-]{0,127}$"},
+    "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"},
+    "packageFiles": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "packageDirs": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "sdkFile": {"type": "string", "minLength": 1},
+    "sdkDestination": {"type": "string", "minLength": 1},
+    "buildInputs": {"type": "array", "items": {"type": "string", "minLength": 1}}
+  }
+}

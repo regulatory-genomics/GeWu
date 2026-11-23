@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:gewu:release:v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "releaseId", "plugin", "version", "channel", "gewu", "package", "runtimes", "capabilities", "permissions", "provenance"],
+  "properties": {
+    "schemaVersion": {"const": "gewu.release/v3"},
+    "releaseId": {"$ref": "urn:gewu:release:v2#/$defs/Id"},
+    "plugin": {"$ref": "urn:gewu:release:v2#/$defs/Id"},
+    "version": {"$ref": "urn:gewu:release:v2#/$defs/Semver"},
+    "channel": {"enum": ["stable", "beta", "nightly"]},
+    "gewu": {"$ref": "urn:gewu:release:v2#/$defs/Compatibility"},
+    "requiredFeatures": {"type": "array", "uniqueItems": true, "items": {"enum": ["runtime-v2", "offline-pixi-pack", "webapp-origin"]}},
+    "package": {"$ref": "urn:gewu:release:v2#/$defs/Artifact"},
+    "runtimes": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/RuntimeRef"}},
+    "capabilities": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "permissions": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "provenance": {"$ref": "urn:gewu:release:v2#/$defs/Provenance"},
+    "releaseNotes": {"type": "string"},
+    "revocation": {"$ref": "urn:gewu:release:v2#/$defs/Revocation"}
+  },
+  "$defs": {
+    "RuntimeRef": {"type": "object", "additionalProperties": false,
+      "required": ["id", "version", "target", "artifact", "manifest", "runtimeSchema", "profile", "requirements", "unpackedBytes", "installedBytesUpperBound"],
+      "properties": {
+        "id": {"$ref": "urn:gewu:release:v2#/$defs/Id"},
+        "version": {"$ref": "urn:gewu:release:v2#/$defs/Semver"},
+        "target": {"$ref": "urn:gewu:release:v2#/$defs/Target"},
+        "artifact": {"$ref": "urn:gewu:release:v2#/$defs/Artifact"},
+        "manifest": {"$ref": "urn:gewu:release:v2#/$defs/Artifact"},
+        "runtimeSchema": {"const": "gewu.runtime/v2"},
+        "profile": {"enum": ["core", "pdf", "tex"]},
+        "requirements": {"type": "object", "additionalProperties": false, "minProperties": 1, "maxProperties": 1, "properties": {
+          "minimumGlibc": {"$ref": "#/$defs/SystemVersion"}, "minimumOsVersion": {"$ref": "#/$defs/SystemVersion"}
+        }},
+        "unpackedBytes": {"type": "integer", "minimum": 1},
+        "installedBytesUpperBound": {"type": "integer", "minimum": 1}
+      },
+      "if": {"properties": {"target": {"properties": {"os": {"const": "linux"}}}}},
+      "then": {"properties": {"target": {"required": ["libc"], "properties": {"libc": {"const": "glibc"}}}, "requirements": {"required": ["minimumGlibc"]}}},
+      "else": {"properties": {"target": {"not": {"required": ["libc"]}}, "requirements": {"required": ["minimumOsVersion"]}}}
+    },
+    "SystemVersion": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+(\\.[0-9]+)?$"}
+  }
+}

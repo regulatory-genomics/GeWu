@@ -61,7 +61,11 @@ pub async fn run(args: UpArgs) -> Result<()> {
 
     // Resolves config, provider, database, and MCP tools; also initializes
     // tracing from --log-level.
-    let boot = gewu_server::bootstrap::bootstrap(&args.common).await?;
+    let boot = gewu_server::bootstrap::bootstrap_with_host_version(
+        &args.common,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await?;
     info!(
         "Starting gewu (agent: {}, model: {}, provider: {})",
         args.common.agent, boot.model, boot.provider_name
@@ -94,6 +98,8 @@ pub async fn run(args: UpArgs) -> Result<()> {
         port: args.gui_port,
         server: server_url.clone(),
         server_http: format!("http://{}:{}", args.host, http_port),
+        public_origin: std::env::var("GEWU_GUI_PUBLIC_ORIGIN").ok(),
+        plugin_app_origin_template: std::env::var("GEWU_PLUGIN_APP_ORIGIN_TEMPLATE").ok(),
         token: args.gui_token.clone(),
         server_token: token.clone(),
         allow_anonymous: args.allow_anonymous,

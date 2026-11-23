@@ -1,0 +1,2 @@
+{"id":"r9","op":"deactivate","params":{"reason":"closed"}}
+{"type":"result","id":"r9","result":{"stopped":true}}
