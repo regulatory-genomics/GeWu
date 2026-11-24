@@ -311,6 +311,7 @@ impl PluginHost {
                 anyhow::bail!("agent results require persistent session storage")
             }
             HostAction::List => {
+                self.reconcile_installed();
                 let mut plugins = self.catalog_for(Some(workspace));
                 for plugin in &mut plugins {
                     if let Some(id) = plugin["id"].as_str() {

@@ -431,7 +431,46 @@ impl PluginHost {
     }
 
     pub fn catalog(&self) -> Vec<Value> {
+        self.reconcile_installed();
         self.catalog_for(None)
+    }
+
+    /// Pick up generations that `gewu plugin install` wrote while this host was
+    /// running. The Plugins panel and `plugin_list` call this before reading the
+    /// catalog, so a CLI install no longer needs a restart. Reading the small
+    /// state file per list is deliberate: an mtime cache could swallow a change
+    /// read while the installer was still writing it.
+    pub(crate) fn reconcile_installed(&self) {
+        if !self.persist {
+            return;
+        }
+        let Some(root) = self.installation_root.as_deref() else {
+            return;
+        };
+        let store = state::StateStore::new(root);
+        let Ok(installed) = store.load() else {
+            return;
+        };
+        for (id, plugin_state) in &installed.plugins {
+            let Some(release_id) = plugin_state.active_generation.as_ref() else {
+                continue;
+            };
+            let Some(generation) = plugin_state.generations.get(release_id) else {
+                continue;
+            };
+            let wanted = root.join(&generation.package_path);
+            let current = self
+                .entries
+                .read()
+                .unwrap()
+                .get(id)
+                .map(|(entry, _)| entry.package.clone());
+            if current.as_ref() != Some(&wanted)
+                && let Err(error) = self.refresh_installation(id)
+            {
+                tracing::warn!(plugin = %id, %error, "could not load a newly installed generation");
+            }
+        }
     }
 
     fn catalog_for(&self, workspace: Option<&str>) -> Vec<Value> {
