@@ -379,6 +379,11 @@ pub(super) async fn execute_tool_call(
 
     match execute_tool_with_panic_recovery(tool, args_val, ctx).await {
         Ok(mut res) => {
+            // Redact before truncation so the spool file never contains a
+            // configured credential. Media payloads are opaque bytes.
+            if extract_media_parts(&res.output).is_empty() {
+                res.output = crate::redaction::redact_text(&res.output);
+            }
             // Media payloads (e.g. `read_file` on an image/PDF) must reach the
             // agent's media extractor intact. Truncating them mangles the
             // base64 JSON and the image is silently lost, so those outputs
@@ -403,8 +408,9 @@ pub(super) async fn execute_tool_call(
             Ok(res)
         }
         Err(e) => {
-            warn!("Tool '{}' failed: {}", tool_name, e);
-            Ok(ToolResult::new(tool_name, format!("Error: {}", e)))
+            let message = crate::redaction::redact_text(&format!("{e}"));
+            warn!("Tool '{}' failed: {}", tool_name, message);
+            Ok(ToolResult::new(tool_name, format!("Error: {message}")))
         }
     }
 }
