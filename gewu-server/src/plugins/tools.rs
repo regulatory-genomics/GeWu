@@ -69,6 +69,7 @@ enum Gateway {
     CallStatus,
     Cancel,
     Focus,
+    Result,
 }
 
 /// Ordinary tools supplied to the existing Agent at the start of a turn.
@@ -208,6 +209,18 @@ impl PluginHost {
                 "Make an open application instance the focused view for this session, so later calls and context follow it.",
                 json!({"instanceId":{"type":"string"}}),
                 json!(["instanceId"]),
+            ),
+            (
+                Gateway::Result,
+                "plugin_result",
+                "Read or export a completed plugin result that was too large for the compact tool response. Use the resultId returned by a truncated response. read returns a bounded selected value; export writes it to a new workspace file. No file_path input is accepted.",
+                json!({
+                    "action":{"enum":["read","export"]},
+                    "resultId":{"type":"string","minLength":1,"maxLength":128},
+                    "pointer":{"type":"string","maxLength":2048},
+                    "destination":{"type":"string","description":"Required for export; workspace:///relative-path"}
+                }),
+                json!(["action","resultId"]),
             ),
         ] {
             if names.insert(name.into()) {
@@ -583,6 +596,42 @@ impl Tool for PluginTool {
                         )
                         .await?
                     }
+                    Gateway::Result => {
+                        let action = text("action")?;
+                        let result_id = text("resultId")?;
+                        let pointer = args
+                            .get("pointer")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        match action {
+                            "read" => {
+                                super::result_delivery::read(
+                                    &ctx.session_state,
+                                    session,
+                                    result_id,
+                                    pointer,
+                                )
+                                .await?
+                            }
+                            "export" => {
+                                super::result_delivery::export(
+                                    &ctx.session_state,
+                                    session,
+                                    root,
+                                    result_id,
+                                    pointer,
+                                    text("destination")?,
+                                )
+                                .await?
+                            }
+                            other => {
+                                return Err(anyhow::anyhow!(
+                                    "action must be read or export, got {other}"
+                                )
+                                .into());
+                            }
+                        }
+                    }
                 };
                 let text = serde_json::to_string(&data)?;
                 if text.len() > 16384 {
@@ -678,34 +727,53 @@ async fn invoke(
         guard.adapter = None;
     }
     let output = output?;
-    let data = serde_json::to_value(output)?;
+    // Plugin output is persisted in session state and replayed to the model.
+    // Redact before either sink so a config dump cannot become durable secret
+    // material outside the diagnostics path.
+    let data = gewu_core::redaction::redact_value(serde_json::to_value(output)?);
     let mut metadata = data.clone();
     metadata["context"] = serde_json::to_value(&app_context)?;
     let text = serde_json::to_string(&data)?;
-    let mut result = ToolResult::new(
-        tool,
-        if text.len() <= 8192 {
-            text
-        } else {
-            format!("{}… [summary truncated]", clip(&text, 8130))
-        },
-    );
     let stored = json!({"workspaceId":instance.activation.workspace_id,"pluginId":instance.package.manifest.id,
         "bindingResource":instance.activation.binding_resource,"context":app_context,"result":data});
-    match ctx
+    let persisted = ctx
         .session_state
         .write(
             &ctx.session_id,
             &format!("gewu.plugin.result.{id}"),
             &stored,
         )
-        .await
-    {
-        Ok(()) => result
-            .output
-            .push_str(&format!("\n[GeWu plugin result: {id}]")),
-        Err(error) => tracing::warn!("could not persist plugin tool output: {error}"),
+        .await;
+    if let Err(error) = &persisted {
+        tracing::warn!("could not persist plugin tool output: {error}");
     }
+    // Never cut serialized JSON: a partial contract is worse than a reference.
+    // Small results keep their original shape and gain a resultId so the agent
+    // can export a full contract without reconstructing it from prose.
+    let visible = if text.len() <= 12 * 1024 {
+        let mut value: Value = serde_json::from_str(&text)?;
+        if persisted.is_ok() {
+            value["resultId"] = json!(id);
+        }
+        serde_json::to_string(&value)?
+    } else {
+        let data_value = data.get("data").unwrap_or(&Value::Null);
+        serde_json::to_string(&json!({
+            "ok": true,
+            "complete": false,
+            "resultId": id,
+            "bytes": text.len(),
+            "preview": {
+                "top_level_keys": data.as_object().map(|object| object.keys().collect::<Vec<_>>()),
+                "data_keys": data_value.as_object().map(|object| object.keys().collect::<Vec<_>>()),
+            },
+            "next_action": {
+                "tool": "plugin_result",
+                "args": {"action": "read", "resultId": id}
+            }
+        }))?
+    };
+    let mut result = ToolResult::new(tool, visible);
     result.metadata.insert("gewu.plugin".into(), metadata);
     result.metadata.insert(
         "gewu.plugin.instanceId".into(),

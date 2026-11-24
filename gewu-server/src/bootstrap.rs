@@ -258,6 +258,16 @@ pub fn build_provider(
             )
         })?;
 
+    gewu_core::redaction::register_secret(api_key.clone());
+    for endpoint in file_config.endpoints.values() {
+        if let Some(key) = endpoint.api_key.as_deref() {
+            gewu_core::redaction::register_secret(key);
+        }
+    }
+    if let Some(key) = args.api_key.as_deref() {
+        gewu_core::redaction::register_secret(key);
+    }
+
     let base_url = args
         .base_url
         .clone()

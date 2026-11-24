@@ -49,6 +49,7 @@ pub mod agent;
 pub mod compaction;
 pub mod middleware;
 pub mod question;
+pub mod redaction;
 pub mod traits;
 pub mod types;
 

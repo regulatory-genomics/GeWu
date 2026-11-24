@@ -674,7 +674,7 @@ impl ToolContext {
     /// the tool's card by frontends). A no-op when no sink is wired.
     pub fn report_progress(&self, message: impl Into<String>) {
         if let Some(sink) = &self.progress {
-            sink.send(message);
+            sink.send(crate::redaction::redact_text(&message.into()));
         }
     }
 
